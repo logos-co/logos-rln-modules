@@ -1,0 +1,8 @@
+target/
+result
+result-*
+# Staged SDK copy (see README "Staged sources") — recreate via `nix run .#generate`.
+/logos-rust-sdk-src/
+# Provider scaffold — recreate via `nix run .#generate`; the nix build
+# regenerates it too, so nothing here needs a checked-in copy any more.
+/rust-lib/generated/

@@ -1,0 +1,72 @@
+name: rln-module
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "logos-rln-module/**"
+      - ".github/workflows/rln-module.yml"
+  pull_request:
+    paths:
+      - "logos-rln-module/**"
+      - ".github/workflows/rln-module.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo:
+    name: cargo (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Nix and Logos cache
+        uses: logos-co/setup-nix-cache-action@v1
+        with:
+          attic-token-ci: ${{ secrets.ATTIC_TOKEN_CI }}
+          attic-token-public: ${{ secrets.ATTIC_TOKEN_PUBLIC }}
+
+      - name: Install Rust toolchain
+        run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
+
+      # The generated scaffold (rust-lib/generated/provider_gen.rs) and the SDK
+      # source the crate path-deps are gitignored; materialise both so bare
+      # cargo resolves them.
+      - name: Generate the rust build inputs
+        run: nix run path:./logos-rln-module#generate -L
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: logos-rln-module/rust-lib
+
+      - name: cargo clippy
+        working-directory: logos-rln-module/rust-lib
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # The keychain tests drive the live macOS keychain; skipped everywhere
+      # (mirrors local convention), doubly so on a Linux runner.
+      - name: cargo test
+        working-directory: logos-rln-module/rust-lib
+        run: cargo test --locked -- --skip keychain
+
+  nix:
+    name: nix build (.lgx)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Nix and Logos cache
+        uses: logos-co/setup-nix-cache-action@v1
+        with:
+          attic-token-ci: ${{ secrets.ATTIC_TOKEN_CI }}
+          attic-token-public: ${{ secrets.ATTIC_TOKEN_PUBLIC }}
+
+      - name: Build the module bundle
+        run: nix build path:./logos-rln-module#lgx -L

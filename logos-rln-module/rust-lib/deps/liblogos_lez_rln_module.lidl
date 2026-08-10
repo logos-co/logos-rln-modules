@@ -1,0 +1,37 @@
+; liblogos_lez_rln_module contract — the subset the membership module's lez-rln
+; registry provider consumes. Hand-maintained from
+; ../../logos-lez-rln-module/rust-lib/liblogos_lez_rln_module.lidl (same repo):
+; update BOTH files in the same PR when either side changes. Wired via
+; metadata.json dependency_overrides; logos-lidl-gen turns it into the typed
+; LiblogosLezRlnModuleClient — unused at runtime (provider.rs speaks raw lp_*
+; for per-call timeouts, like the sibling's wallet path) but the client
+; documents the consumed wire.
+module liblogos_lez_rln_module {
+  version "2.0.0"
+
+  ; All replies are compact JSON strings; "" is the error value.
+
+  ; Idempotent on-chain registration; {"leaf_index":N,"pending":true,
+  ; "tx_result":…} (leaf_index is a pre-submit ESTIMATE) or
+  ; {"already_registered":true,"leaf_index":N}.
+  method register_member(config_account_id: tstr, user_holding_account_id: tstr, id_commitment_hex: tstr, rate_limit: int) -> tstr
+
+  ; Membership PDA read + state from the on-chain clock: {"registered":false}
+  ; or {"clock_timestamp":N,"grace_period_duration":N,
+  ; "grace_period_start_timestamp":N,"leaf_index":N,"rate_limit":N,
+  ; "registered":true,"state":"active"|"grace_period"|"expired"}.
+  method get_membership(config_account_id: tstr, id_commitment_hex: tstr) -> tstr
+
+  ; {"active_duration":N,"current_total_rate_limit":N,
+  ;  "grace_period_duration":N,"max_rate_limit":N,"max_total_rate_limit":N,
+  ;  "min_rate_limit":N,"price_per_unit":"<decimal>","total_registrations":N}.
+  method get_registry_bounds(config_account_id: tstr) -> tstr
+
+  ; JSON array of proof objects (each with valid_roots from the same tree
+  ; snapshot); "[]" for an empty index list.
+  method get_merkle_proofs(config_account_id: tstr, leaf_indices_json: tstr) -> tstr
+
+  ; Compact JSON array of 32-byte lowercase-hex roots (current + non-zero
+  ; history).
+  method get_valid_roots(rln_account_id_hex: tstr) -> tstr
+}

@@ -1,0 +1,40 @@
+[package]
+name    = "lez_rln_module"
+version = "2.0.0"
+edition = "2021"
+
+[lib]
+name = "liblogos_lez_rln_module"
+crate-type = ["staticlib"]
+
+# Standalone crate: the empty table keeps cargo from adopting any workspace
+# found in a parent directory.
+[workspace]
+
+# Panicking across the FFI boundary is UB; mirror chat_module's setting.
+[profile.release]
+panic = "abort"
+
+[dependencies]
+# The RLN register/proof/funding logic lives IN this crate (src/rln_core.rs).
+# It depends on the shared borsh-layout crate rln-layouts — the on-chain wire
+# — pinned to the logos-lez-rln rev whose deployed programs it must match;
+# bump the rev together with any layout change (generally a redeploy).
+rln-layouts = { git = "https://github.com/logos-co/logos-lez-rln.git", rev = "ff02e202cedb3639314478ad2575776fda6f197f" }
+token_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.2.0-rc6" }
+risc0-zkvm = { version = "3.0", default-features = false, features = ["std"] }
+sha2 = "0.10"
+borsh = { version = "1", default-features = false, features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+
+# The runtime SDK, staged by the module builder (codegen.rust) at this
+# path from the same logos-rust-sdk rev its generator came from.
+logos-rust-sdk = { path = "../logos-rust-sdk-src" }
+serde_json = "1"
+
+# zerokit is test-only: testnet_tests recomputes tree roots (Poseidon) and
+# derives a deterministic throwaway identity. The shipped staticlib does not
+# link it — identity/credential work lives in the membership module.
+[dev-dependencies]
+rln = { version = "3.0.0", default-features = false }
+rand_chacha = "0.3"

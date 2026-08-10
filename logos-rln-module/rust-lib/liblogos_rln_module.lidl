@@ -1,0 +1,359 @@
+; liblogos_rln_module — the RLN Module (specs: RLN-API /
+; rln-module-api and RLN-MEMBERSHIP-MANAGEMENT, logos-lips
+; docs/anoncomms/raw/). Registry-agnostic membership management AND rate
+; limiting: CAIP-10 registry ids routed per namespace to a registry
+; provider; identity credentials generated in-module, held in an encrypted
+; keystore (WAKU-RLN-KEYSTORE format), and never released across this wire;
+; lifecycle tracked with a bounded Pending confirmation window; RLN proof
+; generation with persisted per-epoch message_id allocation; verification
+; from a locally maintained valid-root window (no registry access on the
+; hot path). Every call is scoped by (registry_id, rln_identifier); the
+; lez-rln provider ("logos" namespace) is a wire client of the sibling
+; liblogos_lez_rln_module, and delegated registration drives rln_gifter_module.
+;
+; Reply conventions (this module only — the sibling keeps its ""-on-error).
+; Two dialects, split by declared return type:
+; - `result` methods (the RLN-API rate-limiting + lifecycle surface: start,
+;   stop, generate_proof, verify_proof, get_registry_parameters) return a
+;   real LogosResult — on the consumer wire the envelope
+;   {"success":bool,"value":<reply>,"error":<string>}, where on failure
+;   `error` is the JSON-encoded typed object {"class":…,"kind":…,
+;   "message":…}. These methods are NOT QML-bridge-safe (LogosResult nulls
+;   through the UI bridge) — they are for module/shim consumers only, which
+;   is fine: the GUI never calls them.
+; - `tstr` methods (the membership-management surface the GUI drives)
+;   return a compact JSON object; failures are the in-band envelope
+;   {"error":{"class":…,"kind":…,"message":…}}.
+; In both dialects "class" is the coarse RLN-API RlnErrorKind a
+; consumer-side shim switches on mechanically: not_ready (retry once ready
+; — includes a locked keystore) | transient (MAY retry) | budget_exhausted
+; (epoch rate limit spent; retry next epoch) | permanent (retrying as-is
+; cannot succeed). "kind" refines it: unknown_registry | unknown_membership
+; | provider_failure | locked | bad_password | no_usable_membership |
+; ambiguous_selection | invalid_argument | keychain_unavailable | internal
+; | not_ready | transient | budget_exhausted | permanent.
+; JSON replies use serde_json alphabetical key order throughout.
+; Scope args: every call passes its (registry_id, rln_identifier_hex) scope
+; explicitly (spec: the Module holds no default) — an empty registry_id or
+; rln_identifier_hex fails invalid_argument like any other malformed input.
+; Hex args accept an optional 0x prefix; 0x-prefixed is the CLI-safe
+; spelling (the CLI coerces digit-leading strings to numbers).
+; Events are a third channel, pushed over the lp event stream rather than
+; returned from a call — see the events section below.
+module liblogos_rln_module {
+  version "0.4.0"
+  description "RLN Membership Management Module"
+  category "blockchain"
+  depends [liblogos_lez_rln_module]
+
+  ; --- data shapes ---
+  ; Contract documentation, not code generation: no method here declares a
+  ; `-> Type` return (every method below is `tstr` or `result`, per the
+  ; dialect split above), so today's --provider codegen never references
+  ; these records and materializes nothing from them (no struct, no
+  ; QVariant glue — verified: they simply do not appear in
+  ; generated/provider_gen.rs). They are the source of truth the
+  ; hand-written `#[derive(Serialize)]` mirrors in rust-lib/src/views.rs are
+  ; kept in sync with by hand, the way chat_module.lidl's records document
+  ; chat_module's actions.rs. A generated typed consumer client (`--client`,
+  ; unused by this module today) WOULD render a referenced `type` as a
+  ; `serde_json::Value` parameter/return — still no struct — if one of the
+  ; methods below ever adopted `-> Membership` in place of `-> tstr`.
+  ; RateLimitProof (generate_proof's/verify_proof's proof object) is
+  ; documented on `RateLimitProof::to_json` in proof.rs, not restated as a
+  ; record here — its canonical hex bytes have no meaningful LIDL primitive
+  ; breakdown, and it is mutated post-construction by generate_proof_impl
+  ; (message_id/epoch/membership_hash spliced in), unlike the records below.
+  type Credential {
+    identity_commitment: tstr
+  }
+  ; The public Membership view (spec Membership minus secrets) — register,
+  ; select_membership, and get_memberships all return this shape (get_memberships
+  ; wraps it in {"memberships":[…]}). failed_reason/retryable/rln_identifier/
+  ; tx_result/rate_limit_mismatch are present only when the method comments
+  ; above describe them as such; retryable never appears without failed_reason.
+  type Membership {
+    credential: Credential
+    ? failed_reason: tstr
+    leaf_index: int
+    membership_hash: tstr
+    rate_limit: int
+    ? rate_limit_mismatch: bool
+    registry_id: tstr
+    ? retryable: bool
+    ? rln_identifier: tstr
+    state: tstr
+    submitted_at: int
+    ? tx_result: tstr
+  }
+  ; get_membership_state's reply. registry_id/state are always present;
+  ; membership_hash/leaf_index/rate_limit are present only once a single
+  ; membership resolves for the scope (state:"unknown" -> none of the three;
+  ; more than one candidate is an ambiguous_selection ERROR, not this shape).
+  type MembershipState {
+    ? leaf_index: int
+    ? membership_hash: tstr
+    ? rate_limit: int
+    registry_id: tstr
+    state: tstr
+  }
+  type EpochQuota {
+    epoch_index: int
+    rate_limit: int
+    remaining: int
+  }
+  ; get_registry_parameters' reply. epoch_size_sec is always present (the
+  ; module's own start()-configured value); the registry-declared bounds are
+  ; present only when the registry read returned them. price_per_unit is
+  ; passed through opaquely (the sibling documents it as a decimal STRING;
+  ; this contract makes no assumption about its shape).
+  type RegistryParameters {
+    epoch_size_sec: int
+    ? max_rate_limit: int
+    ? max_total_rate_limit: int
+    ? min_rate_limit: int
+    ? price_per_unit: any
+  }
+  ; verify_proof's reply. recovered_secret is present only for the
+  ; "rate_limit_violation" verdict.
+  type VerificationResult {
+    ? recovered_secret: tstr
+    verdict: tstr
+  }
+
+  ; Open (create-if-absent) the keystore at the instance persistence path
+  ; and hold the session password in memory (needed to write credentials on
+  ; register and decrypt them on select). {"membership_count":N,
+  ; "unlocked":true}; bad_password when an existing credential envelope
+  ; fails its MAC under this password. Reads (get_memberships,
+  ; get_membership_state) work without unlocking — the sidecar metadata is
+  ; plaintext-safe by design.
+  method unlock_keystore(password: tstr) -> tstr
+
+  ; Drop the session password (zeroized). Lifecycle polling continues — it
+  ; touches only the plaintext-safe metadata. {"locked":true}.
+  method lock_keystore() -> tstr
+
+  ; Spec register(scope, rate_limit, options). Scope = (registry_id,
+  ; rln_identifier_hex). registry_id: CAIP-10, e.g. logos:<ref>:<config-hex>.
+  ; The identity credential is GENERATED INSIDE the module and
+  ; persisted encrypted — the caller supplies no credential and the secret
+  ; never crosses this wire. options_json is a FLAT string key/value map
+  ; (spec RegistryOptions: char* key/value pairs) for the logos namespace:
+  ; {"funding_holding_account_id":"<account>"} (direct, the caller pays), or
+  ; {"delegated":"true","gifter_peer_id":…,"gifter_multiaddr":…,
+  ; "auth_type"?,"auth_payload"?,"auth_provider"?,"auth_args"?} — delegated
+  ; registration via the RLN Membership Allocation Protocol: register drives
+  ; rln_gifter_module.request with the module-generated commitment. auth_type
+  ; names the gifter auth vector verbatim (open vocabulary); its payload is
+  ; auth_payload (hex) or produced by the auth_provider module (an
+  ; rln_auth_vector producer, auth_args forwarded verbatim — e.g.
+  ; keycard_capture_module, card on reader required). A rate_limit outside
+  ; the registry's bounds fails permanent BEFORE a credential is minted (soft
+  ; pre-check: an unreadable registry skips it and lets the registry enforce
+  ; at submission). Idempotent PER SCOPE (spec): a live membership registered
+  ; under this rln_identifier — or a pre-scope legacy record, which backs
+  ; every application — short-circuits; a DIFFERENT application registering
+  ; on the same registry gets its own membership (isolated slashing blast
+  ; radius), while a lone membership still backs any application at proof
+  ; time. Returns the public Membership view (commitment only, no secrets),
+  ; "state":"pending" on a fresh submit — poll get_membership_state for the
+  ; pending->active transition; "rate_limit_mismatch":true when the scope's
+  ; live membership has a different rate limit. A submission that later goes
+  ; "failed" (window elapsed, provider/gifter refusal) carries
+  ; "failed_reason" plus "retryable":bool (spec: a failed submission SHALL
+  ; report whether it is retryable) — "failed" is a terminal state (never
+  ; blocks a fresh registration), so retrying just means calling register
+  ; again for the same scope.
+  method register(registry_id: tstr, rln_identifier_hex: tstr, rate_limit: int, options_json: tstr) -> tstr
+
+  ; Spec get_membership_state(scope). Resolves the membership BACKING the
+  ; scope: records registered under this rln_identifier (or carrying none —
+  ; legacy) first; with no usable match, any of the registry's records. The
+  ; live registry read overlaid on the local record: an in-window unconfirmed
+  ; submission reports "pending" (not "unknown"), a vanished previously-active
+  ; membership reports "erased". No candidate → "unknown"; more than one
+  ; → ambiguous_selection. {"registry_id":…,"state":"pending"|"failed"|
+  ; "active"|"grace_period"|"expired"|"erased"|"unknown"} plus membership_hash /
+  ; leaf_index / rate_limit when known.
+  method get_membership_state(registry_id: tstr, rln_identifier_hex: tstr) -> tstr
+
+  ; Spec get_memberships(): all locally managed memberships for the
+  ; registry, ANY state including pending and failed (filtering usable ones
+  ; is select's job); public view. {"memberships":[…]}.
+  method get_memberships(registry_id: tstr) -> tstr
+
+  ; Spec select(). rln_identifier_hex: the application's 32-byte scope key
+  ; (opaque here — it never reaches the registry). Candidates: state
+  ; active|grace_period only. selector_json: "" or "{}" (required sole
+  ; candidate), {"by_hash":"<membership_hash>"}, or {"strategy":"round_robin"|
+  ; "highest_rate_limit"} (round_robin state is per (registry_id,
+  ; rln_identifier) scope). Returns the PUBLIC membership view only — the
+  ; identity credential is NEVER released across this interface; proof
+  ; generation happens INSIDE generate_proof, so no unlock is required.
+  method select_membership(registry_id: tstr, rln_identifier_hex: tstr, selector_json: tstr) -> tstr
+
+  ; Provider passthrough. One proof object from a single tree snapshot,
+  ; augmented with the SAME snapshot's valid_roots (never fetch the two
+  ; separately — roots rotate in seconds on an active tree):
+  ; {"depth":N,"leaf":…,"leaf_index":N,"path_elements":[…],
+  ;  "path_indices":[…],"root":…,"valid_roots":[…]}.
+  method get_merkle_proof(registry_id: tstr, leaf_index: int) -> tstr
+
+  ; Provider passthrough. {"valid_roots":["<hex64>",…]} — wrapped in an
+  ; object so the same shape can become the pass-2 subscription event
+  ; payload (which must carry registry_id).
+  method get_valid_roots(registry_id: tstr) -> tstr
+
+  ; Spec generate_proof(scope, signal, timestamp). Scope = (registry_id,
+  ; rln_identifier_hex — the application's 32-byte scope key). signal_hex: the
+  ; raw signal bytes as hex; the circuit binds x = hash_to_field_le(signal).
+  ; timestamp: the consumer's Unix-seconds clock reading — the SAME value it
+  ; stamps on the message. The proof's epoch derives from it (epoch =
+  ; timestamp / epoch_size_sec), NOT this module's clock, so the epoch always
+  ; agrees with the message timestamp a receiver validates against — the two
+  ; independent clocks can no longer disagree on an epoch boundary. Picks the
+  ; scope's sole usable (active|grace_period) membership, decrypts its
+  ; credential IN-MODULE (requires an unlocked keystore — the secret never
+  ; crosses this wire), reserves and durably persists the next message_id,
+  ; fetches the Merkle path, and proves. Returns the RateLimitProof —
+  ; {"proof":<canonical hex>,"root","external_nullifier","share_x","share_y",
+  ; "nullifier"} (all hex) — plus the spent "message_id", the "epoch" (u64
+  ; index), and the "membership_hash". Errors: no_usable_membership,
+  ; ambiguous_selection (multiple; select first), locked, budget_exhausted
+  ; (epoch rate limit spent), invalid_argument (bad signal/timestamp, or a
+  ; timestamp whose epoch is outside now ± max_epoch_gap), transient.
+  method generate_proof(registry_id: tstr, rln_identifier_hex: tstr, signal_hex: tstr, timestamp: tstr) -> result
+
+  ; Spec verify_proof(scope, signal, proof). The message hot path: served
+  ; entirely from the locally maintained valid-root window, NEVER reading the
+  ; registry. Needs no membership or unlocked keystore — a pure validator never
+  ; registers. proof_json accepts EITHER shape: the object generate_proof
+  ; returns (canonical "proof" bytes trusted, other fields ignored) OR the
+  ; spec's decomposed RateLimitProof struct — "proof" as the bare 128-byte
+  ; Groth16 hex plus root/external_nullifier/share_x/share_y/nullifier —
+  ; the shape a consumer reassembles from its own network message. In both,
+  ; "epoch" may be the u64 index (generate_proof's reply) or epoch[32] LE hex. Checks,
+  ; in order: the proof's external nullifier equals the scope's expected
+  ; poseidon(hash_to_field_le(epoch[32]), hash_to_field_le(rln_identifier)) —
+  ; epoch[32] = the epoch index as 32-byte LE (logos-delivery's toEpoch) — for
+  ; the current epoch ±max_epoch_gap (application binding + epoch freshness —
+  ; generator and verifiers must share start()'s epoch_size), then zk-validity
+  ; + signal + root-in-window. Returns a verdict object {"verdict":str}: "valid"
+  ; (first valid proof for its nullifier), "invalid" (any failed check — not an
+  ; error), "duplicate" (nullifier already seen under the same share_x — a
+  ; retransmission), or "rate_limit_violation" (nullifier reused under a
+  ; different share_x — a double-signal). Only "rate_limit_violation" adds a
+  ; field: "recovered_secret" (hex), the offender's own identity secret
+  ; reconstructed from the two colliding shares. The verdict comes from an
+  ; in-module nullifier log (per epoch, retained max_epoch_gap epochs,
+  ; in-memory) — double-signal detection is the Module's job, not the
+  ; consumer's. not_ready while the root window is cold/stale; invalid_argument
+  ; on malformed input.
+  method verify_proof(registry_id: tstr, rln_identifier_hex: tstr, signal_hex: tstr, proof_json: tstr) -> result
+
+  ; Spec get_epoch_quota(scope): the scope's current epoch, its membership's
+  ; rate limit, and the budget still unspent — for consumer-side send
+  ; scheduling (rolling a metering window on the epoch boundary, clamping a
+  ; configured cap). {"epoch_index":N,"rate_limit":N,"remaining":N} —
+  ; epoch_index a NUMBER (floor(unix_seconds / epoch_size_sec), the same
+  ; index generate_proof encodes as epoch[32] into the external nullifier).
+  ; All three
+  ; fields derive from ONE epoch observation (spec MUST — a remaining is
+  ; never paired with another epoch's index). Purely local: no registry
+  ; access, no unlock needed. Advisory only — generate_proof remains the
+  ; allocation authority (budget_exhausted when spent between read and
+  ; proof). A scope without a usable membership is NOT an error (spec
+  ; SHALL): the reply carries the current epoch_index with rate_limit and
+  ; remaining both 0 — rate_limit 0 always means "no usable membership",
+  ; never an exhausted budget (disambiguate via get_membership_state).
+  ; Errors: ambiguous_selection, invalid_argument.
+  method get_epoch_quota(registry_id: tstr, rln_identifier_hex: tstr) -> result
+
+  ; Registry parameters read (spec's optional extension): the
+  ; registry-declared parameters that bound registration, plus the module's
+  ; configured epoch length — {"epoch_size_sec","max_rate_limit",
+  ; "min_rate_limit","max_total_rate_limit","price_per_unit"}. Performs one
+  ; registry read (bounds); the per-scope budget lives in get_epoch_quota.
+  method get_registry_parameters(registry_id: tstr, rln_identifier_hex: tstr) -> result
+
+  ; Provision a wallet-home under this module's persistence dir. Why HERE:
+  ; sandboxed ui_qml views cannot create files, the execution-zone wallet
+  ; module is external pre-lidl C++ that cannot provision its own config,
+  ; and this module owns the only host-stamped writable directory on this
+  ; wire (the keystore already lives there). Creates
+  ; <instance_persistence_path>/wallet-home/ if needed and writes
+  ; wallet_config.json IF ABSENT from options_json.sequencer_addr
+  ; (required; invalid_argument when missing/empty) plus the deployed
+  ; testnet's working defaults (seq_poll_timeout "30s",
+  ; seq_tx_poll_max_blocks 15, seq_poll_max_retries 10,
+  ; seq_block_poll_max_amount 100 — field-for-field the shape
+  ; tools/deployments/stage.sh emits). NEVER creates storage.json — that
+  ; stays the wallet module's job (create_new), so an existing funded
+  ; wallet is never touched. {"config_existed":bool,"config_path":…,
+  ; "storage_exists":bool,"storage_path":…}; internal when the host
+  ; provided no persistence path (same policy as the keystore).
+  method provision_wallet_home(options_json: tstr) -> tstr
+
+  ; OS-keychain auto-unlock (macOS only for now — the `security` CLI
+  ; backend; elsewhere keychain_unavailable and the caller falls back to the
+  ; manual password). Fetches this instance's secret from the login keychain
+  ; (service org.logos.rln-membership.keystore, account = sha256 of the
+  ; verbatim persistence dir) and unlocks through the NORMAL verification
+  ; seam; with no item and an EMPTY keystore it generates 32 random bytes,
+  ; writes the item FIRST, then unlocks. The item carries
+  ; -T /usr/bin/security (dev trust level: any same-user process — where the
+  ; passwordless wallet already lives; production Developer-ID signing
+  ; enables a stricter app-bound ACL later). Returns the secret so a GUI can
+  ; reuse it as the wallet passphrase — the one reply that carries it; treat
+  ; it like the manual password. {"membership_count":N,"secret":…,
+  ; "source":"created"|"existing","unlocked":true}. Errors:
+  ; keychain_unavailable (non-macOS, denied/locked keychain, item missing
+  ; while the keystore HAS credentials — it never invents a secret over one,
+  ; foreign payload, write failure), bad_password (item secret fails the
+  ; keystore MAC — manual-era keystore: unlock manually once and remember),
+  ; internal (no persistence path). CAVEAT: for auto-created accounts the
+  ; user never saw the secret — deleting the keychain item orphans the
+  ; credentials (a future export surface can reveal it first).
+  method unlock_keystore_auto() -> tstr
+
+  ; Persist the CURRENT session password to the OS keychain so the next
+  ; unlock_keystore_auto succeeds silently — the manual-to-auto migration
+  ; hook (the plaintext never re-crosses the wire; it is read module-side).
+  ; Overwrites any existing item (-U; one delete+re-add retry on ACL
+  ; conflicts). {"remembered":true}; locked when nothing is unlocked,
+  ; keychain_unavailable / internal as above.
+  method remember_keystore_password() -> tstr
+
+  ; Spec start(). Apply configuration and begin maintenance (the registry root
+  ; windows, each usable membership's Merkle proof path, the confirmation
+  ; poller), clearing any prior stop(). config_json:
+  ; {"epoch_size_sec":N (REQUIRED — the application rate-limit epoch, an
+  ; APPLICATION parameter every proof generator and verifier of a deployment
+  ; must share; it has no safe default, so until start() sets it the
+  ; rate-limiting methods — generate_proof, verify_proof, get_epoch_quota —
+  ; fail not_ready), "max_epoch_gap"?:N (default 1),
+  ; "registries"?:["<caip10>",…] (their root windows are warmed immediately)}.
+  ; Idempotent — safe to re-call to reconfigure. No default scope: every
+  ; other method takes its (registry_id, rln_identifier_hex) explicitly.
+  ; {"started":true,"epoch_size_sec":N,"registries":[…]}.
+  method start(config_json: tstr) -> result
+
+  ; Spec stop(). Halt the maintenance tasks for real: sleeping workers wake
+  ; and are joined within a short grace; a worker blocked in one in-flight
+  ; registry read is detached and self-exits after that single read, never
+  ; scheduling further work. Nothing spawns again until the next start(),
+  ; which respawns fresh workers. {"stopped":true}.
+  method stop() -> result
+
+  ; --- events ---
+  ; Membership lifecycle transitions observed by the confirmation poller (the
+  ; spec's optional "membership state subscriptions" extension): emitted when
+  ; a membership's registry-observed state CHANGES (pending->active,
+  ; pending->failed, active->grace_period/expired, observed->erased) — never
+  ; for a mere re-observation of the same state. rln_identifier is the
+  ; registering scope's (empty for a pre-scope legacy record); consumers
+  ; filter on (registry_id, membership_hash). previous is the state the
+  ; record held before the transition.
+  event membership_state_changed(registry_id: tstr, rln_identifier: tstr, membership_hash: tstr, state: tstr, previous: tstr)
+}

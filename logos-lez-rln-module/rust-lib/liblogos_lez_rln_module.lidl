@@ -1,0 +1,61 @@
+; liblogos_lez_rln_module — the LEZ RLN registry provider. The contract is the
+; surface its two consumers use: the membership module's registry provider
+; (register_member / get_membership / get_registry_bounds / get_merkle_proofs
+; / get_valid_roots — see logos-rln-module/rust-lib/deps/) and the
+; membership UI's funding flow (claim_tokens / get_token_balance). Identity
+; and credential generation belong to the membership module, which keeps the
+; secret in-module; this module never handles secrets.
+; v2.0.0 dropped the C++-era wire freeze: generate_identity,
+; compute_rate_commitment, is_member_registered, mint_tokens, the two
+; start_*_broadcast methods and the valid_roots / merkle_proof events.
+module liblogos_lez_rln_module {
+  version "2.0.0"
+  description "RLN registry provider (LEZ chain reads + registration/funding txs)"
+  category "blockchain"
+  depends [logos_execution_zone]
+
+  ; Compact JSON array of 32-byte lowercase-hex roots (current + non-zero
+  ; history), or "" on error.
+  method get_valid_roots(rln_account_id_hex: tstr) -> tstr
+
+  ; leaf_indices_json is a JSON array of leaf indices. Returns a compact
+  ; JSON array of proof objects, each augmented with "valid_roots", from a
+  ; stable tree snapshot (5 attempts, "" on sustained churn); "[]" for an
+  ; empty index list, "" on error.
+  method get_merkle_proofs(config_account_id: tstr, leaf_indices_json: tstr) -> tstr
+
+  ; Idempotent on-chain registration. Existing membership PDA →
+  ; {"already_registered":true,"leaf_index":N}; otherwise submits the
+  ; Register tx and returns {"leaf_index":N,"pending":true,"tx_result":s}
+  ; without waiting for confirmation; "" on error.
+  method register_member(config_account_id: tstr, user_holding_account_id: tstr, id_commitment_hex: tstr, rate_limit: int) -> tstr
+
+  ; Live token-holding balance for account_id.
+  ; {"exists":true,"balance":decimal,"definition":hex} |
+  ; {"exists":false,"balance":"0"} for absent | "" on error (NOT zero).
+  method get_token_balance(account_id: tstr) -> tstr
+
+  ; Faucet claim (faucet-funded deployments): mint `amount` into dest from the
+  ; program-owned payment PDA — no human key. amount is int (like rate_limit)
+  ; — the CLI coerces numeric args to numbers on the wire; practical amounts
+  ; fit i64. Non-blocking; returns
+  ; {"tx_result":s,"payment_definition":hex,"pending":true} or "" on failure.
+  method claim_tokens(config_account_id: tstr, dest_account_id: tstr, amount: int) -> tstr
+
+  ; Membership PDA read + lifecycle state derived from the on-chain CLOCK_50
+  ; timestamp (never local time). {"registered":false} when the PDA is absent
+  ; or emptied (erase/slash); otherwise {"clock_timestamp":N,
+  ; "grace_period_duration":N,"grace_period_start_timestamp":N,"leaf_index":N,
+  ; "rate_limit":N,"registered":true,"state":"active"|"grace_period"|"expired"};
+  ; "" on error (including clock fetch failure).
+  method get_membership(config_account_id: tstr, id_commitment_hex: tstr) -> tstr
+
+  ; Registry-declared registration bounds: the compile-time rate-limit range
+  ; plus ConfigState capacity/pricing/duration fields read by offset.
+  ; price_per_unit is a decimal STRING (u128 exceeds JSON number precision,
+  ; like get_token_balance's balance). {"active_duration":N,
+  ; "current_total_rate_limit":N,"grace_period_duration":N,"max_rate_limit":600,
+  ; "max_total_rate_limit":N,"min_rate_limit":100,"price_per_unit":"<decimal>",
+  ; "total_registrations":N}; "" on error.
+  method get_registry_bounds(config_account_id: tstr) -> tstr
+}
