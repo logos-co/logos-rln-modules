@@ -9,8 +9,9 @@
 //! LEZ_RLN_TESTNET_TESTS=1 cargo test testnet_ -- --nocapture
 //! ```
 //!
-//! The registry under test comes from the repo's deployment records:
-//! `deployments/<name>/deployment.json`, `<name>` =
+//! The registry under test comes from a logos-lez-rln checkout's deployment
+//! records: `<LEZ_RLN_CHECKOUT>/deployments/<name>/deployment.json`
+//! (checkout default: `../logos-lez-rln` next to this repo), `<name>` =
 //! `LEZ_RLN_TESTNET_DEPLOYMENT` (default `shared-faucet`, the shared
 //! testnet deployment). The sequencer is reached over its public JSON-RPC
 //! (`getAccount` — the same read the wallet module's `get_account_public`
@@ -22,7 +23,7 @@
 //! deployments — hazard class "run_setup binary drift"), PDA-derivation
 //! divergence, tree/proof encoding drift, and chain-clock unit changes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -65,10 +66,13 @@ fn testnet() -> Option<Deployment> {
         return None;
     }
     let name = std::env::var("LEZ_RLN_TESTNET_DEPLOYMENT").unwrap_or_else(|_| "shared-faucet".to_string());
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../deployments")
-        .join(&name)
-        .join("deployment.json");
+    // Deployment descriptors live with the programs in logos-co/logos-lez-rln:
+    // LEZ_RLN_CHECKOUT points at that checkout (default: a sibling of this
+    // repo), matching the membership e2e script's convention.
+    let checkout = std::env::var("LEZ_RLN_CHECKOUT").map(PathBuf::from).unwrap_or_else(|_| {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../logos-lez-rln")
+    });
+    let path = checkout.join("deployments").join(&name).join("deployment.json");
     let doc: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("deployment record {}: {e}", path.display())),
