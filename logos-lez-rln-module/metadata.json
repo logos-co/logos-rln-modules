@@ -1,0 +1,55 @@
+{
+  "name": "liblogos_lez_rln_module",
+  "display_name": "LEZ RLN Module",
+  "version": "2.0.0",
+  "description": "RLN registry provider (LEZ chain reads + registration/funding txs)",
+  "author": "Logos Blockchain Team",
+  "type": "core",
+  "interface": "cdylib",
+  "category": "blockchain",
+  "main": "liblogos_lez_rln_module_plugin",
+  "dependencies": [
+    "logos_execution_zone"
+  ],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "lidl": "rust-lib/liblogos_lez_rln_module.lidl",
+    "rust": {
+      "crate": "rust-lib"
+    }
+  },
+  "dependency_overrides": {
+    "logos_execution_zone": {
+      "file": "rust-lib/deps/logos_execution_zone.lidl"
+    }
+  },
+  "nix": {
+    "external_libraries": [],
+    "packages": {
+      "build": [],
+      "runtime": []
+    },
+    "cmake": {
+      "find_packages": [],
+      "extra_include_dirs": []
+    },
+    "rust": {
+      "toolchain": "1.94.0",
+      "packages": {
+        "build": [
+          "pkg-config",
+          "perl",
+          "protobuf",
+          "cmake",
+          "python3",
+          "clang"
+        ],
+        "runtime": []
+      },
+      "env": {
+        "RISC0_SKIP_BUILD_KERNELS": "1"
+      }
+    }
+  }
+}

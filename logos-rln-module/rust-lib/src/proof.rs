@@ -1,0 +1,787 @@
+//! RLN rate-limit proof engine: the spec's `generate_proof` / `verify_proof`
+//! crypto, over zerokit `rln` (stateless, the same 2.0.2 pin the sibling
+//! module and lez-rln already build).
+//!
+//! This module is the ONE place identity secrets touch the RLN circuit; it
+//! never persists, logs, or returns a secret — the caller passes the
+//! decrypted `identity_secret_hash` in (from the keystore, in-process) and
+//! gets back only the public `RateLimitProof`. The sole sanctioned exception is
+//! [`recover_identity_secret_hex`]: when a proof double-signals, the spec has
+//! the Module reconstruct and report the offender's OWN secret from their two
+//! colliding shares (`recovered_secret`) — never one of this module's
+//! credentials. Barring that violator-secret egress, nothing here crosses the
+//! module boundary except the proof, keeping the spec's "identity credentials
+//! never leave the Module" invariant true even as we add proving.
+//!
+//! Witness assembly mirrors lez-rln's `run_rln_proof.rs` exactly, so a proof
+//! this module generates verifies against the same on-chain roots that binary
+//! produces. Two constructions are PINNED here (they are the wire contract
+//! every implementation has to match — see `external_nullifier` and
+//! `signal_to_x`):
+//!
+//! - `external_nullifier = poseidon(hash_to_field_le(epoch),
+//!   hash_to_field_le(rln_identifier))`, where `epoch` is the spec's
+//!   `epoch[32]`: the epoch index as a 32-byte little-endian integer
+//! - `x = hash_to_field_le(signal)`
+//!
+//! Both match logos-delivery byte-for-byte (`toEpoch` +
+//! `generateExternalNullifier` + `hashToFieldLe` in its `waku/rln/`), so
+//! proofs cross-verify with its embedded zerokit. Note the divergence from
+//! EVM nwaku `waku_rln_relay/rln/wrappers.nim`, which keccak256-hashes both
+//! poseidon inputs; cross-stack interop with nwaku would require agreeing
+//! this at the spec level.
+//!
+//! Canonical `RateLimitProof` serialization (the proof is a
+//! wire type that crosses from the generating node to verifying nodes, not a
+//! local opaque blob) is zerokit's own `rln_proof_to_bytes_le`: a version
+//! byte, the 128-byte compressed Groth16 proof, then the LE-serialized public
+//! values. The named spec fields (`root`, `external_nullifier`, `share_x`,
+//! `share_y`, `nullifier`) are exposed as a decoded view derived from the
+//! public values; verification always recomputes from the canonical bytes and
+//! never trusts the decoded fields.
+
+use rln::prelude::{
+    bytes_le_to_fr, bytes_le_to_rln_proof, compute_id_secret, fr_to_bytes_le, hash_to_field_le,
+    poseidon_hash, rln_proof_to_bytes_le, Fr, Proof, RLNError, RLNProof, RLNProofValues,
+    RLNWitnessInput, VerifyError, DEFAULT_TREE_DEPTH,
+};
+use rln::utils::IdSecret;
+
+use crate::registry_id::{bytes_to_hex, hex_to_bytes32, hex_to_vec};
+
+/// The circuit's fixed Merkle depth (zerokit stateless default = 20), equal to
+/// the lez-rln registry's `TREE_DEPTH`; a supplied path MUST have this length
+/// or witness construction fails.
+pub(crate) const RLN_TREE_DEPTH: usize = DEFAULT_TREE_DEPTH;
+
+/// Failures the proof engine can raise. `Invalid` is NOT modelled here — a
+/// proof that simply does not verify is `Ok(false)` from [`verify`], so the
+/// hot path can distinguish "invalid message" from "engine could not run"
+/// (the spec's `verify_proof` bool vs `RLN_ERR_*` split).
+#[derive(Debug)]
+pub(crate) enum ProofError {
+    /// Malformed caller input (bad hex, wrong path length, out-of-range
+    /// message id): retrying cannot help — maps to `RLN_ERR_PERMANENT`.
+    BadInput(String),
+    /// The circuit/engine could not run (RLN init, witness calc): maps to
+    /// `RLN_ERR_TRANSIENT` / `RLN_ERR_NOT_READY` at the call site.
+    Engine(String),
+}
+
+/// Everything the circuit needs about the membership, assembled by the caller
+/// (`generate_proof`) from the keystore credential and the registry's Merkle
+/// proof. Hex is lowercase, 32-byte little-endian — the crate-wide encoding.
+pub(crate) struct WitnessMaterial {
+    /// Decrypted `identity_secret_hash` (LE hex) — used only to build the
+    /// witness, never stored or returned.
+    pub(crate) identity_secret_hash_hex: String,
+    /// The membership's rate limit = the circuit's `user_message_limit`.
+    pub(crate) rate_limit: u64,
+    /// The slot allocated for this proof; MUST be `< rate_limit`.
+    pub(crate) message_id: u64,
+    /// Merkle path sibling hashes, root→leaf order as the registry returns
+    /// them, each 32-byte LE hex; length MUST equal [`RLN_TREE_DEPTH`].
+    pub(crate) path_elements_hex: Vec<String>,
+    /// Per-level path direction bits (0/1), same length/order as
+    /// `path_elements_hex`.
+    pub(crate) path_indices: Vec<u8>,
+}
+
+/// A generated RLN proof in the spec's `RateLimitProof` shape. `canonical` is
+/// the authoritative zerokit serialization; the five 32-byte fields are the
+/// decoded public-value view (spec's `share_x`/`share_y` are the circuit's
+/// `x`/`y`).
+#[derive(Debug)]
+pub(crate) struct RateLimitProof {
+    canonical: Vec<u8>,
+    root: [u8; 32],
+    external_nullifier: [u8; 32],
+    share_x: [u8; 32],
+    share_y: [u8; 32],
+    nullifier: [u8; 32],
+    /// The spec's `epoch[32]`, decoded — carried on proofs this module
+    /// generates; `None` for a wire proof reconstructed without one (a
+    /// legacy shape), which `verify_proof` then resolves by scanning
+    /// instead of checking directly.
+    epoch: Option<u64>,
+}
+
+impl RateLimitProof {
+    /// Bundle the Groth16 proof with its public values and capture both the
+    /// canonical bytes and the decoded field view. `epoch` is `None` here —
+    /// callers that know the epoch (generation, a parsed wire `epoch[32]`)
+    /// attach it afterward.
+    fn from_parts(proof: Proof, values: RLNProofValues) -> Result<Self, ProofError> {
+        let root = fr_to_32(values.root());
+        let external_nullifier = fr_to_32(values.external_nullifier());
+        let share_x = fr_to_32(values.x());
+        let share_y = fr_to_32(values.y());
+        let nullifier = fr_to_32(values.nullifier());
+        let canonical = rln_proof_to_bytes_le(&RLNProof {
+            proof,
+            proof_values: values,
+        })
+        .map_err(|e| ProofError::Engine(format!("serialize proof: {e}")))?;
+        Ok(RateLimitProof {
+            canonical,
+            root,
+            external_nullifier,
+            share_x,
+            share_y,
+            nullifier,
+            epoch: None,
+        })
+    }
+
+    /// The root the proof was generated against — the value `verify_proof`
+    /// checks against its valid-root window. Production verification reads
+    /// the root out of the canonical bytes inside zerokit; this decoded view
+    /// serves the tests that build root windows around synthetic proofs.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn root(&self) -> [u8; 32] {
+        self.root
+    }
+
+    /// The spec `RateLimitProof` as a JSON object: `proof` is the canonical
+    /// hex the consumer round-trips unchanged, the rest a decoded view.
+    /// `epoch` (the spec's `epoch[32]`, 32-byte LE hex) is present only when
+    /// this proof carries one.
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        let mut out = serde_json::json!({
+            "proof": bytes_to_hex(&self.canonical),
+            "root": bytes_to_hex(&self.root),
+            "external_nullifier": bytes_to_hex(&self.external_nullifier),
+            "share_x": bytes_to_hex(&self.share_x),
+            "share_y": bytes_to_hex(&self.share_y),
+            "nullifier": bytes_to_hex(&self.nullifier),
+        });
+        if let Some(epoch) = self.epoch {
+            out["epoch"] = serde_json::Value::String(bytes_to_hex(&epoch_to_bytes(epoch)));
+        }
+        out
+    }
+
+    /// Rebuild from the wire form. Two accepted shapes:
+    ///
+    /// 1. Canonical: `proof` carries the full zerokit serialization (what
+    ///    [`Self::to_json`] emits). The decoded fields are recomputed from it,
+    ///    so a tampered field can never desync from what verification checks.
+    /// 2. Decomposed (the spec's `RateLimitProof` struct, what a consumer
+    ///    reassembles from its own network message): `proof` is the bare
+    ///    128-byte compressed Groth16 proof and `root` /
+    ///    `external_nullifier` / `share_x` / `share_y` / `nullifier` carry
+    ///    the public values. The canonical bytes are reconstructed
+    ///    deterministically (version ‖ proof ‖ version ‖ root ‖
+    ///    external_nullifier ‖ x ‖ y ‖ nullifier, all LE) and re-parsed, so
+    ///    both shapes land in the identical verified representation.
+    ///
+    /// Both shapes accept an optional `epoch` (the spec's `epoch[32]`,
+    /// 32-byte LE hex): absent leaves the proof epoch-less, present decodes
+    /// via [`epoch_from_bytes`] and rejects a malformed or non-canonical
+    /// value outright — a bad epoch is never silently dropped.
+    pub(crate) fn from_json(value: &serde_json::Value) -> Result<Self, ProofError> {
+        let proof_hex = value
+            .get("proof")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ProofError::BadInput("proof: missing proof bytes".into()))?;
+        let bytes = hex_to_vec(proof_hex)
+            .ok_or_else(|| ProofError::BadInput("proof: not valid hex".into()))?;
+
+        const GROTH16_LEN: usize = 128;
+        let canonical: Vec<u8> = if bytes.len() == GROTH16_LEN {
+            // Spec-struct shape: reassemble the canonical form around the bare
+            // Groth16 proof, in zerokit's exact SingleV1 field order.
+            let field = |key: &str| -> Result<[u8; 32], ProofError> {
+                value
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .and_then(hex_to_bytes32)
+                    .ok_or_else(|| {
+                        ProofError::BadInput(format!("{key}: expected 32-byte hex alongside a bare proof"))
+                    })
+            };
+            let mut out = Vec::with_capacity(2 + GROTH16_LEN + 5 * 32);
+            out.push(0x00);
+            out.extend_from_slice(&bytes);
+            out.push(0x00);
+            out.extend_from_slice(&field("root")?);
+            out.extend_from_slice(&field("external_nullifier")?);
+            out.extend_from_slice(&field("share_x")?);
+            out.extend_from_slice(&field("share_y")?);
+            out.extend_from_slice(&field("nullifier")?);
+            out
+        } else {
+            bytes
+        };
+
+        // Two accepted encodings of the same epoch: the spec's epoch[32]
+        // LE hex, and the u64 index generate_proof's reply carries.
+        let epoch = match value.get("epoch") {
+            None => None,
+            Some(v) => {
+                if let Some(index) = v.as_u64() {
+                    Some(index)
+                } else {
+                    let hex = v.as_str().ok_or_else(|| {
+                        ProofError::BadInput("epoch: expected 32-byte hex or u64 index".into())
+                    })?;
+                    let bytes = hex_to_bytes32(hex).ok_or_else(|| {
+                        ProofError::BadInput("epoch: expected 32-byte hex or u64 index".into())
+                    })?;
+                    Some(epoch_from_bytes(&bytes).ok_or_else(|| {
+                        ProofError::BadInput("epoch: non-canonical padding".into())
+                    })?)
+                }
+            }
+        };
+
+        let (rln_proof, _) = bytes_le_to_rln_proof(&canonical)
+            .map_err(|e| ProofError::BadInput(format!("proof: not a valid RLN proof: {e}")))?;
+        let mut proof = Self::from_parts(rln_proof.proof, rln_proof.proof_values)?;
+        proof.epoch = epoch;
+        Ok(proof)
+    }
+
+    /// The external nullifier the proof was bound to — checked by
+    /// `verify_proof` against the scope's expected epoch window.
+    pub(crate) fn external_nullifier(&self) -> [u8; 32] {
+        self.external_nullifier
+    }
+
+    /// The proof's nullifier — the per-epoch identity+slot fingerprint the
+    /// nullifier log keys on to detect a reused slot.
+    pub(crate) fn nullifier(&self) -> [u8; 32] {
+        self.nullifier
+    }
+
+    /// The signal-bound share coordinate `x`. Two proofs sharing a nullifier
+    /// but differing here are a double-signal; matching here is a
+    /// retransmission — the split the log's verdict turns on.
+    pub(crate) fn share_x(&self) -> [u8; 32] {
+        self.share_x
+    }
+
+    /// The share coordinate `y`. Paired with `share_x`, it is one Shamir point;
+    /// two colliding points reconstruct the double-signaller's secret.
+    pub(crate) fn share_y(&self) -> [u8; 32] {
+        self.share_y
+    }
+
+    /// The epoch this proof carries (the spec's `epoch[32]`, decoded), or
+    /// `None` for a wire proof reconstructed without one — `verify_proof`
+    /// checks the former directly and resolves the latter by scanning.
+    pub(crate) fn epoch(&self) -> Option<u64> {
+        self.epoch
+    }
+
+    /// Reconstruct the zerokit proof + public values for verification.
+    fn to_rln_proof(&self) -> Result<RLNProof, ProofError> {
+        bytes_le_to_rln_proof(&self.canonical)
+            .map(|(p, _)| p)
+            .map_err(|e| ProofError::BadInput(format!("proof: decode: {e}")))
+    }
+}
+
+/// The spec's `epoch[32]` wire encoding: the epoch index as a 32-byte
+/// little-endian integer (logos-delivery's `toEpoch`). PINNED.
+fn epoch_to_bytes(epoch: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..8].copy_from_slice(&epoch.to_le_bytes());
+    out
+}
+
+/// Decode the spec's `epoch[32]`: an LE `u64` in bytes `0..8`, bytes `8..32`
+/// MUST be zero. Non-canonical padding (a nonzero high byte) is rejected
+/// rather than masked off — accepting it would let a single epoch index be
+/// carried by many distinct byte strings, minting unlimited nullifier-log
+/// buckets for what should key to one epoch. Shared by both `from_json`
+/// shapes and, later, the CBOR proof branch.
+pub(crate) fn epoch_from_bytes(bytes: &[u8; 32]) -> Option<u64> {
+    if bytes[8..32].iter().any(|&b| b != 0) {
+        return None;
+    }
+    Some(u64::from_le_bytes(bytes[..8].try_into().expect("8-byte slice")))
+}
+
+/// The external nullifier binding one epoch and one application:
+/// `poseidon(hash_to_field_le(epoch[32]), hash_to_field_le(rln_identifier))`.
+/// PINNED — see the module docs on the nwaku divergence.
+fn external_nullifier(epoch: u64, rln_identifier: &[u8; 32]) -> Fr {
+    let epoch_fr = hash_to_field_le(&epoch_to_bytes(epoch));
+    let rln_identifier_fr = hash_to_field_le(rln_identifier);
+    poseidon_hash(&[epoch_fr, rln_identifier_fr])
+}
+
+/// The circuit's signal binding: `x = hash_to_field_le(signal)`. PINNED.
+fn signal_to_x(signal: &[u8]) -> Fr {
+    hash_to_field_le(signal)
+}
+
+/// The external nullifier expected for `(epoch, rln_identifier)`, as the
+/// 32-byte LE value a proof's `external_nullifier` field must equal — the
+/// verify-side application + epoch-freshness binding.
+pub(crate) fn expected_external_nullifier(epoch: u64, rln_identifier: &[u8; 32]) -> [u8; 32] {
+    fr_to_32(&external_nullifier(epoch, rln_identifier))
+}
+
+/// `Fr` → 32-byte LE. `fr_to_bytes_le` pads to `FR_BYTE_SIZE` (32) by
+/// contract; a violation would silently corrupt security-relevant bytes, so
+/// it is asserted rather than tolerated.
+fn fr_to_32(fr: &Fr) -> [u8; 32] {
+    fr_to_bytes_le(fr)
+        .try_into()
+        .expect("fr_to_bytes_le pads to FR_BYTE_SIZE = 32")
+}
+
+/// LE-hex 32-byte string → `Fr` (via the field's canonical reduction).
+fn hex_to_fr(hex: &str, label: &str) -> Result<Fr, ProofError> {
+    let bytes = hex_to_bytes32(hex)
+        .ok_or_else(|| ProofError::BadInput(format!("{label}: expected 32-byte hex")))?;
+    bytes_le_to_fr(&bytes)
+        .map(|(fr, _)| fr)
+        .map_err(|e| ProofError::BadInput(format!("{label}: not a field element: {e}")))
+}
+
+/// Generate a fresh RLN identity in-module (spec: `register` generates the
+/// credential itself). Returns `(id_commitment_hex, id_secret_hash_hex)`,
+/// both 32-byte little-endian hex. The secret is handed back only to be
+/// encrypted into the keystore by the caller — it never crosses the module
+/// boundary.
+pub(crate) fn generate_identity() -> Result<(String, String), ProofError> {
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed).map_err(|e| ProofError::Engine(format!("rng: {e}")))?;
+    let (secret_fr, commitment_fr) = rln::prelude::seeded_keygen(&seed);
+    seed.iter_mut().for_each(|b| *b = 0);
+    Ok((
+        bytes_to_hex(&fr_to_bytes_le(&commitment_fr)),
+        bytes_to_hex(&fr_to_bytes_le(&secret_fr)),
+    ))
+}
+
+/// Generate an RLN proof that `signal` came from the membership backing
+/// `material`, for `(epoch, rln_identifier)`, spending slot `message_id`.
+pub(crate) fn generate(
+    material: &WitnessMaterial,
+    signal: &[u8],
+    epoch: u64,
+    rln_identifier: &[u8; 32],
+) -> Result<RateLimitProof, ProofError> {
+    if material.path_elements_hex.len() != material.path_indices.len() {
+        return Err(ProofError::BadInput(format!(
+            "merkle path length mismatch: {} elements vs {} indices",
+            material.path_elements_hex.len(),
+            material.path_indices.len()
+        )));
+    }
+    if material.path_elements_hex.len() != RLN_TREE_DEPTH {
+        return Err(ProofError::BadInput(format!(
+            "merkle path depth {} != circuit depth {RLN_TREE_DEPTH}",
+            material.path_elements_hex.len()
+        )));
+    }
+
+    let secret_bytes = hex_to_bytes32(&material.identity_secret_hash_hex)
+        .ok_or_else(|| ProofError::BadInput("identity_secret_hash: expected 32-byte hex".into()))?;
+    let (identity_secret, _) = IdSecret::from_bytes_le(&secret_bytes)
+        .map_err(|e| ProofError::BadInput(format!("identity_secret: {e}")))?;
+
+    let path_elements = material
+        .path_elements_hex
+        .iter()
+        .map(|h| hex_to_fr(h, "path_element"))
+        .collect::<Result<Vec<Fr>, _>>()?;
+
+    let witness = RLNWitnessInput::new(
+        identity_secret,
+        Fr::from(material.rate_limit),
+        Fr::from(material.message_id),
+        path_elements,
+        material.path_indices.clone(),
+        signal_to_x(signal),
+        external_nullifier(epoch, rln_identifier),
+    )
+    .map_err(|e| ProofError::BadInput(format!("witness: {e}")))?;
+
+    let rln = rln::prelude::RLN::new().map_err(|e| ProofError::Engine(format!("RLN init: {e}")))?;
+    let (proof, values) = rln
+        .generate_rln_proof(&witness)
+        .map_err(|e| ProofError::Engine(format!("generate: {e}")))?;
+    let mut rlp = RateLimitProof::from_parts(proof, values)?;
+    rlp.epoch = Some(epoch);
+    Ok(rlp)
+}
+
+/// Verify an RLN proof for `signal` against a valid-root window. `Ok(true)`
+/// only if the proof is cryptographically valid, its signal matches, and its
+/// root is one of `valid_roots`. A proof that fails any of those is `Ok(false)`
+/// (an invalid message, not an engine error); only an engine failure is `Err`.
+/// An empty `valid_roots` skips the window check (zerokit semantics) — callers
+/// on the hot path MUST pass a non-empty window.
+pub(crate) fn verify(
+    proof: &RateLimitProof,
+    signal: &[u8],
+    valid_roots: &[[u8; 32]],
+) -> Result<bool, ProofError> {
+    let rln_proof = proof.to_rln_proof()?;
+    let x = signal_to_x(signal);
+    // Registry roots are canonical field elements; a non-canonical entry is a
+    // provider bug — skip it rather than fail the whole verification. But a
+    // non-empty window that yields NO usable root leaves the proof no root to
+    // match, so it is invalid: never fall through to zerokit's empty-window =
+    // "skip the root check" semantics on the hot path.
+    let roots: Vec<Fr> = valid_roots
+        .iter()
+        .filter_map(|r| bytes_le_to_fr(r).ok().map(|(fr, _)| fr))
+        .collect();
+    if !valid_roots.is_empty() && roots.is_empty() {
+        return Ok(false);
+    }
+
+    let rln = rln::prelude::RLN::new().map_err(|e| ProofError::Engine(format!("RLN init: {e}")))?;
+    match rln.verify_with_roots(&rln_proof.proof, &rln_proof.proof_values, &x, &roots) {
+        Ok(_) => Ok(true),
+        // A negative verdict is surfaced as a typed error by zerokit; those
+        // three are "the message is invalid", not "the engine broke".
+        Err(RLNError::Verify(
+            VerifyError::InvalidProof | VerifyError::InvalidRoot | VerifyError::InvalidSignal,
+        )) => Ok(false),
+        Err(e) => Err(ProofError::Engine(format!("verify: {e}"))),
+    }
+}
+
+/// Reconstruct a DOUBLE-SIGNALLER's OWN identity secret from the two colliding
+/// Shamir shares their proofs exposed — the spec-sanctioned `recovered_secret`
+/// of a rate-limit violation, and the ONE place a secret legitimately crosses
+/// this module's boundary. It is ALWAYS the violator's secret, never one of
+/// this module's credentials: two accepted proofs sharing a nullifier but
+/// carrying distinct `share_x` are two points `(x, y)` on the same degree-1
+/// sharing polynomial whose constant term is the secret. Returns 32-byte LE
+/// hex. The four coordinates are the recorded prior share and the current one.
+pub(crate) fn recover_identity_secret_hex(
+    prior: ([u8; 32], [u8; 32]),
+    current: ([u8; 32], [u8; 32]),
+) -> Result<String, ProofError> {
+    let field = |bytes: &[u8; 32], label: &str| -> Result<Fr, ProofError> {
+        bytes_le_to_fr(bytes)
+            .map(|(fr, _)| fr)
+            .map_err(|e| ProofError::BadInput(format!("{label}: not a field element: {e}")))
+    };
+    let share1 = (field(&prior.0, "prior share_x")?, field(&prior.1, "prior share_y")?);
+    let share2 = (field(&current.0, "share_x")?, field(&current.1, "share_y")?);
+    // The only failure is DivisionByZero (share_x equal), which the caller's
+    // collision arm has already excluded — but surface it as an engine error
+    // rather than assume the invariant away.
+    let secret = compute_id_secret(share1, share2)
+        .map_err(|e| ProofError::Engine(format!("recover id secret: {e}")))?;
+    Ok(bytes_to_hex(&fr_to_bytes_le(&secret)))
+}
+
+/// Build a proof from a seed over a synthetic zero-sibling depth-20 path — for
+/// cross-module wiring tests (e.g. `verify_proof_impl`) that need a real,
+/// verifiable proof without an on-chain tree.
+#[cfg(test)]
+pub(crate) fn generate_for_test(
+    seed: &[u8],
+    signal: &[u8],
+    epoch: u64,
+    rln_identifier: &[u8; 32],
+) -> RateLimitProof {
+    let (secret_fr, _commitment) = rln::prelude::seeded_keygen(seed);
+    let material = WitnessMaterial {
+        identity_secret_hash_hex: bytes_to_hex(&fr_to_bytes_le(&secret_fr)),
+        rate_limit: 100,
+        message_id: 0,
+        path_elements_hex: vec!["00".repeat(32); RLN_TREE_DEPTH],
+        path_indices: vec![0u8; RLN_TREE_DEPTH],
+    };
+    generate(&material, signal, epoch, rln_identifier).expect("test proof")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rln::prelude::seeded_keygen;
+
+    // A structurally valid depth-20 path: all-zero siblings, all left turns.
+    // The circuit COMPUTES the root from the path, so any well-formed path
+    // yields a self-consistent proof whose root we then accept — enough to
+    // exercise generate/verify/serialize without an on-chain tree.
+    fn zero_path() -> (Vec<String>, Vec<u8>) {
+        let elements = vec!["00".repeat(32); RLN_TREE_DEPTH];
+        let indices = vec![0u8; RLN_TREE_DEPTH];
+        (elements, indices)
+    }
+
+    fn material_from_seed(seed: &[u8], rate_limit: u64, message_id: u64) -> WitnessMaterial {
+        let (mut secret_fr, _commitment) = seeded_keygen(seed);
+        let secret_hex = bytes_to_hex(&fr_to_bytes_le(&secret_fr));
+        // Zeroize our stack copy the way the real keystore path would.
+        secret_fr = Fr::from(0);
+        let _ = secret_fr;
+        let (elements, indices) = zero_path();
+        WitnessMaterial {
+            identity_secret_hash_hex: secret_hex,
+            rate_limit,
+            message_id,
+            path_elements_hex: elements,
+            path_indices: indices,
+        }
+    }
+
+
+    // Frozen interop vectors — the wire contract other implementations must
+    // match (spec Issues C/D and the pinned constructions in the module docs).
+    // Every value below is deterministic (seeded keygen, poseidon,
+    // hash_to_field_le); only the Groth16 proof bytes are randomized, so the
+    // proof is pinned STRUCTURALLY (layout) while its public values are pinned
+    // byte-exact. Inputs: seed = 32×0x07, rln_identifier = 32×0x09,
+    // epoch index = 1231028105 (encoded as the spec's epoch[32]: 32-byte LE,
+    // logos-delivery's `toEpoch`), signal = "Hello, RLN!" (the lez-rln
+    // run_rln_proof demo constants), zero-sibling all-left depth-20 path.
+    // A change here breaks cross-node verification — never rebind silently.
+    #[test]
+    fn frozen_interop_vectors() {
+        // Identity derivation (zerokit seeded_keygen, LE hex).
+        let (secret_fr, commitment_fr) = seeded_keygen(&[7u8; 32]);
+        assert_eq!(
+            bytes_to_hex(&fr_to_bytes_le(&secret_fr)),
+            "3c87aa7480ec2cad022ef39c256ddb6e4fb083c7d4a0dfdc4eee891feda7a62b"
+        );
+        assert_eq!(
+            bytes_to_hex(&fr_to_bytes_le(&commitment_fr)),
+            "08772427f3a88a9787e8f899c13dc10c2b0a226d7500c99edba0f993ba770729"
+        );
+
+        // external_nullifier = poseidon(hash_to_field_le(epoch[32]),
+        // hash_to_field_le(rln_identifier)) — NOT nwaku's keccak construction.
+        let rln_id = [9u8; 32];
+        assert_eq!(
+            bytes_to_hex(&fr_to_bytes_le(&external_nullifier(1231028105, &rln_id))),
+            "a432bb300aeda21d8c14186e134639ecac20732e9ebcbb73139741cef293612a"
+        );
+
+        // x = hash_to_field_le(signal).
+        assert_eq!(
+            bytes_to_hex(&fr_to_bytes_le(&signal_to_x(b"Hello, RLN!"))),
+            "9af96b554db1bc4bfb806f3bcd587c8c0ee80d4d79c440a87b51861235461412"
+        );
+
+        // Public values of a proof over the fixed witness.
+        let material = material_from_seed(&[7u8; 32], 100, 0);
+        let j = generate(&material, b"Hello, RLN!", 1231028105, &rln_id)
+            .expect("generate")
+            .to_json();
+        assert_eq!(
+            j["root"].as_str().unwrap(),
+            "e6b1124d580df28efdb5a009ee7eb485cc33625df6b98fc058054217160d8a07"
+        );
+        assert_eq!(
+            j["nullifier"].as_str().unwrap(),
+            "0d78806341fee59517f2526662095294eee5f590be3c36d9e7d29680b73aa21a"
+        );
+        // The spec's share_x IS the circuit's signal hash x.
+        assert_eq!(
+            j["share_x"].as_str().unwrap(),
+            "9af96b554db1bc4bfb806f3bcd587c8c0ee80d4d79c440a87b51861235461412"
+        );
+        // epoch[32]: 1231028105 = 0x495fff89, LE bytes 89 ff 5f 49 then 24
+        // zero padding bytes.
+        assert_eq!(
+            j["epoch"].as_str().unwrap(),
+            "89ff5f4900000000000000000000000000000000000000000000000000000000"
+        );
+
+        // The nullifier is slot-dependent: reusing a slot collides (the
+        // double-signal detection signal), a fresh slot never does.
+        let j2 = generate(&material_from_seed(&[7u8; 32], 100, 1), b"Hello, RLN!", 1231028105, &rln_id)
+            .expect("generate mid=1")
+            .to_json();
+        assert_eq!(
+            j2["nullifier"].as_str().unwrap(),
+            "cbf8daa2f4d16e31165c6789a738681b0871a5cc775206af276ad4295e185e1e"
+        );
+
+        // Canonical serialization layout: version byte 0x00 (SingleV1), the
+        // 128-byte compressed Groth16 proof, then the 161-byte LE public
+        // values (version + 5 field elements) — 290 bytes total.
+        let canonical = hex_to_vec(j["proof"].as_str().unwrap()).unwrap();
+        assert_eq!(canonical.len(), 290);
+        assert_eq!(canonical[0], 0x00);
+    }
+
+    #[test]
+    fn generate_then_verify_roundtrips() {
+        let material = material_from_seed(&[7u8; 32], 100, 0);
+        let rln_id = [9u8; 32];
+        let proof = generate(&material, b"hello", 1231028105, &rln_id).expect("generate");
+        let root = proof.root();
+        assert!(verify(&proof, b"hello", &[root]).expect("verify"));
+    }
+
+    #[test]
+    fn wrong_signal_is_invalid_not_error() {
+        let material = material_from_seed(&[7u8; 32], 100, 0);
+        let rln_id = [9u8; 32];
+        let proof = generate(&material, b"hello", 1231028105, &rln_id).expect("generate");
+        let root = proof.root();
+        // A different signal must verify false, NOT raise an engine error.
+        assert!(!verify(&proof, b"goodbye", &[root]).expect("verify"));
+    }
+
+    #[test]
+    fn root_outside_window_is_invalid() {
+        let rln_id = [9u8; 32];
+        // Two distinct identities → distinct leaves → distinct (canonical)
+        // roots. Verifying proof A against only B's root must be false.
+        let a = generate(&material_from_seed(&[7u8; 32], 100, 0), b"hello", 1, &rln_id)
+            .expect("generate a");
+        let b = generate(&material_from_seed(&[8u8; 32], 100, 0), b"hello", 1, &rln_id)
+            .expect("generate b");
+        assert_ne!(a.root(), b.root());
+        assert!(!verify(&a, b"hello", &[b.root()]).expect("verify"));
+        // A window that is present but entirely non-canonical is also invalid.
+        assert!(!verify(&a, b"hello", &[[0xffu8; 32]]).expect("verify non-canonical"));
+    }
+
+    // The spec-struct path: a consumer that reassembles the proof from its
+    // OWN network message fields (bare 128-byte Groth16 + the five public
+    // values) must land in the identical verified representation as the
+    // canonical form.
+    #[test]
+    fn decomposed_spec_struct_roundtrip_verifies() {
+        let material = material_from_seed(&[5u8; 32], 100, 2);
+        let rln_id = [6u8; 32];
+        let proof = generate(&material, b"net msg", 77, &rln_id).expect("generate");
+        let root = proof.root();
+        let j = proof.to_json();
+
+        // Slice the bare Groth16 proof out of the canonical bytes (skip the
+        // leading version byte) — exactly what the spec's proof[128] carries.
+        let canonical = hex_to_vec(j["proof"].as_str().unwrap()).unwrap();
+        let bare = bytes_to_hex(&canonical[1..129]);
+        let decomposed = serde_json::json!({
+            "proof": bare,
+            "root": j["root"],
+            "external_nullifier": j["external_nullifier"],
+            "share_x": j["share_x"],
+            "share_y": j["share_y"],
+            "nullifier": j["nullifier"],
+        });
+
+        let restored = RateLimitProof::from_json(&decomposed).expect("decomposed from_json");
+        assert_eq!(restored.root(), root);
+        assert_eq!(
+            restored.to_json()["proof"], j["proof"],
+            "reconstruction must be byte-identical to the canonical form"
+        );
+        assert!(verify(&restored, b"net msg", &[root]).expect("verify"));
+
+        // A tampered public value breaks reconstruction or verification —
+        // never a silent pass.
+        let mut bad = decomposed.clone();
+        bad["share_y"] = serde_json::json!("11".repeat(32));
+        match RateLimitProof::from_json(&bad) {
+            Err(_) => {}
+            Ok(p) => assert!(!verify(&p, b"net msg", &[root]).expect("verify tampered")),
+        }
+    }
+
+    #[test]
+    fn json_roundtrip_preserves_verification() {
+        let material = material_from_seed(&[3u8; 32], 100, 1);
+        let rln_id = [4u8; 32];
+        let proof = generate(&material, b"signal", 42, &rln_id).expect("generate");
+        let root = proof.root();
+        let json = proof.to_json();
+        let restored = RateLimitProof::from_json(&json).expect("from_json");
+        assert_eq!(restored.root(), root);
+        assert!(verify(&restored, b"signal", &[root]).expect("verify"));
+    }
+
+    #[test]
+    fn message_id_at_or_above_rate_limit_is_bad_input() {
+        // message_id must be < rate_limit; the circuit rejects otherwise.
+        let material = material_from_seed(&[1u8; 32], 5, 5);
+        let err = generate(&material, b"x", 1, &[0u8; 32]).unwrap_err();
+        assert!(matches!(err, ProofError::BadInput(_)));
+    }
+
+    #[test]
+    fn short_merkle_path_is_bad_input() {
+        let mut material = material_from_seed(&[1u8; 32], 100, 0);
+        material.path_elements_hex.truncate(RLN_TREE_DEPTH - 1);
+        material.path_indices.truncate(RLN_TREE_DEPTH - 1);
+        let err = generate(&material, b"x", 1, &[0u8; 32]).unwrap_err();
+        assert!(matches!(err, ProofError::BadInput(_)));
+    }
+
+    // Canonicality: bytes 8..32 of epoch[32] MUST be zero. A single nonzero
+    // padding byte must reject, not get masked off — otherwise one epoch
+    // index could be carried by many distinct byte strings.
+    #[test]
+    fn epoch_from_bytes_rejects_non_canonical_padding() {
+        let canonical = epoch_to_bytes(1231028105);
+        assert_eq!(epoch_from_bytes(&canonical), Some(1231028105));
+
+        let mut tampered = canonical;
+        tampered[20] = 0xff;
+        assert_eq!(epoch_from_bytes(&tampered), None);
+    }
+
+    // generate() sets the epoch, and from_json's decode of the wire "epoch"
+    // field lands back on the same RateLimitProof — the carried epoch that
+    // verify_proof's freshness check relies on.
+    #[test]
+    fn epoch_survives_generate_and_json_roundtrip() {
+        let material = material_from_seed(&[3u8; 32], 100, 1);
+        let rln_id = [4u8; 32];
+        let proof = generate(&material, b"signal", 42, &rln_id).expect("generate");
+        assert_eq!(proof.epoch(), Some(42));
+
+        let restored = RateLimitProof::from_json(&proof.to_json()).expect("from_json");
+        assert_eq!(restored.epoch(), Some(42));
+    }
+
+    // The generate_proof handler rewrites "epoch" to the u64 index (its lidl
+    // reply shape), and verify_proof accepts that object as-is — so from_json
+    // must decode a numeric epoch identically to the epoch[32] hex form.
+    #[test]
+    fn from_json_accepts_numeric_epoch_from_the_handler_reply() {
+        let material = material_from_seed(&[3u8; 32], 100, 1);
+        let rln_id = [4u8; 32];
+        let proof = generate(&material, b"signal", 42, &rln_id).expect("generate");
+
+        let mut wire = proof.to_json();
+        wire["epoch"] = serde_json::json!(42u64);
+        let restored = RateLimitProof::from_json(&wire).expect("from_json");
+        assert_eq!(restored.epoch(), Some(42));
+
+        wire["epoch"] = serde_json::json!(-1);
+        assert!(matches!(
+            RateLimitProof::from_json(&wire).unwrap_err(),
+            ProofError::BadInput(_)
+        ));
+    }
+
+    // The double-signal path: two proofs from the SAME identity, epoch, and slot
+    // (generate_for_test pins message_id = 0) over DIFFERENT signals share one
+    // nullifier but split on share_x — the exact collision the nullifier log
+    // flags as a rate-limit violation. Their two Shamir shares reconstruct the
+    // offender's own secret, which for seed 32×0x07 is the frozen value.
+    #[test]
+    fn recover_identity_secret_from_colliding_shares() {
+        let rln_id = [9u8; 32];
+        let a = generate_for_test(&[7u8; 32], b"signal-A", 1231028105, &rln_id);
+        let b = generate_for_test(&[7u8; 32], b"signal-B", 1231028105, &rln_id);
+        assert_eq!(a.nullifier(), b.nullifier(), "same identity+epoch+slot ⇒ one nullifier");
+        assert_ne!(a.share_x(), b.share_x(), "distinct signals ⇒ distinct share_x");
+
+        let secret =
+            recover_identity_secret_hex((a.share_x(), a.share_y()), (b.share_x(), b.share_y()))
+                .expect("recover");
+        assert_eq!(
+            secret,
+            "3c87aa7480ec2cad022ef39c256ddb6e4fb083c7d4a0dfdc4eee891feda7a62b"
+        );
+    }
+}

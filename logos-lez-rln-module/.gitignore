@@ -1,0 +1,5 @@
+target/
+result
+result-*
+# Staged source copies (see README "Staged sources") — recreate via ./stage-sources.sh.
+/logos-rust-sdk-src/

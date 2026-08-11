@@ -1,0 +1,52 @@
+{
+  "name": "liblogos_rln_module",
+  "display_name": "RLN Module",
+  "version": "0.4.0",
+  "description": "Registry-agnostic RLN membership management (RLN-MEMBERSHIP-MANAGEMENT)",
+  "author": "Logos Blockchain Team",
+  "type": "core",
+  "interface": "cdylib",
+  "category": "blockchain",
+  "main": "liblogos_rln_module_plugin",
+  "dependencies": [
+    "liblogos_lez_rln_module"
+  ],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "lidl": "rust-lib/liblogos_rln_module.lidl",
+    "rust": {
+      "crate": "rust-lib"
+    }
+  },
+  "dependency_overrides": {
+    "liblogos_lez_rln_module": {
+      "file": "rust-lib/deps/liblogos_lez_rln_module.lidl"
+    }
+  },
+  "nix": {
+    "external_libraries": [],
+    "packages": {
+      "build": [],
+      "runtime": []
+    },
+    "cmake": {
+      "find_packages": [],
+      "extra_include_dirs": []
+    },
+    "rust": {
+      "toolchain": "1.94.0",
+      "packages": {
+        "build": [
+          "pkg-config",
+          "perl",
+          "protobuf",
+          "cmake",
+          "python3",
+          "clang"
+        ],
+        "runtime": []
+      }
+    }
+  }
+}
