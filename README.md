@@ -27,13 +27,14 @@ applications, backed by the on-chain RLN registry deployed from
 - **Rust (stable)** — only for bare-cargo dev loops (`cargo test` in a
   module's `rust-lib/`) after staging; the nix builds bring their own
   pinned toolchain.
-- **A [logos-lez-rln] checkout** — only for the chain-facing tests: the
-  module-stack e2e (`logos-rln-module/tests/e2e_register_testnet.sh`) and
-  the lez module's live-registry tests (`LEZ_RLN_TESTNET_TESTS=1`) read
-  deployment descriptors from `<checkout>/deployments/`. Both take
-  `LEZ_RLN_CHECKOUT` and default to `../logos-lez-rln` next to this repo.
-  The e2e additionally expects `jq`, `python3`, `tar`, `curl`, `openssl`,
-  and `rsync` on the host.
+- **Chain-facing testing lives in [logos-rln-e2e]** — the module-stack e2e
+  (`register` scenario) and the harness that drives the lez module's
+  live-registry tests against a local sequencer or testnet. The gated
+  cargo tests themselves stay in this repo
+  (`logos-lez-rln-module/rust-lib/src/testnet_tests.rs`,
+  `LEZ_RLN_TESTNET_TESTS=1`) and, when run directly, read deployment
+  descriptors from a [logos-lez-rln] checkout via `LEZ_RLN_CHECKOUT`
+  (default `../logos-lez-rln`).
 - **Platforms** — darwin-arm64, linux-amd64, linux-arm64 (the variant set
   the release workflow publishes).
 

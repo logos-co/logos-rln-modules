@@ -173,32 +173,18 @@ nix build 'path:.#lgx'       # .lgx bundle
 cd rust-lib && cargo test
 ```
 
-### End-to-end registration in logos-core (testnet)
-
-`tests/e2e_register_testnet.sh` loads the real module stack into a
-logoscore daemon (wallet → rln → membership) and drives a PAID registration
-plus a full proof loop against the deployed testnet registry —
-faucet-funded `Register`, not the gifter's `RegisterFree`: open/sync wallet
-→ fresh holding → `claim_tokens` → `unlock_keystore` → `register` (the
-credential is generated in-module) → poll `get_membership_state` to
-`active` → `select_membership` → `get_merkle_proof` → cross-check via the
-sibling's `get_membership` → `start` (warm the root window) →
-`generate_proof` → `verify_proof` (true) → tampered signal (valid:false).
-
-```sh
-bash tests/e2e_register_testnet.sh          # ~3-6 min, burns ~1M RLNTOK (faucet)
-E2E_DEPLOYMENT=<name> …                      # descriptor under ../deployments
-E2E_KEEP=1 …                                 # keep the daemon + state dir
-```
-
-First verified pass (2026-07-14, shared-faucet): leaf 5, ~60s confirmation.
-This run is also the acceptance for two architecture assumptions: raw lp_*
-calls INTO a Rust module work (the lez-rln provider transport), and
-logoscore stamps `instance_persistence_path` (the keystore location) — the
-script diagnoses both explicitly if they regress.
-
 Covers: CAIP-10 canonicalization vectors, the frozen membership_hash
 vector, keystore roundtrip/tamper/wrong-password plus the WAKU-RLN-KEYSTORE
 spec test vector (password `sup3rsecure`), the merged-state matrix, and
 metadata-tamper quarantine. The PBKDF2 tests run ~1M rounds each, so the
 suite takes ~30–40s.
+
+### End-to-end registration
+
+The chain-facing e2e — the real module stack (wallet → rln → membership) in
+a logoscore daemon, a PAID registration and a full proof loop against a
+live chain, plus the R2/R4 architecture diagnostics — lives in
+[logos-rln-e2e](https://github.com/logos-co/logos-rln-e2e) as the
+`register` scenario. `./run.sh register --target local` there boots a local
+sequencer and runs it with zero external infra; `--target testnet` drives
+the deployed registry.

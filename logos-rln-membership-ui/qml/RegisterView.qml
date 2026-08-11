@@ -1,7 +1,7 @@
 // Register flow: unlock keystore -> register (the membership module generates
 // the credential) -> poll get_membership_state until the pending window
 // settles.
-// Mirrors logos-rln-module/tests/e2e_register_testnet.sh. The
+// Mirrors the register scenario in logos-co/logos-rln-e2e. The
 // funding holding account is either typed in or auto-filled by the Wallet
 // tab's faucet claim (Main.qml wires WalletView.funded to fundingAccount).
 import QtQuick
