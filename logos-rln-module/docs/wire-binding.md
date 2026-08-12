@@ -177,11 +177,11 @@ namespace (its registry keeps no recoverable deposit).
 }
 ```
 
-- The **canonical** `proof` is zerokit's serialization: `0x00` version byte ‖
-  128-byte compressed Groth16 proof ‖ `0x00` ‖ root ‖ external_nullifier ‖ x ‖
-  y ‖ nullifier (all 32-byte LE) — 290 bytes total. The spec struct's
-  `proof[128]` is bytes `1..129`; its `share_x` is the circuit's signal hash
-  `x`, `share_y` is `y`.
+- The **canonical** `proof` is zerokit's `RLNProof` LE serialization:
+  128-byte compressed Groth16 proof ‖ mode tag (`0x00` Single) ‖ y ‖ root ‖
+  nullifier ‖ x ‖ external_nullifier (all 32-byte LE) — 289 bytes total. The
+  spec struct's `proof[128]` is bytes `0..128`; its `share_x` is the
+  circuit's signal hash `x`, `share_y` is `y`.
 - `verify_proof` accepts **either** shape: the object above (canonical bytes
   trusted, decoded fields ignored), or the spec's decomposed struct — `proof`
   as the bare 128-byte Groth16 hex plus the five field values — which is what
