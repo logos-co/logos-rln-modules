@@ -1,19 +1,16 @@
 // Shared plumbing for the RLN membership GUI: logos-bridge reply parsing,
 // error rendering, and small formatting helpers. Wire shapes come from
-// rust-lib/liblogos_rln_module.lidl (compact JSON, alphabetical
-// keys; failures {"error":{"class":…,"kind":…,"message":…}}) and the sibling
-// liblogos_lez_rln_module (""-on-error convention).
+// rust-lib/liblogos_rln_module.lidl (failures {"error":{"class":…,"kind":…,
+// "message":…}}) and liblogos_lez_rln_module (""-on-error convention).
 .pragma library
 
 var RLN_MODULE = "liblogos_rln_module";
 var LEZ_RLN_MODULE = "liblogos_lez_rln_module";
 var WALLET_MODULE = "logos_execution_zone";
-// The gifter path (alternative registration) additionally drives these three:
-// rln_gifter_module runs the whole gifter protocol (dial + request) over
-// libp2p_module's GENERIC protocol bridge AND relays libp2p_module calls
-// (node bring-up); keycard_capture_module does the in-process PC/SC Keycard
-// IDENTIFY capture; libp2p_module provides the libp2p node the gifter dials
-// through. None is touched by the base wallet path.
+// Gifter path (alternative registration) only — unused by the wallet path:
+// rln_gifter_module runs the gifter protocol and relays libp2p_module calls;
+// keycard_capture_module does the in-process PC/SC Keycard IDENTIFY capture;
+// libp2p_module provides the node the gifter dials through.
 var LIBP2P_MODULE = "libp2p_module";
 var GIFTER_MODULE = "rln_gifter_module";
 var CAPTURE_MODULE = "keycard_capture_module";
@@ -28,20 +25,15 @@ var RATE_LIMIT_MAX = 600;
 var RATE_LIMIT_DEFAULT = 300;
 
 // register / get_membership_state / select_membership take a MembershipScope
-// (registry_id + rln_identifier). This GUI is a management tool, not a specific
-// RLN application, so it passes a fixed default rln_identifier (a real
-// application generating proofs would pass its own 32-byte scope key). The
-// credential is generated INSIDE the module by register, which the GUI drives
-// without a client-side generate_identity step.
+// (registry_id + rln_identifier). This GUI is a management tool, not an RLN
+// application, so it passes a fixed default rln_identifier; an application
+// generating proofs passes its own 32-byte scope key.
 var DEFAULT_RLN_ID =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
-// The single UI-scale knob. The whole onboarding/status/detail surface is
-// laid out from Theme tokens (font sizes, spacing, radii) plus a handful of
-// literal dimensions; the host Theme singletons can't be mutated, so we
-// multiply at the usage sites via sc() instead. Bump UI_SCALE to resize the
-// entire module uniformly — text stays crisp because the VALUES scale, not a
-// rendered transform. Rounded so every scaled pixel lands on an integer.
+// The single UI-scale knob: host Theme singletons can't be mutated, so token
+// values are multiplied at usage sites via sc(). The values scale (no rendered
+// transform), so text stays crisp; results round to integer pixels.
 var UI_SCALE = 2;
 
 function sc(x) {
@@ -52,17 +44,15 @@ function sc(x) {
 // — prefill for provision_wallet_home's wallet_config.json.
 var TESTNET_SEQUENCER_ADDR = "https://testnet.lez.logos.co/";
 
-// Gifter path prefills — both freely editable in StepGifter. The defaults point
-// at the local dev gifter (tools/run-local-gifter.sh): a fixed node key gives it
-// a stable peerId, so this default stays valid across gifter restarts. Point
-// these elsewhere for a different gifter.
+// StepGifter prefills, both freely editable. Defaults point at the local dev
+// gifter (tools/run-local-gifter.sh), whose fixed node key keeps this peerId
+// stable across restarts.
 var GIFTER_PEER_ID_DEFAULT = "16Uiu2HAm8KkYKyhBK5f8ZcSDJP947bxCqVRRbzP8DKDigqePtX2Y";
 var GIFTER_MULTIADDR_DEFAULT = "/ip4/127.0.0.1/tcp/9000";
 
-// Config for the app's OWN libp2p node — brought up only to dial the gifter
-// (the wallet path never runs libp2p). Ephemeral localhost listen port; a
-// direct protocol dial to a known peer needs no gossipsub/kad/discovery. A plain
-// object: libp2pCall JSON.stringifies it into createNode's single string arg.
+// The app's own libp2p node, brought up only to dial the gifter: a direct
+// protocol dial to a known peer needs no gossipsub/kad/discovery. A plain
+// object — libp2pCall JSON.stringifies it into createNode's single string arg.
 var LIBP2P_NODE_CONFIG = {
     addrs: ["/ip4/127.0.0.1/tcp/0"],
     transport: "tcp",
@@ -77,10 +67,9 @@ var LIBP2P_NODE_CONFIG = {
 
 // libp2p_module's C++ methods return a StdLogosResult that marshals to `null`
 // through the QML bridge, so every libp2p call is relayed through
-// rln_gifter_module.libp2p_call (a module-to-module SDK call). It hands back the
-// real {success,value,error} as a JSON string (bridge-double-encoded like other
-// tstr replies). Parse it as-is — NOT through parseReply, whose empty-"error"
-// rule would flag a successful libp2p reply (error:"") as a failure.
+// rln_gifter_module.libp2p_call, which returns {success,value,error} as a
+// (possibly double-encoded) JSON string. Never route through parseReply: its
+// empty-"error" rule would flag a successful reply (error:"") as a failure.
 function parseLibp2pReply(payload) {
     var v;
     try { v = JSON.parse(payload); } catch (e) { return { error: "unparseable libp2p reply: " + payload }; }
@@ -102,15 +91,11 @@ function mkError(kind, message) {
     return { error: { kind: kind, message: message } };
 }
 
-// LogosQmlBridge double-encodes tstr replies (the module's JSON string is
-// itself JSON-quoted by serializeResult), while bridge-level failures —
-// {"error":"Module not connected"}, {"error":"timeout",…} — arrive as plain
-// objects whose error field is a STRING. The wallet module additionally
-// returns bare scalars (int64 status codes / block numbers) and raw strings
-// (account hex, mnemonics), and the rln/wallet ""-on-error convention signals
-// failure with the empty string. Normalize all of it: JSON-object replies
-// pass through, scalars and raw strings become {value:…}, and every failure
-// looks like the membership module's envelope {error:{kind,message}}.
+// Normalize bridge replies. LogosQmlBridge double-encodes tstr replies;
+// bridge-level failures arrive as plain objects with a STRING error field;
+// the wallet module returns bare scalars and raw strings, with "" signaling
+// failure. JSON-object replies pass through, scalars and raw strings become
+// {value:…}, and every failure becomes {error:{kind,message}}.
 function parseReply(payload) {
     var v;
     try { v = JSON.parse(payload); } catch (e) {
@@ -144,16 +129,11 @@ function parseReply(payload) {
 // bridge's 30s client-side timeout — pass 0 to disable it for calls that
 // legitimately run for minutes (sync_to_block on a fresh wallet).
 //
-// Every numeric argument is coerced with `| 0` before crossing the bridge.
-// The QML engine only sends a JS number as QVariant(int) when V4 has it
-// int32-tagged; arithmetic and parseInt results stay double-tagged and
-// arrive as QVariant(double), which the Rust modules' generated dispatch
-// decodes via serde_json as_i64() — None on a float Value — so the value
-// silently becomes 0 (a zero-token claim that transfers nothing, a zero
-// rate_limit). `| 0` forces the int32 tag; its 2^31-1 ceiling comfortably
-// covers every int on this wire surface (RLNTOK amounts ≤ ~12M, block
-// heights ~22k, rate limits ≤ 600, leaf indices). All lidl numeric params
-// here are ints — no float parameter exists to be harmed by the coercion.
+// Numeric args are coerced with `| 0`: QML sends a JS number as QVariant(int)
+// only while V4 has it int32-tagged; arithmetic and parseInt results arrive
+// as QVariant(double), which the Rust modules' dispatch (serde_json as_i64(),
+// None on a float) silently turns into 0 — a zero-token claim, a zero
+// rate_limit. All lidl numeric params here are ints below the int32 ceiling.
 function call(bridge, module, method, args, cb, timeoutMs) {
     if (!bridge) {
         cb(mkError("no_bridge",
@@ -169,19 +149,16 @@ function call(bridge, module, method, args, cb, timeoutMs) {
 }
 
 // --- events (push channel; see module docs/wire-binding.md "Events") ------
-// membership_state_changed fires whenever a membership's registry-observed
-// state actually changes; positional args
+// membership_state_changed fires when a membership's registry-observed state
+// changes; positional args
 // [registry_id, rln_identifier, membership_hash, state, previous]. It rides
-// LogosQmlBridge's moduleEventReceived signal, NOT callModuleAsync's
-// LogosResult-nulling serializer — decode it directly, never through
-// parseReply. Additive/optional per the spec: a host predating
-// onModuleEvent simply never fires it, so every caller keeps its poll
-// fallback regardless of whether arming succeeds.
+// LogosQmlBridge's moduleEventReceived signal — decode it directly, never
+// through parseReply. Optional per the spec: a host predating onModuleEvent
+// never fires it, so every caller keeps its poll fallback.
 var MEMBERSHIP_STATE_CHANGED = "membership_state_changed";
 
-// Arm a module-event subscription on the bridge. Returns true when armed;
-// false when this host's bridge predates onModuleEvent — callers keep their
-// fallback polling either way, events only tighten the latency.
+// Arm a module-event subscription on the bridge. Returns false when the host
+// bridge predates onModuleEvent; callers keep their poll fallback either way.
 function armModuleEvent(bridge, module, eventName) {
     var armed = !!bridge && typeof bridge.onModuleEvent === "function"
         && bridge.onModuleEvent(module, eventName) === true;
@@ -240,17 +217,13 @@ function formatTimestamp(secs) {
     return new Date(secs * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
 }
 
-// A membership row's `tx_result` is the raw register_member wire reply the
-// module recorded at registration (store.rs MembershipMeta.tx_result, surfaced
-// by public_membership_json): a JSON STRING of
+// A membership row's `tx_result` is the raw register_member wire reply
+// recorded at registration: a JSON STRING of
 //   {"leaf_index":N,"payment_definition":"<hex>","tx_result":"<json string>"}
-// whose INNER `tx_result` is itself JSON-encoded
-//   {"error":"","secrets":[],"success":true,"tx_hash":"<hash>"}
-// — so it needs two JSON.parse steps. It is absent (key omitted) for
-// memberships ADOPTED via the already-registered pre-check (not submitted by
-// us). Parse defensively: any absence / "" / malformed shape returns null so
-// the caller simply hides the registration section. On success returns
-// {hash, success, error, paymentDefinition}.
+// whose inner `tx_result` is itself JSON-encoded — two JSON.parse steps.
+// Absent for memberships adopted via the already-registered pre-check. Any
+// absence / "" / malformed shape returns null (the caller hides the section);
+// success returns {hash, success, error, paymentDefinition}.
 function parseTxResult(raw) {
     if (raw === undefined || raw === null || raw === "")
         return null;
@@ -290,10 +263,9 @@ function registryConfigHex(registryId) {
 
 // Suggested faucet claim for one registration: rate × price_per_unit × 1.2
 // slack, ceiled to an int (price_per_unit arrives as a decimal string).
-// Shared by the onboarding flow; WalletView keeps its inline copy so the
-// live-proven legacy views stay byte-identical. Returns NaN when the price
-// is non-numeric — the caller must surface that rather than claim 0 tokens
-// (a 0-token claim is accepted and silently dropped into the 180s timeout).
+// Returns NaN when the price is non-numeric — the caller must surface that
+// rather than claim 0 tokens (a 0-token claim is accepted and silently
+// dropped into the 180s timeout).
 function suggestedClaimAmount(rate, priceStr) {
     var price = parseInt(priceStr, 10);
     if (!(price > 0))
@@ -301,10 +273,9 @@ function suggestedClaimAmount(rate, priceStr) {
     return Math.ceil(rate * price * 1.2);
 }
 
-// States worth landing the user on the status card for: pending counts, so
-// a relaunch mid-confirmation resumes on the card rather than restarting
-// onboarding (active/grace_period are select()'s usable set; pending will
-// join it within the 300s confirmation window or flip to failed).
+// States that land the user on the status card. Pending counts so a relaunch
+// mid-confirmation resumes on the card; it joins select()'s usable set
+// (active/grace_period) within the 300s confirmation window or flips to failed.
 function isUsableState(s) {
     return s === "pending" || s === "active" || s === "grace_period";
 }
@@ -329,15 +300,10 @@ function fmtOptionalNum(v) {
     return (v === undefined || v === null) ? "—" : String(v);
 }
 
-// Error kinds that are TRANSPORT/host/sequencer flakiness — the rln and
-// wallet modules intermittently drop responses over QtRO under load, which
-// parseReply surfaces as bridge_failure (the bridge's "Invalid response" /
-// "timeout" / "Module not connected"), empty_reply (the module's ""-on-error
-// on a dropped reply), bad_reply (an unparseable frame), or provider_failure
-// (the lez-rln provider's own transient upstream). Retrying these self-heals.
-// Everything else — bad_password, keychain_unavailable, invalid_argument,
-// unknown_registry, locked, no_usable_membership, internal, … — is
-// deterministic: retrying won't help, so it must surface immediately.
+// Transport/host/sequencer flakiness kinds — the rln and wallet modules
+// intermittently drop responses over QtRO under load, surfacing as these
+// kinds; retrying self-heals. Every other kind (bad_password, locked,
+// invalid_argument, …) is deterministic and must surface immediately.
 var TRANSIENT_ERROR_KINDS = {
     bridge_failure: true,
     timeout: true,
@@ -350,11 +316,10 @@ function isTransientError(kind) {
     return TRANSIENT_ERROR_KINDS[kind] === true;
 }
 
-// Deterministic human-readable petname for a public commitment — a display
-// ALIAS, never an identifier (the commitment stays the real id, shown in the
-// detail view). Three bundled 64-word lists (adjective-gem-animal) indexed by
-// pairs of commitment bytes → 64^3 = 262,144 combinations. Same commitment
-// ALWAYS yields the same name; different commitments almost always differ.
+// Deterministic petname for a public commitment — a display alias, never an
+// identifier. Three 64-word lists (adjective-gem-animal) indexed by pairs of
+// commitment bytes give 64^3 = 262,144 combinations; the same commitment
+// always yields the same name.
 var PETNAME_ADJECTIVES = [
     "amber", "brave", "calm", "daring", "eager", "fabled", "gentle", "hardy",
     "ideal", "jolly", "keen", "lucid", "merry", "noble", "opal", "proud",
@@ -402,7 +367,6 @@ function petname(commitmentHex) {
     return adj + "-" + gem + "-" + ani;
 }
 
-// Rate limit rendered as "N msg/epoch" with the pending/undefined guard.
 function rateText(rate) {
     return (rate === undefined || rate === null) ? "— msg/epoch" : String(rate) + " msg/epoch";
 }

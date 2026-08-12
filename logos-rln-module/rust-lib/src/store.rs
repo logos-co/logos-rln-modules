@@ -40,43 +40,31 @@ use crate::keystore::{self, KeystoreEntry, KeystoreFile};
 use crate::registry_id;
 use crate::{ApiError, ErrorKind};
 
-/// The persisted schema cluster lives in `keystore.rs` (it owns the on-disk
-/// format — `MembershipMeta`/`StateChange` are the `membership` field of a
-/// `KeystoreEntry`, and `MembershipState` is `MembershipMeta.state`'s type).
-/// Re-exported here so every `store::MembershipMeta` / `store::MembershipState`
-/// path across the crate keeps resolving, and so `store→keystore` stays the
-/// only edge between the two (defining `MembershipState` in keystore rather
-/// than here is what keeps the former cycle broken).
+/// Persisted schema types owned by `keystore.rs` (the on-disk format);
+/// re-exported so the crate addresses them as `store::` paths.
+/// `store → keystore` is the only dependency edge between the two modules.
 pub(crate) use crate::keystore::{MembershipMeta, MembershipState, StateChange};
 
-/// Pending→Failed bound. Testnet confirmation is 60–90s; 300s keeps a
-/// comfortable margin while still bounding Pending per the spec MUST.
+/// Pending→Failed bound (spec MUST). Testnet confirmation runs 60–90s;
+/// 300s leaves margin.
 pub(crate) const CONFIRMATION_WINDOW_SECS: u64 = 300;
 const STATE_HISTORY_CAP: usize = 20;
 
 // ------------------------------------------------------------------- records
 
 impl MembershipMeta {
-    /// The one place a failed submission is recorded: the state transition,
-    /// the "submit_failed: " failure-reason prefix consumers key on, and the
-    /// spec's retryable flag (mirrors the submission error's class). An
-    /// inherent impl on the keystore-owned schema type — legal cross-module,
-    /// same crate.
+    /// Records a failed submission: state → Failed, the "submit_failed: "
+    /// failure-reason prefix consumers key on, and the spec's retryable flag.
     pub(crate) fn mark_submit_failed(&mut self, message: &str, retryable: bool) {
         self.state = MembershipState::Failed;
         self.failed_reason = Some(format!("submit_failed: {message}"));
         self.retryable = Some(retryable);
     }
 
-    /// Record a LATE/async submission error without clobbering a state the
-    /// poller — or a registry read-back — already advanced past `Pending`: a
-    /// lost or timed-out reply proves nothing about a submission the registry
-    /// may already have confirmed (the exact race that would flip a confirmed
-    /// Active record to a terminal, unselectable Failed). A still-`Pending`
-    /// record is failed only for a definitive (non-retryable) error; a
-    /// retryable transport failure is left `Pending` for the poller to
-    /// confirm-or-time-out (`merge_state` fails a stale Pending after
-    /// `CONFIRMATION_WINDOW_SECS`), per the poller's invariant.
+    /// Record a late/async submission error without clobbering a state already
+    /// advanced past `Pending` (the registry may have confirmed the submission).
+    /// Only a non-retryable error fails a still-`Pending` record; retryable
+    /// ones stay `Pending` for `merge_state` to confirm or time out.
     pub(crate) fn record_async_submit_error(&mut self, message: &str, retryable: bool) {
         if self.state != MembershipState::Pending || retryable {
             return;
@@ -87,9 +75,7 @@ impl MembershipMeta {
 
 /// One registry's local record as consumers see it: the membership_hash, its
 /// sidecar metadata, and whether the load-time tamper scan quarantined it.
-/// Clone-only — NEVER persisted or serialized (the on-disk shape is
-/// `KeystoreEntry`); this is purely the in-memory read triple `records_for`
-/// hands back in place of the former `(String, MembershipMeta, bool)`.
+/// In-memory only — never persisted (the on-disk shape is `KeystoreEntry`).
 #[derive(Clone)]
 pub(crate) struct MembershipRecord {
     pub(crate) hash: String,
@@ -140,11 +126,10 @@ pub(crate) fn init(dir: PathBuf) {
     let file = match keystore::load(&dir) {
         Ok(file) => file,
         Err(e) => {
-            // The keystore file exists but couldn't be read. Fail closed:
-            // leave the store UNINITIALIZED so every op errors instead of
-            // treating the fault as an empty store — which would invent a new
-            // secret over, then clobber, credentials that were only
-            // temporarily unreadable. The next launch retries the read.
+            // Fail closed: leave the store UNINITIALIZED so every op errors,
+            // rather than treating an unreadable file as an empty store —
+            // which would invent a new secret over, then clobber, existing
+            // credentials. The next launch retries the read.
             eprintln!(
                 "store: keystore read failed ({e}); leaving store uninitialized to avoid \
                  clobbering existing credentials — resolve the fault and restart"
@@ -217,10 +202,9 @@ impl Store {
         self.session_password.clone()
     }
 
-    /// Whether unlock() would actually VERIFY a password: mirrors unlock's
-    /// seam (first non-quarantined envelope). Auto-unlock uses this to
-    /// distinguish "fresh keystore — invent a secret" from "existing
-    /// credentials but no keychain item — require the manual password".
+    /// True when unlock() would actually VERIFY a password (a non-quarantined
+    /// envelope exists). Auto-unlock uses this to distinguish a fresh keystore
+    /// from existing credentials that require the manual password.
     pub(crate) fn has_credentials(&self) -> bool {
         self.file
             .credentials
@@ -464,15 +448,11 @@ pub(crate) fn merge_state(
     }
 }
 
-/// The `membership_state_changed` event's args (module docs: LIDL events
-/// section), if `new_state` is an actual transition — `None` for a mere
-/// re-observation of the same state, which the poller and the
-/// self-healing read path (`get_membership_state_impl`) both hit on every
-/// tick/read and must NOT emit for. `meta` is the PRE-transition record —
-/// callers snapshot it before applying the write, so `previous` is always
-/// the state that held immediately before this change. `rln_identifier`
-/// carries through empty for a pre-scope legacy record, matching the
-/// event's documented contract.
+/// The `membership_state_changed` event's args, or `None` when `new_state`
+/// equals the current state (re-observations — every poller tick and read —
+/// must NOT emit). `meta` is the PRE-transition record, so `previous` is the
+/// state held just before the change; an empty (legacy) `rln_identifier`
+/// carries through verbatim.
 pub(crate) fn transition_event(
     hash: &str,
     meta: &MembershipMeta,
@@ -481,9 +461,8 @@ pub(crate) fn transition_event(
     if new_state == meta.state {
         return None;
     }
-    // Enum→wire string for the &str-args generated event: serde (the
-    // `rename_all = "snake_case"` on MembershipState) is the single source of
-    // truth, so the payload bytes stay identical to the former string states.
+    // Enum→wire string: serde's `rename_all = "snake_case"` on
+    // MembershipState is the single source of truth for the wire strings.
     let wire = |s: MembershipState| {
         serde_json::to_value(s)
             .ok()
@@ -565,7 +544,7 @@ mod tests {
         assert_eq!(state, "active");
         assert_eq!(previous, "pending");
 
-        // A legacy record's empty rln_identifier is preserved verbatim.
+        // A scoped record's rln_identifier is carried through verbatim.
         let mut scoped = meta(Pending, 0);
         scoped.rln_identifier = "ab".repeat(32);
         let (_, rln_identifier, ..) =

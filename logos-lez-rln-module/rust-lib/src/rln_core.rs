@@ -1,6 +1,5 @@
-//! RLN core logic — pure Rust, in-process. No C ABI: this crate is the RLN
-//! module itself, so the register/proof/funding logic lives here directly and
-//! is called from `lib.rs` as plain Rust.
+//! RLN core logic — register/proof/funding planning and account decoding,
+//! called from `lib.rs` as plain Rust (no C ABI).
 
 use borsh::BorshDeserialize;
 use rln_layouts::{
@@ -149,9 +148,8 @@ fn derive_pda(program_id: &[u8; 32], pda_seed: &[u8; 32]) -> [u8; 32] {
 }
 
 /// risc0-serde an instruction into its u32 words — the deployed programs'
-/// wire format (LE words on the wire; `send_generic_public_transaction`
-/// takes the words directly, so no byte flatten/re-chunk round-trip exists
-/// to get misaligned).
+/// wire format (LE words on the wire); `send_generic_public_transaction`
+/// takes the words directly.
 fn serialize_instruction<T: Serialize>(instruction: &T) -> Result<Vec<u32>, RlnError> {
     risc0_zkvm::serde::to_vec(instruction).map_err(|_| RlnError::SerializationError)
 }
@@ -306,8 +304,8 @@ pub fn merkle_proofs_plan(
 }
 
 /// One wire proof object. Serialized by the caller via `serde_json::Value`
-/// (BTreeMap ⇒ alphabetical keys, the frozen QJsonObject order), so field
-/// order here is NOT wire-significant.
+/// (BTreeMap ⇒ alphabetical keys, the frozen wire order), so field order
+/// here is NOT wire-significant.
 #[derive(Serialize)]
 pub(crate) struct ProofJson {
     pub(crate) leaf: String,
@@ -473,7 +471,7 @@ pub fn membership_status(grace_start: u64, grace_duration: u32, now: u64) -> &'s
 }
 
 // ============================================================================
-// Funding plans (mint / claim / balance)
+// Funding plans (claim / balance)
 // ============================================================================
 
 /// Parse a Token-program holding account (borsh `TokenHolding`) → its token
@@ -597,8 +595,7 @@ mod tests {
     }
 
     // Pins the Register instruction's word encoding (risc0-serde: variant
-    // index 3, one word per u8, u64 as lo/hi words) — the exact words the
-    // former Vec<u8> representation flattened to LE bytes and re-chunked.
+    // index 3, one word per u8, u64 as lo/hi words).
     #[test]
     fn register_instruction_words_pin() {
         let words = register_build_instruction(&[0xAB; 32], &[0xCD; 32], 0x1_0000_0002, 7).unwrap();

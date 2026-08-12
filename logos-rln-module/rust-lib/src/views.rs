@@ -1,25 +1,16 @@
 //! Typed reply shapes: `#[derive(Serialize)]` mirrors of the wire objects
-//! `lib.rs` hands back, replacing hand-assembled `serde_json::Map`/`json!`
-//! construction with exhaustive, compile-time-checked field lists. Each
-//! struct's doc comment names the `.lidl` record (or method-comment shape)
-//! it mirrors — chat-module's `actions.rs` convention.
+//! `lib.rs` hands back. Each struct's doc comment names the `.lidl` record
+//! (or method-comment shape) it mirrors.
 //!
-//! Every struct's fields are declared in ALPHABETICAL order, matching this
-//! module's `serde_json alphabetical key order throughout` wire convention
-//! (see the `.lidl` header). This is belt-and-suspenders, not load-bearing:
-//! the crate does NOT enable serde_json's `preserve_order` feature (no
-//! `indexmap` in Cargo.lock — verified), so `serde_json::Value`'s `Map` is a
-//! `BTreeMap` and `serde_json::to_value(&struct)` re-sorts into alphabetical
-//! key order regardless of struct field order. Declaring fields alphabetically
-//! anyway keeps the source readable as a preview of the wire shape, and
-//! costs nothing. Every call site converts through `serde_json::to_value`
-//! (never a direct `serde_json::to_string` on the struct, which WOULD emit
-//! declaration order unsorted) so this safety net always applies.
+//! Fields are declared in alphabetical order as a preview of the wire shape.
+//! Actual key order comes from `serde_json::to_value`: without the
+//! `preserve_order` feature `serde_json`'s `Map` is a `BTreeMap`, so keys
+//! sort alphabetically regardless of field order. Call sites must convert
+//! through `to_value` — `serde_json::to_string` directly on a struct would
+//! emit declaration order.
 //!
-//! `Option` fields use `skip_serializing_if = "Option::is_none"` exactly
-//! where the hand-assembled code they replace conditionally inserted the
-//! key — `None` omits the key entirely (never a JSON `null`), so the wire
-//! bytes are unchanged.
+//! `Option` fields use `skip_serializing_if = "Option::is_none"`: `None`
+//! omits the key entirely, never a JSON `null`.
 
 use serde::Serialize;
 
@@ -36,7 +27,7 @@ pub(crate) struct CredentialView {
 
 /// The public Membership view (spec Membership minus secrets) — mirrors the
 /// `.lidl` `Membership` record. Shared by `register`, `select_membership`,
-/// and `get_memberships`, the most-shared reply shape in the crate.
+/// and `get_memberships`.
 #[derive(Serialize)]
 pub(crate) struct MembershipView {
     credential: CredentialView,
@@ -60,12 +51,9 @@ pub(crate) struct MembershipView {
 
 impl MembershipView {
     /// `quarantined` (metadata tamper-check failed) forces `state:"failed"`
-    /// and `failed_reason:"metadata_tamper"` — and SUPPRESSES `retryable`
-    /// even if the underlying record has one set, since a tamper verdict is
-    /// never "just retry". Absent
-    /// quarantine, `failed_reason`/`retryable` come from the record as-is;
-    /// `rate_limit_mismatch` is only ever emitted `true` (never `false`) —
-    /// the caller passes it only when a mismatch was found.
+    /// and `failed_reason:"metadata_tamper"` and suppresses `retryable` — a
+    /// tamper verdict is never retriable. `rate_limit_mismatch` is emitted
+    /// only as `true`, never `false`.
     pub(crate) fn new(
         hash: &str,
         meta: &MembershipMeta,
@@ -96,12 +84,9 @@ impl MembershipView {
 
 /// `get_membership_state`'s reply — mirrors the `.lidl` `MembershipState`
 /// record. `registry_id`/`state` are always present; `membership_hash` /
-/// `leaf_index` / `rate_limit` are present only once a single membership
-/// resolves for the scope (the method's own comment: "plus membership_hash /
-/// leaf_index / rate_limit when known") — `state:"unknown"` when none does,
-/// and more than one candidate is an `ambiguous_selection` ERROR rather than
-/// this shape. One struct rather than two: the spec frames it as ONE reply
-/// with conditional fields, not two distinct shapes.
+/// `leaf_index` / `rate_limit` only once a single membership resolves for
+/// the scope. `state:"unknown"` when none does; more than one candidate is
+/// an `ambiguous_selection` error, not this shape.
 #[derive(Serialize)]
 pub(crate) struct MembershipStateView {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,9 +143,7 @@ impl EpochQuotaView {
     }
 }
 
-/// `start`'s reply. Not a `.lidl` record (not in the record-shapes list —
-/// `start`'s own method comment already spells out the shape); all fields
-/// are always present.
+/// `start`'s reply. Not a `.lidl` record; all fields are always present.
 #[derive(Serialize)]
 pub(crate) struct StartReply {
     epoch_size_sec: u64,
@@ -175,9 +158,7 @@ impl StartReply {
     }
 }
 
-/// `stop`'s reply — a single fixed key, kept a struct for symmetry with
-/// [`StartReply`] and so a future field lands with a compiler-checked
-/// alphabetical slot rather than a fresh `json!`.
+/// `stop`'s reply.
 #[derive(Serialize)]
 pub(crate) struct StopReply {
     stopped: bool,
@@ -191,11 +172,9 @@ impl StopReply {
 
 /// `get_registry_parameters`'s reply — mirrors the `.lidl`
 /// `RegistryParameters` record. `epoch_size_sec` is always present (the
-/// module's own `start()`-configured value); the registry-declared bounds
-/// are present only when the registry's `get_registry_bounds` reply carried
-/// them. `price_per_unit` is passed through opaquely (the sibling module
-/// documents it as a decimal STRING, but this view makes no assumption
-/// about its shape).
+/// `start()`-configured value); the registry-declared bounds appear only
+/// when `get_registry_bounds` carried them. `price_per_unit` passes through
+/// opaquely (documented upstream as a decimal string).
 #[derive(Serialize)]
 pub(crate) struct RegistryParametersView {
     epoch_size_sec: u64,
@@ -244,8 +223,8 @@ impl VerdictReply {
     }
 }
 
-/// `unlock_keystore`'s reply. Not a `.lidl` record (the method comment
-/// already spells out the shape); both fields are always present.
+/// `unlock_keystore`'s reply. Not a `.lidl` record; both fields are always
+/// present.
 #[derive(Serialize)]
 pub(crate) struct UnlockKeystoreReply {
     membership_count: u64,
@@ -259,9 +238,7 @@ impl UnlockKeystoreReply {
 }
 
 /// The typed error envelope's body — mirrors `ApiError::body`'s
-/// `{"class":…,"kind":…,"message":…}`. Not a `.lidl` record (the file
-/// header already documents the shape in prose, shared by both reply
-/// dialects).
+/// `{"class":…,"kind":…,"message":…}`. Not a `.lidl` record.
 #[derive(Serialize)]
 pub(crate) struct ErrorBody {
     class: &'static str,

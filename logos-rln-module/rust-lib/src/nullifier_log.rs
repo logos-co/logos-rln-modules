@@ -1,11 +1,9 @@
 //! Per-epoch nullifier log: the in-memory record of every nullifier
-//! `verify_proof` has already accepted, moved INTO the Module by the spec so
-//! that duplicate / double-signalling detection is no longer the consumer's
-//! job. Keyed epoch → nullifier → the accepted proof's `(share_x, share_y)`,
-//! it turns a second proof reusing a nullifier into a verdict: the same
-//! `share_x` is a retransmission (duplicate), a different `share_x` is a
-//! double-signal (rate-limit violation) whose two Shamir shares reconstruct
-//! the violator's identity secret.
+//! `verify_proof` has accepted. Keyed epoch → nullifier → the accepted
+//! proof's `(share_x, share_y)`, it turns a second proof reusing a nullifier
+//! into a verdict: the same `share_x` is a retransmission (duplicate), a
+//! different `share_x` is a double-signal (rate-limit violation) whose two
+//! Shamir shares reconstruct the violator's identity secret.
 //!
 //! Crypto-free by design — it stores and compares raw 32-byte values only, so
 //! it stays on `verify_proof`'s hot path: no registry access, no disk, no
@@ -34,16 +32,15 @@ pub(crate) enum RecordOutcome {
     Collision { prior_x: [u8; 32], prior_y: [u8; 32] },
 }
 
-/// epoch → nullifier → the `(share_x, share_y)` of the first proof accepted for
 /// One accepted proof's `(share_x, share_y)` — the Shamir point a later
 /// collision reconstructs the secret against.
 type Shares = ([u8; 32], [u8; 32]);
 /// One epoch's bucket: nullifier → the first accepted proof's shares.
 type EpochBucket = HashMap<[u8; 32], Shares>;
 
-/// it. `Option` so the map is `const`-initializable (the crate's `Mutex<Option<
-/// HashMap>>` + `get_or_insert_with` pattern; `HashMap::new` is not `const`),
-/// reached only through the poison-recovering [`crate::lock`].
+/// epoch → nullifier → the first accepted proof's shares. `Option` so the map
+/// is `const`-initializable (`HashMap::new` is not `const`); reached only
+/// through the poison-recovering [`crate::lock`].
 static LOG: Mutex<Option<HashMap<u64, EpochBucket>>> = Mutex::new(None);
 
 /// Record a proof that has ALREADY passed validity + root-window checks, and
@@ -88,11 +85,9 @@ pub(crate) fn reset_for_test() {
 mod tests {
     use super::*;
 
-    // The three-way verdict on one (epoch, nullifier): first sighting is Fresh,
-    // the same share re-sent is Duplicate, a different share is a Collision that
-    // hands back the prior share. Serialized on the crate's global-state lock
-    // and reset at the top, because verdicts here depend on log contents and
-    // the lib verify tests wipe this same static under that lock.
+    // Serialized on the crate's global-state lock and reset first: verdicts
+    // depend on log contents, and the lib verify tests wipe this same static
+    // under that lock.
     #[test]
     fn fresh_then_duplicate_then_collision() {
         let _serial = crate::lock(&crate::store::TEST_STORE_LOCK);
@@ -112,9 +107,6 @@ mod tests {
         }
     }
 
-    // retain_floor prunes epochs below it: an entry recorded at epoch 100 is
-    // gone once a later record at epoch 102 carries retain_floor 101, so 100
-    // reads as Fresh again (it would be Duplicate had the prune not fired).
     #[test]
     fn prunes_below_retain_floor() {
         let _serial = crate::lock(&crate::store::TEST_STORE_LOCK);

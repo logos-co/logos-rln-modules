@@ -1,8 +1,6 @@
-// Clipboard without C++: the QML sandbox's only sanctioned copy path is a
-// TextEdit's copy(), so an invisible one holds the payload. The label flips
-// Copy -> Copied for a moment as feedback. LogosButton exposes no font hook,
-// so its internal caption is suppressed and a scaled overlay label drawn over
-// it (a plain Text passes clicks through to the button) to match the 2x scale.
+// Copies `payload` via a hidden TextEdit's copy() — the QML sandbox's only
+// clipboard path without C++. LogosButton exposes no font hook, so its caption
+// is suppressed and a scaled overlay label (click-transparent Text) drawn on top.
 import QtQuick
 import Logos.Theme
 import Logos.Controls

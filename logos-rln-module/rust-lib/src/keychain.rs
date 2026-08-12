@@ -9,19 +9,16 @@
 //! HOME). Reads pass only service/account on argv; writes go through
 //! `security -i` stdin batch mode so the secret NEVER appears in argv. The
 //! item is written with `-U` (update in place) and `-T /usr/bin/security`
-//! (dev trust: any same-user process via the security tool — the wallet
-//! already lives at that trust level since its open() takes no password;
-//! production basecamp is Developer-ID signed, enabling a stricter
-//! app-bound ACL later). Payloads are hex(password_bytes) uniformly:
-//! quoting-proof in the batch line and deterministic to read back.
+//! (any same-user process can read it via the security tool). Payloads are
+//! hex(password_bytes) uniformly: quoting-proof in the batch line and
+//! deterministic to read back.
 //!
 //! The account is the sha256 of the VERBATIM persistence dir string (not
 //! canonicalized — macOS /var<->/private/var churn would orphan items), so
 //! each module instance owns exactly one item. Missing item + credentials
 //! present maps to keychain_unavailable (never invent a secret over an
-//! existing keystore); the documented lockout caveat: deleting an
-//! auto-created account's item orphans its credentials — the user never saw
-//! the secret. A future export surface can reveal it.
+//! existing keystore). Caveat: deleting an auto-created account's item
+//! orphans its credentials — the user never saw the secret.
 
 use crate::registry_id;
 use crate::{store, ApiError, ErrorKind};
@@ -308,7 +305,7 @@ mod tests {
     }
 
     /// A stored credential so unlock() actually verifies (empty keystores
-    /// adopt any password) — mirrors the store.rs test fixtures.
+    /// adopt any password).
     fn store_credential(password: &str) {
         store::with_store(|s| {
             s.unlock(password)?;

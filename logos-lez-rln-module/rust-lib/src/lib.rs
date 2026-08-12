@@ -9,7 +9,7 @@
 //! registration tx) — the SDK's generated typed client has no per-call
 //! timeout and would cap every call at the 20s protocol default.
 //!
-//! Identity and credential generation deliberately live in the membership
+//! Identity and credential generation live in the membership
 //! module (secrets never cross the module wire); this module only ever sees
 //! the public id_commitment.
 //!
@@ -48,12 +48,10 @@ const TX_TIMEOUT_MS: c_int = 180_000;
 
 // ---------------------------------------------------------------- lp raw ABI
 //
-// The same lp_* consumer C ABI logos_rust_sdk binds (the symbols resolve
-// against the protocol archive linked into this plugin), declared here
-// because the SDK's PluginProxy hardcodes timeout_ms = 0 (the 20s protocol
-// default) with no public escape hatch. One shared client for the wallet
-// target, mirroring both the SDK's per-target client cache and the C++
-// module's single walletClient.
+// The lp_* consumer C ABI (the symbols resolve against the protocol archive
+// linked into this plugin), declared here because the SDK's PluginProxy
+// hardcodes timeout_ms = 0 (the 20s protocol default) with no public escape
+// hatch. One shared client for the wallet target.
 #[cfg(not(test))]
 mod lp {
     use std::ffi::{c_char, c_int};
@@ -156,30 +154,24 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// One entry per membership PDA this session: the reply returned to every
-/// caller after the first. Delivery fires register_member on two paths within
-/// seconds (the sync selfRegisterRln and the Nim fetcher's async trip); the
-/// on-chain pre-check cannot see a submission still confirming (60-90s on
-/// testnet), and a duplicate Register submit poisons the gifter wallet's nonce
-/// sequence and freezes the gifter for the whole confirmation window. The C++
-/// module only avoided this by accidental Qt serialization timing.
+/// In-flight registration dedup: one `(reply, inserted_at)` entry per
+/// membership PDA this session; callers after the first get the first
+/// submission's reply. Delivery fires register_member on two paths within
+/// seconds, the on-chain pre-check cannot see a submission still confirming
+/// (60-90s on testnet), and a duplicate Register submit poisons the gifter
+/// wallet's nonce sequence for the whole confirmation window.
 ///
-/// The key is the membership PDA hex — the canonical `(tree_id, id_commitment)`
-/// identity the on-chain `Claim::Pda` enforces uniqueness on — NOT the raw
-/// caller strings: two callers describing the same membership with equivalent
-/// but differently-formatted inputs (`0xAB..` vs `ab..`, base58 vs 64-hex
-/// config) must land in the same slot, or both submit and freeze the gifter.
-/// (reply, inserted_at) per in-flight registration.
+/// The key is the membership PDA hex — the canonical `(tree_id,
+/// id_commitment)` identity — NOT the raw caller strings: equivalent but
+/// differently-formatted inputs (`0xAB..` vs `ab..`, base58 vs 64-hex) must
+/// land in the same slot.
 type RegInFlightMap = std::collections::HashMap<String, (String, Instant)>;
 
 static REG_IN_FLIGHT: Mutex<Option<RegInFlightMap>> = Mutex::new(None);
 
-/// Entries expire after this TTL: an accepted submission that never applies
-/// on-chain (the membership module reports it Failed after its confirmation
-/// window) must be re-submittable in the same session, and the TTL is far
-/// above the seconds-apart double-fire the map exists to absorb. 300s also
-/// comfortably covers the 60-90s testnet confirmation delay, so a confirming
-/// registration is never double-submitted.
+/// A submission that never applies on-chain must be re-submittable in the
+/// same session, so entries expire; 300s still covers both the seconds-apart
+/// double-fire and the 60-90s testnet confirmation delay.
 const REG_IN_FLIGHT_TTL: Duration = Duration::from_secs(300);
 
 fn reg_in_flight<R>(f: impl FnOnce(&mut RegInFlightMap) -> R) -> R {
@@ -202,7 +194,6 @@ fn init_wallet_client() {
     if slot.is_some() {
         return;
     }
-    // Infallible in practice: both inputs are compile-time constants with no NULs.
     let (Ok(target), Ok(origin)) = (CString::new(WALLET_MODULE), CString::new("core")) else {
         return;
     };
@@ -245,8 +236,7 @@ extern "C" fn wallet_reply_trampoline(
     let _ = reply.tx.send((ok != 0, raw));
 }
 
-/// Interpret a raw lp result exactly as the C++ module saw QVariant::toString()
-/// on an invoke: the JSON string value, or "" for anything else.
+/// The JSON string value of a raw lp result, or "" for anything else.
 fn lp_result_to_string(raw: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(raw) {
         Ok(serde_json::Value::String(s)) => s,
@@ -254,9 +244,8 @@ fn lp_result_to_string(raw: &str) -> String {
     }
 }
 
-/// invokeRemoteMethod analog: JSON-array args in, the QString result out.
-/// Failure (lp error, timeout, non-string result) yields "" — exactly what
-/// the C++ module saw from QVariant::toString() on a failed invoke.
+/// JSON-array args in, string result out. Failure (lp error, timeout,
+/// non-string result) yields "".
 ///
 /// Two paths by thread, per the lp_client owner-thread contract
 /// (logos_protocol.h):
@@ -363,8 +352,7 @@ fn wallet_call(method: &str, args: &serde_json::Value, timeout_ms: c_int) -> Str
 
 // ------------------------------------------------------------------- helpers
 
-/// Trim whitespace and strip an optional 0x/0X prefix — the C++ modules'
-/// shared prefix handling (hexToBytes and resolveAccountId).
+/// Trim whitespace and strip an optional 0x/0X prefix.
 fn strip_hex_prefix(s: &str) -> &str {
     let trimmed = s.trim();
     if trimmed.len() >= 2 && (trimmed.starts_with("0x") || trimmed.starts_with("0X")) {
@@ -374,9 +362,9 @@ fn strip_hex_prefix(s: &str) -> &str {
     }
 }
 
-/// Mirrors the C++ hexToBytes(hex, out, expectedLength): trims whitespace,
-/// strips an optional 0x/0X prefix, requires an even number of hex digits,
-/// and (when expected_len is given) an exact decoded length.
+/// Trims whitespace, strips an optional 0x/0X prefix, requires an even
+/// number of hex digits and (when expected_len is given) an exact decoded
+/// length.
 fn hex_to_bytes(hex: &str, expected_len: Option<usize>) -> Option<Vec<u8>> {
     let digits = strip_hex_prefix(hex);
     if digits.len() % 2 != 0 {
@@ -405,9 +393,9 @@ fn hex_to_bytes32(hex: &str) -> Option<[u8; 32]> {
     })
 }
 
-/// C++ resolveAccountId: 64-hex (with optional 0x) passes through; anything
-/// else goes to the wallet's account_id_from_base58 (the ORIGINAL untrimmed
-/// id, as in C++). Empty string on failure.
+/// 64-hex (with optional 0x) passes through; anything else goes to the
+/// wallet's account_id_from_base58 with the ORIGINAL untrimmed id. Empty
+/// string on failure.
 fn resolve_account_id(id: &str) -> String {
     let stripped = strip_hex_prefix(id);
     if stripped.len() == 64 {
@@ -420,8 +408,8 @@ fn resolve_account_id(id: &str) -> String {
     )
 }
 
-/// Tri-state fetch (C++ fetchAccountDataTriState): Present / legitimately
-/// Absent (empty data) / Error (RPC failure, malformed JSON or hex). Quiet.
+/// Tri-state fetch: Present / legitimately Absent (empty data) / Error
+/// (RPC failure, malformed JSON or hex). Logs nothing.
 enum FetchOutcome {
     Present(Vec<u8>),
     Absent,
@@ -453,9 +441,9 @@ fn fetch_account_data_tri_state(account_id_hex: &str) -> FetchOutcome {
     }
 }
 
-/// Quiet fetch (C++ fetchAccountDataQuiet): Some(data) only for a populated,
-/// well-formed account. Used by the register_member pre-check + membership
-/// polls where "not yet present" is the expected initial state.
+/// Some(data) only for a populated, well-formed account; logs nothing. Used
+/// where "not yet present" is an expected state (register_member pre-check,
+/// membership polls).
 fn fetch_account_data_quiet(account_id_hex: &str) -> Option<Vec<u8>> {
     match fetch_account_data_tri_state(account_id_hex) {
         FetchOutcome::Present(data) => Some(data),
@@ -463,9 +451,9 @@ fn fetch_account_data_quiet(account_id_hex: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Loud fetch (C++ fetchAccountData): logs each failure mode; optionally
-/// extracts + validates the 32-byte program_owner (an empty owner field is
-/// tolerated and leaves `owner_out` empty, as in C++).
+/// Loud fetch: logs each failure mode. Optionally extracts and validates the
+/// 32-byte program_owner; an empty owner field is tolerated and leaves
+/// `owner_out` empty.
 fn fetch_account_data(account_id_hex: &str, owner_out: Option<&mut Vec<u8>>) -> Option<Vec<u8>> {
     let json = wallet_call(
         "get_account_public",
@@ -506,8 +494,8 @@ fn fetch_account_data(account_id_hex: &str, owner_out: Option<&mut Vec<u8>>) -> 
     hex_to_bytes(data_hex, None)
 }
 
-/// C++ RlnConfigContext: the resolved config account (64-hex + raw data) and
-/// the 32-byte program owner — the inputs every on-chain entry point needs.
+/// The resolved config account (64-hex + raw data) and its 32-byte program
+/// owner — the inputs every on-chain entry point needs.
 struct RlnConfigContext {
     config_hex: String,
     config_data: Vec<u8>,
@@ -546,8 +534,8 @@ fn words_to_json(words: &[u32]) -> Vec<serde_json::Value> {
 
 /// Submit one `send_generic_public_transaction` — the frozen 4-element args
 /// array `[account_ids, signing_reqs, instruction_words, program_id]` — with
-/// the C++ module's 180s timeout (a sequencer submit can far outlive the 20s
-/// protocol default). `None` = failed, already logged.
+/// the 180s tx timeout (a sequencer submit can far outlive the 20s protocol
+/// default). `None` = failed, already logged.
 fn send_generic_tx(
     who: &str,
     account_ids: Vec<String>,
@@ -632,8 +620,7 @@ fn roots_to_json_array(roots: &[[u8; 32]]) -> serde_json::Value {
 
 /// Serialize proofs plus the shared `valid_roots` array to the wire JSON.
 /// `serde_json::Value` objects are BTreeMaps, so keys serialize
-/// alphabetically (QJsonObject parity) — byte-identical to the former
-/// serialize→parse→augment string round-trip (pinned by
+/// alphabetically — the frozen wire order (pinned by
 /// `augmented_proofs_match_legacy_string_roundtrip`).
 fn proofs_with_roots_json(proofs: &[native::ProofJson], roots_array: &serde_json::Value) -> String {
     let augmented: Vec<serde_json::Value> = proofs
@@ -684,7 +671,6 @@ fn get_valid_roots_impl(rln_account_id_hex: &str) -> String {
 }
 
 fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> String {
-    // 1. Parse leaf indices from JSON array.
     let indices_doc = serde_json::from_str::<serde_json::Value>(leaf_indices_json).ok();
     let Some(indices_array) = indices_doc.as_ref().and_then(|v| v.as_array()) else {
         eprintln!("get_merkle_proofs: leaf_indices_json is not a JSON array");
@@ -699,7 +685,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
             eprintln!("get_merkle_proofs: leaf index is not a number");
             return String::new();
         }
-        // C++ QJsonValue::toInteger(): doubles truncate toward zero.
+        // Non-integer numbers truncate toward zero.
         let idx = val
             .as_u64()
             .or_else(|| val.as_i64().map(|v| v as u64))
@@ -708,12 +694,10 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
         leaf_indices.push(idx);
     }
 
-    // 2. Resolve config account ID and fetch config data.
     let Some(ctx) = resolve_config_context(config_account_id, "get_merkle_proofs") else {
         return String::new();
     };
 
-    // 3. Phase 1: which accounts do we need to fetch.
     let plan = match native::merkle_proofs_plan(&ctx.config_data, &ctx.program_owner, &leaf_indices)
     {
         Ok(p) => p,
@@ -723,8 +707,8 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
         }
     };
 
-    // 4-7. Stable-snapshot loop: the wallet's reads aren't snapshot-bound, so
-    // the subtree reads are bracketed by two main-account fetches; equal
+    // Stable-snapshot loop: the wallet's reads aren't snapshot-bound, so the
+    // subtree reads are bracketed by two main-account fetches; equal
     // valid_roots windows prove no mutation occurred and the (main, subtree)
     // pair is consistent.
     const K_MAX_SNAPSHOT_ATTEMPTS: usize = 5;
@@ -736,7 +720,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
     let mut consistent = false;
 
     for attempt in 0..K_MAX_SNAPSHOT_ATTEMPTS {
-        // 4. Fetch main account (snapshot A — opens the read window).
+        // Snapshot A — opens the read window.
         let Some(main_data) = fetch_account_data(&main_hex, None) else {
             eprintln!("get_merkle_proofs: failed to fetch main account {main_hex}");
             return String::new();
@@ -749,9 +733,9 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
             }
         };
 
-        // 5. Fetch subtree accounts tri-state: Absent (not yet initialized)
-        //    is legitimate; Error routes into the snapshot retry instead of
-        //    silently substituting "empty" for an existing subtree. [R5]
+        // Subtree fetches are tri-state: Absent (not yet initialized) is
+        // legitimate; Error routes into the snapshot retry instead of
+        // silently substituting "empty" for an existing subtree.
         let mut subtrees: Vec<(u32, Vec<u8>)> = Vec::with_capacity(subtree_count);
         let mut subtree_fetch_errored = false;
         for i in 0..subtree_count {
@@ -772,7 +756,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
             continue;
         }
 
-        // 6. Refetch main account (snapshot B — closes the read window).
+        // Snapshot B — closes the read window.
         let Some(main_data_b) = fetch_account_data(&main_hex, None) else {
             eprintln!("get_merkle_proofs: refetch main account failed (attempt {attempt})");
             continue;
@@ -791,7 +775,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
             continue;
         }
 
-        // 7. Stable window ⇒ build proofs from snapshot A's main data.
+        // Stable window: build proofs from snapshot A's main data.
         let subtree_refs: Vec<(u32, &[u8])> = subtrees
             .iter()
             .map(|(id, data)| (*id, data.as_slice()))
@@ -861,8 +845,6 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             return String::new();
         }
 
-        // tree_id comes from config; id_commitment seeds the init-marked
-        // membership PDA required by the guest's Register instruction.
         let Some(plan) = derive_register_plan(&ctx, &id_commitment, "register_member") else {
             return String::new();
         };
@@ -889,12 +871,8 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             }
         }
 
-        // In-flight dedup (see REG_IN_FLIGHT): first caller proceeds to
-        // submit; concurrent and repeat callers get the first submission's
-        // reply instead of a second conflicting transaction. Keyed by the
-        // canonical membership PDA (derived from the resolved tree_id +
-        // normalized id_commitment), so equivalent-but-differently-formatted
-        // inputs dedup to the same slot.
+        // In-flight dedup (see REG_IN_FLIGHT): the first caller submits;
+        // concurrent and repeat callers get the first submission's reply.
         let reg_key = membership_pda_hex.clone();
         let placeholder = serde_json::json!({
             "leaf_index": plan.next_leaf_index as i64,
@@ -915,8 +893,6 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             return reply;
         }
 
-        // SPEL `Instruction::Register` needs all of {tree_id, id_commitment,
-        // rate_limit, subtree_id}; the plan carries tree_id from the config.
         let instruction = match native::register_build_instruction(
             &plan.tree_id,
             &id_commitment,
@@ -1176,8 +1152,6 @@ mod tests {
     // fall out of the dedup map, while a fresh entry keeps deduping.
     #[test]
     fn reg_in_flight_entries_expire_after_ttl() {
-        // Keys are membership-PDA hex strings (see RegInFlightMap); any two
-        // distinct values exercise the TTL eviction.
         let stale_key = "aa".repeat(32);
         let fresh_key = "bb".repeat(32);
         let Some(back_dated) =
@@ -1197,10 +1171,9 @@ mod tests {
         });
     }
 
-    // Pins proofs_with_roots_json to the byte output of the legacy path
-    // (serialize the structs to a string, re-parse as Value, insert
-    // valid_roots, re-serialize) that the C++-parity wire format was
-    // originally validated against.
+    // Pins proofs_with_roots_json to the byte output of the string
+    // round-trip (serialize → re-parse as Value → insert valid_roots →
+    // re-serialize) that defines the frozen wire format.
     #[test]
     fn augmented_proofs_match_legacy_string_roundtrip() {
         let proofs = vec![native::ProofJson {
@@ -1230,7 +1203,7 @@ mod tests {
 
         let current_str = proofs_with_roots_json(&proofs, &roots_array);
         assert_eq!(current_str, legacy_str);
-        // Alphabetical keys (QJsonObject parity), valid_roots last.
+        // Alphabetical keys, valid_roots last.
         assert!(current_str.starts_with("[{\"depth\":2,\"leaf\":\"aa"));
         assert!(current_str.contains("\"root\":\"bb"));
         let expected_tail = format!("\"valid_roots\":[\"{}\"]}}]", "ee".repeat(32));

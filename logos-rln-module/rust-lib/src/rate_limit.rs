@@ -47,10 +47,9 @@ pub(crate) enum AllocError {
 /// The current epoch index: `floor(now_unix / epoch_size_sec)` — the ONE
 /// place the division (and its zero-size guard) lives.
 ///
-/// Wall-clock based, following nwaku's `nonce_manager` convention. Verifiers
-/// MUST share the same `epoch_size` and time base — per the spec's Appendix A
-/// the `logos` time base is the on-chain clock; which time source feeds this
-/// is a `start()` configuration item, not hard-coded here.
+/// Wall-clock based. Verifiers MUST share the same `epoch_size` and time base
+/// — per the spec's Appendix A the `logos` time base is the on-chain clock;
+/// which time source feeds this is a `start()` configuration item.
 pub(crate) fn current_epoch(now_unix: u64, epoch_size_sec: u64) -> u64 {
     now_unix / epoch_size_sec.max(1)
 }
@@ -68,7 +67,7 @@ pub(crate) fn current_epoch(now_unix: u64, epoch_size_sec: u64) -> u64 {
 /// exposing the Shamir shares that reconstruct the identity secret.
 ///
 /// The caller MUST durably persist `allocations` before using the returned
-/// slot — the whole point of the pre-persist ordering.
+/// slot.
 pub(crate) fn reserve_slot(
     allocations: &mut Vec<EpochAllocation>,
     rln_identifier_hex: &str,
@@ -104,7 +103,7 @@ pub(crate) fn reserve_slot(
 }
 
 /// Remaining slots for `(rln_identifier, epoch)` under `rate_limit` — the
-/// quota read's current-epoch budget. A no-op read: never mutates.
+/// quota read's current-epoch budget.
 pub(crate) fn remaining(
     allocations: &[EpochAllocation],
     rln_identifier_hex: &str,

@@ -1,12 +1,11 @@
 // Wallet & funding flow: open (or create) the execution-zone wallet, sync it
-// to the live chain head, then claim RLNTOK from the faucet into a freshly
-// derived holding account — which auto-fills the Register tab's funding
-// field via the funded() signal. Two hard-won gotchas are designed around:
-// an UNSYNCED wallet submits transactions that are accepted (tx hash and
-// all) but silently never apply, so sync is retried until the wallet itself
-// reports success AND the synced block reaches the discovered head; and a
-// claim exceeding the faucet's remaining balance is also silently dropped,
-// so the credit is polled with a hard timeout instead of spinning forever.
+// to the chain head, then claim RLNTOK from the faucet into a freshly
+// derived holding account, which auto-fills the Register tab's funding
+// field via the funded() signal. Two chain facts shape the flow: an
+// unsynced wallet's transactions are accepted (tx hash and all) but
+// silently never apply, and a claim exceeding the faucet's remaining
+// balance is also silently dropped — so sync completion is verified and
+// the claim credit is polled with a hard timeout.
 import QtQuick
 import QtQuick.Layouts
 import Logos.Theme
@@ -53,11 +52,10 @@ LogosScrollView {
         statusIsError = isError === true
     }
 
-    // One-click path: the membership module provisions wallet-home under
-    // its host-stamped persistence dir (provision_wallet_home — sandboxed
-    // QML cannot create files; see the module lidl for the full rationale),
-    // then storage_exists decides open vs create. The returned paths land in
-    // the advanced fields, so both flows share doOpen/doCreate below.
+    // The membership module provisions wallet-home (sandboxed QML cannot
+    // create files), then storage_exists decides open vs create. The
+    // returned paths land in the advanced fields, so both flows share
+    // doOpen/doCreate below.
     function doProvision() {
         busy = true
         M.call(bridge, M.RLN_MODULE, "provision_wallet_home",
@@ -264,10 +262,9 @@ LogosScrollView {
         })
     }
 
-    // A claim beyond the faucet's remaining balance is ALSO accepted and then
+    // A claim beyond the faucet's remaining balance is accepted and then
     // silently never funds the holding — hence the hard poll timeout
-    // (36 polls x 5s = 180s), with the countdown surfaced so the wait is
-    // visibly bounded rather than an anonymous spinner.
+    // (36 polls x 5s = 180s).
     function pollClaim() {
         claimPolls += 1
         M.call(bridge, M.LEZ_RLN_MODULE, "get_token_balance", [holdingHex], function (r) {

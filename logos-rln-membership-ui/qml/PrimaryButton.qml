@@ -1,9 +1,7 @@
-// The primary (accent) call-to-action. The design system's LogosButton hard-
-// codes its label at the caption size and exposes no font hook, so at 2x its
-// text would stay tiny inside a doubled box; this self-contained button keeps
-// the exact primary/hover/pressed/disabled palette while letting the label
-// scale with sc() like the rest of the module. API is unchanged: text,
-// enabled (inherited Item.enabled — also gates the MouseArea), clicked().
+// The primary (accent) call-to-action. LogosButton hard-codes its label at the
+// caption size with no font hook, so this self-contained button reproduces the
+// primary/hover/pressed/disabled palette with an sc()-scaled label.
+// API: text, enabled (inherited Item.enabled also gates the MouseArea), clicked().
 import QtQuick
 import Logos.Theme
 import Logos.Controls

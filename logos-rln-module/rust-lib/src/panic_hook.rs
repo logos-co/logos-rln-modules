@@ -1,13 +1,10 @@
 //! Panic hook installed on first host contact.
 //!
-//! `panic = "abort"` (Cargo.toml `[profile.release]`, mirroring the sibling
-//! module) is the right setting because unwinding across the C ABI into the
-//! host would be UB — but it means a panicking maintenance tick or dispatch
-//! aborts the whole `logos_host_qt` subprocess before any `catch_unwind`
-//! could return control. What *does* run before the abort is the panic hook:
-//! install one that prints the location and payload to stderr, so a crash
-//! inside this module is locatable in the host log instead of appearing as
-//! an opaque SIGABRT.
+//! Release builds set `panic = "abort"` (unwinding across the C ABI into
+//! the host would be UB), so a panic aborts the whole `logos_host_qt`
+//! subprocess before any `catch_unwind` can run. The panic hook still runs
+//! first: it prints the location and payload to stderr so a crash inside
+//! this module is locatable in the host log instead of an opaque SIGABRT.
 
 use std::panic;
 use std::sync::Once;

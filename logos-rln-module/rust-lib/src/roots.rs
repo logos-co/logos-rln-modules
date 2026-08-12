@@ -1,20 +1,12 @@
-//! Valid-root window: a locally-maintained cache of each tracked registry's
-//! acceptable Merkle roots, refreshed on a background thread so
-//! `verify_proof` can serve the hot path without ever touching the registry
-//! (spec: "SHALL NOT perform registry access on the verification path").
+//! Valid-root window: a per-registry cache of acceptable Merkle roots,
+//! refreshed on a background thread so `verify_proof` never touches the
+//! registry (spec: "SHALL NOT perform registry access on the verification
+//! path"). Kept per registry, independent of the keystore — verification
+//! requires no membership.
 //!
-//! A membership is not required to verify — a validator that only checks
-//! messages never registers — so the window is maintained per *registry*,
-//! independent of the keystore, and warmed from the sibling's
-//! `get_valid_roots` provider read (which returns the current root plus the
-//! registry's short root history).
-//!
-//! Cold vs stale: a registry that has never been refreshed reports `None`
-//! (the caller returns `NOT_READY` rather than serve from a cold view, per
-//! the spec). A window whose last refresh is older than `STALE_AFTER_SECS`
-//! is also treated as cold — better to answer `NOT_READY` than to accept a
-//! proof against a root the registry may have already rotated out (the
-//! refresher runs every `REFRESH_INTERVAL`, so staleness means it stalled).
+//! A registry never refreshed, or whose last refresh is older than
+//! `STALE_AFTER_SECS`, reports `None`; callers map that to `NOT_READY`
+//! rather than accept a proof against a possibly rotated-out root.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -23,10 +15,9 @@ use std::time::Duration;
 use crate::registry_id::{hex_to_bytes32, CanonicalRegistryId};
 use crate::{lock, provider, ApiError, ErrorKind};
 
-/// How often the background thread pulls each tracked registry's roots. Roots
-/// rotate over seconds–minutes and the window carries several historical
-/// roots (lez-rln ROOT_HISTORY_SIZE = 4), so a 10s refresh keeps a proof
-/// generated against a freshly published root from being falsely rejected.
+/// Refresh cadence. Roots rotate over seconds–minutes and the window carries
+/// few historical roots (lez-rln ROOT_HISTORY_SIZE = 4); 10s keeps proofs
+/// against freshly published roots from being falsely rejected.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// A window older than this is treated as cold (NOT_READY): the refresher has
@@ -41,11 +32,9 @@ struct Window {
 static WINDOWS: Mutex<Option<HashMap<String, Window>>> = Mutex::new(None);
 static TRACKED: Mutex<Option<HashMap<String, CanonicalRegistryId>>> = Mutex::new(None);
 
-/// Track a registry's roots and make sure the background refresher is running.
-/// Non-blocking and hot-path-safe: it registers interest and returns, never
-/// performing a registry read itself. Warming happens on the refresher worker.
-/// After `stop()` the ensure is a no-op — interest is still recorded, and the
-/// next `start()`'s respawn + warm pass picks the registry up.
+/// Track a registry's roots and ensure the background refresher is running.
+/// Hot-path-safe: records interest and returns without a registry read.
+/// After `stop()` interest is still recorded; the next `start()` picks it up.
 pub(crate) fn track(registry: &CanonicalRegistryId) {
     {
         let mut guard = lock(&TRACKED);
@@ -69,8 +58,8 @@ pub(crate) fn window(canonical: &str) -> Option<Vec<[u8; 32]>> {
 }
 
 /// Idempotently spawn the background refresher; spawn permission lives in
-/// the supervisor, so nothing spawns after `stop()`. Runs off the owner
-/// thread, so its provider calls take the async lp path (the poller's model).
+/// the supervisor, so nothing spawns after `stop()`. The worker runs off the
+/// owner thread, so its provider calls take the async lp path.
 pub(crate) fn ensure_refresher() {
     crate::worker::ensure_refresher();
 }
@@ -101,8 +90,7 @@ pub(crate) fn refresh_all() {
         if let Err(e) = refresh_one(&registry) {
             eprintln!("roots: refresh {} failed: {}", registry.canonical, e.message);
         }
-        // Re-checked after every registry read so a worker abandoned by
-        // stop() does at most one more read before exiting.
+        // A worker abandoned by stop() does at most one more read.
         if crate::worker::is_stopped() {
             return;
         }
@@ -165,7 +153,6 @@ mod tests {
         let served = window(canonical).expect("fresh window served");
         assert_eq!(served, vec![[1u8; 32], [2u8; 32]]);
 
-        // Backdate past the staleness bound → treated as cold (NOT_READY).
         set_window_for_test(canonical, vec![[1u8; 32]], now - STALE_AFTER_SECS - 1);
         assert!(window(canonical).is_none());
     }

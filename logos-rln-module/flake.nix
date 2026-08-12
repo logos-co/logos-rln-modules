@@ -11,19 +11,12 @@
       systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ];
       forAllSystems = fn: nixpkgs.lib.genAttrs systems fn;
 
-      # The builder runs logos-lidl-gen to emit the module-impl C ABI scaffold
-      # (+ the typed liblogos_lez_rln_module dependency client) at
-      # rust-lib/generated/, compiles the staticlib, and wraps it in the Qt
-      # cdylib glue — all driven by metadata.json (codegen.rust +
-      # dependency_overrides). Concurrency stays at the single default: the
-      # register path is fire-and-record (lp_invoke_async), so no handler
-      # blocks on a sequencer submit.
-      #
-      # No path-deps beyond the staged SDK: the membership logic is pure Rust
-      # (CAIP-10 routing, keystore crypto, lifecycle state machine, and the
-      # RLN proof engine — zerokit `rln`, stateless, from crates.io) and all
-      # lez-rln REGISTRY knowledge lives behind the sibling module's wire —
-      # no rln-layouts / risc0 in this crate.
+      # The builder runs logos-lidl-gen to emit the C ABI scaffold (+ the
+      # typed liblogos_lez_rln_module dependency client) at rust-lib/generated/,
+      # compiles the staticlib, and wraps it in the Qt cdylib glue, driven by
+      # metadata.json. Concurrency stays at the single default: the register
+      # path is fire-and-record (lp_invoke_async), so no handler blocks on a
+      # sequencer submit.
       module = logos-module-builder.lib.mkLogosModule {
         src = ./.;
         configFile = ./metadata.json;
@@ -37,19 +30,10 @@
           liblogos_rln_module = m.default;
         });
 
-      # `nix run .#generate` materialises the two gitignored inputs `rust-lib/`
-      # references into the working tree: the provider scaffold
-      # (logos-lidl-gen over liblogos_rln_module.lidl, with the
-      # hand-maintained liblogos_lez_rln_module dep contract) at
-      # rust-lib/generated/, and the SDK source the crate path-deps as
-      # `../logos-rust-sdk-src`. After it, bare `cargo build/test/clippy`
-      # works in rust-lib/ directly, with no staged copy.
-      #
-      # Unlike logos-chat-module (where the module IS the repo toplevel),
-      # this module is a subdirectory of logos-lez-rln — `git rev-parse
-      # --show-toplevel` returns the repo root, so the script anchors one
-      # level below it. That makes the app runnable from anywhere in the
-      # repo, not just from within this directory.
+      # `nix run .#generate` materialises the two gitignored inputs rust-lib/
+      # references: the provider scaffold at rust-lib/generated/ and the SDK
+      # source the crate path-deps as `../logos-rust-sdk-src`. After it, bare
+      # `cargo build/test/clippy` works in rust-lib/.
       apps = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };

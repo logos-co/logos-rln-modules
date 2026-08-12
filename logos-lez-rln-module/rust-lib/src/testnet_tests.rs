@@ -20,8 +20,8 @@
 //!
 //! What this catches that unit pins cannot: ConfigState layout drift
 //! against the DEPLOYED program (the guest image is pinned by provisioned
-//! deployments — hazard class "run_setup binary drift"), PDA-derivation
-//! divergence, tree/proof encoding drift, and chain-clock unit changes.
+//! deployments), PDA-derivation divergence, tree/proof encoding drift, and
+//! chain-clock unit changes.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -66,9 +66,9 @@ fn testnet() -> Option<Deployment> {
         return None;
     }
     let name = std::env::var("LEZ_RLN_TESTNET_DEPLOYMENT").unwrap_or_else(|_| "shared-faucet".to_string());
-    // Deployment descriptors live with the programs in logos-co/logos-lez-rln:
+    // Deployment descriptors live with the programs in logos-co/logos-lez-rln;
     // LEZ_RLN_CHECKOUT points at that checkout (default: a sibling of this
-    // repo), matching the membership e2e script's convention.
+    // repo).
     let checkout = std::env::var("LEZ_RLN_CHECKOUT").map(PathBuf::from).unwrap_or_else(|_| {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../logos-lez-rln")
     });

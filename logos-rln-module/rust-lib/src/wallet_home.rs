@@ -1,17 +1,14 @@
 //! Wallet-home provisioning under the module's persistence dir.
 //!
-//! Sandboxed ui_qml views cannot create files, and the execution-zone
-//! wallet module (external, pre-lidl C++) cannot provision its own config —
-//! so a GUI needs SOME module on its wire to own the wallet files'
-//! directory. This module already holds the only host-stamped writable dir
-//! (the keystore lives there); `provision_wallet_home` stakes out a
+//! Sandboxed ui_qml views cannot create files and the external wallet
+//! module cannot provision its own config, so this module — owner of the
+//! host-stamped writable dir the keystore lives in — provisions a
 //! `wallet-home/` sibling: mkdir -p, write `wallet_config.json` once (the
-//! deployed testnet's working shape — field-for-field what
-//! tools/deployments/stage.sh emits — with the caller's sequencer_addr),
-//! and report where `storage.json` WOULD live. Creating storage stays the
-//! wallet module's job (`create_new`), so an existing funded wallet is
-//! never touched, and an existing config is never rewritten (a second call
-//! with a different sequencer_addr must not silently re-point a wallet).
+//! shape tools/deployments/stage.sh emits, with the caller's
+//! sequencer_addr), and report where `storage.json` would live. Creating
+//! storage stays the wallet module's job (`create_new`), and an existing
+//! config is never rewritten — a second call with a different
+//! sequencer_addr must not silently re-point a wallet.
 
 use crate::{store, ApiError, ErrorKind};
 
@@ -45,8 +42,8 @@ pub(crate) fn provision_impl(options_json: &str) -> Result<serde_json::Value, Ap
             "seq_poll_max_retries": 10,
             "seq_block_poll_max_amount": 100,
         });
-        // Atomic tmp+rename, same discipline as the keystore saves: the
-        // wallet module reads this file from another process.
+        // Atomic tmp+rename: the wallet module reads this file from another
+        // process.
         let tmp = home.join("wallet_config.json.tmp");
         std::fs::write(&tmp, config.to_string())
             .and_then(|()| std::fs::rename(&tmp, &config_path))
