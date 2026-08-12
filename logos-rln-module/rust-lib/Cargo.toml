@@ -1,5 +1,5 @@
 [package]
-name    = "rln_module"
+name = "rln_module"
 version = "0.4.0"
 edition = "2021"
 
@@ -32,10 +32,11 @@ zeroize = { version = "1", features = ["derive"] }
 getrandom = "0.2"
 
 # RLN zk proof generation & verification (spec generate_proof/verify_proof).
-# v2 here vs v3 in the sibling module is byte-compatible (identical seeded
-# keygen, Poseidon params, circuit resources); migrate deliberately.
 # The identity secret stays in this module — it never crosses to the sibling.
-rln = { version = "2.0.2", default-features = false, features = ["stateless"] }
+rln = { version = "3.0.0", default-features = false }
+
+# ChaCha20Rng for zerokit's seeded keygen (the RNG is chosen at type level).
+rand_chacha = "0.3"
 
 # The runtime SDK, staged by the module builder (codegen.rust) from the same
 # logos-rust-sdk rev its generator came from. Keep the stage-sources.sh pin
