@@ -1,9 +1,7 @@
-// The expert three-tab UI (Register / Memberships / Wallet) — a verbatim
-// lift of the pre-wizard Main body, live-proven against the testnet, now
-// demoted to the "Advanced" mode behind the onboarding wizard and status
-// card. Additions over the lifted body: the "Exit advanced" affordance and
-// the registryEdited signal (the registry field is Advanced-only; edits
-// propagate up to Main, which re-probes on exit).
+// The expert three-tab UI (Register / Memberships / Wallet), shown as the
+// "Advanced" mode behind the onboarding wizard and status card. The registry
+// field is Advanced-only; edits propagate up to Main through registryEdited,
+// and Main re-probes on exit.
 import QtQuick
 import QtQuick.Layouts
 import Logos.Theme
@@ -87,8 +85,6 @@ Item {
             WalletView {
                 bridge: view.bridge
                 registryId: registryField.text.trim()
-                // A confirmed faucet claim fills the Register tab's funding
-                // account with the freshly funded holding.
                 onFunded: function (holdingHex) {
                     registerView.fundingAccount = holdingHex
                 }

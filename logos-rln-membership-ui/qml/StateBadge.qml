@@ -1,7 +1,6 @@
-// Membership lifecycle state as a LogosBadge with a per-state status color
-// (every state the merged-state view can report: pending/failed/active/
-// grace_period/expired/erased/unknown — easy to hit on this testnet, where
-// memberships stay active only ~43 min).
+// Membership lifecycle state as a LogosBadge with a per-state status color,
+// covering every state the merged-state view can report: pending/failed/
+// active/grace_period/expired/erased/unknown.
 import QtQuick
 import Logos.Theme
 import Logos.Controls

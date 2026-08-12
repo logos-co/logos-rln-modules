@@ -1,15 +1,12 @@
 //! CAIP-10 registry identification: parse + canonicalize `registry_id`
-//! strings and compute the spec's `membership_hash`. Also hosts the crate's
-//! hex helpers (single encoder/decoder, like the sibling module).
+//! strings, compute the spec's `membership_hash`, and host the crate's hex
+//! helpers (single encoder/decoder).
 //!
-//! The "logos" namespace binding (this stack's lez-rln registries): the
-//! anchor account is the registration program's CONFIG PDA — the account
-//! every other object of a deployment (tree main, subtrees, membership
-//! PDAs, treasury) is derived from — and the canonical `account_address`
-//! form is 64 lowercase hex chars, no prefix. Other namespaces parse
-//! syntactically only (the spec forbids requiring parseability of accounts
-//! in unsupported namespaces) and fail at provider routing with
-//! `unknown_registry`.
+//! In the "logos" namespace (lez-rln registries) the anchor account is the
+//! registration program's config PDA, canonicalized to 64 lowercase hex
+//! chars, no prefix. Other namespaces parse syntactically only (the spec
+//! forbids requiring parseability of accounts in unsupported namespaces)
+//! and fail at provider routing with `unknown_registry`.
 
 use sha2::{Digest, Sha256};
 
@@ -18,8 +15,8 @@ use sha2::{Digest, Sha256};
 pub(crate) struct CanonicalRegistryId {
     pub(crate) namespace: String,
     pub(crate) account: String,
-    /// The canonical textual form — the ONLY form ever compared, stored, or
-    /// hashed (registry_ids are opaque strings once canonicalized).
+    /// The canonical textual form — the only form ever compared, stored, or
+    /// hashed.
     pub(crate) canonical: String,
 }
 
@@ -54,11 +51,10 @@ pub(crate) fn parse(raw: &str) -> Result<CanonicalRegistryId, String> {
         return Err("chain reference must match [-_a-zA-Z0-9]{1,32}".to_string());
     }
 
-    // The logos binding pins the reference to lowercase (Appendix A): network
-    // names are lowercase, and since references compare opaquely a case
-    // variant would silently identify a distinct registry with a distinct
+    // The logos binding pins the reference to lowercase (Appendix A): a case
+    // variant would identify a distinct registry with a distinct
     // membership_hash, fragmenting stored memberships. Foreign namespaces
-    // keep their case (we cannot know their canonical form).
+    // keep their case.
     let reference = if namespace == "logos" {
         reference.to_ascii_lowercase()
     } else {
@@ -76,8 +72,7 @@ pub(crate) fn parse(raw: &str) -> Result<CanonicalRegistryId, String> {
             }
         }
     } else {
-        // CAIP-10 account_address syntax only; case is preserved (we cannot
-        // know a foreign namespace's canonical form).
+        // CAIP-10 account_address syntax only; case is preserved.
         if account_raw.is_empty()
             || account_raw.len() > 128
             || !account_raw
@@ -123,8 +118,7 @@ pub(crate) fn bytes_to_hex(data: &[u8]) -> String {
     out
 }
 
-/// Whitespace-trimming, 0x/0X-tolerant hex decoder (the sibling module's
-/// input semantics). Even length required.
+/// Whitespace-trimming, 0x/0X-tolerant hex decoder. Even length required.
 pub(crate) fn hex_to_vec(hex: &str) -> Option<Vec<u8>> {
     let s = hex.trim();
     let s = s
@@ -166,11 +160,8 @@ mod tests {
 
     #[test]
     fn logos_reference_pins_to_lowercase_foreign_preserved() {
-        // logos: the Appendix A binding lowercases the reference, so case
-        // variants can't fragment membership_hashes.
         let id = parse(&format!("logos:TestNet-1:{}", "ab".repeat(32))).unwrap();
         assert_eq!(id.canonical, format!("logos:testnet-1:{}", "ab".repeat(32)));
-        // Foreign namespaces: case preserved (their canonical form is theirs).
         let id = parse("eip155:59144:0xB9cd878C90E49F797B4431fBF4fb333108CB90e6").unwrap();
         assert!(id.canonical.starts_with("eip155:59144:0xB9cd"));
     }
@@ -193,9 +184,8 @@ mod tests {
         assert!(parse(&format!("logos::{}", "ab".repeat(32))).is_err());
     }
 
-    // Frozen vector (computed independently: python3 hashlib over
-    // utf8(registry) ‖ 0x00 ‖ 32×0x11): pins the exact byte construction.
-    // A change here breaks every existing keystore key — never rebind.
+    // Independently computed frozen vector pinning the exact byte
+    // construction. A change here breaks every existing keystore key.
     #[test]
     fn membership_hash_matches_frozen_vector() {
         let registry = "logos:testnet:8f3a2b1c4d5e6f708192a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";

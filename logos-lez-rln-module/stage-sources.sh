@@ -1,24 +1,17 @@
 #!/usr/bin/env bash
 #
 # Refresh the gitignored staged SDK copy this module builds from
-# (see README "Staged sources" for why it exists):
+# (see README "Staged sources"):
 #
 #   logos-rust-sdk-src/  <- logos-co/logos-rust-sdk @ SDK_REV
-#
-# The rsync --delete is scoped to the destination dir only. --checksum keeps
-# the itemized output honest: a leading
-# ">" marks a real content change, "." is attribute-only. After syncing, a
-# diff -r verification fails the script on any disagreement. This script
-# never touches this repo's git state and never invokes nix.
 set -euo pipefail
 
-# The one SDK pin. MUST track the rev `nix build` actually uses — the root
-# flake's logos-module-builder → logos-rust-sdk input in flake.lock
-# (rust-lib/Cargo.toml, "The runtime SDK ..."). Bump deliberately, keep it
-# equal to flake.lock, and re-run the sim acceptance gate afterwards.
+# MUST equal the logos-rust-sdk rev locked in the root flake.lock
+# (logos-module-builder → logos-rust-sdk) — nothing enforces the coupling.
+# Bump together with flake.lock and re-run the sim acceptance gate.
 SDK_REV=270e4cf687896d501ed73c1409ea4157cc8a5b54
 SDK_REPO=https://github.com/logos-co/logos-rust-sdk
-# "tests" mirrors the actual staged tree (mkLogosModule needs none of these).
+# Excluded dirs are not needed by mkLogosModule.
 SDK_EXCLUDES=(--exclude .git --exclude target --exclude doctests --exclude result --exclude tests)
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

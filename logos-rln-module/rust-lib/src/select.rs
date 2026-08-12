@@ -3,12 +3,12 @@
 //! (canonical registry_id × rln_identifier) so applications sharing a
 //! registry rotate independently.
 //!
-//! Candidates are the registry's non-quarantined records in a usable state:
-//! `active` or `grace_period`. `pending`/`failed`/`erased` are never
-//! selectable; `expired` is excluded by default (the leaf still proves, but
-//! erasure of an expired membership is permissionless on lez-rln — it can
-//! vanish mid-use). States are the store's poller-refreshed caches (≤60s
-//! stale) — the spec's accepted staleness class for candidate sets.
+//! Candidates are the registry's non-quarantined records in a usable state
+//! (`active` or `grace_period`). `expired` is excluded even though the leaf
+//! still proves: erasure of an expired membership is permissionless on
+//! lez-rln, so it can vanish mid-use. States come from the store's
+//! poller-refreshed caches (≤60s stale — the spec's accepted staleness
+//! class for candidate sets).
 
 use std::collections::HashMap;
 use std::sync::Mutex;

@@ -1,9 +1,8 @@
-// Membership DETAIL panel (Main "detail" mode), opened by tapping a pill.
-// Shows the selected commitment's petname title, live state badge, on-chain
-// expiry context (from the rln module's CLOCK read — never local time), leaf,
-// rate, and the real commitment id; a 10s live poll refreshes state while
-// visible and degrades silently on a transient provider failure. Back returns
-// to the list; Re-register is offered for expired/failed/erased.
+// Membership detail panel (Main "detail" mode), opened by tapping a pill.
+// Shows the commitment's petname, live state badge, on-chain expiry context
+// (from the rln module's CLOCK read — never local time), leaf, rate, and the
+// full commitment id. A live poll refreshes state while visible and degrades
+// silently on a transient provider failure.
 import QtQuick
 import QtQuick.Layouts
 import Logos.Theme
@@ -41,17 +40,13 @@ Item {
     property string txError: ""
 
     // In-flight guard: one refresh cycle (get_memberships → pollLive's two
-    // reads) at a time. Without it, every "Refresh status" tap and every 10s
-    // tick spawns an INDEPENDENT get_memberships + pollLive + auto-retry
-    // chain; under the flaky transport those chains are long-lived (retries
-    // at transientRetryMs, up to an 8s per-attempt timeout on a dropped
-    // reply) and stack, flooding the single QtRO transport — an async call
-    // storm that hangs the UI without pegging CPU. `pending` counts the
-    // reads still outstanding in the current cycle.
+    // reads) at a time — overlapping auto-retry chains stack against the
+    // single QtRO transport and flood it. `pending` counts the reads still
+    // outstanding in the current cycle.
     property bool refreshing: false
     property int pending: 0
-    // Bound a stuck attempt so a dropped reply releases the guard in seconds
-    // instead of the default 30s (auto-retry semantics unchanged).
+    // Bounds a stuck attempt so a dropped reply releases the guard in
+    // seconds instead of the default 30s.
     readonly property int readTimeoutMs: 8000
 
     readonly property bool renewable: M.isRenewable(liveState)
@@ -92,7 +87,6 @@ Item {
         }, readTimeoutMs)
     }
 
-    // Clears the guard once every read in the cycle has settled.
     function readDone() {
         card.pending -= 1
         if (card.pending <= 0)
@@ -136,10 +130,9 @@ Item {
     onVisibleChanged: if (visible) refresh()
     onCommitmentChanged: if (visible) refresh()
 
-    // The periodic live refresh goes through the SAME guarded refresh(), so a
-    // tick that lands mid-cycle is skipped rather than stacking a new chain.
-    // 60s once the flow's push channel is armed (a slow-poll safety net
-    // behind the events below); 10s otherwise, unchanged.
+    // The periodic refresh goes through the guarded refresh(), so a tick
+    // landing mid-cycle is skipped. 60s once the flow's push channel is
+    // armed (a slow-poll safety net behind the events below); 10s otherwise.
     Timer {
         interval: card.flow.eventsArmed ? 60000 : 10000
         repeat: true
@@ -147,13 +140,10 @@ Item {
         onTriggered: card.refresh()
     }
 
-    // Wake-up only, exactly like OnboardingFlow's own Connections — refresh()
-    // re-reads authoritatively and does its own commitment lookup. Reuses
-    // flow.eventsArmed rather than arming a second subscription for the
-    // same (module, event) pair on the same bridge object flow already
-    // armed. No membership_hash is tracked here either, so any state change
-    // on this registry re-triggers while the card is visible; refresh()'s
-    // `refreshing` in-flight guard bounds the cost of an unrelated wake-up.
+    // Wake-up only — refresh() re-reads authoritatively. Reuses
+    // flow.eventsArmed (the flow already armed this subscription on this
+    // bridge). Any state change on this registry re-triggers while the card
+    // is visible; the `refreshing` guard bounds unrelated wake-ups.
     Connections {
         target: card.flow.bridge
         enabled: card.flow.eventsArmed
@@ -254,9 +244,8 @@ Item {
             }
         }
 
-        // Registration transaction (hidden for adopted memberships,
-        // which carry no tx we submitted). Same label/value grid style
-        // as above: on-chain status, the tx hash, and when it landed.
+        // Registration transaction; hidden for adopted memberships, which
+        // carry no tx we submitted.
         ColumnLayout {
             visible: card.hasTx
             Layout.fillWidth: true
@@ -303,7 +292,6 @@ Item {
                         text: card.txHash !== "" ? M.truncateHex(card.txHash, 10, 8) : "—"
                         font.pixelSize: M.sc(Theme.typography.secondaryText)
                     }
-                    // Copies the FULL hash, not the truncated display.
                     CopyButton {
                         visible: card.txHash !== ""
                         payload: card.txHash

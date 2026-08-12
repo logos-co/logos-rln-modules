@@ -49,8 +49,7 @@ jobs:
         working-directory: logos-rln-module/rust-lib
         run: cargo clippy --locked --all-targets -- -D warnings
 
-      # The keychain tests drive the live macOS keychain; skipped everywhere
-      # (mirrors local convention), doubly so on a Linux runner.
+      # The keychain tests drive the live macOS keychain; always skipped in CI.
       - name: cargo test
         working-directory: logos-rln-module/rust-lib
         run: cargo test --locked -- --skip keychain

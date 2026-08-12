@@ -1,9 +1,8 @@
 // Register flow: unlock keystore -> register (the membership module generates
 // the credential) -> poll get_membership_state until the pending window
-// settles.
-// Mirrors the register scenario in logos-co/logos-rln-e2e. The
-// funding holding account is either typed in or auto-filled by the Wallet
-// tab's faucet claim (Main.qml wires WalletView.funded to fundingAccount).
+// settles. The funding holding account is either typed in or auto-filled by
+// the Wallet tab's faucet claim (Main.qml wires WalletView.funded to
+// fundingAccount).
 import QtQuick
 import QtQuick.Layouts
 import Logos.Theme
@@ -27,18 +26,14 @@ LogosScrollView {
     // generated and kept inside the module and never reaches QML.
     property string commitment: ""
 
-    // In-flight + registration status.
     property bool busy: false
     property string status: ""
     property bool statusIsError: false
     property string liveState: ""
 
     // True once the module's push channel is armed on this bridge (see
-    // M.armModuleEvent). AdvancedView wires this view with only bridge +
-    // registryId (no OnboardingFlow reference — the two implementations
-    // stay deliberately separate, see the file header), so unlike
-    // MembershipCard this view arms its own subscription rather than
-    // sharing OnboardingFlow's.
+    // M.armModuleEvent). This view is wired with only bridge + registryId,
+    // so it arms its own subscription.
     property bool eventsArmed: false
 
     Component.onCompleted: {
@@ -122,7 +117,7 @@ LogosScrollView {
     // The pending confirmation window is bounded (300s) module-side, so the
     // poll always reaches a settled state and stops itself. 60s once
     // eventsArmed (a slow-poll safety net behind the Connections below);
-    // 10s otherwise, unchanged.
+    // 10s otherwise.
     Timer {
         id: pollTimer
         interval: view.eventsArmed ? 60000 : 10000
@@ -130,13 +125,10 @@ LogosScrollView {
         onTriggered: view.pollState()
     }
 
-    // Wake-up only, mirroring OnboardingFlow.pollRegistration's Connections
-    // — pollState() re-reads authoritatively over the same
-    // (registryId, DEFAULT_RLN_ID) scope get_membership_state already
-    // polls. No membership_hash is tracked here to filter tighter, so any
-    // state change on this registry re-triggers while a registration is
-    // pending; gated on pollTimer.running so an event outside an active
-    // confirmation wait is a no-op.
+    // Wake-up only — pollState() re-reads authoritatively. Any state change
+    // on this registry re-triggers while a registration is pending; gated on
+    // pollTimer.running so an event outside an active confirmation wait is a
+    // no-op.
     Connections {
         target: view.bridge
         enabled: view.eventsArmed

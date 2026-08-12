@@ -1,21 +1,19 @@
 // Hermetic UI smoke test: mkLogosQmlModule auto-detects this file and mounts
 // the module in logos-standalone-app under the logos-qt-mcp test framework
-// (`nix build .#integration-test`). Backend modules are NOT loaded here, so
-// the startup probe's get_memberships errors immediately -> the app lands
-// deterministically in onboarding mode. Hermetically untestable (covered by
-// the live basecamp smoke instead): the membership status card, step
-// progression past the password step (no text-input API), and the
-// wizard->card completion handoff. Note expectTexts matches
-// elements regardless of visibility; click() needs a visible element — the
-// wizard/card/advanced clickable labels are chosen mutually disjoint and
-// disjoint from every string in the legacy views.
+// (`nix build .#integration-test`). Backend modules are not loaded, so the
+// startup probe's get_memberships errors and the app lands deterministically
+// in onboarding mode. Hermetically untestable (covered by the live basecamp
+// smoke): the membership status card, step progression past the password step
+// (no text-input API), and the wizard->card completion handoff. expectTexts
+// matches elements regardless of visibility; click() needs a visible element,
+// so clickable labels are chosen mutually disjoint across all views.
 import { resolve } from "node:path";
 
-// The inspector defaults to port 3768 — the SAME port a running basecamp's
-// inspector holds, and the darwin nix sandbox does not isolate the host
-// network, so the hermetic check would silently connect to basecamp's UI
-// instead of the app under test. Pin a non-default port (framework client
-// and the spawned app both read this env var) before the framework loads.
+// The inspector's default port (3768) is the one a running basecamp holds,
+// and the darwin nix sandbox does not isolate the host network — the hermetic
+// check would silently connect to basecamp instead of the app under test. Pin
+// a non-default port (client and spawned app both read it) before the
+// framework loads.
 process.env.QML_INSPECTOR_PORT = process.env.QML_INSPECTOR_PORT || "13768";
 
 // CI sets LOGOS_QT_MCP; interactively: nix build .#test-framework -o result-mcp
@@ -33,10 +31,9 @@ test("rln_membership_ui: loads into onboarding with the headline and CTA", async
 });
 
 test("rln_membership_ui: password screen and progress bar exist", async (app) => {
-  // findByProperty is exact-match and sees invisible items — every screen
-  // stays instantiated in the StackLayout. The morphing progress row shows
-  // its first segment's label ("Syncing…") by default while phases are idle
-  // (only the active/errored segment's label renders at a time now).
+  // Text matching sees invisible items — every screen stays instantiated in
+  // the StackLayout. While phases are idle the progress row renders only its
+  // first segment's label ("Syncing…").
   await app.expectTexts(["Choose a password", "Syncing with Logos Blockchain..."]);
 });
 

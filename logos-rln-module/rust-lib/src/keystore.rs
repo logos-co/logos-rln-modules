@@ -29,9 +29,9 @@
 //! ## Atomicity
 //!
 //! Writes go to `rln_keystore.json.tmp`, then POSIX `rename` over the
-//! target (chat-module `persistence.rs` precedent) — a crash mid-write
-//! leaves the prior file intact. An unparseable file is renamed to
-//! `.bad.<unix-ts>` so the next save never overwrites evidence.
+//! target — a crash mid-write leaves the prior file intact. An unparseable
+//! file is renamed to `.bad.<unix-ts>` so the next save never overwrites
+//! evidence.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -104,16 +104,12 @@ pub(crate) struct KeystoreEntry {
 }
 
 /// The module-local lifecycle state, persisted as `MembershipMeta.state` and
-/// each `StateChange.state`. `#[serde(rename_all = "snake_case")]` makes each
-/// variant serialize to the EXACT wire string logos-lez-rln-module
-/// `rln_core::membership_status` returns over the provider wire
-/// (`GracePeriod → "grace_period"`, the rest 1:1) — the same strings that
-/// travel through the reply views. The two crates are deliberately decoupled
-/// (no shared type — this crate has no rln-layouts dep); the
-/// `membership_state_wire_strings` test is the single tested anchor for the
-/// contract. Persistence is STRICT: there is no `#[serde(other)]`, so a stray
-/// persisted string loud-fails deserialize rather than silently degrading —
-/// every in-crate write goes through a known variant.
+/// each `StateChange.state`. `#[serde(rename_all = "snake_case")]` serializes
+/// each variant to the EXACT wire string logos-lez-rln-module's
+/// `rln_core::membership_status` returns (`GracePeriod → "grace_period"`);
+/// the crates deliberately share no type — the `membership_state_wire_strings`
+/// test anchors the contract. No `#[serde(other)]`: a stray persisted string
+/// loud-fails deserialize rather than silently degrading.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MembershipState {
@@ -142,8 +138,7 @@ impl MembershipState {
     }
 
     /// Ever observed on the registry — the "was Active, now gone → erased"
-    /// removal signal's building block (see `store::merge_state`). Called
-    /// cross-module from `store::has_been_active`, hence `pub(crate)`.
+    /// removal signal's building block (see `store::merge_state`).
     pub(crate) fn is_active_like(self) -> bool {
         matches!(self, Self::Active | Self::GracePeriod | Self::Expired | Self::Erased)
     }
@@ -176,10 +171,8 @@ pub(crate) struct MembershipMeta {
     pub(crate) retryable: Option<bool>,
     /// The rln_identifier of the scope that REGISTERED this membership —
     /// register's per-scope idempotency key (spec: "idempotent for a scope").
-    /// Local bookkeeping only: the membership itself carries no application
-    /// association and its hash excludes this (Appendix B). Empty on records
-    /// from before this field existed — treated as matching ANY scope, so a
-    /// legacy membership keeps backing every application on its registry.
+    /// Local bookkeeping only: the membership_hash excludes it (Appendix B).
+    /// Empty on pre-scope records — treated as matching ANY scope.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) rln_identifier: String,
     pub(crate) state: MembershipState,
@@ -315,11 +308,10 @@ pub(crate) fn decrypt(
 // ------------------------------------------------------------------- file IO
 
 /// Load the keystore. A missing file is a fresh (empty) one; an unparseable
-/// file is quarantined to `.bad.<ts>` and replaced by a fresh keystore — never
-/// silently overwritten in place. A file that EXISTS but cannot be read
-/// (EIO/EACCES/…) returns `Err`: the caller MUST fail closed rather than treat
-/// "unreadable" as "empty", because an empty store invents a new secret over —
-/// and then clobbers — the credentials that were merely temporarily unreadable.
+/// file is quarantined to `.bad.<ts>` and replaced. A file that EXISTS but
+/// cannot be read (EIO/EACCES/…) returns `Err`: the caller MUST fail closed —
+/// treating "unreadable" as "empty" would invent a new secret over, then
+/// clobber, credentials that were merely temporarily unreadable.
 pub(crate) fn load(dir: &Path) -> io::Result<KeystoreFile> {
     let path = dir.join(KEYSTORE_FILE);
     let raw = match fs::read_to_string(&path) {
@@ -387,8 +379,8 @@ mod tests {
         flip_salt.kdfparams.salt = String::from_utf8(salt).unwrap();
         assert!(matches!(decrypt("pw", &flip_salt), Err(KeystoreError::BadPassword)));
 
-        // A flipped IV survives the MAC (it isn't MAC'd in V3 keyfiles) but
-        // must yield garbage, not the plaintext — document the boundary.
+        // A flipped IV survives the MAC (the IV isn't MAC'd in V3 keyfiles)
+        // but must yield garbage, not the plaintext.
         let mut flip_iv = env;
         let mut iv = flip_iv.cipherparams.iv.into_bytes();
         iv[0] = if iv[0] == b'0' { b'1' } else { b'0' };

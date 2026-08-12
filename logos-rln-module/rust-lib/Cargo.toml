@@ -11,7 +11,7 @@ crate-type = ["staticlib"]
 # found in a parent directory.
 [workspace]
 
-# Panicking across the FFI boundary is UB; mirror the sibling module's setting.
+# Panicking across the FFI boundary is UB.
 [profile.release]
 panic = "abort"
 
@@ -19,10 +19,9 @@ panic = "abort"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Keystore crypto (WAKU-RLN-KEYSTORE: PBKDF2-HMAC-SHA256 + AES-128-CTR +
-# keccak256 MAC — the format the spec's own test vector actually uses, i.e.
-# the Ethereum-V3/nim-eth keyfile construction; the spec PROSE says SHA256
-# but its vector disagrees — see keystore.rs) — all pure Rust.
+# Keystore crypto (WAKU-RLN-KEYSTORE): PBKDF2-HMAC-SHA256 + AES-128-CTR +
+# keccak256 MAC (the Ethereum-V3 keyfile construction). The spec prose says
+# SHA256 but its own test vector uses keccak256 — see keystore.rs.
 sha2 = "0.10"
 sha3 = "0.10"
 aes = "0.8"
@@ -32,15 +31,13 @@ hmac = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 getrandom = "0.2"
 
-# RLN zk proof generation & verification (spec generate_proof / verify_proof).
-# Still v2 while the sibling liblogos_lez_rln_module and lez-rln are on v3 —
-# byte-compatible (identical seeded keygen, Poseidon params, circuit
-# resources); migrate deliberately. We use the full stateless proving API
-# (keygen+poseidon is not enough), so the identity secret stays in this
-# module — it never crosses to the sibling.
+# RLN zk proof generation & verification (spec generate_proof/verify_proof).
+# v2 here vs v3 in the sibling module is byte-compatible (identical seeded
+# keygen, Poseidon params, circuit resources); migrate deliberately.
+# The identity secret stays in this module — it never crosses to the sibling.
 rln = { version = "2.0.2", default-features = false, features = ["stateless"] }
 
-# The runtime SDK, staged by the module builder (codegen.rust) at this
-# path from the same logos-rust-sdk rev its generator came from. Keep the
-# stage-sources.sh pin identical to ../../logos-lez-rln-module's.
+# The runtime SDK, staged by the module builder (codegen.rust) from the same
+# logos-rust-sdk rev its generator came from. Keep the stage-sources.sh pin
+# in ../../logos-lez-rln-module identical.
 logos-rust-sdk = { path = "../logos-rust-sdk-src" }

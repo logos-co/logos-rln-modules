@@ -35,12 +35,9 @@ endif()
 
 message(STATUS "Found liblogos_lez_rln_module Rust static library: ${LIBLOGOS_RLN_MODULE_RUST}")
 
-# The Rust archive provides the logos_module_* exports the generated glue
-# calls; its own lp_* undefineds resolve against the logos-protocol archive
-# already in the plugin link (via logos-qt-sdk). Re-mention the protocol
-# target after the Rust archive so single-pass linkers (GNU ld) see it later
-# on the line. No lssa crates are in the tree, so no pyo3/libpython or
-# Metal-prover bindings are needed.
+# The Rust archive's lp_* undefineds resolve against logos-protocol; keep the
+# protocol target after the archive so single-pass linkers (GNU ld) see it
+# later on the line.
 target_link_libraries(liblogos_lez_rln_module_module_plugin PRIVATE
     ${LIBLOGOS_RLN_MODULE_RUST}
     logos-protocol::logos_protocol

@@ -15,11 +15,9 @@
 
     logos-module-viewer.url = "github:logos-co/logos-module-viewer";
 
-    # Path inputs: each one's logos-module-builder closure inlines into
-    # flake.lock (roughly doubling it per module). Deliberately no nested
-    # `follows` — the duplicated nixpkgs nodes already lock our same rev, the
-    # builder pins its own rust-overlay/toolchain, and dedup is only
-    # reachable upstream in the builder.
+    # Deliberately no nested `follows` on these path inputs: the builder pins
+    # its own rust-overlay/toolchain and the duplicated nixpkgs nodes already
+    # lock the same rev.
     logos-lez-rln-module.url = "path:./logos-lez-rln-module";
     logos-rln-module.url = "path:./logos-rln-module";
   };
@@ -52,15 +50,13 @@
         let
           walletModulePackage = logos-wallet-module.packages.${system}.lgx;
 
-          # The sim overrides this input with a local `path:` tree at build
-          # time (`--override-input logos-lez-rln-module path:...`) so its
-          # gitignored staged source — logos-rust-sdk-src — is visible; the
-          # default `path:./logos-lez-rln-module` covers in-tree builds.
+          # The sim builds with `--override-input logos-lez-rln-module
+          # path:...` so the gitignored staged logos-rust-sdk-src is visible;
+          # the default covers in-tree builds.
           lezRlnModule = logos-lez-rln-module.packages.${system};
 
-          # The main RLN module (RLN-MEMBERSHIP-MANAGEMENT spec); same
-          # staged-sources caveat as the LEZ RLN module — refresh its
-          # logos-rust-sdk-src via `nix run ./logos-rln-module#generate`.
+          # The main RLN module (RLN-MEMBERSHIP-MANAGEMENT spec); refresh its
+          # gitignored logos-rust-sdk-src via `nix run ./logos-rln-module#generate`.
           rlnModule = logos-rln-module.packages.${system};
         in
         {

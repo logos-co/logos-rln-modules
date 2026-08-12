@@ -2,18 +2,13 @@
 //! namespace → provider routing, and the lez-rln provider — a raw `lp_*`
 //! wire client of the sibling `liblogos_lez_rln_module`.
 //!
-//! Why raw `lp_*` rather than the SDK's generated typed client
-//! (`LiblogosLezRlnModuleClient`, from `deps/liblogos_lez_rln_module.lidl`): the
-//! generated `PluginProxy` hardcodes `timeout_ms = 0` (the ~20s protocol
-//! default) at EVERY call site, with no per-call override — while this
-//! module's reads need up to [`READ_TIMEOUT_MS`] (70s, the sibling's own
-//! wallet-backed reads run up to 60s; add hop margin) and the gifter path
-//! needs [`GIFTER_REQUEST_TIMEOUT_MS`] (340s: vector payload production
-//! plus the dial). So this module binds the consumer C ABI directly, giving
-//! every call an explicit, per-call timeout instead of the generated
-//! client's one-size-fits-all default.
+//! Binds the raw consumer C ABI rather than the SDK's generated typed
+//! client: the generated `PluginProxy` hardcodes `timeout_ms = 0` (the ~20s
+//! protocol default) at every call site with no per-call override, and calls
+//! here need per-call timeouts ([`READ_TIMEOUT_MS`],
+//! [`GIFTER_REQUEST_TIMEOUT_MS`]).
 //!
-//! Threading contract (mirrors the sibling): the lp client is created once
+//! Threading contract: the lp client is created once
 //! on the host's main Qt thread (`init_client` from `on_context_ready`) and
 //! is owner-thread-bound. On the owner thread `provider_call` uses the
 //! synchronous `lp_invoke` (its QtRO wait loop pumps the owner loop); off
@@ -87,8 +82,8 @@ mod lp {
 }
 
 // The unit-test binary has no protocol archive to resolve lp_* against;
-// stub them as "no client" (the sibling's pattern). `unsafe` only mirrors
-// the extern ABI's signatures so call sites compile identically.
+// stub them as "no client". `unsafe` mirrors the extern ABI's signatures so
+// call sites compile identically.
 #[cfg(test)]
 #[allow(clippy::missing_safety_doc)]
 mod lp {
@@ -399,9 +394,8 @@ fn invoke_async_recorded(
 // ------------------------------------------------------------ gifter delegate
 
 /// The delegated-registration executor (RLN Membership Allocation Protocol):
-/// the co-located gifter client module. Deliberately NOT declared in
-/// metadata.json dependencies — deployments without a gifter module must
-/// still load; the lazy client below means they never pay for it either.
+/// the co-located gifter client module. NOT declared in metadata.json
+/// dependencies — deployments without a gifter module must still load.
 const GIFTER_MODULE: &str = "rln_gifter_module";
 /// The gifter request budget: client-side payload production by the vector's
 /// provider module (≤120s — keycard capture with a slow tap sets the bar)
@@ -412,8 +406,7 @@ const GIFTER_REQUEST_TIMEOUT_MS: c_int = 340_000;
 static GIFTER_CLIENT: Mutex<Option<ClientHandle>> = Mutex::new(None);
 
 /// Owner-thread-lazy client to the gifter module — created on first delegated
-/// register, never at init, so deployments without a gifter module pay nothing
-/// and fail cleanly only when actually asked to delegate.
+/// register, never at init.
 fn gifter_client(method: &str) -> Result<*mut lp::LpClient, ApiError> {
     if lock(&GIFTER_CLIENT).is_none() {
         let owner = *lock(&PROVIDER_OWNER);
@@ -445,8 +438,8 @@ fn gifter_client(method: &str) -> Result<*mut lp::LpClient, ApiError> {
 }
 
 /// Fire the gifter module's `request` with the module-generated commitment and
-/// record the reply (fire-and-record, like the funded submit). The gifter
-/// client produces the auth payload via the selected vector's provider module
+/// record the reply (fire-and-record). The gifter client produces the auth
+/// payload via the selected vector's provider module
 /// — bound to that commitment — then dials the gifter server, which verifies
 /// through its configured vector and funds the on-chain register.
 pub(crate) fn gifter_request_async(
@@ -564,11 +557,10 @@ impl RegistryProvider for LezRlnProvider {
                 rate_limit: 0,
             });
         }
-        // For a membership the registry just reported registered, these
-        // fields are its contract — a missing one is a provider fault, never
-        // a defaultable value (leaf 0 is a VALID leaf, so defaulting would
-        // silently prove against the wrong membership; rate 0 would brick
-        // allocation).
+        // For a registered member these fields are the registry's contract —
+        // a missing one is a provider fault, never a defaultable value (leaf 0
+        // is a VALID leaf; defaulting would prove against the wrong
+        // membership).
         let required = |key: &str| {
             v.get(key).and_then(|x| x.as_u64()).ok_or_else(|| {
                 ApiError::new(
@@ -579,8 +571,6 @@ impl RegistryProvider for LezRlnProvider {
         };
         Ok(ProviderMembership {
             registered: true,
-            // Loud-fail on an unrecognized state string, matching the adjacent
-            // missing-field faults — no panic, no silent fallback.
             state: serde_json::from_value::<MembershipState>(
                 v.get("state").cloned().unwrap_or(serde_json::Value::Null),
             )

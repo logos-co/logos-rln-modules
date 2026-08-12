@@ -1,43 +1,32 @@
 //! RLN rate-limit proof engine: the spec's `generate_proof` / `verify_proof`
-//! crypto, over zerokit `rln` (stateless, the same 2.0.2 pin the sibling
-//! module and lez-rln already build).
+//! crypto, over stateless zerokit `rln`.
 //!
-//! This module is the ONE place identity secrets touch the RLN circuit; it
-//! never persists, logs, or returns a secret — the caller passes the
-//! decrypted `identity_secret_hash` in (from the keystore, in-process) and
-//! gets back only the public `RateLimitProof`. The sole sanctioned exception is
-//! [`recover_identity_secret_hex`]: when a proof double-signals, the spec has
-//! the Module reconstruct and report the offender's OWN secret from their two
-//! colliding shares (`recovered_secret`) — never one of this module's
-//! credentials. Barring that violator-secret egress, nothing here crosses the
-//! module boundary except the proof, keeping the spec's "identity credentials
-//! never leave the Module" invariant true even as we add proving.
+//! Identity secrets touch the RLN circuit only here, and are never persisted,
+//! logged, or returned: the caller passes the decrypted
+//! `identity_secret_hash` in and gets back only the public `RateLimitProof`.
+//! The one exception is [`recover_identity_secret_hex`], which reconstructs a
+//! double-signaller's OWN secret (`recovered_secret`) from their two
+//! colliding shares — never one of this module's credentials.
 //!
-//! Witness assembly mirrors lez-rln's `run_rln_proof.rs` exactly, so a proof
-//! this module generates verifies against the same on-chain roots that binary
-//! produces. Two constructions are PINNED here (they are the wire contract
-//! every implementation has to match — see `external_nullifier` and
-//! `signal_to_x`):
+//! Two constructions are PINNED (they are the wire contract every
+//! implementation has to match — see `external_nullifier` and `signal_to_x`):
 //!
 //! - `external_nullifier = poseidon(hash_to_field_le(epoch),
 //!   hash_to_field_le(rln_identifier))`, where `epoch` is the spec's
 //!   `epoch[32]`: the epoch index as a 32-byte little-endian integer
 //! - `x = hash_to_field_le(signal)`
 //!
-//! Both match logos-delivery byte-for-byte (`toEpoch` +
-//! `generateExternalNullifier` + `hashToFieldLe` in its `waku/rln/`), so
-//! proofs cross-verify with its embedded zerokit. Note the divergence from
-//! EVM nwaku `waku_rln_relay/rln/wrappers.nim`, which keccak256-hashes both
-//! poseidon inputs; cross-stack interop with nwaku would require agreeing
-//! this at the spec level.
+//! Both match logos-delivery byte-for-byte, so proofs cross-verify with its
+//! embedded zerokit. They diverge from nwaku
+//! (`waku_rln_relay/rln/wrappers.nim`), which keccak256-hashes both poseidon
+//! inputs; nwaku interop requires agreeing this at the spec level.
 //!
-//! Canonical `RateLimitProof` serialization (the proof is a
-//! wire type that crosses from the generating node to verifying nodes, not a
-//! local opaque blob) is zerokit's own `rln_proof_to_bytes_le`: a version
-//! byte, the 128-byte compressed Groth16 proof, then the LE-serialized public
-//! values. The named spec fields (`root`, `external_nullifier`, `share_x`,
-//! `share_y`, `nullifier`) are exposed as a decoded view derived from the
-//! public values; verification always recomputes from the canonical bytes and
+//! Canonical `RateLimitProof` serialization (the proof is a wire type that
+//! crosses from the generating node to verifying nodes) is zerokit's
+//! `rln_proof_to_bytes_le`: a version byte, the 128-byte compressed Groth16
+//! proof, then the LE-serialized public values. The named spec fields
+//! (`root`, `external_nullifier`, `share_x`, `share_y`, `nullifier`) are a
+//! decoded view; verification always recomputes from the canonical bytes and
 //! never trusts the decoded fields.
 
 use rln::prelude::{
@@ -49,9 +38,8 @@ use rln::utils::IdSecret;
 
 use crate::registry_id::{bytes_to_hex, hex_to_bytes32, hex_to_vec};
 
-/// The circuit's fixed Merkle depth (zerokit stateless default = 20), equal to
-/// the lez-rln registry's `TREE_DEPTH`; a supplied path MUST have this length
-/// or witness construction fails.
+/// The circuit's fixed Merkle depth (zerokit stateless default = 20); a
+/// supplied path MUST have this length or witness construction fails.
 pub(crate) const RLN_TREE_DEPTH: usize = DEFAULT_TREE_DEPTH;
 
 /// Failures the proof engine can raise. `Invalid` is NOT modelled here — a
@@ -100,9 +88,8 @@ pub(crate) struct RateLimitProof {
     share_y: [u8; 32],
     nullifier: [u8; 32],
     /// The spec's `epoch[32]`, decoded — carried on proofs this module
-    /// generates; `None` for a wire proof reconstructed without one (a
-    /// legacy shape), which `verify_proof` then resolves by scanning
-    /// instead of checking directly.
+    /// generates; `None` for a wire proof reconstructed without one, which
+    /// `verify_proof` resolves by scanning instead of checking directly.
     epoch: Option<u64>,
 }
 
@@ -136,7 +123,7 @@ impl RateLimitProof {
     /// The root the proof was generated against — the value `verify_proof`
     /// checks against its valid-root window. Production verification reads
     /// the root out of the canonical bytes inside zerokit; this decoded view
-    /// serves the tests that build root windows around synthetic proofs.
+    /// serves tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn root(&self) -> [u8; 32] {
         self.root
@@ -294,8 +281,7 @@ fn epoch_to_bytes(epoch: u64) -> [u8; 32] {
 /// MUST be zero. Non-canonical padding (a nonzero high byte) is rejected
 /// rather than masked off — accepting it would let a single epoch index be
 /// carried by many distinct byte strings, minting unlimited nullifier-log
-/// buckets for what should key to one epoch. Shared by both `from_json`
-/// shapes and, later, the CBOR proof branch.
+/// buckets for what should key to one epoch.
 pub(crate) fn epoch_from_bytes(bytes: &[u8; 32]) -> Option<u64> {
     if bytes[8..32].iter().any(|&b| b != 0) {
         return None;
@@ -424,11 +410,9 @@ pub(crate) fn verify(
 ) -> Result<bool, ProofError> {
     let rln_proof = proof.to_rln_proof()?;
     let x = signal_to_x(signal);
-    // Registry roots are canonical field elements; a non-canonical entry is a
-    // provider bug — skip it rather than fail the whole verification. But a
-    // non-empty window that yields NO usable root leaves the proof no root to
-    // match, so it is invalid: never fall through to zerokit's empty-window =
-    // "skip the root check" semantics on the hot path.
+    // A non-canonical root entry is skipped, but a non-empty window yielding
+    // NO usable root must verify false — never fall through to zerokit's
+    // empty-window "skip the root check" semantics.
     let roots: Vec<Fr> = valid_roots
         .iter()
         .filter_map(|r| bytes_le_to_fr(r).ok().map(|(fr, _)| fr))
@@ -468,9 +452,7 @@ pub(crate) fn recover_identity_secret_hex(
     };
     let share1 = (field(&prior.0, "prior share_x")?, field(&prior.1, "prior share_y")?);
     let share2 = (field(&current.0, "share_x")?, field(&current.1, "share_y")?);
-    // The only failure is DivisionByZero (share_x equal), which the caller's
-    // collision arm has already excluded — but surface it as an engine error
-    // rather than assume the invariant away.
+    // compute_id_secret fails only on equal share_x (DivisionByZero).
     let secret = compute_id_secret(share1, share2)
         .map_err(|e| ProofError::Engine(format!("recover id secret: {e}")))?;
     Ok(bytes_to_hex(&fr_to_bytes_le(&secret)))
@@ -502,10 +484,9 @@ mod tests {
     use super::*;
     use rln::prelude::seeded_keygen;
 
-    // A structurally valid depth-20 path: all-zero siblings, all left turns.
-    // The circuit COMPUTES the root from the path, so any well-formed path
-    // yields a self-consistent proof whose root we then accept — enough to
-    // exercise generate/verify/serialize without an on-chain tree.
+    // All-zero siblings, all left turns. The circuit COMPUTES the root from
+    // the path, so any well-formed path yields a self-consistent proof —
+    // enough to exercise generate/verify/serialize without an on-chain tree.
     fn zero_path() -> (Vec<String>, Vec<u8>) {
         let elements = vec!["00".repeat(32); RLN_TREE_DEPTH];
         let indices = vec![0u8; RLN_TREE_DEPTH];
@@ -515,7 +496,7 @@ mod tests {
     fn material_from_seed(seed: &[u8], rate_limit: u64, message_id: u64) -> WitnessMaterial {
         let (mut secret_fr, _commitment) = seeded_keygen(seed);
         let secret_hex = bytes_to_hex(&fr_to_bytes_le(&secret_fr));
-        // Zeroize our stack copy the way the real keystore path would.
+        // Zeroize the local secret copy.
         secret_fr = Fr::from(0);
         let _ = secret_fr;
         let (elements, indices) = zero_path();
@@ -530,14 +511,11 @@ mod tests {
 
 
     // Frozen interop vectors — the wire contract other implementations must
-    // match (spec Issues C/D and the pinned constructions in the module docs).
-    // Every value below is deterministic (seeded keygen, poseidon,
-    // hash_to_field_le); only the Groth16 proof bytes are randomized, so the
-    // proof is pinned STRUCTURALLY (layout) while its public values are pinned
-    // byte-exact. Inputs: seed = 32×0x07, rln_identifier = 32×0x09,
-    // epoch index = 1231028105 (encoded as the spec's epoch[32]: 32-byte LE,
-    // logos-delivery's `toEpoch`), signal = "Hello, RLN!" (the lez-rln
-    // run_rln_proof demo constants), zero-sibling all-left depth-20 path.
+    // match. Every value below is deterministic; only the Groth16 proof bytes
+    // are randomized, so the proof is pinned structurally (layout) while its
+    // public values are pinned byte-exact. Inputs: seed = 32×0x07,
+    // rln_identifier = 32×0x09, epoch index = 1231028105, signal =
+    // "Hello, RLN!", zero-sibling all-left depth-20 path.
     // A change here breaks cross-node verification — never rebind silently.
     #[test]
     fn frozen_interop_vectors() {
@@ -715,9 +693,6 @@ mod tests {
         assert!(matches!(err, ProofError::BadInput(_)));
     }
 
-    // Canonicality: bytes 8..32 of epoch[32] MUST be zero. A single nonzero
-    // padding byte must reject, not get masked off — otherwise one epoch
-    // index could be carried by many distinct byte strings.
     #[test]
     fn epoch_from_bytes_rejects_non_canonical_padding() {
         let canonical = epoch_to_bytes(1231028105);
@@ -728,9 +703,6 @@ mod tests {
         assert_eq!(epoch_from_bytes(&tampered), None);
     }
 
-    // generate() sets the epoch, and from_json's decode of the wire "epoch"
-    // field lands back on the same RateLimitProof — the carried epoch that
-    // verify_proof's freshness check relies on.
     #[test]
     fn epoch_survives_generate_and_json_roundtrip() {
         let material = material_from_seed(&[3u8; 32], 100, 1);
@@ -742,9 +714,9 @@ mod tests {
         assert_eq!(restored.epoch(), Some(42));
     }
 
-    // The generate_proof handler rewrites "epoch" to the u64 index (its lidl
-    // reply shape), and verify_proof accepts that object as-is — so from_json
-    // must decode a numeric epoch identically to the epoch[32] hex form.
+    // The generate_proof handler's reply carries "epoch" as a u64 index, and
+    // verify_proof accepts that object as-is — so from_json must decode a
+    // numeric epoch identically to the epoch[32] hex form.
     #[test]
     fn from_json_accepts_numeric_epoch_from_the_handler_reply() {
         let material = material_from_seed(&[3u8; 32], 100, 1);

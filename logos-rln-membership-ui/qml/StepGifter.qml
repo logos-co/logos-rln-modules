@@ -1,10 +1,7 @@
 // The gifter work screen (step 2 in "gifter" mode): point at a gifter node,
-// tap a Keycard, and let the gifter pay for the registration. Unlike the wallet
-// path's unattended bar this screen takes input (the gifter's peer id/address)
-// and a physical card tap, so it owns its own action button and progress — the
-// shell hides the shared CTA on step 2. On success the flow's regPhase reaches
-// done and OnboardingView hands off to the membership list, same as the wallet
-// path.
+// tap a Keycard, and the gifter pays for the registration. Takes input and a
+// physical card tap, so it owns its own action button and progress — the
+// shell hides the shared CTA on step 2.
 import QtQuick
 import QtQuick.Layouts
 import Logos.Theme
@@ -23,10 +20,9 @@ ColumnLayout {
     // No auto-start: the user supplies the gifter address and taps the card.
     function entered() {}
 
-    // Plain-language caption for the running sub-step. After the delegated
-    // register() is dispatched the module captures + dials in the background,
-    // so the "capture" caption (keep the card on the reader) holds until the
-    // shared confirmation poll settles.
+    // Caption for the running sub-step. The "capture" caption (keep the card
+    // on the reader) holds while the module captures + dials in the
+    // background, until the shared confirmation poll settles.
     readonly property string stageCaption:
         flow.gifterStage === "wallet" ? "Setting up your account…"
         : flow.gifterStage === "node" ? "Starting a peer-to-peer node…"
@@ -34,8 +30,8 @@ ColumnLayout {
         : flow.regPhase === "running" ? "Confirming your membership on-chain…"
         : "Working…"
 
-    // LogosTextField sizes its glyphs from a fixed caption token; lift them to
-    // the scaled size at 2x, as StepPassword does.
+    // LogosTextField sizes its glyphs from a fixed caption token; lift them
+    // to the scaled size at 2x.
     Component.onCompleted: {
         var px = M.sc(Theme.typography.secondaryText)
         peerIdField.text = step.flow.gifterPeerId
@@ -66,8 +62,6 @@ ColumnLayout {
               + "when you prove you hold a genuine Keycard."
     }
 
-    // Gifter coordinates. Hidden once the work starts so the screen becomes a
-    // clean progress view.
     ColumnLayout {
         visible: step.flow.gifterPhase === "idle" || step.flow.gifterPhase === "error"
         Layout.fillWidth: true
@@ -91,7 +85,6 @@ ColumnLayout {
         }
     }
 
-    // The action. Owns its own button because step 2 has no shared CTA.
     PrimaryButton {
         visible: step.flow.gifterPhase !== "done" || step.flow.regPhase === "error"
         Layout.fillWidth: true
@@ -101,8 +94,6 @@ ColumnLayout {
         onClicked: step.flow.retryGifter()
     }
 
-    // Running: a spinner + the current sub-step caption. The capture step is the
-    // one that waits on the human, so its caption names the card tap.
     RowLayout {
         visible: step.busy
         Layout.alignment: Qt.AlignHCenter
@@ -122,7 +113,6 @@ ColumnLayout {
         }
     }
 
-    // Error: plain line + the technical detail, with the retry above.
     ColumnLayout {
         visible: step.flow.gifterError !== "" || step.flow.regError !== ""
         Layout.fillWidth: true

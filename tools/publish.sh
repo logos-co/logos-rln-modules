@@ -38,8 +38,6 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# --base-url hosts the catalog anywhere (e.g. a raw branch URL); --tag is the
-# shorthand that targets a GitHub release on --repo. One of them is required.
 if [ -z "$BASE_URL" ]; then
   [ -n "$TAG" ] || { echo "provide --base-url <url>, or --tag <tag> for a GitHub release" >&2; exit 2; }
   BASE_URL="https://github.com/${RELEASE_REPO}/releases/download/${TAG}"
@@ -49,11 +47,9 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/lgx"
 
-# The two Rust modules build from a gitignored staged SDK copy (not in a fresh
-# clone). Stage it on demand so this works straight from `git clone`. Each
-# module stages differently: logos-lez-rln-module has a stage-sources.sh; the
-# membership module has none — it codegens its scaffold + stages the SDK via
-# `nix run .#generate` (exactly as its own CI does).
+# The two Rust modules build from gitignored staged sources; stage them on
+# demand so this works from a fresh clone. logos-lez-rln-module stages via
+# stage-sources.sh; logos-rln-module codegens + stages via `nix run .#generate`.
 if [ ! -d "${REPO_ROOT}/logos-lez-rln-module/logos-rust-sdk-src" ]; then
   echo "== Staging sources for logos-lez-rln-module =="
   bash "${REPO_ROOT}/logos-lez-rln-module/stage-sources.sh"

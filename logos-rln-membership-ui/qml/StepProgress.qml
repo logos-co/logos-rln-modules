@@ -1,9 +1,7 @@
-// The one async screen: a segmented Syncing→Claiming→Registering bar driven by
-// the flow's phase properties, with a stage caption above it and an inline
-// Retry on a failed segment. The instant registration completes, OnboardingView
-// hands off to the membership list (Main → status mode), so this view only ever
-// paints the in-progress and error states. Nothing here needs user input, so
-// the shell hides Back and the CTA on this step.
+// Segmented Syncing→Claiming→Registering bar driven by the flow's phase
+// properties, with a stage caption above it and an inline Retry on a failed
+// segment. OnboardingView hands off the instant registration completes, so
+// this view only ever paints the in-progress and error states.
 import QtQuick
 import QtQuick.Layouts
 import Logos.Theme
@@ -27,8 +25,8 @@ ColumnLayout {
         : flow.fundPhase === "error" ? flow.fundError
         : flow.regPhase === "error" ? flow.regError : ""
 
-    // Resume-aware kick-off: the guards cover phases that are already done
-    // (fast-paths, re-entry); the Connections chain live transitions.
+    // Resume-aware kick-off: the guards cover already-done phases; the
+    // Connections chain live transitions.
     function entered() {
         if (flow.walletPhase === "done")
             flow.startSync()
@@ -40,7 +38,6 @@ ColumnLayout {
             flow.startRegistration()
     }
 
-    // Route the bar's Retry to whichever segment errored.
     function retryErroredSegment() {
         if (flow.walletPhase === "error") { flow.startWallet(); return }
         if (flow.syncPhase === "error") { flow.startSync(); return }
@@ -79,9 +76,7 @@ ColumnLayout {
         text: "This takes a few minutes — hang tight."
     }
 
-    // Stage caption ABOVE the bar (on this stable background, high-contrast) so
-    // the segments stay label-free and the shimmer reads cleanly. Hidden during
-    // an error (the bar's own error row carries the message).
+    // Hidden during an error — the bar's own error row carries the message.
     LogosText {
         Layout.fillWidth: true
         wrapMode: Text.Wrap
@@ -93,9 +88,8 @@ ColumnLayout {
         text: progressRow.stageLabel
     }
 
-    // The morph: single pill-height segmented bar → membership pill, in place.
-    // The intra-sync progress lives INSIDE segment 1's fill (which advances
-    // with the chunked sync), so there is no separate bar here.
+    // Intra-sync progress lives inside segment 1's fill (which advances with
+    // the chunked sync); there is no separate sync bar.
     MembershipRow {
         id: progressRow
         Layout.fillWidth: true
@@ -105,7 +99,6 @@ ColumnLayout {
         onRetryRequested: step.retryErroredSegment()
     }
 
-    // Technical diagnostic as fine print under the bar's plain-language line.
     LogosText {
         visible: step.currentError !== ""
         Layout.fillWidth: true
@@ -117,8 +110,8 @@ ColumnLayout {
     }
 
     // Registration may have failed for lack of funds: offer a fresh claim.
-    // (Internal caption suppressed + scaled overlay label — LogosButton has
-    // no font hook; the plain Text passes clicks through to the button.)
+    // LogosButton has no font hook, so text stays "" and a scaled overlay
+    // LogosText paints the label; the plain Text passes clicks through.
     LogosButton {
         visible: step.flow.regPhase === "error"
         Layout.alignment: Qt.AlignHCenter

@@ -1,23 +1,18 @@
 // Deterministic state-machine tests for the onboarding flow, driven by a
 // scripted mock bridge injected through the inspector's `evaluate` command
-// (which framework.mjs doesn't wrap but the server supports). No daemon, no
-// faucet: the mock replies with the SAME parseReply-visible shapes as the real
-// wire (fixtures cross-checked against liblogos_rln_module.lidl,
-// liblogos_lez_rln_module.lidl, the wallet module's int64/raw-string returns, and
-// qml/membership.js parseReply). Object replies are single-JSON-encoded —
-// parseReply collapses single/double encoding to the same value — scalars and
-// strings pass through, and "" maps to empty_reply exactly as the wallet
-// module's ""-on-error convention does live.
+// (framework.mjs doesn't wrap it; the server supports it). No daemon, no
+// faucet: the mock replies with the same parseReply-visible shapes as the
+// real wire (the module .lidl files plus the wallet module's int64 and
+// raw-string returns).
 //
-// The seam: Main.qml `bridgeOverride` (null in prod) re-threads the whole tree
-// to the mock; OnboardingView `flowController` exposes the OnboardingFlow so we
-// read phase properties and call methods; test-tunable poll intervals on the
-// flow let the claim/register timers fire in milliseconds. Qt.callLater keeps
-// mock dispatch async (no synchronous re-entrancy).
+// The seam: Main.qml `bridgeOverride` re-threads the whole tree to the mock;
+// OnboardingView `flowController` exposes the flow's phase properties and
+// methods; test-tunable poll intervals let the claim/register timers fire in
+// milliseconds; Qt.callLater keeps mock dispatch async (no re-entrancy).
 //
-// Runs in its own app process (mkPluginTest invokes each tests/*.mjs
-// separately), shared across the scenarios below — each scenario starts by
-// fully resetting the flow state and installing a fresh mock.
+// One app process (mkPluginTest invokes each tests/*.mjs separately) is
+// shared across the scenarios; each fully resets flow state and installs a
+// fresh mock.
 import { resolve } from "node:path";
 
 process.env.QML_INSPECTOR_PORT = process.env.QML_INSPECTOR_PORT || "13769";
@@ -69,8 +64,7 @@ function mockExpr(cfg) {
     registerFailReason: cfg.registerFailReason ?? "insufficient funds",
     unlockOk: cfg.unlockOk ?? true,
     // Map of method -> { kind, times }: return that transient error kind for
-    // the first `times` calls of the method, then succeed. Exercises
-    // auto-retry recovery.
+    // the first `times` calls of the method, then succeed.
     transientOnce: cfg.transientOnce ?? {},
   });
   return `(function () {
@@ -164,9 +158,8 @@ function mockExpr(cfg) {
   })()`;
 }
 
-// Full reset of Main + flow state so scenarios are isolated, then install the
-// mock. registryId is preserved (stays the valid testnet default) unless the
-// scenario later edits it through AdvancedView.
+// Fully reset Main + flow state so scenarios are isolated, then install the
+// mock. registryId is preserved unless a scenario edits it via AdvancedView.
 function resetExpr(cfg) {
   return `(function () {
     var f = onboardingView.flowController;
@@ -192,10 +185,9 @@ async function setup(app, cfg) {
 
 // ---- scenarios --------------------------------------------------------------
 
-// 1. Golden: auto-unlock created → wallet → chunked sync → fund → register →
-//    active → completion HANDS OFF to the list (status mode), refreshed so the
-//    new membership shows as a pill (petname + "300 msg/epoch", A2-safe); the
-//    FIRST membership celebrates ("You're in!"). Tapping the pill opens detail.
+// 1. Golden path: auto-unlock → wallet → chunked sync → fund → register →
+//    active; completion lands on the refreshed list, the first membership
+//    celebrates, and tapping the pill opens detail.
 test("flow: golden path lands the first membership in a celebrating list", async (app) => {
   await setup(app, { autoUnlock: "created", registerState: "active" });
   await waitPhase(app, "autoUnlockPhase", "done");
@@ -204,31 +196,25 @@ test("flow: golden path lands the first membership in a celebrating list", async
   if (skipped !== true) throw new Error("password screen not skipped after auto-unlock");
   await app.click("Get started");
   await waitPhase(app, "regPhase", "done", 12000);
-  // Completion routes to the list; the first membership celebrates.
   await waitMode(app, "status");
   if (await evalExpr(app, "membershipView.celebrate") !== true)
     throw new Error("first membership did not celebrate");
   const pet = await evalExpr(app, `M.petname("${"aa".repeat(32)}")`);
   if (!/^[a-z]+-[a-z]+-[a-z]+$/.test(pet)) throw new Error(`bad petname: ${pet}`);
-  // "You're in!" header + the new pill (petname + rate) + the ghost, in the list.
   await app.expectTexts(["You're in!", pet, "300 msg/epoch", "+ New Membership"]);
-  // Tap the pill → membership detail.
   await app.click(pet);
   await waitMode(app, "detail");
   await app.expectTexts([pet, "Rate limit", "Leaf index", "Membership id", "Back"]);
-  // A2 regression: the detail's rate/leaf render real values, never "undefined".
   if (/undefined/.test(await evalExpr(app, "detailCard.leaf + '|' + detailCard.rate")))
     throw new Error("detail shows undefined leaf/rate");
-  // Registration tx info: the double-encoded tx_result the mock recorded at
-  // register is parsed and the detail's Registration section shows the hash.
+  // The double-encoded tx_result recorded at register surfaces in the
+  // detail's Registration section.
   if (await evalExpr(app, "detailCard.hasTx") !== true)
     throw new Error("registration tx section not shown");
   const txHash = "12".repeat(32);
   if (await evalExpr(app, "detailCard.txHash") !== txHash)
     throw new Error(`tx hash not parsed: ${await evalExpr(app, "detailCard.txHash")}`);
   const shownHash = await evalExpr(app, `M.truncateHex("${txHash}", 10, 8)`);
-  // The Registration section shows the truncated hash, on-chain status, and a
-  // Copy affordance (copies the FULL hash via the TextEdit.copy() path).
   await app.expectTexts(["Registration", "Confirmed", shownHash, "Copy"]);
 });
 
@@ -239,9 +225,8 @@ test("flow: keychain fallback shows the password screen and remembers on unlock"
   await waitPhase(app, "autoUnlockPhase", "fallback");
   await app.click("Get started");
   await app.expectTexts(["Choose a password"]);
-  // Drive the manual unlock through the real checkPassword() (the field →
-  // flow.password binding is trivial QML plumbing; the tested logic is
-  // checkPassword's unlock + migration hook + the advance-on-done Connection).
+  // No text-input API: set flow.password directly and drive the real
+  // checkPassword().
   await evalExpr(app, "onboardingView.flowController.password = 'pw-manual'");
   await evalExpr(app, "onboardingView.flowController.checkPassword()");
   await waitPhase(app, "unlockPhase", "done");
@@ -251,8 +236,8 @@ test("flow: keychain fallback shows the password screen and remembers on unlock"
   await waitPhase(app, "regPhase", "done", 12000);
 });
 
-// 3. Advanced round-trip (A1 regression): a transient exit re-probe error must
-//    restore the pre-advanced mode, NOT bounce to onboarding; a clean exit
+// 3. Advanced round-trip regression: a transient exit re-probe error must
+//    restore the pre-advanced mode, not bounce to onboarding; a clean exit
 //    routes by reality.
 test("flow: exit-advanced restores mode on a transient error, routes on success", async (app) => {
   await setup(app, { memberships: [{ credential: { identity_commitment: "aa".repeat(32) }, membership_hash: "ee".repeat(32), leaf_index: 5, rate_limit: 300, state: "active", submitted_at: 1 }] });
@@ -260,7 +245,6 @@ test("flow: exit-advanced restores mode on a transient error, routes on success"
   await app.click("Advanced", { exact: true });   // card's Advanced link
   await waitMode(app, "advanced");
   if (await evalExpr(app, "root.preAdvancedMode") !== "status") throw new Error("preAdvancedMode not captured");
-  // Transient error on exit: re-probe's get_memberships fails.
   await evalExpr(app, "root.bridgeOverride.state.failMemberships = true");
   await app.click("Exit advanced");
   await waitMode(app, "status");   // restored, NOT bounced to onboarding
@@ -272,7 +256,7 @@ test("flow: exit-advanced restores mode on a transient error, routes on success"
   await waitMode(app, "status");
 });
 
-// 4. Registry poisoning (A1 regression): a garbled edit must not reach
+// 4. Registry poisoning regression: a garbled edit must not reach
 //    root.registryId; a valid CAIP-10 edit is adopted.
 test("flow: advanced registry edits reject garbage, accept valid CAIP-10", async (app) => {
   await setup(app, { autoUnlock: "created" });
@@ -282,40 +266,35 @@ test("flow: advanced registry edits reject garbage, accept valid CAIP-10", async
     throw new Error("baseline registryId not a valid CAIP-10");
   await app.click("Advanced setup");
   await waitMode(app, "advanced");
-  // Garbage / cleared field must not poison root.registryId.
   await evalExpr(app, "advancedView.registryEdited('')");
   await evalExpr(app, "advancedView.registryEdited('not a caip10 id')");
   if (await evalExpr(app, "root.registryId") !== good)
     throw new Error("garbage edit poisoned registryId");
   if (await evalExpr(app, `M.registryConfigHex(root.registryId) !== ""`) !== true)
     throw new Error("funding path would be poisoned (registryConfigHex empty)");
-  // A valid edit IS adopted.
   const other = "logos:testnet:" + "ab".repeat(32);
   await evalExpr(app, `advancedView.registryEdited(${JSON.stringify(other)})`);
   if (await evalExpr(app, "root.registryId") !== other)
     throw new Error("valid registry edit not adopted");
 });
 
-// 5. New membership via the ghost (A4 sync-reset): a completed run leaves
-//    syncPhase done; the "+ New Membership" ghost resets it so the re-run
-//    re-enters sync (else startSync would early-return) and reaches active.
+// 5. New membership via the ghost: a completed run leaves syncPhase done; the
+//    "+ New Membership" ghost resets it so the re-run re-enters sync (else
+//    startSync would early-return) and reaches active.
 test("flow: the New Membership ghost re-runs the flow with a sync reset", async (app) => {
   await setup(app, { autoUnlock: "created", registerState: "active" });
   await waitPhase(app, "autoUnlockPhase", "done");
   await app.click("Get started");
   await waitPhase(app, "regPhase", "done", 12000);
   if (await phase(app, "syncPhase") !== "done") throw new Error("precondition: syncPhase done after a run");
-  // The ghost is present and clickable on the completed screen.
   await app.expectTexts(["+ New Membership"]);
   const before = (await callLog(app)).filter((m) => m === "get_current_block_height").length;
-  // Trigger the ghost's exact action (onNewMembershipRequested → restart).
-  // The findAndClick text "+ New Membership" is ambiguous — MembershipView's
-  // always-instantiated (but invisible) ghost is shallower in the tree, so
-  // BFS would match it; live there is only one visible ghost. Drive the real
-  // handler directly to test the A4 sync-reset deterministically.
+  // Not app.click: MembershipView's always-instantiated (invisible) ghost
+  // shares the text and the click BFS would match it. Drive the ghost's
+  // handler (onNewMembershipRequested → restart) directly.
   await evalExpr(app, "onboardingView.restart()");
-  // The re-run re-enters sync — proof syncPhase was reset (a stale "done"
-  // would make startSync early-return and never re-call the head read).
+  // Re-entering sync proves syncPhase was reset (a stale "done" would make
+  // startSync early-return and never re-read the head).
   await waitFor(app, async () => {
     const n = (await callLog(app)).filter((m) => m === "get_current_block_height").length;
     if (n <= before) throw new Error(`no re-sync: head reads ${n} <= ${before}`);
@@ -323,10 +302,8 @@ test("flow: the New Membership ghost re-runs the flow with a sync reset", async 
   await waitPhase(app, "regPhase", "done", 12000);
 });
 
-// 5b. Second membership: with one membership already present the list is a
-//     relaunch (never celebrates); completing a SECOND (via "+ New Membership")
-//     lands BOTH pills in the list with the plain "Your Memberships" header —
-//     the 0->1 one-shot is not re-armed for a 1->2 completion.
+// 5b. A second membership never celebrates: the 0->1 one-shot is not re-armed
+//     for a 1->2 completion; both pills land under "Your Memberships".
 test("flow: a second membership lands in the list without celebrating", async (app) => {
   const cOld = "cc".repeat(32);
   await setup(app, { autoUnlock: "created", registerState: "active",
@@ -337,16 +314,12 @@ test("flow: a second membership lands in the list without celebrating", async (a
   await app.expectTexts(["Your Memberships", petOld]);
   if (await evalExpr(app, "membershipView.celebrate") !== false)
     throw new Error("relaunch into the list must not celebrate");
-  // "+ New Membership" → onboarding (Welcome, since this launch never unlocked)
-  // → complete a SECOND membership with a distinct identity.
   await evalExpr(app, "root.startNewMembership()");
   await waitMode(app, "onboarding");
   await waitPhase(app, "autoUnlockPhase", "done");
   await app.click("Get started");
   await waitPhase(app, "regPhase", "done", 12000);
   await waitMode(app, "status");
-  // Two memberships now: both pills, header stays "Your Memberships" (1->2, not
-  // the celebrated 0->1).
   const petNew = await evalExpr(app, `M.petname("${"aa".repeat(32)}")`);
   if (petNew === petOld) throw new Error("test fixtures collided on a petname");
   await app.expectTexts(["Your Memberships", petOld, petNew, "+ New Membership"]);
@@ -354,9 +327,8 @@ test("flow: a second membership lands in the list without celebrating", async (a
     throw new Error("a second membership must not celebrate");
 });
 
-// 5c. Relaunch with exactly one membership: the list always reads "Your
-//     Memberships" (never "You're in!") — celebration is tied to the completion
-//     EVENT, not to the launch count, so a status-mode launch never celebrates.
+// 5c. A relaunch with one membership reads "Your Memberships": celebration is
+//     tied to the completion event, not the launch count.
 test("flow: a relaunch with one membership reads 'Your Memberships', never celebrates", async (app) => {
   const c = "aa".repeat(32);
   await setup(app, { memberships: [{ credential: { identity_commitment: c }, membership_hash: "ee".repeat(32), leaf_index: 5, rate_limit: 300, state: "active", submitted_at: 1 }] });
@@ -396,19 +368,17 @@ test("flow: register failure shows the reason and try-again", async (app) => {
   if (!/insufficient funds/.test(err)) throw new Error(`failed_reason missing: ${err}`);
 });
 
-// 7. Auto-retry recovery: a transient transport error (the diagnosed
-//    bridge_failure "Invalid response" class) on the FIRST get_registry_bounds
-//    call self-heals — the flow reaches active WITHOUT surfacing the error.
+// 7. Auto-retry recovery: transient bridge_failure errors on the first
+//    get_registry_bounds calls self-heal — the flow reaches active without
+//    surfacing the error.
 test("flow: transient error on a critical read auto-recovers", async (app) => {
   await setup(app, { autoUnlock: "created", registerState: "active",
     transientOnce: { get_registry_bounds: { kind: "bridge_failure", times: 2 } } });
   await waitPhase(app, "autoUnlockPhase", "done");
   await app.click("Get started");
   await waitPhase(app, "regPhase", "done", 12000);
-  // fundPhase never surfaced the transient failure to the user.
   if (await phase(app, "fundPhase") !== "done") throw new Error("fund phase did not recover");
   if (await phase(app, "fundError") !== "") throw new Error("transient error leaked to the user");
-  // The mock saw the retries: get_registry_bounds called more than once.
   const log = await callLog(app);
   const bounds = log.filter((m) => m === "get_registry_bounds").length;
   if (bounds < 3) throw new Error(`expected retries, saw ${bounds} get_registry_bounds calls`);
@@ -424,7 +394,6 @@ test("flow: non-transient error (bad_password) is not retried", async (app) => {
   await evalExpr(app, "onboardingView.flowController.password = 'wrong'");
   await evalExpr(app, "onboardingView.flowController.checkPassword()");
   await waitPhase(app, "unlockPhase", "error");
-  // Exactly one unlock_keystore call — no retry on a deterministic failure.
   const log = await callLog(app);
   const unlocks = log.filter((m) => m === "unlock_keystore").length;
   if (unlocks !== 1) throw new Error(`bad_password was retried: ${unlocks} unlock_keystore calls`);
@@ -432,8 +401,7 @@ test("flow: non-transient error (bad_password) is not retried", async (app) => {
     throw new Error(`unexpected unlock error: ${await phase(app, "unlockError")}`);
 });
 
-// 9. Petname is deterministic: same commitment → same name (twice), and two
-//    different commitments differ. Evaluated against the real M.petname.
+// 9. Petname determinism, evaluated against the real M.petname.
 test("petname is stable per commitment and varies across commitments", async (app) => {
   const a = "aa".repeat(32), b = "bb".repeat(32);
   const pa1 = await evalExpr(app, `M.petname("${a}")`);
@@ -442,14 +410,12 @@ test("petname is stable per commitment and varies across commitments", async (ap
   if (!/^[a-z]+-[a-z]+-[a-z]+$/.test(pa1)) throw new Error(`bad petname shape: ${pa1}`);
   if (pa1 !== pa2) throw new Error(`petname not stable: ${pa1} vs ${pa2}`);
   if (pa1 === pb) throw new Error(`distinct commitments share a petname: ${pa1}`);
-  // Empty / invalid → empty string (no crash).
   if (await evalExpr(app, `M.petname("")`) !== "") throw new Error("empty commitment should yield ''");
 });
 
-// 10. Regression: detail "Refresh status" under a flaky transport must NOT
-//     stack overlapping refresh cycles (the freeze). With the in-flight guard,
-//     a burst of refreshes collapses to ONE cycle; the view stays interactive
-//     and the guard releases so a later refresh still works.
+// 10. Regression: detail "Refresh status" under a flaky transport must not
+//     stack overlapping refresh cycles — a burst collapses to one cycle, the
+//     view stays interactive, and the guard releases for a later refresh.
 test("detail refresh is guarded — bursts don't stack retry chains", async (app) => {
   const c = "aa".repeat(32);
   await setup(app, { memberships: [{ credential: { identity_commitment: c }, membership_hash: "ee".repeat(32), leaf_index: 5, rate_limit: 300, state: "active", submitted_at: 1 }] });
@@ -468,11 +434,10 @@ test("detail refresh is guarded — bursts don't stack retry chains", async (app
   }, "refresh cycle to settle", 8000);
   const memBurst = (await callLog(app)).filter((m) => m === "get_memberships").length - mem0;
   const gmsBurst = (await callLog(app)).filter((m) => m === "get_membership_state").length;
-  // One admitted cycle → ~1 get_memberships (not 20) and one pollLive's
-  // bounded retries (not 20x); un-guarded this was linear in the burst size.
+  // One admitted cycle: ~1 get_memberships plus one bounded retry chain;
+  // unguarded, both counts scale linearly with the burst size.
   if (memBurst > 2) throw new Error(`burst stacked ${memBurst} get_memberships (guard failed)`);
   if (gmsBurst > 6) throw new Error(`burst stacked ${gmsBurst} get_membership_state (guard failed)`);
-  // Still interactive, and the guard released so a fresh cycle can run.
   if (await mode(app) !== "detail") throw new Error("view left detail mode");
   await evalExpr(app, "detailCard.refresh()");
   await waitFor(app, async () => {

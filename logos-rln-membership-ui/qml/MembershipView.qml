@@ -1,10 +1,7 @@
 // The simple end-state view (Main "status" mode): the registry's memberships
-// rendered as pill rows (best first) with a "+ New Membership" ghost beneath,
-// each pill clickable → membership detail. This is BOTH the relaunch landing
-// and the onboarding-completion landing — a finished registration hands off
-// here (refreshed so the new membership joins the pills), celebrating "You're
-// in!" only for the first one. get_memberships is local-only + auto-retried,
-// so a transient hiccup on entry self-heals rather than blanking the list.
+// rendered as pill rows (best state first) with a "+ New Membership" ghost
+// beneath, each pill clickable → membership detail. Serves as both the
+// relaunch landing and the onboarding-completion landing.
 pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Layouts
@@ -17,8 +14,7 @@ Item {
 
     required property var bridge
     required property string registryId
-    // The flow controller (from Main) so this view can auto-retry reads the
-    // same way the onboarding flow does.
+    // The flow controller (from Main), used for auto-retried reads.
     required property OnboardingFlow flow
 
     signal detailRequested(string commitment)
@@ -27,23 +23,20 @@ Item {
 
     property var rows: []
     property string error: ""
-    // In-flight guard: one get_memberships cycle at a time, so a burst of
-    // "Refresh" taps (or a tap landing on a visible-change refresh) doesn't
-    // stack overlapping auto-retry chains against the flaky transport.
+    // In-flight guard: one get_memberships cycle at a time, so refresh
+    // bursts don't stack overlapping auto-retry chains.
     property bool refreshing: false
 
-    // One-shot celebration: the header reads "You're in!" instead of "Your
-    // Memberships" for exactly the completion event where this became the
-    // user's FIRST membership (count 0->1). Set by the completion refresh
-    // below, cleared by Main on any navigation away, never set on a relaunch.
-    // No persistence — it lives only for that one landing.
+    // One-shot celebration: the header reads "You're in!" only for the
+    // completion event where this became the user's FIRST membership
+    // (count 0->1). Set by the completion refresh below, cleared by Main on
+    // any navigation away, never set on a relaunch. Not persisted.
     property bool celebrate: false
     // Marks the NEXT refresh as the post-completion one, so its callback can
     // decide the one-shot celebrate from the freshly-read membership count.
     property bool completionRefresh: false
 
-    // Called by Main on the onboarding→list handoff: the next refresh is the
-    // completion one, so its result decides the one-shot celebrate.
+    // Called by Main on the onboarding→list handoff.
     function markCompletion() {
         completionRefresh = true
         refresh()
@@ -60,9 +53,8 @@ Item {
         flow.callRetry(M.RLN_MODULE, "get_memberships", [registryId], function (r) {
             view.refreshing = false
             if (r.error) {
-                // A transient poll hiccup (bridge/module timeout, e.g. a slow
-                // on-chain read) must NOT replace the shown memberships with an
-                // error — keep the last-known list and let the next tick retry.
+                // A transient hiccup must not replace the shown memberships
+                // with an error — keep the last-known list; the next tick retries.
                 if (!M.isTransientError(r.error.kind)) view.error = M.errorText(r.error)
                 return
             }
@@ -76,9 +68,6 @@ Item {
             })
             list.sort(function (a, b) { return M.stateRank(a.state) - M.stateRank(b.state) })
             view.rows = list
-            // Celebrate ONLY the completion that IS the first membership
-            // (count 0->1). A later membership (>1) or any non-completion
-            // refresh leaves the plain "Your Memberships" header.
             if (wasCompletion)
                 view.celebrate = list.length === 1
         }, 8000)
@@ -99,7 +88,6 @@ Item {
             text: view.celebrate ? "You're in!" : "Your Memberships"
         }
 
-        // The pill rows, best state first.
         ColumnLayout {
             Layout.fillWidth: true
             spacing: M.sc(Theme.spacing.small)

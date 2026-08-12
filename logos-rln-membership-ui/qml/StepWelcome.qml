@@ -1,6 +1,5 @@
-// Step 1 — the pitch and nothing else: one headline, one sentence, Get
-// started. A prior-membership notice from the startup probe and a plain
-// explanation when no logos bridge exists are the only extras.
+// Step 1 — the pitch: one headline, one sentence, Get started, plus a
+// prior-membership notice and an explanation when no logos bridge exists.
 import QtQuick
 import QtQuick.Layouts
 import Logos.Theme
@@ -11,9 +10,8 @@ ColumnLayout {
     id: step
 
     required property OnboardingFlow flow
-    // Also wait for auto-unlock to settle (done|fallback) so Get started
-    // knows whether to skip the password screen — instant hermetically (no
-    // backend -> immediate fallback), sub-second live.
+    // Get started also waits for auto-unlock to settle (done|fallback) so it
+    // knows whether to skip the password screen.
     readonly property bool ready: flow.bridge !== null
                                   && (flow.autoUnlockPhase === "done"
                                       || flow.autoUnlockPhase === "fallback")

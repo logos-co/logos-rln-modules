@@ -1,26 +1,15 @@
-// The simple-view row element: one full-width, low-height rounded rectangle —
-// IDENTICAL footprint (height, width, radiusLarge) across all three kinds so
-// rows never shift between states:
-//   "progress"   — ONE bar the size of the pill: three Syncing→Claiming→
-//                  Registering rounded segments (no outer container) fill it —
-//                  sync uses the real chunk fraction, claim/register sweep,
-//                  upcoming is a faint accent track, completed settles to the
-//                  deep accent. The stage label is a caption ABOVE the bar
-//                  (StepProgress), not inside a segment; on a failed segment
-//                  the bar becomes a clean tinted row with the plain-language
-//                  line + an inline Retry (all within the fixed row height;
-//                  auto-retry runs underneath).
-//   "membership" — a pill: petname (left) + rate "N msg/epoch" (right) + a
-//                  subtle state badge for non-active states; clickable →
+// The simple-view row element: one full-width, low-height rounded rectangle
+// with an identical footprint (height, width, radiusLarge) across all three
+// kinds, so rows never shift between states:
+//   "progress"   — three Syncing→Claiming→Registering segments, a pure view
+//                  over OnboardingFlow's phase properties. Sync fills by the
+//                  real chunk fraction, claim/register shimmer; the stage
+//                  caption renders ABOVE the bar (StepProgress). A failed
+//                  segment turns the row into a tinted headline with an
+//                  inline Retry at the same fixed height.
+//   "membership" — a clickable pill: petname + rate + state badge →
 //                  membership detail.
 //   "ghost"      — a dashed "+ New Membership" wireframe → start a new one.
-// The progress kind is a pure view over OnboardingFlow's phase properties.
-//
-// Segmented bar: every segment shares height / corner-radius / gap and differs
-// only by state, in ONE accent hue expressed via lightness — faint idle track
-// → LINEAR sync fill (real chunk fraction) → feathered ease-in-out shimmer for
-// claim/register → deep settled completion (a soft colour settle + pop, never a
-// snap).
 pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Layouts
@@ -48,15 +37,11 @@ Item {
     Layout.fillWidth: true
 
     // ---- shared tempo + segment geometry (progress) ------------------------
-    // ONE base duration drives every loop so the shimmers pulse in sympathy;
-    // the determinate sync fill and the completion settle are derived from it.
     readonly property int baseDur: 1200
     readonly property int fillDur: Math.round(baseDur / 3)    // 400 — LINEAR determinate fill
     readonly property int settleDur: Math.round(baseDur / 6)  // 200 — loading→complete transition
     readonly property int segGap: M.sc(6)
     readonly property int segRadius: M.sc(4)
-    // Completion is a DEEPER, settled version of the ONE accent hue — not a
-    // second colour — so the finished bar reads as one calm family.
     readonly property color doneColor: Qt.darker(Theme.palette.primary, 1.4)
 
     // ---- segment state helpers (progress) ----------------------------------
@@ -81,9 +66,8 @@ Item {
              : flow.regPhase === "running" ? "active" : "upcoming"
     }
     // The label + retry for the current (active or errored) stage. shortErr
-    // is the CONCISE error headline shown in the clean error row (no
-    // ellipsis, always fits); the technical reason is fine print in
-    // StepProgress below the row.
+    // is the headline for the error row; the technical reason renders as
+    // fine print in StepProgress below the row.
     readonly property var activeSeg: {
         var segs = [
             { st: syncState(), active: "Syncing with Logos Blockchain...", done: "Synced!",
@@ -101,15 +85,11 @@ Item {
         return segs[0]
     }
 
-    // The current stage's caption. StepProgress shows this ABOVE the bar (on a
-    // stable background) so the segments stay label-free and the shimmer reads
-    // cleanly.
+    // The current stage's caption, shown by StepProgress above the bar.
     readonly property string stageLabel: activeSeg.st === "done" ? activeSeg.done : activeSeg.active
 
-    // How full a segment renders: done/error = full, upcoming = empty, and
-    // the ACTIVE segment fills proportionally — sync by the real chunk
-    // fraction (advances with lastSynced), claim/register full (the shimmer
-    // conveys indeterminate work). idx 0 = sync.
+    // done/error render full, upcoming empty; the active sync segment
+    // (idx 0) fills by the real chunk fraction, claim/register render full.
     function segFill(idx, s) {
         if (s === "done" || s === "error") return 1.0
         if (s !== "active") return 0.0
@@ -120,9 +100,6 @@ Item {
     }
 
     // ---- progress (in-progress): pill-height row of segments ---------------
-    // No outer container — the rounded segments are the ONLY elements, so
-    // nothing nests non-concentrically. The stage caption lives ABOVE the bar
-    // (StepProgress); here the segments are pure visual state indicators.
     Item {
         anchors.fill: parent
         visible: root.rowKind === "progress" && root.activeSeg.st !== "error"
@@ -146,23 +123,18 @@ Item {
                     readonly property bool segFilling: modelData === "active" && index === 0
                     readonly property bool segLoading: modelData === "active" && index > 0
 
-                    // A completed step pops once as it lands — punctuation for
-                    // the colour settle, never a snap.
                     onModelDataChanged: if (modelData === "done") pop.restart()
 
-                    // Idle track: a FAINT accent tint (not near-black) so the
-                    // full track previews the shape of the journey.
+                    // Idle track.
                     Rectangle {
                         anchors.fill: parent
                         radius: root.segRadius
                         color: Theme.colors.getColor(Theme.palette.primary, 0.18)
                     }
 
-                    // Determinate / settled fill. Sync grows LINEARLY from the
-                    // real fraction; claim/register hold a translucent base
-                    // swept by the shimmer; done settles to the deep accent.
-                    // Focus is carried by the fill/shimmer motion — no hard
-                    // ring (which read as accidental on the middle segment).
+                    // Fill: sync grows linearly by the real fraction;
+                    // loading segments hold a translucent base under the
+                    // shimmer; done settles to the deep accent.
                     Rectangle {
                         id: fill
                         height: parent.height
@@ -177,10 +149,8 @@ Item {
                         Behavior on color { ColorAnimation { duration: root.settleDur } }
                         Behavior on opacity { NumberAnimation { duration: root.settleDur; easing.type: Easing.InOutQuad } }
 
-                        // Indeterminate shimmer: a WIDE, feathered highlight
-                        // (transparent→peak→transparent, same hue) sweeps
-                        // across on the shared base tempo — light passing over
-                        // a surface, no hard band edges. Clipped to the fill.
+                        // Indeterminate shimmer: a feathered highlight sweeping
+                        // across the loading segment, clipped to the fill.
                         Rectangle {
                             id: shimmer
                             visible: seg.segLoading
@@ -218,9 +188,6 @@ Item {
     }
 
     // ---- progress (error): a clean error-tinted row at the same footprint --
-    // No segment fills here — the concise headline sits on a clean tinted
-    // background (never on top of a green/red fill) with a compact Retry; the
-    // technical reason stays as fine print below the row (StepProgress).
     Rectangle {
         anchors.fill: parent
         visible: root.rowKind === "progress" && root.activeSeg.st === "error"

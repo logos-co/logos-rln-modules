@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-# Generate a Logos package catalog (logos-repo.json + index.json + files/) from
-# a directory of built .lgx bundles. Mirrors the schema served by
-# logos-modules-release: a repo descriptor (schemaVersion 1) whose indexUrl
-# points at a package index (schemaVersion 2) whose per-version entries embed
-# each bundle's full manifest — so the package manager reads dependencies
-# before downloading. Signing is done to the .lgx beforehand; this only reads
-# and hashes them, so signed bundles carry their signature into the catalog.
+# Generate a Logos package catalog (logos-repo.json + index.json + files/)
+# from a directory of built .lgx bundles: a repo descriptor (schemaVersion 1)
+# whose indexUrl points at a package index (schemaVersion 2) whose per-version
+# entries embed each bundle's full manifest, so the package manager reads
+# dependencies before downloading. Bundles are signed before this runs; the
+# script only reads and hashes them.
 import argparse
 import hashlib
 import io

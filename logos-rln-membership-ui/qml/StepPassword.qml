@@ -1,13 +1,7 @@
-// Step 2 — one password protects the whole account (it encrypts both the
-// wallet storage and the credential keystore). The copy adapts to Main's
-// probe: creation framing ("Choose a password" + confirm — a typo would
-// lock the user out of both stores) for fresh installs, entry framing
-// ("Enter your password", no confirm: the unlock check IS the
-// confirmation) when local records exist. The shell gates Continue on
-// unlock_keystore succeeding, so a wrong password surfaces here, before
-// the minutes-long setup steps. Fields freeze once the account was created
-// with this password. The rate limit is fixed at the default here —
-// choosing one is an Advanced concern.
+// Step 2 — one password encrypts both the wallet storage and the credential
+// keystore. Copy adapts to Main's probe: creation framing (with confirm) for
+// fresh installs, entry framing when local records exist. The shell gates
+// Continue on unlock_keystore succeeding; fields freeze once walletCreated.
 import QtQuick
 import QtQuick.Layouts
 import Logos.Theme
@@ -24,9 +18,8 @@ ColumnLayout {
                                   && flow.unlockPhase !== "running"
     function entered() {}
 
-    // LogosTextField sizes its inner input/placeholder from a fixed caption
-    // token with no declarative hook, so at 2x the glyphs would stay small in
-    // a doubled field. Lift them once to the scaled size to match the rest.
+    // LogosTextField sizes its input/placeholder from a fixed caption token
+    // with no declarative hook; lift them once to the scaled size.
     Component.onCompleted: {
         var px = M.sc(Theme.typography.secondaryText)
         passwordField.textInput.font.pixelSize = px
@@ -51,8 +44,8 @@ ColumnLayout {
         horizontalAlignment: Text.AlignHCenter
         font.pixelSize: M.sc(Theme.typography.primaryText)
         color: Theme.palette.textSecondary
-        // A stale saved sign-in (keychain item present but its secret no
-        // longer opens the keystore) is the one fallback worth naming.
+        // bad_password here means a stale saved sign-in: a keychain item
+        // exists but its secret no longer opens the keystore.
         text: step.flow.autoUnlockKind === "bad_password"
               ? "Your saved sign-in didn't match — use the password from your earlier setup."
               : step.flow.hasExistingAccount
@@ -69,8 +62,7 @@ ColumnLayout {
         enabled: !step.flow.walletCreated
         onTextChanged: if (!step.flow.walletCreated) step.flow.password = text
     }
-    // Confirming is a creation concern — for an existing account the unlock
-    // check itself is the confirmation.
+    // For an existing account the unlock check is the confirmation.
     LogosTextField {
         id: confirmField
         visible: !step.flow.hasExistingAccount
@@ -112,8 +104,6 @@ ColumnLayout {
             dotSize: M.sc(4)
         }
         LogosText {
-            // A brand-new account has nothing to check against — the
-            // password is being adopted, so the copy stays neutral.
             text: step.flow.hasExistingAccount ? "Checking…" : "Just a moment…"
             color: Theme.palette.textSecondary
             font.pixelSize: M.sc(Theme.typography.secondaryText)

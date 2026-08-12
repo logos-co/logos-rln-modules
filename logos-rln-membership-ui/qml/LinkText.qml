@@ -1,6 +1,4 @@
-// Text-link affordance for tertiary navigation (Back, Advanced setup):
-// design-system text with a click surface — deliberately chrome-free where
-// a boxed button would compete with the single primary CTA.
+// Chrome-free text link for tertiary navigation (Back, Advanced setup).
 import QtQuick
 import Logos.Theme
 import Logos.Controls

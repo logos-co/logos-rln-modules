@@ -1,5 +1,5 @@
 //! Confirmation + lifecycle poller: one supervisor-owned worker (see
-//! `worker.rs`; no SDK timer exists) that
+//! `worker.rs`) that
 //!
 //! 1. every tick (15s), re-reads each `pending` membership from its
 //!    registry: observed ⇒ pending→active with the AUTHORITATIVE
@@ -7,8 +7,7 @@
 //!    submit-time values are estimates); not observed past the
 //!    confirmation window ⇒ pending→failed. A provider failure leaves the
 //!    record pending — an unreachable registry proves nothing about the
-//!    submission, and idempotent re-registration keeps the failure path
-//!    safe either way.
+//!    submission.
 //! 2. every 4th tick (60s), refreshes non-terminal states
 //!    (active/grace_period/expired transitions come from the registry's
 //!    chain clock; a previously-observed record the registry no longer has
@@ -103,9 +102,7 @@ enum RecordUpdate {
 
 /// Confirm/refresh write shared by both Observed branches: record the
 /// registry's authoritative state/leaf_index/rate_limit and clear any
-/// failed_reason/retryable. On the refresh path both are already None
-/// (records there are active/grace/expired), so clearing them is
-/// behavior-neutral.
+/// failed_reason/retryable.
 fn apply_observed(
     hash: &str,
     state: MembershipState,
@@ -229,11 +226,8 @@ fn tick(refresh_states: bool) {
 
 /// One Merkle-path refresh pass over every USABLE (active/grace_period)
 /// membership — the poller's third maintenance job (module docs point 3).
-/// Shared by the refresh tick and `start`'s warm-up, so both feed
-/// `path_cache.rs` through the identical fetch+decode
-/// (`path_cache::fill_path_cache`). Self-contained stopped check (mirrors
-/// `roots::refresh_all`) so it is safe to call directly off the warm thread,
-/// not just from `tick`.
+/// Called from the refresh tick and from `start`'s warm-up; does its own
+/// stopped check so it is safe to call off the warm thread.
 pub(crate) fn refresh_paths() {
     if crate::worker::is_stopped() {
         return;
@@ -253,8 +247,7 @@ pub(crate) fn refresh_paths() {
         let Some(provider) = provider_for(&registry.namespace) else { continue };
         if let Err(e) = path_cache::fill_path_cache(&registry, &hash, meta.leaf_index, provider) {
             // Keep the previous cache entry — a slightly-stale but still
-            // verifiable path beats none, the same trade-off the root window
-            // makes (module docs point 3).
+            // verifiable path beats none.
             eprintln!("membership poller: {hash} path refresh failed: {}", e.message);
         }
         // Re-checked after every record's read so a worker abandoned by

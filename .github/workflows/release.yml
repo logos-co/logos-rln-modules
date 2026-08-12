@@ -7,23 +7,10 @@ name: release
 # install by adding `<repo>/releases/download/index/logos-repo.json` in the
 # Basecamp package manager.
 #
-# Why not the upstream logos-modules-release-action? It builds each module with
-# a clean git-tree `nix build .#lgx-portable` and no pre-step. Our two Rust
-# modules keep their SDK (+ generated scaffold) gitignored and build via
-# `nix build path:...#lgx-portable` after a staging/codegen step — so we wire
-# our own build here and reuse tools/catalog-gen.py for the (identical) catalog
-# contract. Staging per module: logos-lez-rln-module -> stage-sources.sh (rsyncs a
-# pinned SDK); logos-rln-module -> `nix run .#generate` (codegens the
-# scaffold + stages the SDK, exactly as its own CI does); the UI is pure QML.
-#
 # The catalog also carries the four logos-rln-gifter modules (checked out at
 # GIFTER_REV): the membership UI declares rln_gifter_module and
-# keycard_capture_module as dependencies, and a gifter node needs the
-# keycard/eth verifier modules — none of them are in the official catalog, so
-# they only resolve if THIS catalog publishes them. They need NO staging step:
-# their bare mkLogosModule flakes codegen inside the derivation (their
-# #generate output is a staged source package for local dev, not a runnable
-# app).
+# keycard_capture_module as dependencies, a gifter node needs the keycard/eth
+# verifier modules, and none of them are in the official catalog.
 
 on:
   workflow_dispatch:
@@ -149,10 +136,7 @@ jobs:
           ref: ${{ env.GIFTER_REV }}
           path: external/logos-rln-gifter
 
-      # Sets up Nix + the Logos attic cache (the heavy zerokit build needs it).
-      # If a runner family isn't supported here, that variant fails and the
-      # others still publish (fail-fast:false) — swap to the DeterminateSystems
-      # installer for that runner if it becomes a problem.
+      # The heavy zerokit build needs the attic cache.
       - name: Setup Nix and Logos cache
         uses: logos-co/setup-nix-cache-action@v1
         with:
