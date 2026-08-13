@@ -133,9 +133,12 @@ mod tests {
             hash: hash.to_string(),
             meta: MembershipMeta {
                 allocations: Vec::new(),
+                allocations_mac: None,
+                epoch_size_sec: 0,
                 failed_reason: None,
                 identity_commitment: "11".repeat(32),
                 leaf_index: 0,
+                prune_floor: 0,
                 rate_limit: rate,
                 registry_id: "logos:local:aa".to_string(),
                 retryable: None,

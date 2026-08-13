@@ -222,7 +222,10 @@ module liblogos_rln_module {
   ; index), and the "membership_hash". Errors: no_usable_membership,
   ; ambiguous_selection (multiple; select first), locked, budget_exhausted
   ; (epoch rate limit spent), invalid_argument (bad signal/timestamp, or a
-  ; timestamp whose epoch is outside now ± max_epoch_gap), transient.
+  ; timestamp whose epoch is outside now ± max_epoch_gap), permanent (the
+  ; epoch is below the persisted allocation floor — a backwards clock step or
+  ; widened max_epoch_gap — or epoch_size_sec differs from the size this
+  ; membership's allocations are bound to; re-register to recover), transient.
   method generate_proof(registry_id: tstr, rln_identifier_hex: tstr, signal_hex: tstr, timestamp: tstr) -> result
 
   ; Spec verify_proof(scope, signal, proof). The message hot path: served

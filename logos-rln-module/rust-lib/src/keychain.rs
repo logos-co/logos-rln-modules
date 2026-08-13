@@ -311,9 +311,12 @@ mod tests {
             s.unlock(password)?;
             let meta = store::MembershipMeta {
                 allocations: Vec::new(),
+                allocations_mac: None,
+                epoch_size_sec: 0,
                 failed_reason: None,
                 identity_commitment: "11".repeat(32),
                 leaf_index: 7,
+                prune_floor: 0,
                 rate_limit: 300,
                 registry_id: format!("logos:local:{}", "ab".repeat(32)),
                 retryable: None,

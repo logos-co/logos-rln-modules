@@ -26,6 +26,26 @@
 //! Reads honor each envelope's own `kdfparams` (so foreign iteration counts
 //! decrypt); writes use `WRITE_KDF_ROUNDS`.
 //!
+//! ## Sidecar authentication & its limits
+//!
+//! The reservation-critical sidecar fields (`allocations`, `epoch_size_sec`,
+//! `prune_floor`) are HMAC'd per entry (`allocations_mac`): HMAC-SHA256 under
+//! a PBKDF2 key derived at unlock from the keystore password + the file-level
+//! `metaMacSalt`, over a canonical payload bound to the entry's
+//! membership_hash and a domain separator. Verified at every unlock; a
+//! failure quarantines the entry. This detects targeted edits (e.g. rewinding
+//! a spent `used` counter, which would reissue a slot and leak the identity
+//! secret) and MAC transplants between entries. It CANNOT detect: (1)
+//! whole-file rollback to an older honest snapshot — a restored backup was
+//! validly MAC'd; (2) stripping the MAC together with ALL MAC'd state back to
+//! the legacy shape, which the next unlock re-adopts as a pre-upgrade file;
+//! (3) an attacker who also knows the password. `rate_limit`/`leaf_index`
+//! stay OUTSIDE the MAC by design: the locked-mode poller self-heals them
+//! from the registry, and tampering them yields invalid proofs (the on-chain
+//! leaf pins poseidon(commitment, rate_limit)), not a share collision.
+//! Future hardening (out of scope): a keychain-anchored monotonic counter,
+//! which would also close the rollback case.
+//!
 //! ## Atomicity & durability
 //!
 //! Writes go to `rln_keystore.json.tmp` (0600), which is fsync'd, then POSIX
@@ -49,6 +69,11 @@ use zeroize::Zeroizing;
 use crate::registry_id::{bytes_to_hex, hex_to_vec};
 
 pub(crate) const KEYSTORE_FILE: &str = "rln_keystore.json";
+/// Sentinel file `store::init` takes an exclusive OS lock on: two processes
+/// sharing one persistence path would last-writer-wins clobber each other's
+/// whole-file rewrites (allocation counters included), so the second one
+/// fails closed instead.
+pub(crate) const LOCK_FILE: &str = "rln_keystore.lock";
 /// PBKDF2 rounds for envelopes THIS module writes — the nwaku ecosystem
 /// default (and the spec vector's count). Reads honor stored kdfparams.
 const WRITE_KDF_ROUNDS: u32 = 1_000_000;
@@ -85,6 +110,11 @@ pub(crate) struct KeystoreFile {
     #[serde(rename = "appIdentifier")]
     pub(crate) app_identifier: String,
     pub(crate) credentials: BTreeMap<String, KeystoreEntry>,
+    /// Salt (hex) for the sidecar-MAC key (PBKDF2 from the keystore
+    /// password — see "Sidecar authentication" above). Absent on legacy
+    /// files; generated at the first unlock after upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "metaMacSalt")]
+    pub(crate) meta_mac_salt: Option<String>,
     pub(crate) version: String,
 }
 
@@ -94,6 +124,7 @@ impl Default for KeystoreFile {
             application: "logos-rln-membership".to_string(),
             app_identifier: "liblogos_rln_module".to_string(),
             credentials: BTreeMap::new(),
+            meta_mac_salt: None,
             version: "1".to_string(),
         }
     }
@@ -149,21 +180,51 @@ impl MembershipState {
 /// Plaintext-safe sidecar metadata stored NEXT TO the crypto envelope.
 /// `registry_id` + `identity_commitment` are tamper-bound by the entry's
 /// membership_hash key (recomputed at load) and duplicated inside the
-/// ciphertext; the rest are self-healing caches of registry state.
+/// ciphertext. The reservation-critical fields (`allocations`,
+/// `epoch_size_sec`, `prune_floor`) are tamper-bound by `allocations_mac`,
+/// verified at unlock — they are local security state with NO authoritative
+/// source to re-read (see "Sidecar authentication" above). The rest are
+/// self-healing caches of registry state, deliberately OUTSIDE the MAC so
+/// the locked-mode poller can keep healing them.
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct MembershipMeta {
     /// Per-application `message_id` allocation, one row per active
-    /// `(rln_identifier, current epoch)`. Plaintext-safe counters; persisted
-    /// with the sidecar so a restart never reissues a spent slot.
+    /// `(rln_identifier, current epoch)`. Plaintext-safe counters (no
+    /// secret), persisted with the sidecar — fsync-durably, under
+    /// `allocations_mac`, and floored by `prune_floor` — so neither a
+    /// restart, power loss, sidecar edit, clock rewind, nor gap/size
+    /// reconfiguration reissues a spent slot.
     /// Omitted from older files (serde default = empty).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) allocations: Vec<crate::rate_limit::EpochAllocation>,
+    /// HMAC (hex) over the reservation-critical sidecar state — see
+    /// `meta_mac`. Keyed by the unlock-derived store MAC key; absent on
+    /// legacy entries until adopted at the first unlock (or written at the
+    /// first insert/reservation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) allocations_mac: Option<String>,
+    /// Epoch length (seconds) `allocations` and `prune_floor` are denominated
+    /// in. 0 = unset (legacy file, or no reservation yet); adopted from the
+    /// configured `epoch_size_sec` at the first successful reservation. A
+    /// reservation under a DIFFERENT configured size fails `permanent`:
+    /// changing the epoch size rebases the numeric epoch indexing that keys
+    /// spent slots (and their external nullifiers), which no floor conversion
+    /// can make safe. Recovery: register a fresh membership.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) epoch_size_sec: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) failed_reason: Option<String>,
     pub(crate) identity_commitment: String,
     /// Provisional while pending (pre-submit estimate); authoritative after
     /// the pending→active re-read (spec MUST).
     pub(crate) leaf_index: u64,
+    /// Monotonically NON-DECREASING allocation floor, in units of
+    /// `epoch_size_sec`: epochs below it may have had rows pruned, so a
+    /// reservation there is permanently refused — even when the wall clock
+    /// rewinds past the window or `max_epoch_gap` is widened across restarts.
+    /// Raised (never lowered) on every successful reservation.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) prune_floor: u64,
     pub(crate) rate_limit: u64,
     pub(crate) registry_id: String,
     /// Whether a `failed` state is worth retrying (spec: a failed submission
@@ -182,6 +243,12 @@ pub(crate) struct MembershipMeta {
     pub(crate) submitted_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tx_result: Option<String>,
+}
+
+/// serde `skip_serializing_if` for the defaulted u64 fields: untouched legacy
+/// entries keep serializing byte-identically.
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -240,6 +307,63 @@ fn mac_bytes(dk: &[u8], ciphertext: &[u8]) -> [u8; 32] {
 /// Constant-time-ish comparison: MAC bytes never early-exit.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+// ------------------------------------------------------------- sidecar MAC
+
+/// Derive the store-level sidecar-MAC key: PBKDF2 (WRITE_KDF_ROUNDS) from the
+/// keystore password and the file's `metaMacSalt` — one derivation per
+/// unlock, cached by the store. A salt distinct from every envelope's
+/// kdfparams salt keeps this key independent of the credential dk.
+pub(crate) fn derive_meta_mac_key(
+    password: &str,
+    salt_hex: &str,
+) -> Result<Zeroizing<[u8; 32]>, KeystoreError> {
+    let salt = hex_to_vec(salt_hex).ok_or(KeystoreError::Malformed("meta MAC salt"))?;
+    let mut key = Zeroizing::new([0u8; 32]);
+    pbkdf2::pbkdf2::<Hmac<Sha256>>(password.as_bytes(), &salt, WRITE_KDF_ROUNDS, &mut key[..])
+        .map_err(|_| KeystoreError::Malformed("meta MAC key length"))?;
+    Ok(key)
+}
+
+/// The canonical HMAC payload: the reservation-critical sidecar fields, bound
+/// to the entry's membership_hash (no MAC transplants between entries) and a
+/// version/domain separator. Serialized field order is this declaration
+/// order — changing it invalidates every stored MAC.
+#[derive(Serialize)]
+struct MetaMacPayload<'a> {
+    allocations: &'a [crate::rate_limit::EpochAllocation],
+    epoch_size_sec: u64,
+    membership_hash: &'a str,
+    prune_floor: u64,
+    v: &'static str,
+}
+
+/// HMAC-SHA256 (hex) over the entry's reservation-critical sidecar state.
+pub(crate) fn meta_mac(key: &[u8; 32], membership_hash: &str, meta: &MembershipMeta) -> String {
+    use hmac::Mac;
+    let payload = MetaMacPayload {
+        allocations: &meta.allocations,
+        epoch_size_sec: meta.epoch_size_sec,
+        membership_hash,
+        prune_floor: meta.prune_floor,
+        v: "rln-meta-mac-1",
+    };
+    // Serializing a struct of ints/strs/derived-Serialize slices cannot fail,
+    // and HMAC accepts any key length.
+    let bytes = serde_json::to_vec(&payload).expect("meta MAC payload serializes");
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts 32-byte keys");
+    mac.update(&bytes);
+    bytes_to_hex(&mac.finalize().into_bytes())
+}
+
+/// Verify an entry's `allocations_mac`. `false` when the MAC is absent,
+/// malformed, or does not match the recomputation.
+pub(crate) fn meta_mac_ok(key: &[u8; 32], membership_hash: &str, meta: &MembershipMeta) -> bool {
+    match &meta.allocations_mac {
+        Some(stored) => ct_eq(meta_mac(key, membership_hash, meta).as_bytes(), stored.as_bytes()),
+        None => false,
+    }
 }
 
 fn apply_aes128ctr(key: &[u8], iv: &[u8], buf: &mut [u8]) -> Result<(), KeystoreError> {

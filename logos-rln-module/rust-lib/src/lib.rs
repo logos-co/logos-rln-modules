@@ -90,10 +90,10 @@ pub(crate) enum ErrorKind {
     Transient,
     /// The epoch's rate-limit budget is spent — retry next epoch.
     BudgetExhausted,
-    /// Invalid input or unsupported operation — retrying cannot succeed.
-    /// Declared for the wire contract's kind list; nothing constructs it
-    /// directly today.
-    #[allow(dead_code)]
+    /// Retrying as-is cannot succeed. Constructed by the rate-limit
+    /// allocator's floor/epoch-size guards (`store::reserve_message_id`):
+    /// an epoch below the persisted allocation floor, or a configured
+    /// `epoch_size_sec` this membership's allocations are not bound to.
     Permanent,
 }
 
@@ -626,9 +626,16 @@ fn register_impl(
     // lands on the owner thread after this handler has returned.
     let meta = store::MembershipMeta {
         allocations: Vec::new(),
+        // Stamped by insert() under the unlock-derived MAC key.
+        allocations_mac: None,
+        // Epoch-size binding and floor start unset; both are adopted at the
+        // first successful reservation (registration doesn't know the app's
+        // final epoch size).
+        epoch_size_sec: 0,
         failed_reason: None,
         identity_commitment: commitment_hex.clone(),
         leaf_index: 0,
+        prune_floor: 0,
         rate_limit,
         registry_id: registry.canonical.clone(),
         retryable: None,
@@ -868,6 +875,23 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
     }
 
     *lock(&CONFIG) = Some(ModuleConfig { epoch_size_sec, max_epoch_gap });
+    // A membership whose persisted allocations are bound to a DIFFERENT
+    // epoch_size_sec can no longer generate proofs (the store fails those
+    // reservations `permanent`); surface that at configure time. Warn-only:
+    // rejecting start() would DoS verify_proof for every scope over one
+    // stale local membership. Ignore an uninitialized store (pre-context).
+    let _ = store::with_store(|s| {
+        for (hash, bound) in s.epoch_size_bindings() {
+            if bound != 0 && bound != epoch_size_sec {
+                eprintln!(
+                    "membership start: entry {hash} allocations are bound to \
+                     epoch_size_sec={bound}, config says {epoch_size_sec}; \
+                     generate_proof for it will fail permanent"
+                );
+            }
+        }
+        Ok(())
+    });
     // Permit + (re)spawn the maintenance workers, and warm the tracked
     // registries' root windows and every usable membership's Merkle path in
     // the background — must not block start() itself.
@@ -994,13 +1018,16 @@ fn generate_proof_impl(
         }
     };
 
-    // Reserve + PERSIST the slot BEFORE proving, so a crash can waste a slot
-    // but never reissue one. The retain floor is the oldest epoch this window
-    // can still serve; the reservation must keep every in-window epoch's
-    // counter so an interleaving timestamp can't reuse a spent slot.
+    // Reserve + durably persist the slot BEFORE proving, so a crash can waste
+    // a slot but never reissue one. The candidate floor is the oldest epoch
+    // this window claims to serve; the store keeps a persisted MONOTONE floor
+    // (max of every candidate seen), so a backwards clock or a widened
+    // max_epoch_gap can never resurrect a pruned, possibly spent epoch, and
+    // every in-window epoch keeps its counter so an interleaving timestamp
+    // can't reuse a spent slot.
     let retain_floor = now_epoch.saturating_sub(epoch_gap());
     let message_id = store::with_store(|s| {
-        s.reserve_message_id(&hash, &rln_id_hex, epoch, retain_floor, meta.rate_limit)
+        s.reserve_message_id(&hash, &rln_id_hex, epoch, retain_floor, meta.rate_limit, size)
     })?;
 
     let material = proof::WitnessMaterial {
@@ -1075,7 +1102,10 @@ fn resolve_key_epoch(
 /// `share_x` → `rate_limit_violation`, whose `recovered_secret` is the
 /// VIOLATOR'S OWN identity secret reconstructed from the colliding shares
 /// (never one of this module's credentials). An invalid proof never mutates
-/// the log.
+/// the log. The log is in-memory with a wall-clock floor, so a restart or
+/// clock rewind forgets nullifiers — detection is best-effort across those
+/// events (see `nullifier_log` docs); slot uniqueness on the generation
+/// side does not depend on it.
 fn verify_proof_impl(
     registry_id_raw: &str,
     rln_identifier_hex: &str,
@@ -1728,9 +1758,12 @@ mod tests {
             s.unlock("pw")?;
             let meta = store::MembershipMeta {
                 allocations: Vec::new(),
+                allocations_mac: None,
+                epoch_size_sec: 0,
                 failed_reason: None,
                 identity_commitment: registry_id::bytes_to_hex(&commitment),
                 leaf_index: 4,
+                prune_floor: 0,
                 rate_limit: 100,
                 registry_id: registry.clone(),
                 retryable: None,
@@ -1760,8 +1793,8 @@ mod tests {
         // Spend two slots in the CURRENT epoch; the snapshot pairs the same
         // index with the decremented budget.
         store::with_store(|s| {
-            s.reserve_message_id(&hash, &rln_id, epoch_index, epoch_index, 100)?;
-            s.reserve_message_id(&hash, &rln_id, epoch_index, epoch_index, 100)
+            s.reserve_message_id(&hash, &rln_id, epoch_index, epoch_index, 100, 600)?;
+            s.reserve_message_id(&hash, &rln_id, epoch_index, epoch_index, 100, 600)
         })
         .unwrap();
         let spent = get_epoch_quota_impl(&registry, &rln_id).unwrap();
@@ -1846,9 +1879,12 @@ mod tests {
         store::with_store(|s| {
             let meta = store::MembershipMeta {
                 allocations: Vec::new(),
+                allocations_mac: None,
+                epoch_size_sec: 0,
                 failed_reason: None,
                 identity_commitment: commitment_hex.clone(),
                 leaf_index,
+                prune_floor: 0,
                 rate_limit: 300,
                 registry_id: reg.clone(),
                 retryable: None,
@@ -1931,9 +1967,12 @@ mod tests {
         store::with_store(|s| {
             let meta = store::MembershipMeta {
                 allocations: Vec::new(),
+                allocations_mac: None,
+                epoch_size_sec: 0,
                 failed_reason: None,
                 identity_commitment: commitment_hex.clone(),
                 leaf_index,
+                prune_floor: 0,
                 rate_limit: 300,
                 registry_id: reg.clone(),
                 retryable: None,
@@ -2085,9 +2124,12 @@ mod tests {
         store::with_store(|s| {
             let meta = store::MembershipMeta {
                 allocations: Vec::new(),
+                allocations_mac: None,
+                epoch_size_sec: 0,
                 failed_reason: None,
                 identity_commitment: registry_id::bytes_to_hex(&commitment),
                 leaf_index: 7,
+                prune_floor: 0,
                 rate_limit: 300,
                 registry_id: reg_b.clone(),
                 retryable: None,
@@ -2159,9 +2201,12 @@ mod tests {
         store::with_store(|s| {
             let meta = store::MembershipMeta {
                 allocations: Vec::new(),
+                allocations_mac: None,
+                epoch_size_sec: 0,
                 failed_reason: None,
                 identity_commitment: registry_id::bytes_to_hex(&expired_commitment),
                 leaf_index: 3,
+                prune_floor: 0,
                 rate_limit: 300,
                 registry_id: reg_expired.clone(),
                 retryable: None,
@@ -2207,9 +2252,12 @@ mod tests {
         store::with_store(|s| {
             let meta = store::MembershipMeta {
                 allocations: Vec::new(),
+                allocations_mac: None,
+                epoch_size_sec: 0,
                 failed_reason: None,
                 identity_commitment: registry_id::bytes_to_hex(&erased_commitment),
                 leaf_index: 5,
+                prune_floor: 0,
                 rate_limit: 300,
                 registry_id: reg_erased.clone(),
                 retryable: None,
@@ -2427,9 +2475,12 @@ mod tests {
         store::with_store(|s| {
             let meta = store::MembershipMeta {
                 allocations: Vec::new(),
+                allocations_mac: None,
+                epoch_size_sec: 0,
                 failed_reason: None,
                 identity_commitment: registry_id::bytes_to_hex(&commitment),
                 leaf_index: 3,
+                prune_floor: 0,
                 rate_limit: 300,
                 registry_id: registry.clone(),
                 retryable: None,
@@ -2476,9 +2527,12 @@ mod tests {
         let rln_identifier = "ef".repeat(32);
         let meta = store::MembershipMeta {
             allocations: Vec::new(),
+            allocations_mac: None,
+            epoch_size_sec: 0,
             failed_reason: Some("submit_failed: boom".to_string()),
             identity_commitment: commitment.clone(),
             leaf_index: 7,
+            prune_floor: 0,
             rate_limit: 300,
             registry_id: registry.clone(),
             retryable: Some(true),

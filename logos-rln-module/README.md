@@ -64,9 +64,12 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   in-module identity generation, witness assembly, generate/verify, the
   canonical `RateLimitProof` serialization, and the frozen interop vectors.
 - `rust-lib/src/rate_limit.rs` — epoch derivation + per-(rln_identifier,
-  epoch) `message_id` allocation. The store persists an allocation BEFORE
-  the proof is returned, so a crash can waste a slot but never reissue one
-  (reuse would leak the identity secret via the Shamir shares).
+  epoch) `message_id` allocation. The store fsync-durably persists an
+  allocation BEFORE the proof is returned, and keeps a persisted MONOTONE
+  floor + epoch-size binding, so neither a crash, a backwards wall clock,
+  nor a reconfigured `max_epoch_gap`/`epoch_size_sec` can reissue a spent
+  slot (reuse would leak the identity secret via the Shamir shares) — the
+  allocator answers `permanent` instead.
 - `rust-lib/src/roots.rs` — the valid-root window: a background-refreshed
   per-registry cache (10s tick; >60s-stale = cold) that `verify_proof`
   serves from with no registry access on the hot path; cold = `not_ready`,
@@ -127,11 +130,24 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   password unlocks and becomes the encryption password at first write — the
   keystore format has no keystore-level verifier; later unlocks verify
   against the first stored envelope's MAC.
-- **Slot allocation is persist-before-issue.** `generate_proof` durably
-  records the `(rln_identifier, epoch, message_id)` allocation before the
-  proof leaves the module; two proofs on one slot reconstruct the identity
-  secret, so a crash may waste a slot but never double-spends one.
-  `budget_exhausted` when the epoch's `rate_limit` slots are gone.
+- **Slot allocation is persist-before-issue, and the allocator is
+  monotonic.** `generate_proof` durably records the `(rln_identifier, epoch,
+  message_id)` allocation before the proof leaves the module (fsync'd write —
+  power-loss-safe, not merely crash-safe); two proofs on one slot reconstruct
+  the identity secret, so a crash may waste a slot but never double-spends
+  one. A persisted, monotonically non-decreasing floor (plus an epoch-size
+  binding) refuses — `permanent` — any epoch a backwards clock step, a
+  widened `max_epoch_gap`, or a changed `epoch_size_sec` would otherwise
+  re-admit after its rows were pruned; recovery from a deliberate epoch-size
+  change is a fresh registration. The allocation counters are HMAC'd inside
+  the keystore sidecar (verified at unlock; tampered entries are
+  quarantined) — though a whole-file rollback from a backup is inherently
+  undetectable by a local MAC (see `keystore.rs` docs). One process per
+  persistence path is enforced with an exclusive lock on
+  `rln_keystore.lock`, failing closed; the lock is advisory, so
+  network/shared-volume filesystems that don't honor OS file locks must
+  enforce single-process at the deployment layer. `budget_exhausted` when
+  the epoch's `rate_limit` slots are gone.
 - **Verification is hot-path-only.** `verify_proof` reads the locally
   maintained valid-root window and performs zero registry calls; a cold or
   stale window answers `not_ready` rather than serving a false reject.
