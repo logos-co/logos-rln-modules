@@ -139,7 +139,12 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   binding) refuses — `permanent` — any epoch a backwards clock step, a
   widened `max_epoch_gap`, or a changed `epoch_size_sec` would otherwise
   re-admit after its rows were pruned; recovery from a deliberate epoch-size
-  change is a fresh registration. The allocation counters are HMAC'd inside
+  change is a fresh registration. The epoch-size binding is adopted per
+  membership at its first reservation (or at unlock, for pre-upgrade
+  entries, when `start()` has already configured a size), so it cannot
+  retro-protect allocation history recorded before the upgrade: do NOT
+  change `epoch_size_sec` across the upgrade boundary while pre-upgrade
+  memberships hold live allocation rows. The allocation counters are HMAC'd inside
   the keystore sidecar (verified at unlock; tampered entries are
   quarantined) — though a whole-file rollback from a backup is inherently
   undetectable by a local MAC (see `keystore.rs` docs). One process per

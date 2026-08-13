@@ -822,6 +822,12 @@ fn epoch_size() -> Result<u64, ApiError> {
     })
 }
 
+/// Best-effort read of the configured epoch size for `store::unlock`'s
+/// legacy adoption — `None` before `start()` configures it.
+pub(crate) fn configured_epoch_size() -> Option<u64> {
+    lock(&CONFIG).as_ref().map(|c| c.epoch_size_sec)
+}
+
 #[cfg(test)]
 pub(crate) fn reset_config_for_test() {
     *lock(&CONFIG) = None;
@@ -979,7 +985,9 @@ fn generate_proof_impl(
     // A stale or future timestamp fails fast instead of minting a proof the
     // verifier would reject as not fresh.
     let now_epoch = rate_limit::current_epoch(now_unix(), size);
-    if !(now_epoch.saturating_sub(epoch_gap())..=now_epoch + epoch_gap()).contains(&epoch) {
+    if !(now_epoch.saturating_sub(epoch_gap())..=now_epoch.saturating_add(epoch_gap()))
+        .contains(&epoch)
+    {
         return Err(ApiError::new(
             ErrorKind::InvalidArgument,
             "timestamp is outside the acceptable epoch window (now ± max_epoch_gap)",
@@ -1076,7 +1084,7 @@ fn resolve_key_epoch(
     now_epoch: u64,
 ) -> Option<u64> {
     let gap = epoch_gap();
-    let mut window = now_epoch.saturating_sub(gap)..=now_epoch + gap;
+    let mut window = now_epoch.saturating_sub(gap)..=now_epoch.saturating_add(gap);
     match carried {
         Some(e) => (window.contains(&e)
             && proof::expected_external_nullifier(e, rln_identifier) == *bound)
@@ -1181,7 +1189,8 @@ fn get_epoch_quota_impl(
     provider_of(&registry)?;
     // Readiness gate FIRST. The single epoch observation: taken once, it
     // keys the remaining lookup.
-    let epoch_index = rate_limit::current_epoch(now_unix(), epoch_size()?);
+    let size = epoch_size()?;
+    let epoch_index = rate_limit::current_epoch(now_unix(), size);
 
     let records = records_for_registry(&registry)?;
     let usable: Vec<_> = scope_candidates(&records, &rln_id_hex)
@@ -1200,7 +1209,7 @@ fn get_epoch_quota_impl(
     let store::MembershipRecord { hash, meta, .. } = &usable[0];
 
     let remaining = store::with_store(|s| {
-        Ok(s.remaining_budget(hash, &rln_id_hex, epoch_index, meta.rate_limit))
+        Ok(s.remaining_budget(hash, &rln_id_hex, epoch_index, meta.rate_limit, size))
     })?;
     ok_json(views::EpochQuotaView::new(epoch_index, meta.rate_limit, remaining))
 }

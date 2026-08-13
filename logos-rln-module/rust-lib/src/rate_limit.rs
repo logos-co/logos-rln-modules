@@ -19,12 +19,13 @@
 //! message timestamp and `generate_proof` accepts anything within
 //! `now ± max_epoch_gap`, so several epochs are live at once and each keeps its
 //! own counter; rows below the window floor are pruned to bound growth. Pruning
-//! destroys the only record that a pruned epoch's slots were spent, so the
-//! floor itself is persisted and monotonically non-decreasing
-//! (`MembershipMeta::prune_floor`): once an epoch falls below it, reservation
-//! there is refused forever (`AllocError::EpochBelowFloor`) — even when the
-//! wall clock rewinds past the window or a widened `max_epoch_gap` would
-//! re-admit it. The index's wire encoding (the spec's `epoch[32]`) lives in
+//! destroys the only record that a pruned epoch's slots were spent, so every
+//! prune is recorded in a persisted, monotonically non-decreasing floor
+//! (`MembershipMeta::prune_floor`, capped at one past the highest allocated
+//! epoch so a spiked clock cannot brick the future): once an epoch falls below
+//! it, reservation there is refused forever (`AllocError::EpochBelowFloor`) —
+//! even when the wall clock rewinds past the window or a widened
+//! `max_epoch_gap` would re-admit it. The index's wire encoding (the spec's `epoch[32]`) lives in
 //! the proof engine (`proof::epoch_to_bytes`); this module deals only in the
 //! `u64`.
 
@@ -48,11 +49,12 @@ pub(crate) struct EpochAllocation {
 pub(crate) enum AllocError {
     /// The epoch's `rate_limit` slots are all spent; retry next epoch.
     BudgetExhausted,
-    /// The requested epoch is below the persisted monotone floor — its rows
-    /// may have been pruned, so reissuing could double-spend a slot and leak
-    /// the identity secret. Permanent for this epoch: a backwards clock step
-    /// or a widened `max_epoch_gap` re-admitted it, and the allocator must
-    /// answer an error rather than silently mint a colliding proof.
+    /// The requested epoch is below the persisted monotone floor — its row
+    /// was (or may have been) pruned, so reissuing could double-spend a slot
+    /// and leak the identity secret. Permanent for this epoch: a backwards
+    /// clock step or a widened `max_epoch_gap` re-admitted it, and the
+    /// allocator must answer an error rather than silently mint a colliding
+    /// proof.
     EpochBelowFloor,
 }
 
@@ -67,22 +69,34 @@ pub(crate) fn current_epoch(now_unix: u64, epoch_size_sec: u64) -> u64 {
 }
 
 /// Reserve the next `message_id` for `(rln_identifier, epoch)` within
-/// `rate_limit`, mutating `allocations` and `floor` in place. Returns the
-/// slot, `BudgetExhausted` when that epoch's budget is spent, or
+/// `rate_limit`, mutating `allocations` and `floor` in place ONLY on success.
+/// Returns the slot, `BudgetExhausted` when that epoch's budget is spent, or
 /// `EpochBelowFloor` when `epoch` is below the effective floor.
 ///
 /// `retain_floor_candidate` is the oldest epoch the CURRENT window claims to
 /// serve (`now_epoch - max_epoch_gap`) — a wall-clock-derived value that can
-/// move backwards (NTP step, suspend/resume, VM restore) or drop when
-/// `max_epoch_gap` is reconfigured wider. `floor` is the persisted monotone
-/// floor: the effective floor is `max(*floor, retain_floor_candidate)`, it
-/// only ever rises, and rows below it are pruned. An `epoch` below it is
-/// refused BEFORE any mutation — those rows may already be gone, and evicting
-/// or forgetting a spent epoch's row would reissue a spent
-/// `(epoch, message_id)` slot, exposing the Shamir shares that reconstruct
-/// the identity secret. Pruning must likewise never drop an in-window epoch:
-/// interleaving timestamps can revisit a neighboring epoch, which must
-/// continue its counter.
+/// move backwards (NTP step, suspend/resume, VM restore), drop when
+/// `max_epoch_gap` is reconfigured wider, or SPIKE forward on a bad clock.
+/// `floor` is the persisted monotone floor: everything strictly below it may
+/// have had its row pruned, so a reservation there is refused forever —
+/// reissuing a pruned epoch's slot would expose the Shamir shares that
+/// reconstruct the identity secret.
+///
+/// The prune threshold each call may advance to is
+/// `max(*floor, min(candidate, highest allocated epoch + 1))`:
+/// - `max(*floor, ..)` keeps the floor monotone against a rewound candidate;
+/// - capping the candidate at one past the highest allocated row means a
+///   forward clock spike can never persist a far-future floor that bricks
+///   the membership once the clock is corrected — only epochs whose rows
+///   actually existed (and are now pruned) become unservable, which is
+///   exactly the set at risk of reissue;
+/// - with no rows there is nothing to prune and the floor stays put.
+///
+/// Every error path leaves `allocations` and `floor` EXACTLY as found: the
+/// store restamps the sidecar MAC only on success, so an error must not
+/// diverge the in-memory state from its persisted MAC. Pruning likewise never
+/// drops an in-window epoch: interleaving timestamps can revisit a
+/// neighboring epoch, which must continue its counter.
 ///
 /// The caller MUST durably persist `allocations` AND `floor` before using the
 /// returned slot.
@@ -94,16 +108,20 @@ pub(crate) fn reserve_slot(
     retain_floor_candidate: u64,
     rate_limit: u64,
 ) -> Result<u64, AllocError> {
-    let effective = (*floor).max(retain_floor_candidate);
-    if epoch < effective {
+    let highest = allocations.iter().map(|a| a.epoch.saturating_add(1)).max();
+    let threshold = match highest {
+        Some(h) => (*floor).max(retain_floor_candidate.min(h)),
+        None => *floor,
+    };
+    if epoch < threshold {
         return Err(AllocError::EpochBelowFloor);
     }
-    *floor = effective;
-    allocations.retain(|a| a.epoch >= effective);
 
-    // Rows for several in-window epochs coexist, so the slot must be looked up
-    // by `(rln_identifier, epoch)` — never by application alone.
-    if let Some(row) = allocations
+    // Allocate first — rows for several in-window epochs coexist, so the slot
+    // is looked up by `(rln_identifier, epoch)`, never by application alone —
+    // and only then advance the floor and prune, so both error returns above
+    // and below mutate nothing.
+    let slot = if let Some(row) = allocations
         .iter_mut()
         .find(|a| a.rln_identifier == rln_identifier_hex && a.epoch == epoch)
     {
@@ -112,18 +130,21 @@ pub(crate) fn reserve_slot(
         }
         let slot = row.used;
         row.used += 1;
-        return Ok(slot);
-    }
-
-    if rate_limit == 0 {
-        return Err(AllocError::BudgetExhausted);
-    }
-    allocations.push(EpochAllocation {
-        rln_identifier: rln_identifier_hex.to_string(),
-        epoch,
-        used: 1,
-    });
-    Ok(0)
+        slot
+    } else {
+        if rate_limit == 0 {
+            return Err(AllocError::BudgetExhausted);
+        }
+        allocations.push(EpochAllocation {
+            rln_identifier: rln_identifier_hex.to_string(),
+            epoch,
+            used: 1,
+        });
+        0
+    };
+    *floor = threshold;
+    allocations.retain(|a| a.epoch >= threshold);
+    Ok(slot)
 }
 
 /// Remaining slots for `(rln_identifier, epoch)` under `rate_limit` — the
@@ -231,37 +252,96 @@ mod tests {
     }
 
     #[test]
-    fn rewound_clock_never_reissues_below_floor() {
-        // Audit cause B: epoch 10 issued while the window floor was 9; the
-        // wall clock then steps backwards far enough that the window would
-        // re-admit epoch 4 (candidate floor 3). Epoch 4's row may have been
-        // pruned long ago — the persisted floor must answer an error, never
-        // a reissued slot 0.
+    fn rewound_clock_never_reissues_a_pruned_epoch() {
+        // Audit cause B: epoch 10 is spent; the window then advances
+        // (candidate 11), pruning 10's row and recording floor 11. A later
+        // backwards clock step re-admits epoch 10 at the window check — the
+        // persisted floor must answer an error, never a reissued slot 0.
         let mut allocs = Vec::new();
         let mut floor = 0;
         assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 10, 9, 5), Ok(0));
-        assert_eq!(floor, 9);
+        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 12, 11, 5), Ok(0));
+        assert_eq!(floor, 11, "pruning epoch 10 must be recorded in the floor");
         assert_eq!(
-            reserve_slot(&mut allocs, &mut floor, APP_A, 4, 3, 5),
+            reserve_slot(&mut allocs, &mut floor, APP_A, 10, 9, 5),
             Err(AllocError::EpochBelowFloor)
         );
-        assert_eq!(floor, 9, "a rewound candidate must never lower the floor");
+        assert_eq!(floor, 11, "a rewound candidate must never lower the floor");
         // An epoch at/above the floor still continues its own counter.
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 10, 3, 5), Ok(1));
+        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 12, 9, 5), Ok(1));
+    }
+
+    #[test]
+    fn forward_clock_spike_cannot_brick_future_epochs() {
+        // A spiked clock supplies an enormous candidate floor (and possibly a
+        // spiked reservation). The threshold is capped one past the highest
+        // allocated epoch, so after the clock is corrected only epochs whose
+        // rows actually existed are refused — not months of future epochs.
+        let mut allocs = Vec::new();
+        let mut floor = 0;
+        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 10, 9, 5), Ok(0));
+        // Spike: the candidate leaps far ahead; the floor advances only past
+        // the allocated row (10 -> pruned, floor 11), never to the spike.
+        assert_eq!(
+            reserve_slot(&mut allocs, &mut floor, APP_A, 1_000_000, 999_999, 5),
+            Ok(0)
+        );
+        assert_eq!(floor, 11, "the spike must not persist a far-future floor");
+        // Clock corrected: normal epochs keep allocating.
+        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 12, 11, 5), Ok(0));
+        // The genuinely pruned epoch stays refused.
+        assert_eq!(
+            reserve_slot(&mut allocs, &mut floor, APP_A, 10, 11, 5),
+            Err(AllocError::EpochBelowFloor)
+        );
+    }
+
+    #[test]
+    fn failed_reservations_mutate_nothing() {
+        // The store restamps the sidecar MAC only on success, so every error
+        // path must leave allocations and the floor exactly as persisted —
+        // otherwise a later unrelated persist writes state under a stale MAC
+        // and the next unlock falsely quarantines an honest entry.
+        let mut allocs = Vec::new();
+        let mut floor = 0;
+        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 10, 9, 1), Ok(0));
+        let before = (allocs.clone(), floor);
+        // Budget exhausted, with a candidate that would otherwise advance the
+        // floor and prune.
+        assert_eq!(
+            reserve_slot(&mut allocs, &mut floor, APP_A, 10, 10, 1),
+            Err(AllocError::BudgetExhausted)
+        );
+        assert_eq!((allocs.clone(), floor), before);
+        // Zero-limit no-row path: same guarantee.
+        assert_eq!(
+            reserve_slot(&mut allocs, &mut floor, APP_A, 11, 10, 0),
+            Err(AllocError::BudgetExhausted)
+        );
+        assert_eq!((allocs.clone(), floor), before);
+        // Below-floor path: same guarantee.
+        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 12, 11, 1), Ok(0));
+        let after_prune = (allocs.clone(), floor);
+        assert_eq!(
+            reserve_slot(&mut allocs, &mut floor, APP_A, 10, 11, 1),
+            Err(AllocError::EpochBelowFloor)
+        );
+        assert_eq!((allocs.clone(), floor), after_prune);
     }
 
     #[test]
     fn widened_epoch_gap_never_resurrects_pruned_epochs() {
-        // Audit cause D: a gap=1 run reaches epoch 12 (candidate floor 11),
-        // pruning every row below 11. A restart (or live start()) with gap=10
-        // lowers the candidate to 2 — epochs 2..11 pass the wall-clock window
-        // check but their spent rows are gone. The persisted floor must
-        // refuse them.
+        // Audit cause D: a gap=1 run reaches epoch 12 (candidate floor 11,
+        // capped at highest-row+1 = 10), pruning spent epoch 9 and recording
+        // floor 10. A restart (or live start()) with gap=10 lowers the
+        // candidate to 2 — epoch 9 passes the wall-clock window check but its
+        // spent row is gone. The persisted floor must refuse it.
         let mut allocs = Vec::new();
         let mut floor = 0;
         assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 9, 8, 5), Ok(0));
         assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 12, 11, 5), Ok(0));
-        assert!(allocs.iter().all(|a| a.epoch >= 11), "epoch 9's row is pruned");
+        assert!(allocs.iter().all(|a| a.epoch >= 10), "epoch 9's row is pruned");
+        assert_eq!(floor, 10);
         assert_eq!(
             reserve_slot(&mut allocs, &mut floor, APP_A, 9, 2, 5),
             Err(AllocError::EpochBelowFloor)

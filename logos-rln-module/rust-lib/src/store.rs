@@ -224,16 +224,20 @@ pub(crate) fn with_store<R>(f: impl FnOnce(&mut Store) -> Result<R, ApiError>) -
 impl Store {
     /// Verify the password, then derive the sidecar-MAC key and authenticate
     /// every entry's reservation-critical state (quarantining mismatches,
-    /// adopting legacy pre-MAC entries) — two PBKDF2 runs per unlock.
+    /// adopting entries of a legacy pre-MAC file) — two 1M-round PBKDF2 runs
+    /// per unlock, held under the store lock; acceptable at this module's
+    /// single-consumer concurrency, but callers should treat unlock as a
+    /// ~seconds operation. The session fields are set only after every
+    /// fallible step, so a failed unlock never leaves the store half
+    /// unlocked.
     pub(crate) fn unlock(&mut self, password: &str) -> Result<usize, ApiError> {
-        if let Some(entry) = self
+        match self
             .file
             .credentials
             .iter()
             .find(|(hash, _)| !self.quarantined.contains(*hash))
-            .map(|(_, e)| e)
         {
-            match keystore::decrypt(password, &entry.crypto) {
+            Some((_, entry)) => match keystore::decrypt(password, &entry.crypto) {
                 Ok(_) => {}
                 Err(keystore::KeystoreError::BadPassword) => {
                     return Err(ApiError::new(
@@ -242,13 +246,39 @@ impl Store {
                     ))
                 }
                 Err(e) => return Err(ApiError::internal(&format!("keystore decrypt: {e}"))),
+            },
+            // Refuse an all-quarantined store outright: with nothing to
+            // verify against, ANY password would "unlock" vacuously and be
+            // adopted as the session/MAC key — silently splitting the
+            // keystore across two passwords at the next register.
+            None if !self.file.credentials.is_empty() => {
+                return Err(ApiError::internal(
+                    "every keystore entry is quarantined (metadata tamper); restore \
+                     rln_keystore.json from a backup",
+                ))
             }
+            // Empty keystore: any password unlocks and becomes the
+            // encryption password at first write (see module docs).
+            None => {}
         }
-        self.session_password = Some(Zeroizing::new(password.to_string()));
 
         // Sidecar authentication (see keystore.rs module docs, including what
-        // a MAC can and cannot stop): fresh salt on the first post-upgrade
-        // unlock, then verify or adopt each non-quarantined entry.
+        // a MAC can and cannot stop). Adoption of MAC-less entries is a
+        // one-shot migration gated on the FILE being legacy (no metaMacSalt):
+        // in an upgraded file every entry carries a MAC from insert, so a
+        // missing MAC there is tamper, not legacy.
+        let file_was_legacy = self.file.meta_mac_salt.is_none();
+        if file_was_legacy
+            && self.file.credentials.values().any(|e| e.membership.allocations_mac.is_some())
+        {
+            // MACs cannot exist without the salt they were keyed from: the
+            // salt was stripped or the file spliced from mixed versions.
+            return Err(ApiError::internal(
+                "metaMacSalt is missing but entries carry allocation MACs — the keystore \
+                 was tampered with or partially restored; restore rln_keystore.json from \
+                 a consistent backup",
+            ));
+        }
         let mut dirty = false;
         let salt = match &self.file.meta_mac_salt {
             Some(s) => s.clone(),
@@ -262,8 +292,15 @@ impl Store {
                 s
             }
         };
-        let key = keystore::derive_meta_mac_key(password, &salt)
-            .map_err(|e| ApiError::internal(&format!("meta MAC key: {e}")))?;
+        // A present-but-malformed salt fails closed on every unlock (fail
+        // here, not regenerate: a fresh salt would mass-quarantine every
+        // MAC'd entry); recovery is restoring the file from a backup.
+        let key = keystore::derive_meta_mac_key(password, &salt).map_err(|e| {
+            ApiError::internal(&format!(
+                "meta MAC key: {e}; if metaMacSalt is corrupt, restore rln_keystore.json \
+                 from a backup"
+            ))
+        })?;
         for (hash, entry) in &mut self.file.credentials {
             if self.quarantined.contains(hash) {
                 continue;
@@ -276,23 +313,38 @@ impl Store {
                     );
                     self.quarantined.insert(hash.clone());
                 }
-            } else if !meta.allocations.is_empty()
-                || meta.prune_floor > 0
-                || meta.epoch_size_sec > 0
-            {
-                // Legacy (pre-MAC) entry carrying live allocation state:
-                // adopt it. Stripping the MAC together with ALL its covered
-                // state reaches this same legacy shape — the documented
-                // residual (keystore.rs module docs).
+            } else if file_was_legacy {
+                // One-shot legacy adoption: every entry gets a MAC now, so a
+                // missing MAC can never pass again once the salt exists.
+                // Best-effort epoch-size binding for pre-upgrade allocation
+                // state (start() may not have run yet — then the binding
+                // waits for the first reservation; operators must not change
+                // epoch_size_sec while legacy rows are live, see README).
+                if meta.epoch_size_sec == 0
+                    && (!meta.allocations.is_empty() || meta.prune_floor > 0)
+                {
+                    if let Some(size) = crate::configured_epoch_size() {
+                        meta.epoch_size_sec = size;
+                    }
+                }
                 meta.allocations_mac = Some(keystore::meta_mac(&key, hash, meta));
                 dirty = true;
+            } else {
+                // Upgraded file, missing MAC: an attacker deleting just
+                // allocations_mac (to launder rewound counters through
+                // re-adoption) lands here.
+                eprintln!(
+                    "store: entry {hash} is missing its allocation MAC in an upgraded \
+                     keystore — quarantined"
+                );
+                self.quarantined.insert(hash.clone());
             }
-            // No MAC and no allocation state: MAC'd at first insert/reserve.
         }
-        self.meta_mac_key = Some(key);
         if dirty {
             self.persist()?;
         }
+        self.session_password = Some(Zeroizing::new(password.to_string()));
+        self.meta_mac_key = Some(key);
         Ok(self.file.credentials.len())
     }
 
@@ -436,6 +488,12 @@ impl Store {
     /// Mutate one record's metadata and persist. State changes go through
     /// here so history stays consistent: pass the new state via
     /// `MembershipMeta::state`; history appends automatically on change.
+    ///
+    /// Closures normally run in LOCKED mode (the poller) and must only touch
+    /// un-MAC'd cache fields; a mutation of MAC-covered state is restamped
+    /// when the key is available and REVERTED + refused when it is not —
+    /// persisting it under a stale MAC would falsely quarantine the entry at
+    /// the next unlock.
     pub(crate) fn update(
         &mut self,
         hash: &str,
@@ -445,7 +503,32 @@ impl Store {
             ApiError::new(ErrorKind::UnknownMembership, "no such membership_hash")
         })?;
         let before = entry.membership.state;
+        let covered_before = (
+            entry.membership.allocations.clone(),
+            entry.membership.epoch_size_sec,
+            entry.membership.prune_floor,
+        );
         f(&mut entry.membership);
+        let covered_changed = covered_before.0 != entry.membership.allocations
+            || covered_before.1 != entry.membership.epoch_size_sec
+            || covered_before.2 != entry.membership.prune_floor;
+        if covered_changed {
+            match self.meta_mac_key.as_ref() {
+                Some(key) => {
+                    entry.membership.allocations_mac =
+                        Some(keystore::meta_mac(key, hash, &entry.membership));
+                }
+                None => {
+                    let meta = &mut entry.membership;
+                    (meta.allocations, meta.epoch_size_sec, meta.prune_floor) = covered_before;
+                    return Err(ApiError::internal(
+                        "update touched MAC-covered allocation state while the keystore \
+                         is locked; reverted — route such mutations through the unlocked \
+                         reservation path",
+                    ));
+                }
+            }
+        }
         if entry.membership.state != before {
             entry.membership.state_history.push(StateChange {
                 at: crate::now_unix(),
@@ -483,8 +566,13 @@ impl Store {
         rate_limit: u64,
         epoch_size_sec: u64,
     ) -> Result<u64, ApiError> {
-        // Key check FIRST: a locked failure must leave the in-memory
-        // counters untouched.
+        // Guards FIRST — a refused call must leave the in-memory counters
+        // untouched. The quarantine check mirrors decrypt_credential: without
+        // it, a future caller could reserve from tampered counters and stamp
+        // a fresh valid MAC over them, laundering the tamper.
+        if self.quarantined.contains(hash) {
+            return Err(ApiError::internal("entry quarantined (metadata tamper)"));
+        }
         if self.meta_mac_key.is_none() {
             return Err(ApiError::new(
                 ErrorKind::Locked,
@@ -548,24 +636,31 @@ impl Store {
     }
 
     /// Remaining slots for `(membership, rln_identifier, epoch)` — the quota
-    /// read's current-epoch budget. Read-only.
+    /// read's current-epoch budget. Read-only. Mirrors the reserve path's
+    /// permanent refusals: an epoch below the persisted floor, or a
+    /// configured epoch size the membership isn't bound to, reports 0 — the
+    /// wire contract's fallback cue — instead of advertising slots
+    /// `reserve_message_id` will refuse.
     pub(crate) fn remaining_budget(
         &self,
         hash: &str,
         rln_identifier_hex: &str,
         epoch: u64,
         rate_limit: u64,
+        epoch_size_sec: u64,
     ) -> u64 {
         self.file
             .credentials
             .get(hash)
             .map(|e| {
-                crate::rate_limit::remaining(
-                    &e.membership.allocations,
-                    rln_identifier_hex,
-                    epoch,
-                    rate_limit,
-                )
+                let meta = &e.membership;
+                if meta.epoch_size_sec != 0 && meta.epoch_size_sec != epoch_size_sec {
+                    return 0;
+                }
+                if epoch < meta.prune_floor {
+                    return 0;
+                }
+                crate::rate_limit::remaining(&meta.allocations, rln_identifier_hex, epoch, rate_limit)
             })
             .unwrap_or(0)
     }
@@ -756,6 +851,9 @@ mod tests {
         .unwrap();
 
         // Tamper the sidecar registry_id on disk, then re-init: quarantined.
+        // With every entry quarantined, unlock refuses outright — a vacuous
+        // password match would otherwise adopt ANY password as the session
+        // key.
         let path = dir.join(keystore::KEYSTORE_FILE);
         let tampered = std::fs::read_to_string(&path)
             .unwrap()
@@ -764,7 +862,11 @@ mod tests {
         init(dir.clone());
         with_store(|s| {
             assert!(s.is_quarantined(&hash), "tampered entry must be quarantined");
-            s.unlock("pw")?; // verification skips quarantined entries
+            let denied = s.unlock("pw");
+            assert!(
+                matches!(denied, Err(ref e) if e.message.contains("quarantined")),
+                "an all-quarantined store must refuse every password: {denied:?}"
+            );
             assert!(s.decrypt_credential(&hash).is_err());
             Ok(())
         })
@@ -850,9 +952,15 @@ mod tests {
         })
         .unwrap();
 
-        // Reserve in epoch 10 (window floor 9) under epoch_size 600.
+        // Reserve in epoch 10, then in epoch 12 with the window floor at 11 —
+        // the second reservation prunes epoch 10's spent row and records
+        // floor 11, all under epoch_size 600.
         assert_eq!(
             with_store(|s| s.reserve_message_id(&hash, "aa", 10, 9, 5, 600)).unwrap(),
+            0
+        );
+        assert_eq!(
+            with_store(|s| s.reserve_message_id(&hash, "aa", 12, 11, 5, 600)).unwrap(),
             0
         );
 
@@ -861,17 +969,18 @@ mod tests {
         init(dir.clone());
         with_store(|s| s.unlock("pw").map(|_| ())).unwrap();
 
-        // Audit cause B/D: a rewound (or gap-widened) window re-admits epoch 4,
-        // but the persisted floor must refuse it instead of reissuing slot 0.
-        let rewound = with_store(|s| s.reserve_message_id(&hash, "aa", 4, 3, 5, 600));
+        // Audit cause B/D: a rewound (or gap-widened) window re-admits pruned
+        // epoch 10, but the persisted floor must refuse it instead of
+        // reissuing slot 0.
+        let rewound = with_store(|s| s.reserve_message_id(&hash, "aa", 10, 9, 5, 600));
         assert!(matches!(rewound, Err(e) if e.kind == ErrorKind::Permanent));
-        // Epoch 10 continues its persisted counter — slot 1, never a fresh 0.
+        // Epoch 12 continues its persisted counter — slot 1, never a fresh 0.
         assert_eq!(
-            with_store(|s| s.reserve_message_id(&hash, "aa", 10, 3, 5, 600)).unwrap(),
+            with_store(|s| s.reserve_message_id(&hash, "aa", 12, 11, 5, 600)).unwrap(),
             1
         );
         // A different epoch_size_sec rebases the epoch numbering: permanently refused.
-        let rebased = with_store(|s| s.reserve_message_id(&hash, "aa", 10, 9, 5, 1200));
+        let rebased = with_store(|s| s.reserve_message_id(&hash, "aa", 12, 11, 5, 1200));
         assert!(matches!(rebased, Err(e) if e.kind == ErrorKind::Permanent));
 
         reset_for_tests();
@@ -927,24 +1036,63 @@ mod tests {
         })
         .unwrap();
 
-        // Documented residual (keystore.rs module docs): stripping the MAC
-        // together with ALL its covered state reaches the legacy pre-MAC
-        // shape, which the next unlock re-adopts rather than detects. Pinned
-        // here as intended behavior, not a regression.
+        // Deleting just one entry's MAC (keeping the rewound state and the
+        // file's salt) must be DETECTED, not re-adopted: adoption is a
+        // one-shot legacy-file migration, and in an upgraded file a missing
+        // MAC is tamper.
         let mut v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let entry = v["credentials"][hash_a.as_str()]["membership"].as_object_mut().unwrap();
-        entry.remove("allocations");
-        entry.remove("allocations_mac");
-        entry.remove("epoch_size_sec");
-        entry.remove("prune_floor");
+        v["credentials"][hash_a.as_str()]["membership"]
+            .as_object_mut()
+            .unwrap()
+            .remove("allocations_mac");
         std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
         init(dir.clone());
         with_store(|s| {
             s.unlock("pw")?;
             assert!(
-                !s.is_quarantined(&hash_a),
-                "full strip-to-legacy is re-adopted (documented residual)"
+                s.is_quarantined(&hash_a),
+                "a stripped MAC in an upgraded file must quarantine"
+            );
+            assert!(!s.is_quarantined(&hash_b));
+            Ok(())
+        })
+        .unwrap();
+
+        // Stripping the salt while entry MACs remain is an inconsistency that
+        // must refuse unlock loudly (restore-from-backup guidance), not
+        // regenerate a salt and mass-quarantine.
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("metaMacSalt");
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        init(dir.clone());
+        with_store(|s| {
+            let denied = s.unlock("pw");
+            assert!(
+                matches!(denied, Err(ref e) if e.message.contains("metaMacSalt")),
+                "salt strip with MACs present must fail unlock: {denied:?}"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        // Documented residual (keystore.rs module docs, limit (3)): stripping
+        // the salt together with EVERY entry's MAC reaches the legacy shape,
+        // which the next unlock re-adopts rather than detects. Pinned here as
+        // the known limit, not a regression.
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for (_, entry) in v["credentials"].as_object_mut().unwrap() {
+            entry["membership"].as_object_mut().unwrap().remove("allocations_mac");
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        init(dir.clone());
+        with_store(|s| {
+            s.unlock("pw")?;
+            assert!(
+                !s.is_quarantined(&hash_a) && !s.is_quarantined(&hash_b),
+                "full salt+MAC strip reaches the legacy shape and is re-adopted"
             );
             Ok(())
         })

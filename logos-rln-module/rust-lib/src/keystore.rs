@@ -33,13 +33,20 @@
 //! a PBKDF2 key derived at unlock from the keystore password + the file-level
 //! `metaMacSalt`, over a canonical payload bound to the entry's
 //! membership_hash and a domain separator. Verified at every unlock; a
-//! failure quarantines the entry. This detects targeted edits (e.g. rewinding
-//! a spent `used` counter, which would reissue a slot and leak the identity
-//! secret) and MAC transplants between entries. It CANNOT detect: (1)
-//! whole-file rollback to an older honest snapshot — a restored backup was
-//! validly MAC'd; (2) stripping the MAC together with ALL MAC'd state back to
-//! the legacy shape, which the next unlock re-adopts as a pre-upgrade file;
-//! (3) an attacker who also knows the password. `rate_limit`/`leaf_index`
+//! failure quarantines the entry, as does a MISSING MAC once the file carries
+//! `metaMacSalt` (adoption of MAC-less entries is a one-shot legacy-file
+//! migration, so deleting one entry's MAC is detected, not re-adopted). This
+//! detects targeted edits (e.g. rewinding a spent `used` counter, which would
+//! reissue a slot and leak the identity secret) and MAC transplants between
+//! entries. It CANNOT detect: (1) whole-file rollback to an older honest
+//! snapshot — a restored backup was validly MAC'd; (2) per-entry SPLICE
+//! rollback — pasting one entry's older honest (state + MAC) block into the
+//! current file verifies, since the key/salt are file-stable and the payload
+//! carries no freshness anchor; (3) stripping `metaMacSalt` together with
+//! EVERY entry's MAC, which reaches the legacy shape the next unlock
+//! re-adopts (stripping the salt while any MAC remains fails unlock loudly
+//! instead); (4) an attacker who also knows the password.
+//! `rate_limit`/`leaf_index`
 //! stay OUTSIDE the MAC by design: the locked-mode poller self-heals them
 //! from the registry, and tampering them yields invalid proofs (the on-chain
 //! leaf pins poseidon(commitment, rate_limit)), not a share collision.
@@ -319,10 +326,17 @@ pub(crate) fn derive_meta_mac_key(
     password: &str,
     salt_hex: &str,
 ) -> Result<Zeroizing<[u8; 32]>, KeystoreError> {
-    let salt = hex_to_vec(salt_hex).ok_or(KeystoreError::Malformed("meta MAC salt"))?;
+    // Delegate to the one PBKDF2 site (derive_key) so the two KDF paths can
+    // never drift apart — drift would silently invalidate every stored MAC.
+    let params = KdfParams {
+        c: WRITE_KDF_ROUNDS,
+        dklen: DKLEN as u32,
+        prf: "hmac-sha256".to_string(),
+        salt: salt_hex.to_string(),
+    };
+    let dk = derive_key(password, &params)?;
     let mut key = Zeroizing::new([0u8; 32]);
-    pbkdf2::pbkdf2::<Hmac<Sha256>>(password.as_bytes(), &salt, WRITE_KDF_ROUNDS, &mut key[..])
-        .map_err(|_| KeystoreError::Malformed("meta MAC key length"))?;
+    key.copy_from_slice(&dk);
     Ok(key)
 }
 
@@ -490,12 +504,30 @@ pub(crate) fn save_atomic(dir: &Path, file: &KeystoreFile) -> io::Result<()> {
         f.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
     f.write_all(json.as_bytes())?;
-    f.sync_all()?;
+    sync_or_warn(&f, "keystore tmp")?;
     drop(f);
     fs::rename(&tmp, dir.join(KEYSTORE_FILE))?;
     #[cfg(unix)]
-    fs::File::open(dir)?.sync_all()?;
+    sync_or_warn(&fs::File::open(dir)?, "keystore dir")?;
     Ok(())
+}
+
+/// fsync, tolerating filesystems that cannot (`ErrorKind::Unsupported` —
+/// network/FUSE mounts, where F_FULLFSYNC/fsync may return ENOTSUP): there,
+/// durability degrades to best-effort with a stderr warning rather than
+/// bricking persistence entirely, which would be a total regression on such
+/// deployments. Any other error still fails the save.
+fn sync_or_warn(f: &fs::File, what: &str) -> io::Result<()> {
+    match f.sync_all() {
+        Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+            eprintln!(
+                "keystore: {what} fsync unsupported on this filesystem ({e}); continuing \
+                 WITHOUT power-loss durability — prefer a local persistence path"
+            );
+            Ok(())
+        }
+        r => r,
+    }
 }
 
 #[cfg(test)]
