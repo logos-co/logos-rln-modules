@@ -26,12 +26,14 @@
 //! Reads honor each envelope's own `kdfparams` (so foreign iteration counts
 //! decrypt); writes use `WRITE_KDF_ROUNDS`.
 //!
-//! ## Atomicity
+//! ## Atomicity & durability
 //!
-//! Writes go to `rln_keystore.json.tmp`, then POSIX `rename` over the
-//! target — a crash mid-write leaves the prior file intact. An unparseable
-//! file is renamed to `.bad.<unix-ts>` so the next save never overwrites
-//! evidence.
+//! Writes go to `rln_keystore.json.tmp` (0600), which is fsync'd, then POSIX
+//! `rename`d over the target, then the directory is fsync'd — a crash mid-write
+//! leaves the prior file intact, and a power cut cannot land the rename without
+//! the data (or lose the rename): the allocation counters this file carries
+//! must never rewind past proofs already issued. An unparseable file is renamed
+//! to `.bad.<unix-ts>` so the next save never overwrites evidence.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -333,13 +335,43 @@ pub(crate) fn load(dir: &Path) -> io::Result<KeystoreFile> {
     }
 }
 
-/// tmp + rename write; creates `dir` if needed.
+/// tmp + fsync + rename + dir-fsync write; creates `dir` if needed. 0600 perms.
+///
+/// Durable against power loss, not just process crash: `rename` alone orders
+/// nothing on stable storage — the rename can survive a power cut while the
+/// tmp file's data blocks do not, resurrecting a stale allocation counter
+/// whose slots are already spent on the wire (identity-secret exposure, see
+/// `rate_limit`). So the tmp file is `sync_all`'d (F_FULLFSYNC on macOS)
+/// before the rename and the directory is `sync_all`'d after it so the
+/// rename itself survives. Ordering verified by inspection — write →
+/// fsync(tmp) → rename → fsync(dir); power-loss behavior is not covered by
+/// tests, do not reorder.
 pub(crate) fn save_atomic(dir: &Path, file: &KeystoreFile) -> io::Result<()> {
+    use std::io::Write;
     fs::create_dir_all(dir)?;
     let tmp = dir.join(format!("{KEYSTORE_FILE}.tmp"));
     let json = serde_json::to_string_pretty(file).map_err(io::Error::other)?;
-    fs::write(&tmp, json)?;
-    fs::rename(&tmp, dir.join(KEYSTORE_FILE))
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&tmp)?;
+    #[cfg(unix)]
+    {
+        // mode() applies only at creation; force 0600 if tmp pre-existed.
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    f.write_all(json.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(&tmp, dir.join(KEYSTORE_FILE))?;
+    #[cfg(unix)]
+    fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -431,6 +463,12 @@ mod tests {
         save_atomic(&dir, &fresh).unwrap();
         let reloaded = load(&dir).unwrap();
         assert_eq!(reloaded.application, "logos-rln-membership");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.join(KEYSTORE_FILE)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "keystore must be private to the owner");
+        }
 
         // Corrupt file → quarantined to .bad.<ts>, fresh keystore returned.
         fs::write(dir.join(KEYSTORE_FILE), "{not json").unwrap();
