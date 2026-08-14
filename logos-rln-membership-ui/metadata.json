@@ -1,7 +1,7 @@
 {
   "name": "rln_membership_ui",
   "display_name": "RLN Membership",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "type": "ui_qml",
   "category": "blockchain",
   "description": "RLN membership GUI: guided onboarding wizard, membership status card, and an advanced expert view (drives liblogos_rln_module)",

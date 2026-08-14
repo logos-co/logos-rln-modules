@@ -74,7 +74,8 @@ LogosScrollView {
     function doOpen() {
         busy = true
         M.call(bridge, M.WALLET_MODULE, "open",
-               [configField.text.trim(), storageField.text.trim()], function (r) {
+               [configField.text.trim(), storageField.text.trim(),
+                M.statsPathFor(storageField.text.trim())], function (r) {
             view.busy = false
             if (r.error) { view.report(M.errorText(r.error), true); return }
             if (r.value === 0) {
@@ -94,7 +95,8 @@ LogosScrollView {
     function doCreate() {
         busy = true
         M.call(bridge, M.WALLET_MODULE, "open",
-               [configField.text.trim(), storageField.text.trim()], function (r) {
+               [configField.text.trim(), storageField.text.trim(),
+                M.statsPathFor(storageField.text.trim())], function (r) {
             if (!r.error && r.value === 0) {
                 view.busy = false
                 view.walletOpen = true
@@ -109,7 +111,8 @@ LogosScrollView {
 
     function doCreateFresh() {
         M.call(bridge, M.WALLET_MODULE, "create_new",
-               [configField.text.trim(), storageField.text.trim(), createPasswordField.text], function (r) {
+               [configField.text.trim(), storageField.text.trim(),
+                M.statsPathFor(storageField.text.trim()), createPasswordField.text], function (r) {
             if (r.error) { view.busy = false; view.report(M.errorText(r.error), true); return }
             var words = r.value !== undefined ? String(r.value) : ""
             if (words === "") {
