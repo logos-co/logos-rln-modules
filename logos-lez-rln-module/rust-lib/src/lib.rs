@@ -5,7 +5,7 @@
 //! tx, and the faucet funding flow (claim_tokens / get_token_balance). The
 //! chain logic lives in-crate (`mod rln_core`, plain Rust — no C ABI), and
 //! wallet access is over raw `lp_*` protocol calls to the wallet module
-//! (`logos_execution_zone`) with per-call timeouts (60s reads, 180s
+//! (`lez_core`) with per-call timeouts (60s reads, 180s
 //! registration tx) — the SDK's generated typed client has no per-call
 //! timeout and would cap every call at the 20s protocol default.
 //!
@@ -40,7 +40,7 @@ mod generated {
 }
 pub(crate) use generated::*;
 
-const WALLET_MODULE: &str = "logos_execution_zone";
+const WALLET_MODULE: &str = "lez_core";
 /// Timeout on account_id_from_base58 / get_account_public.
 const READ_TIMEOUT_MS: c_int = 60_000;
 /// Timeout on send_generic_public_transaction.

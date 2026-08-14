@@ -9,7 +9,7 @@
   "category": "blockchain",
   "main": "liblogos_lez_rln_module_plugin",
   "dependencies": [
-    "logos_execution_zone"
+    "lez_core"
   ],
   "include": [],
   "capabilities": [],
@@ -20,8 +20,8 @@
     }
   },
   "dependency_overrides": {
-    "logos_execution_zone": {
-      "file": "rust-lib/deps/logos_execution_zone.lidl"
+    "lez_core": {
+      "file": "rust-lib/deps/lez_core.lidl"
     }
   },
   "nix": {

@@ -12,7 +12,7 @@
       forAllSystems = fn: nixpkgs.lib.genAttrs systems fn;
 
       # The builder runs logos-lidl-gen to emit the C ABI scaffold (+ the
-      # typed logos_execution_zone dependency client) at rust-lib/generated/,
+      # typed lez_core dependency client) at rust-lib/generated/,
       # compiles the staticlib, and wraps it in the Qt cdylib glue, driven by
       # metadata.json. Concurrency stays at the single default (see README
       # "Design constraints").

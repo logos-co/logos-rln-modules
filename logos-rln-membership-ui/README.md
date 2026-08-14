@@ -61,7 +61,7 @@ reference implementation `logos-package-manager-ui`):
 | Confirmation poll | `liblogos_rln_module.get_membership_state(registry_id, rln_identifier_hex)` every 10s until the pending window settles |
 | Memberships list | `liblogos_rln_module.get_memberships(registry_id)` (public view, works locked) |
 | One-click wallet | `liblogos_rln_module.provision_wallet_home({"sequencer_addr":…})` → wallet-home under the module's basecamp data dir, then `open` when `storage_exists`, else `create_new` + `save` |
-| Open / create wallet | `logos_execution_zone.open(config_path, storage_path)` / `create_new(config_path, storage_path, password)` + `save()` (create shows the mnemonic ONCE) |
+| Open / create wallet | `lez_core.open(config_path, storage_path, statistics_path)` / `create_new(config_path, storage_path, password)` + `save()` (create shows the mnemonic ONCE) |
 | Sync | `get_current_block_height()` (head discovery) → `sync_to_block(head)` retried until it returns 0 **and** `get_last_synced_block()` reaches the head (progress-polled) |
 | Faucet claim | `create_account_public()` → `liblogos_lez_rln_module.get_token_balance` until `exists:false` → `claim_tokens(config_hex, holding_hex, amount)` → balance-polled until the credit lands (hard timeout) |
 | Claim sizing | `liblogos_lez_rln_module.get_registry_bounds(config_hex)` → suggested amount = default rate × `price_per_unit` × 1.2 (editable) |

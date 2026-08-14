@@ -6,10 +6,16 @@
 
     logos-core.url = "github:logos-co/logos-cpp-sdk/25c88f4d48fa95ea4437194bcf60bd8d0cf84a74";
 
-    logos-execution-zone.url = "github:logos-blockchain/logos-execution-zone?rev=e37876a64028a335eb693198a1ed6a0e875ec5b4";
+    # lez v0.2.2 exactly — the hosted testnet's era. NOT upstream main:
+    # cd47b9e's tx-polling binds wallet_ffi_poll_transaction_status (post-
+    # v0.2.2), and 87fca2a1's wallet storage renames PrivateKeyHolder's
+    # nullifier_secret_key to a derived authorization_secret_key, which
+    # rejects every v0.2.2-written storage.json (and lez-rln's host tools
+    # still write the v0.2.2 schema).
+    logos-execution-zone.url = "github:logos-blockchain/logos-execution-zone?rev=d6e4ae694e7419f5906b340c232704466a1917b7";
 
     logos-wallet-module = {
-      url = "github:logos-blockchain/logos-execution-zone-module?rev=d70225ced646934d2294fd9e8f8b03615c104b80";
+      url = "github:logos-blockchain/logos-execution-zone-module?rev=549cf1159f20fa0c3fe8e88a5ab71de68a5aa34b";
       inputs.logos-execution-zone.follows = "logos-execution-zone";
     };
 

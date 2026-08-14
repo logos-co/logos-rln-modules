@@ -1,8 +1,9 @@
-; logos_execution_zone contract — the subset the RLN module uses. Supplied as
+; lez_core contract — the subset the RLN module uses. Supplied as
 ; a dependency_override: the consumer generates a typed
-; LogosExecutionZoneClient from just these three methods instead of the full
+; LezCoreClient from just these three methods instead of the full
 ; wallet surface. Signatures must stay in sync with the wallet module's own
-; logos_execution_zone.lidl.
+; interface (src/lez_core_module.h upstream; the module id was
+; logos_execution_zone before logos-execution-zone-module@01c6f40).
 ;
 ; Call sites (rust-lib/src/lib.rs): resolve_account_id ->
 ; account_id_from_base58; fetch_account_data* -> get_account_public;
@@ -11,8 +12,8 @@
 ; account_ids/signing_requirements/instruction as QVariant-wrapped
 ; QVariantLists and treats an EMPTY string return as failure.
 ; Original C++ call-site evidence: git show 4b403c1:logos-lez-rln-module/src/logos_lez_rln_module.cpp
-module logos_execution_zone {
-  version "1.0.0"
+module lez_core {
+  version "0.4.0"
 
   ; Decode a base58 account id to 64 hex chars; empty string on failure.
   method account_id_from_base58(base58_str: tstr) -> tstr description "Decode a base58 account id to 64 hex chars; empty string on failure."
