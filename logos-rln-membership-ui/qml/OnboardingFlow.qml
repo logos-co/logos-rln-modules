@@ -38,15 +38,25 @@ Item {
     // The wallet's block when this sync began — the progress bar's origin.
     property int syncStart: 0
     property int lastSynced: -1
-    // Total sync_to_block calls this run (hard global bound) and consecutive
-    // no-progress failures on the current chunk (bounded retries).
+    // Total sync_to_block calls this run (hard global bound).
     property int syncAttempts: 0
-    property int syncChunkRetries: 0
     property bool syncToppedUp: false
-    // The testnet syncs ~110–180 blocks/s: 500-block chunks give a visible
-    // bar step every few seconds and keep a fresh sync well inside the
-    // 200-call attempt budget.
-    readonly property int syncChunk: 500
+    // Sync throughput varies wildly: ~110–180 blocks/s when first measured
+    // (2026-08-04), but ~8–10 blocks/s for the v0.2.2 wallet against the
+    // hosted testnet (2026-08-14). 250-block chunks keep one chunk near ~30s
+    // even at the slow end, so the bar still ticks and the probe loop can
+    // tell "slow" from "stuck".
+    readonly property int syncChunk: 250
+    // The wallet module serves NO reads while a sync_to_block runs: a slow
+    // chunk outlives the bridge reply, and progress probes queue behind it —
+    // both come back bridge_failure while the wallet keeps syncing
+    // underneath. So the chunk reply is advisory; probeChunk re-checks every
+    // syncProbeMs and declares failure only after syncProbePatienceMs with
+    // NO block progress (any advance resets the patience). Test-tunable.
+    property int syncProbeMs: 3000
+    property int syncProbePatienceMs: 180000
+    property int syncChunkTarget: 0
+    property double syncProbeDeadline: 0
 
     // Phase C — keystore password check (fired by the password step's Next).
     property string unlockPhase: "idle"
@@ -264,7 +274,7 @@ Item {
         if (syncPhase === "running" || syncPhase === "done")
             return
         syncAttempts = 0
-        syncChunkRetries = 0
+        syncChunkTarget = 0
         syncToppedUp = false
         syncPhase = "running"
         syncError = ""
@@ -304,31 +314,41 @@ Item {
                 + "or registering."
             return
         }
-        var chunkTarget = Math.min(lastSynced + syncChunk, syncTarget)
-        M.call(bridge, M.WALLET_MODULE, "sync_to_block", [chunkTarget], function (r) {
-            M.call(bridge, M.WALLET_MODULE, "get_last_synced_block", [], function (r2) {
-                var last = (!r2.error && r2.value !== undefined) ? r2.value : -1
-                var progressed = last > flow.lastSynced
-                if (last >= 0)
-                    flow.lastSynced = last
-                if (!r.error && r.value === 0 && last >= chunkTarget) {
-                    flow.syncChunkRetries = 0
-                    if (last >= flow.syncTarget)
-                        flow.syncTopUp()
-                    else
-                        flow.syncChunkStep()
-                } else if (progressed || flow.syncChunkRetries < 3) {
-                    flow.syncChunkRetries = progressed ? 0 : flow.syncChunkRetries + 1
-                    flow.syncChunkStep()
-                } else {
-                    flow.syncPhase = "error"
-                    flow.syncError = "Sync did not complete (last status "
-                        + (r.error ? r.error.kind : r.value) + ", synced " + last + " / "
-                        + flow.syncTarget + "). Transactions from an unsynced wallet are "
-                        + "accepted but never apply — retry before claiming or registering."
-                }
-            })
+        flow.syncChunkTarget = Math.min(lastSynced + syncChunk, syncTarget)
+        flow.syncProbeDeadline = Date.now() + syncProbePatienceMs
+        M.call(bridge, M.WALLET_MODULE, "sync_to_block", [flow.syncChunkTarget], function (r) {
+            // The reply is advisory — see the syncProbeMs comment. Success and
+            // bridge_failure alike fall through to the probe loop.
+            flow.probeChunk()
         }, 0)
+    }
+
+    function probeChunk() {
+        M.call(bridge, M.WALLET_MODULE, "get_last_synced_block", [], function (r2) {
+            var last = (!r2.error && r2.value !== undefined) ? r2.value : -1
+            if (last > flow.lastSynced) {
+                flow.lastSynced = last
+                flow.syncProbeDeadline = Date.now() + flow.syncProbePatienceMs
+            }
+            if (last >= flow.syncChunkTarget) {
+                if (last >= flow.syncTarget)
+                    flow.syncTopUp()
+                else
+                    flow.syncChunkStep()
+            } else if (Date.now() < flow.syncProbeDeadline) {
+                // Still inside the patience window: the chunk is (probably)
+                // grinding server-side. Re-probe after a pause — each probe
+                // already self-paces by its own bridge timeout when queued.
+                syncProbeTimer.restart()
+            } else {
+                flow.syncPhase = "error"
+                flow.syncError = "Sync did not complete (no progress for "
+                    + Math.round(flow.syncProbePatienceMs / 1000) + "s, last status "
+                    + (r2.error ? r2.error.kind : last) + ", synced " + last + " / "
+                    + flow.syncTarget + "). Transactions from an unsynced wallet are "
+                    + "accepted but never apply — retry before claiming or registering."
+            }
+        })
     }
 
     // The head can advance while a long sync runs; one top-up pass re-syncs
@@ -782,6 +802,13 @@ Item {
             flow.rateLimitMismatch = r.rate_limit_mismatch === true
             regTimer.start()
         })
+    }
+
+    Timer {
+        id: syncProbeTimer
+        interval: flow.syncProbeMs
+        repeat: false
+        onTriggered: flow.probeChunk()
     }
 
     Timer {

@@ -163,15 +163,24 @@ LogosScrollView {
         M.call(bridge, M.WALLET_MODULE, "sync_to_block", [syncTarget], function (r) {
             M.call(bridge, M.WALLET_MODULE, "get_last_synced_block", [], function (r2) {
                 var last = (!r2.error && r2.value !== undefined) ? r2.value : -1
-                view.lastSynced = last
+                var progressed = last > view.lastSynced
+                if (last >= 0)
+                    view.lastSynced = last
                 if (!r.error && r.value === 0 && last >= view.syncTarget) {
                     progressTimer.stop()
                     view.syncing = false
                     view.synced = true
                     view.report("Synced to block " + last + ".", false)
                     view.fetchSuggestedAmount()
-                } else if (view.syncAttempts < 10) {
-                    view.runSyncAttempt()
+                } else if (progressed || view.syncAttempts < 40) {
+                    // A slow chain outlives the bridge reply while the wallet
+                    // keeps syncing (the module serves no reads meanwhile) —
+                    // each attempt already waits out its own bridge timeout,
+                    // and observed progress resets the budget. Pause before
+                    // re-issuing so retries don't storm the module queue.
+                    if (progressed)
+                        view.syncAttempts = 0
+                    syncRetryTimer.restart()
                 } else {
                     progressTimer.stop()
                     view.syncing = false
@@ -303,6 +312,13 @@ LogosScrollView {
         interval: 4000
         repeat: true
         onTriggered: view.pollSyncProgress()
+    }
+
+    Timer {
+        id: syncRetryTimer
+        interval: 3000
+        repeat: false
+        onTriggered: view.runSyncAttempt()
     }
 
     Timer {
