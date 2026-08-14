@@ -17,10 +17,10 @@ v2.0.0 dropped the C++-era frozen wire surface: `generate_identity`,
 ## Layout
 
 - `metadata.json` — module manifest: `codegen.rust` drives logos-module-builder
-  (lidl scaffold + typed `logos_execution_zone` client + Qt cdylib glue).
+  (lidl scaffold + typed `lez_core` client + Qt cdylib glue).
 - `rust-lib/liblogos_lez_rln_module.lidl` — the module contract (7 methods, no
   events).
-- `rust-lib/deps/logos_execution_zone.lidl` — hand-maintained dependency
+- `rust-lib/deps/lez_core.lidl` — hand-maintained dependency
   contract for the wallet module, wired via `dependency_overrides`.
 - `rust-lib/src/lib.rs` — the provider implementation (wallet lp client + the
   7 handlers).
@@ -29,7 +29,7 @@ v2.0.0 dropped the C++-era frozen wire surface: `generate_identity`,
 - `rust-lib/generated/provider_gen.rs` — checked-in scaffold for local
   `cargo check`/tests; the nix build regenerates it. Regenerate manually with:
   `logos-lidl-gen rust-lib/liblogos_lez_rln_module.lidl --provider \
-   --dep logos_execution_zone=rust-lib/deps/logos_execution_zone.lidl \
+   --dep lez_core=rust-lib/deps/lez_core.lidl \
    -o rust-lib/generated/provider_gen.rs`
 
 ## Staged sources (not committed)

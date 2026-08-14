@@ -6,7 +6,7 @@
 
 var RLN_MODULE = "liblogos_rln_module";
 var LEZ_RLN_MODULE = "liblogos_lez_rln_module";
-var WALLET_MODULE = "logos_execution_zone";
+var WALLET_MODULE = "lez_core";
 // Gifter path (alternative registration) only — unused by the wallet path:
 // rln_gifter_module runs the gifter protocol and relays libp2p_module calls;
 // keycard_capture_module does the in-process PC/SC Keycard IDENTIFY capture;

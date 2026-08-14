@@ -12,7 +12,7 @@ module liblogos_lez_rln_module {
   version "2.0.0"
   description "RLN registry provider (LEZ chain reads + registration/funding txs)"
   category "blockchain"
-  depends [logos_execution_zone]
+  depends [lez_core]
 
   ; Compact JSON array of 32-byte lowercase-hex roots (current + non-zero
   ; history), or "" on error.

@@ -36,11 +36,20 @@ pub(crate) fn provision_impl(options_json: &str) -> Result<serde_json::Value, Ap
     let config_existed = config_path.exists();
     if !config_existed {
         let config = serde_json::json!({
+            // Dual-shape sequencer field, mirroring stage.sh: lez >= v0.2.1
+            // requires `sequencers` (no serde default), the rc6-era wallet
+            // reads flat `sequencer_addr`; neither denies unknown fields.
             "sequencer_addr": sequencer,
+            "sequencers": [{ "sequencer_addr": sequencer }],
             "seq_poll_timeout": "30s",
             "seq_tx_poll_max_blocks": 15,
             "seq_poll_max_retries": 10,
             "seq_block_poll_max_amount": 100,
+            // v0.2.2 open calibrates each sequencer with calibration_limit
+            // sequential probes when no statistics file exists (default 100 —
+            // minutes against a slow chain, and open blocks the module's
+            // dispatch the whole time). One sequencer, 3 probes.
+            "multi_sequencer_client_config": { "distribution_limit": 1, "calibration_limit": 3 },
         });
         // Atomic tmp+rename: the wallet module reads this file from another
         // process.
@@ -120,10 +129,12 @@ mod tests {
             on_disk,
             serde_json::json!({
                 "sequencer_addr": "https://seq.example/",
+                "sequencers": [{ "sequencer_addr": "https://seq.example/" }],
                 "seq_poll_timeout": "30s",
                 "seq_tx_poll_max_blocks": 15,
                 "seq_poll_max_retries": 10,
                 "seq_block_poll_max_amount": 100,
+                "multi_sequencer_client_config": { "distribution_limit": 1, "calibration_limit": 3 },
             })
         );
 
