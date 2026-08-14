@@ -41,12 +41,25 @@ env:
   # to that repo for checkout to fetch it).
   GIFTER_REPO: logos-co/logos-rln-gifter
   GIFTER_REV: be6ddc84feec68a7e7ab01562ffeb8128c7cfb98
+  # TEMPORARY SHADOW of the official catalog's lez_core: its published 0.4.0
+  # bundles a pre-v0.2.2 wallet-ffi that cannot parse the v0.2.2 chain's
+  # privacy-preserving transactions — wallet sync wedges forever at the first
+  # one (testnet block 1078). Publish our own build instead: the exact rev the
+  # rln-modules flake pins (lssa tag v0.2.2) and the register e2e validated,
+  # re-versioned 0.4.1 so dependency resolution prefers it over the stale
+  # official bundle. REMOVE the EZ_MODULE_* lines, the MODULE_DIRS entry, and
+  # the three checkout + shadow-version steps once the official catalog
+  # republishes a v0.2.2-era lez_core at or above 0.4.1.
+  EZ_MODULE_REPO: logos-blockchain/logos-execution-zone-module
+  EZ_MODULE_REV: 549cf1159f20fa0c3fe8e88a5ab71de68a5aa34b
+  EZ_MODULE_SHADOW_VERSION: "0.4.1"
   # Every module dir the catalog publishes, local and external. The three
   # per-module loops below all iterate this one list.
   MODULE_DIRS: >-
     logos-lez-rln-module
     logos-rln-module
     logos-rln-membership-ui
+    external/logos-execution-zone-module
     external/logos-rln-gifter/rust/rln-gifter-module
     external/logos-rln-gifter/rust/keycard-capture-module
     external/logos-rln-gifter/rust/keycard-auth-module
@@ -67,6 +80,19 @@ jobs:
           repository: ${{ env.GIFTER_REPO }}
           ref: ${{ env.GIFTER_REV }}
           path: external/logos-rln-gifter
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.EZ_MODULE_REPO }}
+          ref: ${{ env.EZ_MODULE_REV }}
+          path: external/logos-execution-zone-module
+      # Shadow-version — see the EZ_MODULE_* note in env.
+      - name: Re-version the shadowed lez_core module
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq --arg v "$EZ_MODULE_SHADOW_VERSION" '.version = $v' \
+            external/logos-execution-zone-module/metadata.json > _ez_meta.json
+          mv _ez_meta.json external/logos-execution-zone-module/metadata.json
       - id: decide
         shell: bash
         env:
@@ -135,6 +161,19 @@ jobs:
           repository: ${{ env.GIFTER_REPO }}
           ref: ${{ env.GIFTER_REV }}
           path: external/logos-rln-gifter
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.EZ_MODULE_REPO }}
+          ref: ${{ env.EZ_MODULE_REV }}
+          path: external/logos-execution-zone-module
+      # Shadow-version — see the EZ_MODULE_* note in env.
+      - name: Re-version the shadowed lez_core module
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq --arg v "$EZ_MODULE_SHADOW_VERSION" '.version = $v' \
+            external/logos-execution-zone-module/metadata.json > _ez_meta.json
+          mv _ez_meta.json external/logos-execution-zone-module/metadata.json
 
       # The heavy zerokit build needs the attic cache.
       - name: Setup Nix and Logos cache
@@ -168,6 +207,8 @@ jobs:
                   nix run "path:./$dir#generate" -L ;;
                 logos-rln-membership-ui)
                   : ;;  # pure QML — no staging
+                external/logos-execution-zone-module)
+                  : ;;  # builder codegens in-derivation — no staging
                 external/logos-rln-gifter/*)
                   : ;;  # builder codegens in-derivation — no staging
                 *)
@@ -215,6 +256,19 @@ jobs:
           repository: ${{ env.GIFTER_REPO }}
           ref: ${{ env.GIFTER_REV }}
           path: external/logos-rln-gifter
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.EZ_MODULE_REPO }}
+          ref: ${{ env.EZ_MODULE_REV }}
+          path: external/logos-execution-zone-module
+      # Shadow-version — see the EZ_MODULE_* note in env.
+      - name: Re-version the shadowed lez_core module
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq --arg v "$EZ_MODULE_SHADOW_VERSION" '.version = $v' \
+            external/logos-execution-zone-module/metadata.json > _ez_meta.json
+          mv _ez_meta.json external/logos-execution-zone-module/metadata.json
 
       - name: Setup Nix and Logos cache
         uses: logos-co/setup-nix-cache-action@v1
