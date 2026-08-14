@@ -15,10 +15,12 @@ var LIBP2P_MODULE = "libp2p_module";
 var GIFTER_MODULE = "rln_gifter_module";
 var CAPTURE_MODULE = "keycard_capture_module";
 
-// shared-faucet testnet registry (CAIP-10; descriptor under
-// <repo>/deployments/shared-faucet/) — the GUI's prefill, freely editable.
+// testnet-shrink-verify registry (CAIP-10; descriptor under
+// logos-lez-rln deployments/testnet-shrink-verify/) — the GUI's prefill,
+// freely editable. The previous shared-faucet instance died with the
+// testnet reset; its config account no longer exists on-chain.
 var TESTNET_REGISTRY_ID =
-    "logos:testnet:bf24f9e9f0440d7c7268cfc5ce6edb981feda003104c9d96ca276443ccc0a607";
+    "logos:testnet:2fdff09aec02fe4f03157c77bddfa36bd3fd4c8ac546558daf4fe174647e5542";
 
 var RATE_LIMIT_MIN = 100;
 var RATE_LIMIT_MAX = 600;
@@ -40,9 +42,18 @@ function sc(x) {
     return Math.round(x * UI_SCALE);
 }
 
-// The deployed testnet sequencer (deployments/shared-faucet/deployment.json)
+// The deployed testnet sequencer (testnet-shrink-verify deployment)
 // — prefill for provision_wallet_home's wallet_config.json.
 var TESTNET_SEQUENCER_ADDR = "https://testnet.lez.logos.co/";
+
+// The wallet's open/create_new take a statistics_path since LEZ v0.2.2
+// (sequencer-latency stats live beside the wallet). Derived from the storage
+// path so it works for provision_wallet_home's layout and hand-entered
+// Advanced paths alike; the file need not pre-exist.
+function statsPathFor(storagePath) {
+    var i = storagePath.lastIndexOf("/");
+    return (i >= 0 ? storagePath.substring(0, i + 1) : "") + "statistics.json";
+}
 
 // StepGifter prefills, both freely editable. Defaults point at the local dev
 // gifter (tools/run-local-gifter.sh), whose fixed node key keeps this peerId

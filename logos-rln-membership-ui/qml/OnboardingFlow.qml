@@ -211,7 +211,8 @@ Item {
     // a previous run reports open != 0; a working chain-head read proves it
     // is still usable.
     function openWallet(configPath, storagePath) {
-        callRetry(M.WALLET_MODULE, "open", [configPath, storagePath], function (r) {
+        callRetry(M.WALLET_MODULE, "open",
+               [configPath, storagePath, M.statsPathFor(storagePath)], function (r) {
             if (!r.error && r.value === 0) {
                 flow.walletPhase = "done"
                 flow.startSync()
@@ -234,7 +235,7 @@ Item {
     // mirrors WalletView.doCreateFresh — keep in sync
     function createWallet(configPath, storagePath) {
         M.call(bridge, M.WALLET_MODULE, "create_new",
-               [configPath, storagePath, password], function (r) {
+               [configPath, storagePath, M.statsPathFor(storagePath), password], function (r) {
             if (r.error) {
                 // create_new returns "" (-> empty_reply) when a DIFFERENT
                 // wallet is already open in the daemon; that wallet is
@@ -646,14 +647,16 @@ Item {
             var configPath = String(r.config_path || "")
             var storagePath = String(r.storage_path || "")
             if (r.storage_exists === true) {
-                flow.callRetry(M.WALLET_MODULE, "open", [configPath, storagePath], function (ro) {
+                flow.callRetry(M.WALLET_MODULE, "open",
+                       [configPath, storagePath, M.statsPathFor(storagePath)], function (ro) {
                     // A non-zero open on an already-open daemon wallet is fine for
                     // reads; proceed either way.
                     flow.gifterWalletReady = true
                     cb("")
                 })
             } else {
-                M.call(bridge, M.WALLET_MODULE, "create_new", [configPath, storagePath, flow.password], function (rc) {
+                M.call(bridge, M.WALLET_MODULE, "create_new",
+                       [configPath, storagePath, M.statsPathFor(storagePath), flow.password], function (rc) {
                     if (rc.error && rc.error.kind !== "empty_reply") {
                         cb("Couldn't create the wallet: " + M.errorText(rc.error)); return
                     }
