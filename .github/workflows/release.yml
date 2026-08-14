@@ -182,10 +182,21 @@ jobs:
           attic-token-ci: ${{ secrets.ATTIC_TOKEN_CI }}
           attic-token-public: ${{ secrets.ATTIC_TOKEN_PUBLIC }}
 
+      # risc0-build-kernel invokes `xcrun metal` / `metallib` to compile GPU
+      # kernels. On macOS, the Metal Toolchain is a per-user optional Xcode
+      # component that must be installed explicitly before the nix build.
+      - name: Install Metal Toolchain (macOS only)
+        if: startsWith(matrix.variant, 'darwin')
+        run: xcodebuild -downloadComponent MetalToolchain
+
       - name: Build portable .lgx (${{ matrix.variant }})
         shell: bash
         env:
           TO_BUILD: ${{ needs.plan.outputs.to_build }}
+          # risc0-build-kernel compiles Metal GPU kernels on macOS, which
+          # requires access to the system Xcode Metal Toolchain — outside the
+          # Nix sandbox. Disable the sandbox for darwin builds only.
+          NIX_SANDBOX_OPT: ${{ startsWith(matrix.variant, 'darwin') && '--option sandbox false' || '' }}
         run: |
           set -uo pipefail
           mkdir -p _artifacts
@@ -214,7 +225,8 @@ jobs:
                 *)
                   echo "::error::unknown module $dir"; exit 1 ;;
               esac
-              out="$(nix build "path:./$dir#lgx-portable" --no-link --print-out-paths -L)"
+              # shellcheck disable=SC2086
+              out="$(nix build "path:./$dir#lgx-portable" --no-link --print-out-paths -L $NIX_SANDBOX_OPT)"
               lgx="$(find "$out" -maxdepth 2 -name '*.lgx' | head -n1)"
               [ -n "$lgx" ] || { echo "::error::no .lgx produced for $dir"; exit 1; }
               name="$(jq -r .name "$dir/metadata.json")"
