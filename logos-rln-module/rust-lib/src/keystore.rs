@@ -32,35 +32,24 @@
 //! `prune_floor`) are HMAC'd per entry (`allocations_mac`): HMAC-SHA256 under
 //! a PBKDF2 key derived at unlock from the keystore password + the file-level
 //! `metaMacSalt`, over a canonical payload bound to the entry's
-//! membership_hash and a domain separator. Verified at every unlock; a
-//! failure quarantines the entry, as does a MISSING MAC once the file carries
-//! `metaMacSalt` (adoption of MAC-less entries is a one-shot legacy-file
-//! migration, so deleting one entry's MAC is detected, not re-adopted). This
-//! detects targeted edits (e.g. rewinding a spent `used` counter, which would
-//! reissue a slot and leak the identity secret) and MAC transplants between
-//! entries. It CANNOT detect: (1) whole-file rollback to an older honest
-//! snapshot — a restored backup was validly MAC'd; (2) per-entry SPLICE
-//! rollback — pasting one entry's older honest (state + MAC) block into the
-//! current file verifies, since the key/salt are file-stable and the payload
-//! carries no freshness anchor; (3) stripping `metaMacSalt` together with
-//! EVERY entry's MAC, which reaches the legacy shape the next unlock
-//! re-adopts (stripping the salt while any MAC remains fails unlock loudly
-//! instead); (4) an attacker who also knows the password.
-//! `rate_limit`/`leaf_index`
-//! stay OUTSIDE the MAC by design: the locked-mode poller self-heals them
-//! from the registry, and tampering them yields invalid proofs (the on-chain
-//! leaf pins poseidon(commitment, rate_limit)), not a share collision.
-//! Future hardening (out of scope): a keychain-anchored monotonic counter,
-//! which would also close the rollback case.
+//! membership_hash and a domain separator. Verified at every unlock: a
+//! mismatch quarantines the entry, as does a MISSING MAC once the file
+//! carries `metaMacSalt` (adoption of MAC-less entries is a one-shot
+//! legacy-file migration). It CANNOT detect: (1) whole-file rollback to an
+//! older honest snapshot; (2) per-entry splice of an older honest
+//! (state + MAC) block; (3) stripping `metaMacSalt` together with EVERY
+//! entry's MAC (the partial strips fail loudly instead); (4) an attacker who
+//! also knows the password. `rate_limit`/`leaf_index` stay OUTSIDE the MAC
+//! by design: the locked-mode poller self-heals them, and tampering them is
+//! self-DoS, not disclosure.
 //!
 //! ## Atomicity & durability
 //!
 //! Writes go to `rln_keystore.json.tmp` (0600), which is fsync'd, then POSIX
-//! `rename`d over the target, then the directory is fsync'd — a crash mid-write
-//! leaves the prior file intact, and a power cut cannot land the rename without
-//! the data (or lose the rename): the allocation counters this file carries
-//! must never rewind past proofs already issued. An unparseable file is renamed
-//! to `.bad.<unix-ts>` so the next save never overwrites evidence.
+//! `rename`d over the target, then the directory is fsync'd — a crash
+//! mid-write leaves the prior file intact, and a power cut cannot land the
+//! rename without the data. An unparseable file is renamed to
+//! `.bad.<unix-ts>` so the next save never overwrites evidence.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -474,16 +463,8 @@ pub(crate) fn load(dir: &Path) -> io::Result<KeystoreFile> {
 }
 
 /// tmp + fsync + rename + dir-fsync write; creates `dir` if needed. 0600 perms.
-///
-/// Durable against power loss, not just process crash: `rename` alone orders
-/// nothing on stable storage — the rename can survive a power cut while the
-/// tmp file's data blocks do not, resurrecting a stale allocation counter
-/// whose slots are already spent on the wire (identity-secret exposure, see
-/// `rate_limit`). So the tmp file is `sync_all`'d (F_FULLFSYNC on macOS)
-/// before the rename and the directory is `sync_all`'d after it so the
-/// rename itself survives. Ordering verified by inspection — write →
-/// fsync(tmp) → rename → fsync(dir); power-loss behavior is not covered by
-/// tests, do not reorder.
+/// The write → fsync(tmp) → rename → fsync(dir) ordering is power-loss-
+/// durability-critical and untestable in CI — do not reorder or drop a sync.
 pub(crate) fn save_atomic(dir: &Path, file: &KeystoreFile) -> io::Result<()> {
     use std::io::Write;
     fs::create_dir_all(dir)?;
@@ -513,10 +494,8 @@ pub(crate) fn save_atomic(dir: &Path, file: &KeystoreFile) -> io::Result<()> {
 }
 
 /// fsync, tolerating filesystems that cannot (`ErrorKind::Unsupported` —
-/// network/FUSE mounts, where F_FULLFSYNC/fsync may return ENOTSUP): there,
-/// durability degrades to best-effort with a stderr warning rather than
-/// bricking persistence entirely, which would be a total regression on such
-/// deployments. Any other error still fails the save.
+/// network/FUSE mounts): there durability degrades to a stderr warning
+/// rather than failing the save; any other error still fails it.
 fn sync_or_warn(f: &fs::File, what: &str) -> io::Result<()> {
     match f.sync_all() {
         Err(e) if e.kind() == io::ErrorKind::Unsupported => {

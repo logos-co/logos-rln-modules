@@ -133,9 +133,10 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
 - **Slot allocation is persist-before-issue, and the allocator is
   monotonic.** `generate_proof` durably records the `(rln_identifier, epoch,
   message_id)` allocation before the proof leaves the module (fsync'd write —
-  power-loss-safe, not merely crash-safe); two proofs on one slot reconstruct
-  the identity secret, so a crash may waste a slot but never double-spends
-  one. A persisted, monotonically non-decreasing floor (plus an epoch-size
+  power-loss-safe, not merely crash-safe, on filesystems that support fsync;
+  mounts that cannot sync warn loudly and degrade to crash-safe); two proofs
+  on one slot reconstruct the identity secret, so a crash may waste a slot
+  but never double-spends one. A persisted, monotonically non-decreasing floor (plus an epoch-size
   binding) refuses — `permanent` — any epoch a backwards clock step, a
   widened `max_epoch_gap`, or a changed `epoch_size_sec` would otherwise
   re-admit after its rows were pruned; recovery from a deliberate epoch-size

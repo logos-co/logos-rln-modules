@@ -224,12 +224,10 @@ pub(crate) fn with_store<R>(f: impl FnOnce(&mut Store) -> Result<R, ApiError>) -
 impl Store {
     /// Verify the password, then derive the sidecar-MAC key and authenticate
     /// every entry's reservation-critical state (quarantining mismatches,
-    /// adopting entries of a legacy pre-MAC file) — two 1M-round PBKDF2 runs
-    /// per unlock, held under the store lock; acceptable at this module's
-    /// single-consumer concurrency, but callers should treat unlock as a
-    /// ~seconds operation. The session fields are set only after every
-    /// fallible step, so a failed unlock never leaves the store half
-    /// unlocked.
+    /// adopting entries of a legacy pre-MAC file). Two 1M-round PBKDF2 runs —
+    /// treat unlock as a ~seconds operation. The session fields are set only
+    /// after every fallible step, so a failed unlock never leaves the store
+    /// half unlocked.
     pub(crate) fn unlock(&mut self, password: &str) -> Result<usize, ApiError> {
         match self
             .file
@@ -247,10 +245,9 @@ impl Store {
                 }
                 Err(e) => return Err(ApiError::internal(&format!("keystore decrypt: {e}"))),
             },
-            // Refuse an all-quarantined store outright: with nothing to
-            // verify against, ANY password would "unlock" vacuously and be
-            // adopted as the session/MAC key — silently splitting the
-            // keystore across two passwords at the next register.
+            // Refuse an all-quarantined store: with nothing to verify
+            // against, ANY password would "unlock" vacuously and become the
+            // session/MAC key.
             None if !self.file.credentials.is_empty() => {
                 return Err(ApiError::internal(
                     "every keystore entry is quarantined (metadata tamper); restore \
@@ -262,11 +259,10 @@ impl Store {
             None => {}
         }
 
-        // Sidecar authentication (see keystore.rs module docs, including what
-        // a MAC can and cannot stop). Adoption of MAC-less entries is a
-        // one-shot migration gated on the FILE being legacy (no metaMacSalt):
-        // in an upgraded file every entry carries a MAC from insert, so a
-        // missing MAC there is tamper, not legacy.
+        // Sidecar authentication (see keystore.rs module docs). Adoption of
+        // MAC-less entries is a one-shot migration gated on the FILE being
+        // legacy (no metaMacSalt): in an upgraded file a missing MAC is
+        // tamper, not legacy.
         let file_was_legacy = self.file.meta_mac_salt.is_none();
         if file_was_legacy
             && self.file.credentials.values().any(|e| e.membership.allocations_mac.is_some())
@@ -292,9 +288,8 @@ impl Store {
                 s
             }
         };
-        // A present-but-malformed salt fails closed on every unlock (fail
-        // here, not regenerate: a fresh salt would mass-quarantine every
-        // MAC'd entry); recovery is restoring the file from a backup.
+        // A present-but-malformed salt fails closed (never regenerate — a
+        // fresh salt would mass-quarantine every MAC'd entry).
         let key = keystore::derive_meta_mac_key(password, &salt).map_err(|e| {
             ApiError::internal(&format!(
                 "meta MAC key: {e}; if metaMacSalt is corrupt, restore rln_keystore.json \
@@ -314,12 +309,10 @@ impl Store {
                     self.quarantined.insert(hash.clone());
                 }
             } else if file_was_legacy {
-                // One-shot legacy adoption: every entry gets a MAC now, so a
-                // missing MAC can never pass again once the salt exists.
-                // Best-effort epoch-size binding for pre-upgrade allocation
-                // state (start() may not have run yet — then the binding
-                // waits for the first reservation; operators must not change
-                // epoch_size_sec while legacy rows are live, see README).
+                // One-shot legacy adoption: every entry gets a MAC now.
+                // Best-effort epoch-size binding for pre-upgrade rows
+                // (start() may not have run yet; operators must not change
+                // epoch_size_sec while legacy rows are live — see README).
                 if meta.epoch_size_sec == 0
                     && (!meta.allocations.is_empty() || meta.prune_floor > 0)
                 {
@@ -330,9 +323,8 @@ impl Store {
                 meta.allocations_mac = Some(keystore::meta_mac(&key, hash, meta));
                 dirty = true;
             } else {
-                // Upgraded file, missing MAC: an attacker deleting just
-                // allocations_mac (to launder rewound counters through
-                // re-adoption) lands here.
+                // Upgraded file, missing MAC: deleting just allocations_mac
+                // must be detected, never re-adopted.
                 eprintln!(
                     "store: entry {hash} is missing its allocation MAC in an upgraded \
                      keystore — quarantined"
@@ -546,17 +538,13 @@ impl Store {
     /// and durably persist it before returning — the caller uses the slot only
     /// after this call succeeds, so a crash can waste a slot but never reissue
     /// one. Requires an unlocked keystore (the sidecar MAC key derives from
-    /// the session password); `generate_proof` already decrypts the
-    /// credential — unlock-gated — before reserving.
+    /// the session password).
     ///
     /// `BudgetExhausted` when the epoch's `rate_limit` is spent. `Permanent`
-    /// when `epoch` is below the persisted allocation floor (a backwards
-    /// wall-clock step or a widened `max_epoch_gap` re-admitted a pruned,
-    /// possibly spent epoch), or when `epoch_size_sec` differs from the size
-    /// this membership's allocations are bound to — a changed epoch size
-    /// rebases the numeric epoch indexing that keys spent slots (and their
-    /// external nullifiers), which no floor conversion can make safe; the
-    /// recovery path is registering a fresh membership.
+    /// when `epoch` is below the persisted allocation floor, or when
+    /// `epoch_size_sec` differs from the size this membership's allocations
+    /// are bound to (an epoch-size change is not migratable — see
+    /// `MembershipMeta::epoch_size_sec`); recovery is a fresh membership.
     pub(crate) fn reserve_message_id(
         &mut self,
         hash: &str,
@@ -566,10 +554,9 @@ impl Store {
         rate_limit: u64,
         epoch_size_sec: u64,
     ) -> Result<u64, ApiError> {
-        // Guards FIRST — a refused call must leave the in-memory counters
-        // untouched. The quarantine check mirrors decrypt_credential: without
-        // it, a future caller could reserve from tampered counters and stamp
-        // a fresh valid MAC over them, laundering the tamper.
+        // Guards FIRST — a refused call must leave the counters untouched,
+        // and reserving from a quarantined entry would stamp a fresh valid
+        // MAC over tampered counters.
         if self.quarantined.contains(hash) {
             return Err(ApiError::internal("entry quarantined (metadata tamper)"));
         }
@@ -617,10 +604,8 @@ impl Store {
         meta.epoch_size_sec = epoch_size_sec; // adopt-on-first-success
         let key = self.meta_mac_key.as_ref().expect("checked above");
         meta.allocations_mac = Some(keystore::meta_mac(key, hash, meta));
-        // On persist failure the in-memory counter/floor stay advanced —
-        // deliberate: this call returns Err so no proof is issued for the
-        // slot; in-process it can only be WASTED, and after a restart the
-        // disk counter still equals the count of proof-backed slots.
+        // On persist failure the counter/floor deliberately stay advanced:
+        // no proof is issued, so the slot can only be WASTED, never reissued.
         self.persist()?;
         Ok(slot)
     }

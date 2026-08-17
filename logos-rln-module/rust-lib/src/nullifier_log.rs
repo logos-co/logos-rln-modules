@@ -11,13 +11,12 @@
 //! that can no longer host a fresh proof (below `now − max_epoch_gap`) is
 //! pruned, since a collision there is already undetectable.
 //!
-//! Known limit: unlike the GENERATION-side allocator (persisted, monotone
-//! floor — see `rate_limit`), this DETECTION-side log is in-memory and its
-//! prune floor tracks the wall clock, so a verifier restart or a backwards
-//! clock step forgets recorded nullifiers and a collision spanning that gap
-//! goes unobserved. That weakens detection, not the slot-uniqueness
-//! invariant; hardening it (persistence + a monotone floor, same fix class)
-//! is deliberately out of scope here.
+//! Known limit: this DETECTION-side log is in-memory and its prune floor
+//! tracks the wall clock, so a verifier restart or a backwards clock step
+//! forgets recorded nullifiers and a collision spanning that gap goes
+//! unobserved. That weakens detection, not the slot-uniqueness invariant;
+//! hardening it (persistence + a monotone floor, as in `rate_limit`) is
+//! deliberately out of scope.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

@@ -50,11 +50,8 @@ pub(crate) enum AllocError {
     /// The epoch's `rate_limit` slots are all spent; retry next epoch.
     BudgetExhausted,
     /// The requested epoch is below the persisted monotone floor — its row
-    /// was (or may have been) pruned, so reissuing could double-spend a slot
-    /// and leak the identity secret. Permanent for this epoch: a backwards
-    /// clock step or a widened `max_epoch_gap` re-admitted it, and the
-    /// allocator must answer an error rather than silently mint a colliding
-    /// proof.
+    /// was (or may have been) pruned, so reissuing could double-spend a
+    /// slot. Permanent for this epoch.
     EpochBelowFloor,
 }
 
@@ -73,30 +70,18 @@ pub(crate) fn current_epoch(now_unix: u64, epoch_size_sec: u64) -> u64 {
 /// Returns the slot, `BudgetExhausted` when that epoch's budget is spent, or
 /// `EpochBelowFloor` when `epoch` is below the effective floor.
 ///
-/// `retain_floor_candidate` is the oldest epoch the CURRENT window claims to
-/// serve (`now_epoch - max_epoch_gap`) — a wall-clock-derived value that can
-/// move backwards (NTP step, suspend/resume, VM restore), drop when
-/// `max_epoch_gap` is reconfigured wider, or SPIKE forward on a bad clock.
-/// `floor` is the persisted monotone floor: everything strictly below it may
-/// have had its row pruned, so a reservation there is refused forever —
-/// reissuing a pruned epoch's slot would expose the Shamir shares that
-/// reconstruct the identity secret.
+/// `retain_floor_candidate` is wall-clock-derived (`now_epoch -
+/// max_epoch_gap`) and untrusted: it can rewind, drop (widened gap), or
+/// spike forward. `floor` is the persisted monotone floor: epochs strictly
+/// below it may have had rows pruned and are refused forever. The threshold
+/// a call may advance the floor to is
+/// `max(*floor, min(candidate, highest allocated epoch + 1))` — monotone
+/// against a rewound candidate, capped so a spiked candidate can only prune
+/// what was actually allocated, inert when no rows exist.
 ///
-/// The prune threshold each call may advance to is
-/// `max(*floor, min(candidate, highest allocated epoch + 1))`:
-/// - `max(*floor, ..)` keeps the floor monotone against a rewound candidate;
-/// - capping the candidate at one past the highest allocated row means a
-///   forward clock spike can never persist a far-future floor that bricks
-///   the membership once the clock is corrected — only epochs whose rows
-///   actually existed (and are now pruned) become unservable, which is
-///   exactly the set at risk of reissue;
-/// - with no rows there is nothing to prune and the floor stays put.
-///
-/// Every error path leaves `allocations` and `floor` EXACTLY as found: the
-/// store restamps the sidecar MAC only on success, so an error must not
-/// diverge the in-memory state from its persisted MAC. Pruning likewise never
-/// drops an in-window epoch: interleaving timestamps can revisit a
-/// neighboring epoch, which must continue its counter.
+/// Every error path leaves `allocations` and `floor` EXACTLY as found (the
+/// store restamps the sidecar MAC only on success — do not add error-path
+/// mutation); pruning never drops an in-window epoch.
 ///
 /// The caller MUST durably persist `allocations` AND `floor` before using the
 /// returned slot.
@@ -117,10 +102,9 @@ pub(crate) fn reserve_slot(
         return Err(AllocError::EpochBelowFloor);
     }
 
-    // Allocate first — rows for several in-window epochs coexist, so the slot
-    // is looked up by `(rln_identifier, epoch)`, never by application alone —
-    // and only then advance the floor and prune, so both error returns above
-    // and below mutate nothing.
+    // Allocate first — the slot is looked up by `(rln_identifier, epoch)` —
+    // and only then advance the floor and prune, so every error return
+    // mutates nothing.
     let slot = if let Some(row) = allocations
         .iter_mut()
         .find(|a| a.rln_identifier == rln_identifier_hex && a.epoch == epoch)

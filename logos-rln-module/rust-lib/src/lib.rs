@@ -1026,13 +1026,10 @@ fn generate_proof_impl(
         }
     };
 
-    // Reserve + durably persist the slot BEFORE proving, so a crash can waste
-    // a slot but never reissue one. The candidate floor is the oldest epoch
-    // this window claims to serve; the store keeps a persisted MONOTONE floor
-    // (max of every candidate seen), so a backwards clock or a widened
-    // max_epoch_gap can never resurrect a pruned, possibly spent epoch, and
-    // every in-window epoch keeps its counter so an interleaving timestamp
-    // can't reuse a spent slot.
+    // Reserve + durably persist the slot BEFORE proving, so a crash can
+    // waste a slot but never reissue one. `retain_floor` is only the
+    // window's CANDIDATE; the store's persisted monotone floor decides what
+    // may be pruned or served.
     let retain_floor = now_epoch.saturating_sub(epoch_gap());
     let message_id = store::with_store(|s| {
         s.reserve_message_id(&hash, &rln_id_hex, epoch, retain_floor, meta.rate_limit, size)
