@@ -39,9 +39,13 @@
 //! older honest snapshot; (2) per-entry splice of an older honest
 //! (state + MAC) block; (3) stripping `metaMacSalt` together with EVERY
 //! entry's MAC (the partial strips fail loudly instead); (4) an attacker who
-//! also knows the password. `rate_limit`/`leaf_index` stay OUTSIDE the MAC
-//! by design: the locked-mode poller self-heals them, and tampering them is
-//! self-DoS, not disclosure.
+//! also knows the password (with keychain auto-unlock in use, any same-user
+//! process can read it — see `keychain`); (5) a COPIED keystore: the file is
+//! self-contained, so a second live instance verifies and forks the
+//! counters — migrate by moving, never copying (see README).
+//! `rate_limit`/`leaf_index` stay OUTSIDE the MAC by design: the
+//! locked-mode poller self-heals them, and tampering them is self-DoS, not
+//! disclosure.
 //!
 //! ## Atomicity & durability
 //!

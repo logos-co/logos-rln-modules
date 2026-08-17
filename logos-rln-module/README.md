@@ -152,8 +152,13 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   persistence path is enforced with an exclusive lock on
   `rln_keystore.lock`, failing closed; the lock is advisory, so
   network/shared-volume filesystems that don't honor OS file locks must
-  enforce single-process at the deployment layer. `budget_exhausted` when
-  the epoch's `rate_limit` slots are gone.
+  enforce single-process at the deployment layer. The no-reissue guarantee
+  is likewise per keystore INSTANCE: copying `rln_keystore.json` to a
+  second device (or importing it into another RLN stack — the envelope is
+  deliberately portable) forks the allocation counters, and concurrent use
+  of both copies discloses the identity secret; migrate a keystore by
+  moving it, never by copying. `budget_exhausted` when the epoch's
+  `rate_limit` slots are gone.
 - **Verification is hot-path-only.** `verify_proof` reads the locally
   maintained valid-root window and performs zero registry calls; a cold or
   stale window answers `not_ready` rather than serving a false reject.
