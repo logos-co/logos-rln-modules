@@ -33,15 +33,14 @@
 //! a PBKDF2 key derived at unlock from the keystore password + the file-level
 //! `metaMacSalt`, over a canonical payload bound to the entry's
 //! membership_hash and a domain separator. Verified at every unlock: a
-//! mismatch quarantines the entry, as does a MISSING MAC once the file
-//! carries `metaMacSalt` (adoption of MAC-less entries is a one-shot
-//! legacy-file migration). It CANNOT detect: (1) whole-file rollback to an
-//! older honest snapshot; (2) per-entry splice of an older honest
-//! (state + MAC) block; (3) stripping `metaMacSalt` together with EVERY
-//! entry's MAC (the partial strips fail loudly instead); (4) an attacker who
-//! also knows the password (with keychain auto-unlock in use, any same-user
-//! process can read it — see `keychain`); (5) a COPIED keystore: the file is
-//! self-contained, so a second live instance verifies and forks the
+//! missing or mismatched MAC quarantines the entry, and a non-empty file
+//! without `metaMacSalt` refuses to unlock — there is no MAC-less legacy
+//! shape; entries are MAC'd from birth (`insert`). It CANNOT detect:
+//! (1) whole-file rollback to an older honest snapshot; (2) per-entry
+//! splice of an older honest (state + MAC) block; (3) an attacker who also
+//! knows the password (with keychain auto-unlock in use, any same-user
+//! process can read it — see `keychain`); (4) a COPIED keystore: the file
+//! is self-contained, so a second live instance verifies and forks the
 //! counters — migrate by moving, never copying (see README).
 //! `rate_limit`/`leaf_index` stay OUTSIDE the MAC by design: the
 //! locked-mode poller self-heals them, and tampering them is self-DoS, not
@@ -111,8 +110,9 @@ pub(crate) struct KeystoreFile {
     pub(crate) app_identifier: String,
     pub(crate) credentials: BTreeMap<String, KeystoreEntry>,
     /// Salt (hex) for the sidecar-MAC key (PBKDF2 from the keystore
-    /// password — see "Sidecar authentication" above). Absent on legacy
-    /// files; generated at the first unlock after upgrade.
+    /// password — see "Sidecar authentication" above). Generated at the
+    /// unlock that initializes an EMPTY keystore; a non-empty file without
+    /// it refuses to unlock.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "metaMacSalt")]
     pub(crate) meta_mac_salt: Option<String>,
     pub(crate) version: String,
@@ -198,14 +198,14 @@ pub(crate) struct MembershipMeta {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) allocations: Vec<crate::rate_limit::EpochAllocation>,
     /// HMAC (hex) over the reservation-critical sidecar state — see
-    /// `meta_mac`. Keyed by the unlock-derived store MAC key; absent on
-    /// legacy entries until adopted at the first unlock (or written at the
-    /// first insert/reservation).
+    /// `meta_mac`. Keyed by the unlock-derived store MAC key; stamped at
+    /// `insert` so entries are authenticated from birth. Missing or
+    /// mismatched = quarantined at unlock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) allocations_mac: Option<String>,
     /// Epoch length (seconds) `allocations` and `prune_floor` are denominated
-    /// in. 0 = unset (legacy file, or no reservation yet); adopted from the
-    /// configured `epoch_size_sec` at the first successful reservation. A
+    /// in. 0 = unset (no reservation yet); adopted from the configured
+    /// `epoch_size_sec` at the first successful reservation. A
     /// reservation under a DIFFERENT configured size fails `permanent`:
     /// changing the epoch size rebases the numeric epoch indexing that keys
     /// spent slots (and their external nullifiers), which no floor conversion
@@ -245,8 +245,8 @@ pub(crate) struct MembershipMeta {
     pub(crate) tx_result: Option<String>,
 }
 
-/// serde `skip_serializing_if` for the defaulted u64 fields: untouched legacy
-/// entries keep serializing byte-identically.
+/// serde `skip_serializing_if` for the defaulted u64 fields: they are
+/// omitted while unset (0).
 fn is_zero(n: &u64) -> bool {
     *n == 0
 }

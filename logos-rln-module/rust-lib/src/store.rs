@@ -223,11 +223,11 @@ pub(crate) fn with_store<R>(f: impl FnOnce(&mut Store) -> Result<R, ApiError>) -
 
 impl Store {
     /// Verify the password, then derive the sidecar-MAC key and authenticate
-    /// every entry's reservation-critical state (quarantining mismatches,
-    /// adopting entries of a legacy pre-MAC file). Two 1M-round PBKDF2 runs —
-    /// treat unlock as a ~seconds operation. The session fields are set only
-    /// after every fallible step, so a failed unlock never leaves the store
-    /// half unlocked.
+    /// every entry's reservation-critical state (quarantining a missing or
+    /// mismatched MAC). Two 1M-round PBKDF2 runs — treat unlock as a
+    /// ~seconds operation. The session fields are set only after every
+    /// fallible step, so a failed unlock never leaves the store half
+    /// unlocked.
     pub(crate) fn unlock(&mut self, password: &str) -> Result<usize, ApiError> {
         match self
             .file
@@ -259,25 +259,22 @@ impl Store {
             None => {}
         }
 
-        // Sidecar authentication (see keystore.rs module docs). Adoption of
-        // MAC-less entries is a one-shot migration gated on the FILE being
-        // legacy (no metaMacSalt): in an upgraded file a missing MAC is
-        // tamper, not legacy.
-        let file_was_legacy = self.file.meta_mac_salt.is_none();
-        if file_was_legacy
-            && self.file.credentials.values().any(|e| e.membership.allocations_mac.is_some())
-        {
-            // MACs cannot exist without the salt they were keyed from: the
-            // salt was stripped or the file spliced from mixed versions.
-            return Err(ApiError::internal(
-                "metaMacSalt is missing but entries carry allocation MACs — the keystore \
-                 was tampered with or partially restored; restore rln_keystore.json from \
-                 a consistent backup",
-            ));
-        }
+        // Sidecar authentication (see keystore.rs module docs). Every
+        // non-empty keystore carries `metaMacSalt` and every entry is MAC'd
+        // from birth (insert stamps it); there is no MAC-less shape to
+        // adopt, so a missing salt over credentials is tamper or a foreign
+        // writer, never a migration.
         let mut dirty = false;
         let salt = match &self.file.meta_mac_salt {
             Some(s) => s.clone(),
+            None if !self.file.credentials.is_empty() => {
+                return Err(ApiError::internal(
+                    "metaMacSalt is missing from a non-empty keystore — the file was \
+                     tampered with, partially restored, or written by a foreign tool; \
+                     restore rln_keystore.json from a consistent backup",
+                ))
+            }
+            // Empty keystore: initialize the salt at first unlock.
             None => {
                 let mut raw = [0u8; 16];
                 getrandom::getrandom(&mut raw)
@@ -296,38 +293,16 @@ impl Store {
                  from a backup"
             ))
         })?;
-        for (hash, entry) in &mut self.file.credentials {
+        for (hash, entry) in &self.file.credentials {
             if self.quarantined.contains(hash) {
                 continue;
             }
-            let meta = &mut entry.membership;
-            if meta.allocations_mac.is_some() {
-                if !keystore::meta_mac_ok(&key, hash, meta) {
-                    eprintln!(
-                        "store: entry {hash} sidecar allocation state fails MAC — quarantined"
-                    );
-                    self.quarantined.insert(hash.clone());
-                }
-            } else if file_was_legacy {
-                // One-shot legacy adoption: every entry gets a MAC now.
-                // Best-effort epoch-size binding for pre-upgrade rows
-                // (start() may not have run yet; operators must not change
-                // epoch_size_sec while legacy rows are live — see README).
-                if meta.epoch_size_sec == 0
-                    && (!meta.allocations.is_empty() || meta.prune_floor > 0)
-                {
-                    if let Some(size) = crate::configured_epoch_size() {
-                        meta.epoch_size_sec = size;
-                    }
-                }
-                meta.allocations_mac = Some(keystore::meta_mac(&key, hash, meta));
-                dirty = true;
-            } else {
-                // Upgraded file, missing MAC: deleting just allocations_mac
-                // must be detected, never re-adopted.
+            // meta_mac_ok is false for an ABSENT MAC too: entries are MAC'd
+            // from birth, so a missing tag is as much tamper as a mismatch.
+            if !keystore::meta_mac_ok(&key, hash, &entry.membership) {
                 eprintln!(
-                    "store: entry {hash} is missing its allocation MAC in an upgraded \
-                     keystore — quarantined"
+                    "store: entry {hash} sidecar allocation state is missing its MAC or \
+                     fails verification — quarantined"
                 );
                 self.quarantined.insert(hash.clone());
             }
@@ -1022,9 +997,8 @@ mod tests {
         .unwrap();
 
         // Deleting just one entry's MAC (keeping the rewound state and the
-        // file's salt) must be DETECTED, not re-adopted: adoption is a
-        // one-shot legacy-file migration, and in an upgraded file a missing
-        // MAC is tamper.
+        // file's salt) must be DETECTED: entries are MAC'd from birth, so a
+        // missing tag is tamper.
         let mut v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         v["credentials"][hash_a.as_str()]["membership"]
@@ -1035,18 +1009,15 @@ mod tests {
         init(dir.clone());
         with_store(|s| {
             s.unlock("pw")?;
-            assert!(
-                s.is_quarantined(&hash_a),
-                "a stripped MAC in an upgraded file must quarantine"
-            );
+            assert!(s.is_quarantined(&hash_a), "a stripped MAC must quarantine");
             assert!(!s.is_quarantined(&hash_b));
             Ok(())
         })
         .unwrap();
 
-        // Stripping the salt while entry MACs remain is an inconsistency that
-        // must refuse unlock loudly (restore-from-backup guidance), not
-        // regenerate a salt and mass-quarantine.
+        // Stripping the salt from a non-empty keystore must refuse unlock
+        // loudly (restore-from-backup guidance) — with or without entry MACs
+        // remaining: there is no MAC-less legacy shape to fall back to.
         let mut v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         v.as_object_mut().unwrap().remove("metaMacSalt");
@@ -1062,22 +1033,23 @@ mod tests {
         })
         .unwrap();
 
-        // Documented residual (keystore.rs module docs, limit (3)): stripping
-        // the salt together with EVERY entry's MAC reaches the legacy shape,
-        // which the next unlock re-adopts rather than detects. Pinned here as
-        // the known limit, not a regression.
+        // Stripping the salt together with EVERY entry's MAC used to reach
+        // an adoptable legacy shape (the old accepted residual 3); with
+        // legacy adoption gone it must refuse unlock exactly like the
+        // partial strip above.
         let mut v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("metaMacSalt");
         for (_, entry) in v["credentials"].as_object_mut().unwrap() {
             entry["membership"].as_object_mut().unwrap().remove("allocations_mac");
         }
         std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
         init(dir.clone());
         with_store(|s| {
-            s.unlock("pw")?;
+            let denied = s.unlock("pw");
             assert!(
-                !s.is_quarantined(&hash_a) && !s.is_quarantined(&hash_b),
-                "full salt+MAC strip reaches the legacy shape and is re-adopted"
+                matches!(denied, Err(ref e) if e.message.contains("metaMacSalt")),
+                "full salt+MAC strip must refuse unlock, never re-adopt: {denied:?}"
             );
             Ok(())
         })

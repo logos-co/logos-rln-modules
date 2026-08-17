@@ -141,14 +141,11 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   widened `max_epoch_gap`, or a changed `epoch_size_sec` would otherwise
   re-admit after its rows were pruned; recovery from a deliberate epoch-size
   change is a fresh registration. The epoch-size binding is adopted per
-  membership at its first reservation (or at unlock, for pre-upgrade
-  entries, when `start()` has already configured a size), so it cannot
-  retro-protect allocation history recorded before the upgrade: do NOT
-  change `epoch_size_sec` across the upgrade boundary while pre-upgrade
-  memberships hold live allocation rows. The allocation counters are HMAC'd inside
-  the keystore sidecar (verified at unlock; tampered entries are
-  quarantined) — though a whole-file rollback from a backup is inherently
-  undetectable by a local MAC (see `keystore.rs` docs). One process per
+  membership at its first reservation. The allocation counters are HMAC'd
+  inside the keystore sidecar (entries are authenticated from birth and
+  verified at unlock; tampered entries are quarantined) — though a
+  whole-file rollback from a backup is inherently undetectable by a local
+  MAC (see `keystore.rs` docs). One process per
   persistence path is enforced with an exclusive lock on
   `rln_keystore.lock`, failing closed; the lock is advisory, so
   network/shared-volume filesystems that don't honor OS file locks must

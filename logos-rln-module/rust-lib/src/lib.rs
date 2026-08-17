@@ -822,12 +822,6 @@ fn epoch_size() -> Result<u64, ApiError> {
     })
 }
 
-/// Best-effort read of the configured epoch size for `store::unlock`'s
-/// legacy adoption — `None` before `start()` configures it.
-pub(crate) fn configured_epoch_size() -> Option<u64> {
-    lock(&CONFIG).as_ref().map(|c| c.epoch_size_sec)
-}
-
 #[cfg(test)]
 pub(crate) fn reset_config_for_test() {
     *lock(&CONFIG) = None;
