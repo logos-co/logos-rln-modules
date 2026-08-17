@@ -29,8 +29,8 @@ JSON replies; `scope` = the `registry_id` + `rln_identifier_hex` arg pair):
 | `register(scope, rate_limit, options)` | `register(registry_id, rln_identifier_hex, rate_limit, options_json)` |
 | `get_membership_state(scope)` | `get_membership_state(registry_id, rln_identifier_hex)` |
 | `generate_proof(scope, signal, timestamp)` | `generate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp)` |
-| `verify_proof(scope, signal, proof)` | `verify_proof(registry_id, rln_identifier_hex, signal_hex, proof_json)` |
-| `get_epoch_quota(scope)` | `get_epoch_quota(registry_id, rln_identifier_hex)` |
+| `validate_proof(scope, signal, timestamp, proof)` | `verify_proof(registry_id, rln_identifier_hex, signal_hex, timestamp, proof_json)` |
+| `get_epoch_quota(scope, timestamp)` | `get_epoch_quota(registry_id, rln_identifier_hex, timestamp)` |
 | registry parameters read (optional ext.) | `get_registry_parameters(registry_id, rln_identifier_hex)` |
 | membership state subscriptions (optional ext.) | `event membership_state_changed(registry_id, rln_identifier, membership_hash, state, previous)` — see `docs/wire-binding.md` |
 | `RlnErrorKind` | the `class` field of every typed error object: `not_ready` \| `transient` \| `budget_exhausted` \| `permanent` |

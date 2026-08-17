@@ -228,21 +228,27 @@ module liblogos_rln_module {
   ; membership's allocations are bound to; re-register to recover), transient.
   method generate_proof(registry_id: tstr, rln_identifier_hex: tstr, signal_hex: tstr, timestamp: tstr) -> result
 
-  ; Spec verify_proof(scope, signal, proof). The message hot path: served
-  ; entirely from the locally maintained valid-root window, NEVER reading the
-  ; registry. Needs no membership or unlocked keystore — a pure validator never
-  ; registers. proof_json accepts EITHER shape: the object generate_proof
-  ; returns (canonical "proof" bytes trusted, other fields ignored) OR the
-  ; spec's decomposed RateLimitProof struct — "proof" as the bare 128-byte
-  ; Groth16 hex plus root/external_nullifier/share_x/share_y/nullifier —
-  ; the shape a consumer reassembles from its own network message. In both,
-  ; "epoch" may be the u64 index (generate_proof's reply) or epoch[32] LE hex. Checks,
-  ; in order: the proof's external nullifier equals the scope's expected
+  ; Spec validate_proof(scope, signal, timestamp, proof). The message hot
+  ; path: served entirely from the locally maintained valid-root window, NEVER
+  ; reading the registry. Needs no membership or unlocked keystore — a pure
+  ; validator never registers. timestamp: the Unix-seconds value stamped on
+  ; the message under validation; the expected epoch derives from it (epoch =
+  ; timestamp / epoch_size_sec), so the budget the proof spends provably
+  ; belongs to the epoch the message claims — the generator bound the same
+  ; value in generate_proof. proof_json accepts EITHER shape: the object
+  ; generate_proof returns (canonical "proof" bytes trusted, other fields
+  ; ignored) OR the spec's decomposed RateLimitProof struct — "proof" as the
+  ; bare 128-byte Groth16 hex plus root/external_nullifier/share_x/share_y/
+  ; nullifier — the shape a consumer reassembles from its own network message.
+  ; In both, "epoch" may be the u64 index (generate_proof's reply) or
+  ; epoch[32] LE hex, and when carried it must EQUAL the timestamp's epoch.
+  ; Checks, in order: the timestamp's epoch is within the current epoch
+  ; ±max_epoch_gap (freshness — generator and verifiers must share start()'s
+  ; epoch_size), the proof's external nullifier equals the scope's expected
   ; poseidon(hash_to_field_le(epoch[32]), hash_to_field_le(rln_identifier)) —
-  ; epoch[32] = the epoch index as 32-byte LE (logos-delivery's toEpoch) — for
-  ; the current epoch ±max_epoch_gap (application binding + epoch freshness —
-  ; generator and verifiers must share start()'s epoch_size), then zk-validity
-  ; + signal + root-in-window. Returns a verdict object {"verdict":str}: "valid"
+  ; epoch[32] = the timestamp's epoch index as 32-byte LE (logos-delivery's
+  ; toEpoch) — (application + epoch binding), then zk-validity + signal +
+  ; root-in-window. Returns a verdict object {"verdict":str}: "valid"
   ; (first valid proof for its nullifier), "invalid" (any failed check — not an
   ; error), "duplicate" (nullifier already seen under the same share_x — a
   ; retransmission), or "rate_limit_violation" (nullifier reused under a
@@ -252,26 +258,32 @@ module liblogos_rln_module {
   ; in-module nullifier log (per epoch, retained max_epoch_gap epochs,
   ; in-memory) — double-signal detection is the Module's job, not the
   ; consumer's. not_ready while the root window is cold/stale; invalid_argument
-  ; on malformed input.
-  method verify_proof(registry_id: tstr, rln_identifier_hex: tstr, signal_hex: tstr, proof_json: tstr) -> result
+  ; on malformed input (a non-integer timestamp included).
+  method verify_proof(registry_id: tstr, rln_identifier_hex: tstr, signal_hex: tstr, timestamp: tstr, proof_json: tstr) -> result
 
-  ; Spec get_epoch_quota(scope): the scope's current epoch, its membership's
-  ; rate limit, and the budget still unspent — for consumer-side send
-  ; scheduling (rolling a metering window on the epoch boundary, clamping a
-  ; configured cap). {"epoch_index":N,"rate_limit":N,"remaining":N} —
-  ; epoch_index a NUMBER (floor(unix_seconds / epoch_size_sec), the same
-  ; index generate_proof encodes as epoch[32] into the external nullifier).
-  ; All three
-  ; fields derive from ONE epoch observation (spec MUST — a remaining is
-  ; never paired with another epoch's index). Purely local: no registry
-  ; access, no unlock needed. Advisory only — generate_proof remains the
-  ; allocation authority (budget_exhausted when spent between read and
-  ; proof). A scope without a usable membership is NOT an error (spec
-  ; SHALL): the reply carries the current epoch_index with rate_limit and
-  ; remaining both 0 — rate_limit 0 always means "no usable membership",
-  ; never an exhausted budget (disambiguate via get_membership_state).
-  ; Errors: ambiguous_selection, invalid_argument.
-  method get_epoch_quota(registry_id: tstr, rln_identifier_hex: tstr) -> result
+  ; Spec get_epoch_quota(scope, timestamp): the epoch of the supplied
+  ; timestamp, the scope's membership rate limit, and the budget still
+  ; unspent in that epoch — for consumer-side send scheduling (rolling a
+  ; metering window on the epoch boundary, clamping a configured cap, and
+  ; testing a message's timestamp before committing to it). timestamp: Unix
+  ; seconds, normally the value the consumer will stamp on the message; its
+  ; epoch must lie within the current epoch ±max_epoch_gap or the read fails
+  ; (spec: permanent) — the same window generate_proof enforces, so an
+  ; accepted read means the timestamp is provable.
+  ; {"epoch_index":N,"rate_limit":N,"remaining":N} — epoch_index a NUMBER
+  ; (floor(timestamp / epoch_size_sec), the same index generate_proof
+  ; encodes as epoch[32] into the external nullifier). All three fields
+  ; derive from ONE epoch observation (spec MUST — a remaining is never
+  ; paired with another epoch's index). Purely local: no registry access, no
+  ; unlock needed. Advisory only — generate_proof remains the allocation
+  ; authority (budget_exhausted when spent between read and proof). A scope
+  ; without a usable membership is NOT an error (spec SHALL): the reply
+  ; carries the timestamp's epoch_index with rate_limit and remaining both
+  ; 0 — rate_limit 0 always means "no usable membership", never an exhausted
+  ; budget (disambiguate via get_membership_state). Errors:
+  ; ambiguous_selection, invalid_argument (malformed timestamp, or one whose
+  ; epoch is outside the window — permanent class either way).
+  method get_epoch_quota(registry_id: tstr, rln_identifier_hex: tstr, timestamp: tstr) -> result
 
   ; Registry parameters read (spec's optional extension): the
   ; registry-declared parameters that bound registration, plus the module's
