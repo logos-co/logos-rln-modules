@@ -1088,7 +1088,7 @@ fn epoch_binding_holds(
     now_epoch: u64,
 ) -> bool {
     epoch_in_window(expected_epoch, now_epoch)
-        && carried.map_or(true, |e| e == expected_epoch)
+        && carried.is_none_or(|e| e == expected_epoch)
         && proof::expected_external_nullifier(expected_epoch, rln_identifier) == *bound
 }
 
