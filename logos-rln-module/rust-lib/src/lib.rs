@@ -278,7 +278,9 @@ fn scope_candidates(
 ) -> Vec<store::MembershipRecord> {
     let has_usable_match = records
         .iter()
-        .any(|r| !r.quarantined && scope_matches(&r.meta, rln_id_hex) && r.meta.state.is_usable());
+        .any(|r| {
+            !r.quarantined && scope_matches(&r.meta, rln_id_hex) && r.meta.cache.state.is_usable()
+        });
     if has_usable_match {
         records
             .iter()
@@ -384,7 +386,7 @@ fn is_retryable_submit_error(e: &ApiError) -> bool {
 fn funded_submit_callback(hash: String) -> provider::RegisterCallback {
     Box::new(move |result| {
         let update = store::with_store(|s| {
-            s.update(&hash, |m| match &result {
+            s.update_cache(&hash, |m| match &result {
                 Ok(reply) => {
                     m.tx_result = Some(reply.clone());
                     // The reply's leaf_index is a pre-submit ESTIMATE; recorded
@@ -411,7 +413,7 @@ fn funded_submit_callback(hash: String) -> provider::RegisterCallback {
 fn delegated_submit_callback(hash: String) -> provider::RegisterCallback {
     Box::new(move |result| {
         let update = store::with_store(|s| {
-            s.update(&hash, |m| match &result {
+            s.update_cache(&hash, |m| match &result {
                 Ok(reply) => match serde_json::from_str::<serde_json::Value>(reply) {
                     Ok(v) => {
                         if let Some(e) = v.get("error") {
@@ -579,9 +581,11 @@ fn register_impl(
     let records = records_for_registry(&registry)?;
     if let Some(rec) = records
         .iter()
-        .find(|r| !r.quarantined && r.meta.state.is_live() && scope_matches(&r.meta, &rln_id_hex))
+        .find(|r| {
+            !r.quarantined && r.meta.cache.state.is_live() && scope_matches(&r.meta, &rln_id_hex)
+        })
     {
-        let mismatch = rec.meta.rate_limit != rate_limit;
+        let mismatch = rec.meta.cache.rate_limit != rate_limit;
         return Ok(public_membership_json(&rec.hash, &rec.meta, false, mismatch));
     }
 
@@ -625,25 +629,26 @@ fn register_impl(
     // record the poller will resolve), then the async submit, whose callback
     // lands on the owner thread after this handler has returned.
     let meta = store::MembershipMeta {
-        allocations: Vec::new(),
+        // Allocations, the epoch-size binding, and the floor start unset;
+        // the binding and floor are adopted at the first successful
+        // reservation (registration doesn't know the app's final epoch
+        // size).
+        alloc: store::AllocationState::default(),
         // Stamped by insert() under the unlock-derived MAC key.
         allocations_mac: None,
-        // Epoch-size binding and floor start unset; both are adopted at the
-        // first successful reservation (registration doesn't know the app's
-        // final epoch size).
-        epoch_size_sec: 0,
-        failed_reason: None,
+        cache: store::CacheState {
+            failed_reason: None,
+            leaf_index: 0,
+            rate_limit,
+            retryable: None,
+            state: store::MembershipState::Pending,
+            state_history: vec![],
+            submitted_at: now_unix(),
+            tx_result: None,
+        },
         identity_commitment: commitment_hex.clone(),
-        leaf_index: 0,
-        prune_floor: 0,
-        rate_limit,
         registry_id: registry.canonical.clone(),
-        retryable: None,
         rln_identifier: rln_id_hex.clone(),
-        state: store::MembershipState::Pending,
-        state_history: vec![],
-        submitted_at: now_unix(),
-        tx_result: None,
     };
     store::with_store(|s| s.insert(&hash, meta, &credential))?;
 
@@ -664,7 +669,9 @@ fn register_impl(
         // Synchronous submission failure (bad options, no client): the
         // record goes Failed immediately and the error surfaces.
         let retryable = is_retryable_submit_error(&e);
-        store::with_store(|s| s.update(&hash, |m| m.mark_submit_failed(&e.message, retryable)))?;
+        store::with_store(|s| {
+            s.update_cache(&hash, |m| m.mark_submit_failed(&e.message, retryable))
+        })?;
         return Err(e);
     }
     poller::ensure_running();
@@ -706,12 +713,12 @@ fn get_membership_state_impl(
     let registry_state = if pm.registered { Some(pm.state) } else { None };
     let merged = store::merge_state(Some(meta), registry_state, now_unix());
 
-    if merged != meta.state {
+    if merged != meta.cache.state {
         // Self-healing cache write: the merged view is recomputed from
         // (local, registry, now) on every read, so a failed persist only
         // costs the next reader a recompute — log it and move on.
         let persist = store::with_store(|s| {
-            s.update(hash, |m| {
+            s.update_cache(hash, |m| {
                 m.state = merged;
                 if pm.registered {
                     // The pending→active re-read (spec MUST).
@@ -746,8 +753,11 @@ fn get_membership_state_impl(
         }
     }
 
-    let (leaf_index, rate_limit) =
-        if pm.registered { (pm.leaf_index, pm.rate_limit) } else { (meta.leaf_index, meta.rate_limit) };
+    let (leaf_index, rate_limit) = if pm.registered {
+        (pm.leaf_index, pm.rate_limit)
+    } else {
+        (meta.cache.leaf_index, meta.cache.rate_limit)
+    };
     let view = views::MembershipStateView::resolved(
         hash,
         &registry.canonical,
@@ -1004,11 +1014,11 @@ fn generate_proof_impl(
     // cache hit is ZERO registry I/O; a miss falls back to the on-demand
     // fetch, which also fills the cache. A cached entry is only trusted
     // when its leaf_index still matches — see path_cache.rs.
-    let (path_elements_hex, path_indices) = match path_cache::hit(&hash, meta.leaf_index) {
+    let (path_elements_hex, path_indices) = match path_cache::hit(&hash, meta.cache.leaf_index) {
         Some(path) => path,
         None => {
-            path_cache::fill_path_cache(&registry, &hash, meta.leaf_index, prov)?;
-            path_cache::hit(&hash, meta.leaf_index)
+            path_cache::fill_path_cache(&registry, &hash, meta.cache.leaf_index, prov)?;
+            path_cache::hit(&hash, meta.cache.leaf_index)
                 .ok_or_else(|| ApiError::internal("path cache: fetched path vanished before use"))?
         }
     };
@@ -1019,12 +1029,12 @@ fn generate_proof_impl(
     // may be pruned or served.
     let retain_floor = now_epoch.saturating_sub(epoch_gap());
     let message_id = store::with_store(|s| {
-        s.reserve_message_id(&hash, &rln_id_hex, epoch, retain_floor, meta.rate_limit, size)
+        s.reserve_message_id(&hash, &rln_id_hex, epoch, retain_floor, meta.cache.rate_limit, size)
     })?;
 
     let material = proof::WitnessMaterial {
         identity_secret_hash_hex: credential.identity_secret_hash.clone(),
-        rate_limit: meta.rate_limit,
+        rate_limit: meta.cache.rate_limit,
         message_id,
         path_elements_hex,
         path_indices,
@@ -1213,7 +1223,7 @@ fn get_epoch_quota_impl(
     let records = records_for_registry(&registry)?;
     let usable: Vec<_> = scope_candidates(&records, &rln_id_hex)
         .into_iter()
-        .filter(|r| !r.quarantined && r.meta.state.is_usable())
+        .filter(|r| !r.quarantined && r.meta.cache.state.is_usable())
         .collect();
     if usable.is_empty() {
         return ok_json(views::EpochQuotaView::new(epoch_index, 0, 0));
@@ -1227,9 +1237,9 @@ fn get_epoch_quota_impl(
     let store::MembershipRecord { hash, meta, .. } = &usable[0];
 
     let remaining = store::with_store(|s| {
-        Ok(s.remaining_budget(hash, &rln_id_hex, epoch_index, meta.rate_limit, size))
+        Ok(s.remaining_budget(hash, &rln_id_hex, epoch_index, meta.cache.rate_limit, size))
     })?;
-    ok_json(views::EpochQuotaView::new(epoch_index, meta.rate_limit, remaining))
+    ok_json(views::EpochQuotaView::new(epoch_index, meta.cache.rate_limit, remaining))
 }
 
 /// Registry parameters read (spec's optional extension): the
@@ -1920,21 +1930,21 @@ mod tests {
         store::with_store(|s| {
             s.unlock("pw")?;
             let meta = store::MembershipMeta {
-                allocations: Vec::new(),
+                alloc: store::AllocationState::default(),
                 allocations_mac: None,
-                epoch_size_sec: 0,
-                failed_reason: None,
+                cache: store::CacheState {
+                    failed_reason: None,
+                    leaf_index: 4,
+                    rate_limit: 100,
+                    retryable: None,
+                    state: store::MembershipState::Active,
+                    state_history: vec![],
+                    submitted_at: now_unix(),
+                    tx_result: None,
+                },
                 identity_commitment: registry_id::bytes_to_hex(&commitment),
-                leaf_index: 4,
-                prune_floor: 0,
-                rate_limit: 100,
                 registry_id: registry.clone(),
-                retryable: None,
                 rln_identifier: rln_id.clone(),
-                state: store::MembershipState::Active,
-                state_history: vec![],
-                submitted_at: now_unix(),
-                tx_result: None,
             };
             let credential = store::StoredCredential {
                 identity_commitment: registry_id::bytes_to_hex(&commitment),
@@ -2079,21 +2089,21 @@ mod tests {
 
         store::with_store(|s| {
             let meta = store::MembershipMeta {
-                allocations: Vec::new(),
+                alloc: store::AllocationState::default(),
                 allocations_mac: None,
-                epoch_size_sec: 0,
-                failed_reason: None,
+                cache: store::CacheState {
+                    failed_reason: None,
+                    leaf_index,
+                    rate_limit: 300,
+                    retryable: None,
+                    state: store::MembershipState::Active,
+                    state_history: vec![],
+                    submitted_at: now_unix(),
+                    tx_result: None,
+                },
                 identity_commitment: commitment_hex.clone(),
-                leaf_index,
-                prune_floor: 0,
-                rate_limit: 300,
                 registry_id: reg.clone(),
-                retryable: None,
                 rln_identifier: rln_id_hex.clone(),
-                state: store::MembershipState::Active,
-                state_history: vec![],
-                submitted_at: now_unix(),
-                tx_result: None,
             };
             let credential = store::StoredCredential {
                 identity_commitment: commitment_hex.clone(),
@@ -2167,21 +2177,21 @@ mod tests {
         let leaf_index = 3u64;
         store::with_store(|s| {
             let meta = store::MembershipMeta {
-                allocations: Vec::new(),
+                alloc: store::AllocationState::default(),
                 allocations_mac: None,
-                epoch_size_sec: 0,
-                failed_reason: None,
+                cache: store::CacheState {
+                    failed_reason: None,
+                    leaf_index,
+                    rate_limit: 300,
+                    retryable: None,
+                    state: store::MembershipState::Active,
+                    state_history: vec![],
+                    submitted_at: now_unix(),
+                    tx_result: None,
+                },
                 identity_commitment: commitment_hex.clone(),
-                leaf_index,
-                prune_floor: 0,
-                rate_limit: 300,
                 registry_id: reg.clone(),
-                retryable: None,
                 rln_identifier: rln_id_hex.clone(),
-                state: store::MembershipState::Active,
-                state_history: vec![],
-                submitted_at: now_unix(),
-                tx_result: None,
             };
             let credential = store::StoredCredential {
                 identity_commitment: commitment_hex.clone(),
@@ -2324,21 +2334,21 @@ mod tests {
         let hash = registry_id::membership_hash(&reg_b, &commitment);
         store::with_store(|s| {
             let meta = store::MembershipMeta {
-                allocations: Vec::new(),
+                alloc: store::AllocationState::default(),
                 allocations_mac: None,
-                epoch_size_sec: 0,
-                failed_reason: None,
+                cache: store::CacheState {
+                    failed_reason: None,
+                    leaf_index: 7,
+                    rate_limit: 300,
+                    retryable: None,
+                    state: store::MembershipState::Active,
+                    state_history: vec![],
+                    submitted_at: now_unix(),
+                    tx_result: None,
+                },
                 identity_commitment: registry_id::bytes_to_hex(&commitment),
-                leaf_index: 7,
-                prune_floor: 0,
-                rate_limit: 300,
                 registry_id: reg_b.clone(),
-                retryable: None,
                 rln_identifier: "ef".repeat(32),
-                state: store::MembershipState::Active,
-                state_history: vec![],
-                submitted_at: now_unix(),
-                tx_result: None,
             };
             let credential = store::StoredCredential {
                 identity_commitment: registry_id::bytes_to_hex(&commitment),
@@ -2401,21 +2411,21 @@ mod tests {
         let expired_hash = registry_id::membership_hash(&reg_expired, &expired_commitment);
         store::with_store(|s| {
             let meta = store::MembershipMeta {
-                allocations: Vec::new(),
+                alloc: store::AllocationState::default(),
                 allocations_mac: None,
-                epoch_size_sec: 0,
-                failed_reason: None,
+                cache: store::CacheState {
+                    failed_reason: None,
+                    leaf_index: 3,
+                    rate_limit: 300,
+                    retryable: None,
+                    state: store::MembershipState::Expired,
+                    state_history: vec![],
+                    submitted_at: now_unix(),
+                    tx_result: None,
+                },
                 identity_commitment: registry_id::bytes_to_hex(&expired_commitment),
-                leaf_index: 3,
-                prune_floor: 0,
-                rate_limit: 300,
                 registry_id: reg_expired.clone(),
-                retryable: None,
                 rln_identifier: rln_id.clone(),
-                state: store::MembershipState::Expired,
-                state_history: vec![],
-                submitted_at: now_unix(),
-                tx_result: None,
             };
             let credential = store::StoredCredential {
                 identity_commitment: registry_id::bytes_to_hex(&expired_commitment),
@@ -2441,7 +2451,7 @@ mod tests {
             "the expired record is retained AND a fresh one was minted: {hashes:?}"
         );
         assert!(
-            records.iter().any(|r| r.hash != expired_hash && r.meta.state == store::MembershipState::Failed),
+            records.iter().any(|r| r.hash != expired_hash && r.meta.cache.state == store::MembershipState::Failed),
             "a NEW credential (different membership_hash) was minted, then failed at the \
              dead transport: {hashes:?}"
         );
@@ -2452,21 +2462,21 @@ mod tests {
         let erased_hash = registry_id::membership_hash(&reg_erased, &erased_commitment);
         store::with_store(|s| {
             let meta = store::MembershipMeta {
-                allocations: Vec::new(),
+                alloc: store::AllocationState::default(),
                 allocations_mac: None,
-                epoch_size_sec: 0,
-                failed_reason: None,
+                cache: store::CacheState {
+                    failed_reason: None,
+                    leaf_index: 5,
+                    rate_limit: 300,
+                    retryable: None,
+                    state: store::MembershipState::Erased,
+                    state_history: vec![],
+                    submitted_at: now_unix(),
+                    tx_result: None,
+                },
                 identity_commitment: registry_id::bytes_to_hex(&erased_commitment),
-                leaf_index: 5,
-                prune_floor: 0,
-                rate_limit: 300,
                 registry_id: reg_erased.clone(),
-                retryable: None,
                 rln_identifier: rln_id.clone(),
-                state: store::MembershipState::Erased,
-                state_history: vec![],
-                submitted_at: now_unix(),
-                tx_result: None,
             };
             let credential = store::StoredCredential {
                 identity_commitment: registry_id::bytes_to_hex(&erased_commitment),
@@ -2483,7 +2493,7 @@ mod tests {
         assert!(out.contains(r#""kind":"provider_failure""#), "got: {out}");
         let records = store::with_store(|s| Ok(s.records_for(&reg_erased))).unwrap();
         assert_eq!(records.len(), 2, "the erased record is retained AND a fresh one was minted");
-        assert!(records.iter().any(|r| r.hash != erased_hash && r.meta.state == store::MembershipState::Failed));
+        assert!(records.iter().any(|r| r.hash != erased_hash && r.meta.cache.state == store::MembershipState::Failed));
 
         store::reset_for_tests();
         let _ = std::fs::remove_dir_all(&dir);
@@ -2675,21 +2685,21 @@ mod tests {
         let hash = registry_id::membership_hash(&registry, &commitment);
         store::with_store(|s| {
             let meta = store::MembershipMeta {
-                allocations: Vec::new(),
+                alloc: store::AllocationState::default(),
                 allocations_mac: None,
-                epoch_size_sec: 0,
-                failed_reason: None,
+                cache: store::CacheState {
+                    failed_reason: None,
+                    leaf_index: 3,
+                    rate_limit: 300,
+                    retryable: None,
+                    state: store::MembershipState::Active,
+                    state_history: vec![],
+                    submitted_at: now_unix(),
+                    tx_result: None,
+                },
                 identity_commitment: registry_id::bytes_to_hex(&commitment),
-                leaf_index: 3,
-                prune_floor: 0,
-                rate_limit: 300,
                 registry_id: registry.clone(),
-                retryable: None,
                 rln_identifier: String::new(),
-                state: store::MembershipState::Active,
-                state_history: vec![],
-                submitted_at: now_unix(),
-                tx_result: None,
             };
             let credential = store::StoredCredential {
                 identity_commitment: registry_id::bytes_to_hex(&commitment),
@@ -2727,21 +2737,21 @@ mod tests {
         let registry = format!("logos:local:{}", "ab".repeat(32));
         let rln_identifier = "ef".repeat(32);
         let meta = store::MembershipMeta {
-            allocations: Vec::new(),
+            alloc: store::AllocationState::default(),
             allocations_mac: None,
-            epoch_size_sec: 0,
-            failed_reason: Some("submit_failed: boom".to_string()),
+            cache: store::CacheState {
+                failed_reason: Some("submit_failed: boom".to_string()),
+                leaf_index: 7,
+                rate_limit: 300,
+                retryable: Some(true),
+                state: store::MembershipState::Failed,
+                state_history: vec![],
+                submitted_at: 1_234_567_890,
+                tx_result: Some("tx-result-blob".to_string()),
+            },
             identity_commitment: commitment.clone(),
-            leaf_index: 7,
-            prune_floor: 0,
-            rate_limit: 300,
             registry_id: registry.clone(),
-            retryable: Some(true),
             rln_identifier: rln_identifier.clone(),
-            state: store::MembershipState::Failed,
-            state_history: vec![],
-            submitted_at: 1_234_567_890,
-            tx_result: Some("tx-result-blob".to_string()),
         };
         let out = public_membership_json("fixture-hash", &meta, false, true);
         assert_eq!(

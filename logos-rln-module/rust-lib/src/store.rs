@@ -43,7 +43,9 @@ use crate::{ApiError, ErrorKind};
 /// Persisted schema types owned by `keystore.rs` (the on-disk format);
 /// re-exported so the crate addresses them as `store::` paths.
 /// `store → keystore` is the only dependency edge between the two modules.
-pub(crate) use crate::keystore::{MembershipMeta, MembershipState, StateChange};
+pub(crate) use crate::keystore::{
+    AllocationState, CacheState, MembershipMeta, MembershipState, StateChange,
+};
 
 /// Pending→Failed bound (spec MUST). Testnet confirmation runs 60–90s;
 /// 300s leaves margin.
@@ -52,7 +54,7 @@ const STATE_HISTORY_CAP: usize = 20;
 
 // ------------------------------------------------------------------- records
 
-impl MembershipMeta {
+impl CacheState {
     /// Records a failed submission: state → Failed, the "submit_failed: "
     /// failure-reason prefix consumers key on, and the spec's retryable flag.
     pub(crate) fn mark_submit_failed(&mut self, message: &str, retryable: bool) {
@@ -356,7 +358,7 @@ impl Store {
         let key = self.meta_mac_key.as_ref().ok_or_else(|| {
             ApiError::new(ErrorKind::Locked, "unlock_keystore before registering")
         })?;
-        meta.allocations_mac = Some(keystore::meta_mac(key, hash, &meta));
+        meta.allocations_mac = Some(keystore::meta_mac(key, hash, &meta.alloc));
         self.file
             .credentials
             .insert(hash.to_string(), KeystoreEntry { crypto, membership: meta });
@@ -430,7 +432,10 @@ impl Store {
         self.file
             .credentials
             .iter()
-            .filter(|(h, e)| e.membership.state == MembershipState::Pending && !self.quarantined.contains(*h))
+            .filter(|(h, e)| {
+                e.membership.cache.state == MembershipState::Pending
+                    && !self.quarantined.contains(*h)
+            })
             .map(|(h, e)| (h.clone(), e.membership.clone()))
             .collect()
     }
@@ -444,7 +449,7 @@ impl Store {
             .filter(|(h, e)| {
                 !self.quarantined.contains(*h)
                     && matches!(
-                        e.membership.state,
+                        e.membership.cache.state,
                         MembershipState::Active | MembershipState::GracePeriod | MembershipState::Expired
                     )
             })
@@ -452,58 +457,29 @@ impl Store {
             .collect()
     }
 
-    /// Mutate one record's metadata and persist. State changes go through
-    /// here so history stays consistent: pass the new state via
-    /// `MembershipMeta::state`; history appends automatically on change.
-    ///
-    /// Closures normally run in LOCKED mode (the poller) and must only touch
-    /// un-MAC'd cache fields; a mutation of MAC-covered state is restamped
-    /// when the key is available and REVERTED + refused when it is not —
-    /// persisting it under a stale MAC would falsely quarantine the entry at
-    /// the next unlock.
-    pub(crate) fn update(
+    /// Run a cache-only mutation against an entry and persist. The closure
+    /// receives `CacheState` ONLY — MAC-covered allocation state is not
+    /// reachable here by construction; the sole covered-mutation path is
+    /// `reserve_message_id`.
+    pub(crate) fn update_cache(
         &mut self,
         hash: &str,
-        f: impl FnOnce(&mut MembershipMeta),
+        f: impl FnOnce(&mut CacheState),
     ) -> Result<(), ApiError> {
         let entry = self.file.credentials.get_mut(hash).ok_or_else(|| {
             ApiError::new(ErrorKind::UnknownMembership, "no such membership_hash")
         })?;
-        let before = entry.membership.state;
-        let covered_before = (
-            entry.membership.allocations.clone(),
-            entry.membership.epoch_size_sec,
-            entry.membership.prune_floor,
-        );
-        f(&mut entry.membership);
-        let covered_changed = covered_before.0 != entry.membership.allocations
-            || covered_before.1 != entry.membership.epoch_size_sec
-            || covered_before.2 != entry.membership.prune_floor;
-        if covered_changed {
-            match self.meta_mac_key.as_ref() {
-                Some(key) => {
-                    entry.membership.allocations_mac =
-                        Some(keystore::meta_mac(key, hash, &entry.membership));
-                }
-                None => {
-                    let meta = &mut entry.membership;
-                    (meta.allocations, meta.epoch_size_sec, meta.prune_floor) = covered_before;
-                    return Err(ApiError::internal(
-                        "update touched MAC-covered allocation state while the keystore \
-                         is locked; reverted — route such mutations through the unlocked \
-                         reservation path",
-                    ));
-                }
-            }
-        }
-        if entry.membership.state != before {
-            entry.membership.state_history.push(StateChange {
+        let cache = &mut entry.membership.cache;
+        let before = cache.state;
+        f(cache);
+        if cache.state != before {
+            cache.state_history.push(StateChange {
                 at: crate::now_unix(),
-                state: entry.membership.state,
+                state: cache.state,
             });
-            if entry.membership.state_history.len() > STATE_HISTORY_CAP {
-                let drop_n = entry.membership.state_history.len() - STATE_HISTORY_CAP;
-                entry.membership.state_history.drain(..drop_n);
+            if cache.state_history.len() > STATE_HISTORY_CAP {
+                let drop_n = cache.state_history.len() - STATE_HISTORY_CAP;
+                cache.state_history.drain(..drop_n);
             }
         }
         self.persist()
@@ -519,7 +495,7 @@ impl Store {
     /// when `epoch` is below the persisted allocation floor, or when
     /// `epoch_size_sec` differs from the size this membership's allocations
     /// are bound to (an epoch-size change is not migratable — see
-    /// `MembershipMeta::epoch_size_sec`); recovery is a fresh membership.
+    /// `AllocationState::epoch_size_sec`); recovery is a fresh membership.
     pub(crate) fn reserve_message_id(
         &mut self,
         hash: &str,
@@ -545,20 +521,19 @@ impl Store {
             ApiError::new(ErrorKind::UnknownMembership, "no such membership_hash")
         })?;
         let meta = &mut entry.membership;
-        if meta.epoch_size_sec != 0 && meta.epoch_size_sec != epoch_size_sec {
+        if meta.alloc.epoch_size_sec != 0 && meta.alloc.epoch_size_sec != epoch_size_sec {
             return Err(ApiError::new(
                 ErrorKind::Permanent,
                 &format!(
                     "configured epoch_size_sec {epoch_size_sec} differs from {} — the size this \
                      membership's allocations are bound to; a rebased epoch numbering could \
                      reissue spent slots. Register a fresh membership under the new size",
-                    meta.epoch_size_sec
+                    meta.alloc.epoch_size_sec
                 ),
             ));
         }
         let slot = crate::rate_limit::reserve_slot(
-            &mut meta.allocations,
-            &mut meta.prune_floor,
+            &mut meta.alloc,
             rln_identifier_hex,
             epoch,
             retain_floor,
@@ -576,9 +551,9 @@ impl Store {
                  possibly spent slot",
             ),
         })?;
-        meta.epoch_size_sec = epoch_size_sec; // adopt-on-first-success
+        meta.alloc.epoch_size_sec = epoch_size_sec; // adopt-on-first-success
         let key = self.meta_mac_key.as_ref().expect("checked above");
-        meta.allocations_mac = Some(keystore::meta_mac(key, hash, meta));
+        meta.allocations_mac = Some(keystore::meta_mac(key, hash, &meta.alloc));
         // On persist failure the counter/floor deliberately stay advanced:
         // no proof is issued, so the slot can only be WASTED, never reissued.
         self.persist()?;
@@ -591,7 +566,7 @@ impl Store {
         self.file
             .credentials
             .iter()
-            .map(|(h, e)| (h.clone(), e.membership.epoch_size_sec))
+            .map(|(h, e)| (h.clone(), e.membership.alloc.epoch_size_sec))
             .collect()
     }
 
@@ -613,14 +588,14 @@ impl Store {
             .credentials
             .get(hash)
             .map(|e| {
-                let meta = &e.membership;
-                if meta.epoch_size_sec != 0 && meta.epoch_size_sec != epoch_size_sec {
+                let alloc = &e.membership.alloc;
+                if alloc.epoch_size_sec != 0 && alloc.epoch_size_sec != epoch_size_sec {
                     return 0;
                 }
-                if epoch < meta.prune_floor {
+                if epoch < alloc.prune_floor {
                     return 0;
                 }
-                crate::rate_limit::remaining(&meta.allocations, rln_identifier_hex, epoch, rate_limit)
+                crate::rate_limit::remaining(&alloc.allocations, rln_identifier_hex, epoch, rate_limit)
             })
             .unwrap_or(0)
     }
@@ -636,7 +611,8 @@ impl Store {
 /// True once a record has ever been observed on the registry — the spec's
 /// "state becomes Unknown after having been Active" removal signal.
 fn has_been_active(meta: &MembershipMeta) -> bool {
-    meta.state.is_active_like() || meta.state_history.iter().any(|c| c.state.is_active_like())
+    meta.cache.state.is_active_like()
+        || meta.cache.state_history.iter().any(|c| c.state.is_active_like())
 }
 
 /// The spec's merged view, as a pure function: the registry's report
@@ -652,8 +628,8 @@ pub(crate) fn merge_state(
         // The registry has it: its chain-clock view wins outright.
         (_, Some(state)) => state,
         (Some(meta), None) => {
-            if meta.state == MembershipState::Pending {
-                if now.saturating_sub(meta.submitted_at) > CONFIRMATION_WINDOW_SECS {
+            if meta.cache.state == MembershipState::Pending {
+                if now.saturating_sub(meta.cache.submitted_at) > CONFIRMATION_WINDOW_SECS {
                     MembershipState::Failed
                 } else {
                     MembershipState::Pending
@@ -662,7 +638,7 @@ pub(crate) fn merge_state(
                 MembershipState::Erased
             } else {
                 // failed stays failed (visible until re-registered).
-                meta.state
+                meta.cache.state
             }
         }
     }
@@ -678,7 +654,7 @@ pub(crate) fn transition_event(
     meta: &MembershipMeta,
     new_state: MembershipState,
 ) -> Option<(String, String, String, String, String)> {
-    if new_state == meta.state {
+    if new_state == meta.cache.state {
         return None;
     }
     // Enum→wire string: serde's `rename_all = "snake_case"` on
@@ -694,7 +670,7 @@ pub(crate) fn transition_event(
         meta.rln_identifier.clone(),
         hash.to_string(),
         wire(new_state),
-        wire(meta.state),
+        wire(meta.cache.state),
     ))
 }
 
@@ -704,21 +680,21 @@ mod tests {
 
     fn meta(state: MembershipState, submitted_at: u64) -> MembershipMeta {
         MembershipMeta {
-            allocations: Vec::new(),
+            alloc: AllocationState::default(),
             allocations_mac: None,
-            epoch_size_sec: 0,
-            failed_reason: None,
+            cache: CacheState {
+                failed_reason: None,
+                leaf_index: 7,
+                rate_limit: 300,
+                retryable: None,
+                state,
+                state_history: vec![],
+                submitted_at,
+                tx_result: None,
+            },
             identity_commitment: "11".repeat(32),
-            leaf_index: 7,
-            prune_floor: 0,
-            rate_limit: 300,
             registry_id: format!("logos:local:{}", "ab".repeat(32)),
-            retryable: None,
             rln_identifier: String::new(),
-            state,
-            state_history: vec![],
-            submitted_at,
-            tx_result: None,
         }
     }
 
@@ -743,7 +719,7 @@ mod tests {
         let was_active = meta(Active, now - 1_000);
         assert_eq!(merge_state(Some(&was_active), None, now), Erased);
         let mut expired_history = meta(Failed, now - 1_000);
-        expired_history.state_history.push(StateChange {
+        expired_history.cache.state_history.push(StateChange {
             at: now - 500,
             state: Expired,
         });
@@ -1082,15 +1058,15 @@ mod tests {
             s.insert(&hash, m, &credential)?;
             for i in 0..(STATE_HISTORY_CAP + 5) {
                 let next = if i % 2 == 0 { MembershipState::Active } else { MembershipState::GracePeriod };
-                s.update(&hash, |m| m.state = next)?;
+                s.update_cache(&hash, |m| m.state = next)?;
             }
             let meta = s.get(&hash).unwrap();
-            assert_eq!(meta.state_history.len(), STATE_HISTORY_CAP);
+            assert_eq!(meta.cache.state_history.len(), STATE_HISTORY_CAP);
             // Unchanged state must NOT append history.
-            let len_before = meta.state_history.len();
-            s.update(&hash, |m| m.leaf_index = 42)?;
-            assert_eq!(s.get(&hash).unwrap().state_history.len(), len_before);
-            assert_eq!(s.get(&hash).unwrap().leaf_index, 42);
+            let len_before = meta.cache.state_history.len();
+            s.update_cache(&hash, |m| m.leaf_index = 42)?;
+            assert_eq!(s.get(&hash).unwrap().cache.state_history.len(), len_before);
+            assert_eq!(s.get(&hash).unwrap().cache.leaf_index, 42);
             Ok(())
         })
         .unwrap();

@@ -21,7 +21,7 @@
 //! own counter; rows below the window floor are pruned to bound growth. Pruning
 //! destroys the only record that a pruned epoch's slots were spent, so every
 //! prune is recorded in a persisted, monotonically non-decreasing floor
-//! (`MembershipMeta::prune_floor`, capped at one past the highest allocated
+//! (`AllocationState::prune_floor`, capped at one past the highest allocated
 //! epoch so a spiked clock cannot brick the future): once an epoch falls below
 //! it, reservation there is refused forever (`AllocError::EpochBelowFloor`) —
 //! even when the wall clock rewinds past the window or a widened
@@ -66,37 +66,37 @@ pub(crate) fn current_epoch(now_unix: u64, epoch_size_sec: u64) -> u64 {
 }
 
 /// Reserve the next `message_id` for `(rln_identifier, epoch)` within
-/// `rate_limit`, mutating `allocations` and `floor` in place ONLY on success.
-/// Returns the slot, `BudgetExhausted` when that epoch's budget is spent, or
+/// `rate_limit`, mutating `alloc` in place ONLY on success. The counters
+/// and their floor are a transactional pair, so they travel as ONE value —
+/// the MAC-covered `keystore::AllocationState`. Returns the slot,
+/// `BudgetExhausted` when that epoch's budget is spent, or
 /// `EpochBelowFloor` when `epoch` is below the effective floor.
 ///
 /// `retain_floor_candidate` is wall-clock-derived (`now_epoch -
 /// max_epoch_gap`) and untrusted: it can rewind, drop (widened gap), or
-/// spike forward. `floor` is the persisted monotone floor: epochs strictly
-/// below it may have had rows pruned and are refused forever. The threshold
-/// a call may advance the floor to is
-/// `max(*floor, min(candidate, highest allocated epoch + 1))` — monotone
+/// spike forward. `alloc.prune_floor` is the persisted monotone floor:
+/// epochs strictly below it may have had rows pruned and are refused
+/// forever. The threshold a call may advance the floor to is
+/// `max(floor, min(candidate, highest allocated epoch + 1))` — monotone
 /// against a rewound candidate, capped so a spiked candidate can only prune
 /// what was actually allocated, inert when no rows exist.
 ///
-/// Every error path leaves `allocations` and `floor` EXACTLY as found (the
-/// store restamps the sidecar MAC only on success — do not add error-path
-/// mutation); pruning never drops an in-window epoch.
+/// Every error path leaves `alloc` EXACTLY as found (the store restamps the
+/// sidecar MAC only on success — do not add error-path mutation); pruning
+/// never drops an in-window epoch.
 ///
-/// The caller MUST durably persist `allocations` AND `floor` before using the
-/// returned slot.
+/// The caller MUST durably persist `alloc` before using the returned slot.
 pub(crate) fn reserve_slot(
-    allocations: &mut Vec<EpochAllocation>,
-    floor: &mut u64,
+    alloc: &mut crate::keystore::AllocationState,
     rln_identifier_hex: &str,
     epoch: u64,
     retain_floor_candidate: u64,
     rate_limit: u64,
 ) -> Result<u64, AllocError> {
-    let highest = allocations.iter().map(|a| a.epoch.saturating_add(1)).max();
+    let highest = alloc.allocations.iter().map(|a| a.epoch.saturating_add(1)).max();
     let threshold = match highest {
-        Some(h) => (*floor).max(retain_floor_candidate.min(h)),
-        None => *floor,
+        Some(h) => alloc.prune_floor.max(retain_floor_candidate.min(h)),
+        None => alloc.prune_floor,
     };
     if epoch < threshold {
         return Err(AllocError::EpochBelowFloor);
@@ -105,7 +105,8 @@ pub(crate) fn reserve_slot(
     // Allocate first — the slot is looked up by `(rln_identifier, epoch)` —
     // and only then advance the floor and prune, so every error return
     // mutates nothing.
-    let slot = if let Some(row) = allocations
+    let slot = if let Some(row) = alloc
+        .allocations
         .iter_mut()
         .find(|a| a.rln_identifier == rln_identifier_hex && a.epoch == epoch)
     {
@@ -119,15 +120,15 @@ pub(crate) fn reserve_slot(
         if rate_limit == 0 {
             return Err(AllocError::BudgetExhausted);
         }
-        allocations.push(EpochAllocation {
+        alloc.allocations.push(EpochAllocation {
             rln_identifier: rln_identifier_hex.to_string(),
             epoch,
             used: 1,
         });
         0
     };
-    *floor = threshold;
-    allocations.retain(|a| a.epoch >= threshold);
+    alloc.prune_floor = threshold;
+    alloc.allocations.retain(|a| a.epoch >= threshold);
     Ok(slot)
 }
 
@@ -166,35 +167,33 @@ mod tests {
 
     #[test]
     fn slots_increment_from_zero_then_exhaust() {
-        let mut allocs = Vec::new();
-        let mut floor = 0;
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 1, 1, 3), Ok(0));
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 1, 1, 3), Ok(1));
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 1, 1, 3), Ok(2));
+        let mut alloc = crate::keystore::AllocationState::default();
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 1, 1, 3), Ok(0));
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 1, 1, 3), Ok(1));
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 1, 1, 3), Ok(2));
         assert_eq!(
-            reserve_slot(&mut allocs, &mut floor, APP_A, 1, 1, 3),
+            reserve_slot(&mut alloc, APP_A, 1, 1, 3),
             Err(AllocError::BudgetExhausted)
         );
-        assert_eq!(remaining(&allocs, APP_A, 1, 3), 0);
+        assert_eq!(remaining(&alloc.allocations, APP_A, 1, 3), 0);
     }
 
     #[test]
     fn below_floor_epochs_are_pruned_but_in_window_ones_survive() {
-        let mut allocs = Vec::new();
-        let mut floor = 0;
+        let mut alloc = crate::keystore::AllocationState::default();
         // Window floor 4: epochs 4 and 5 are both live and keep independent
         // budgets — reserving 4 does NOT evict epoch 5's row.
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 5, 4, 2), Ok(0));
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 4, 4, 2), Ok(0));
-        assert_eq!(allocs.len(), 2);
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 5, 4, 2), Ok(0));
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 4, 4, 2), Ok(0));
+        assert_eq!(alloc.allocations.len(), 2);
         // Revisiting epoch 5 continues its counter — slot 1, never a reissued 0.
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 5, 4, 2), Ok(1));
-        assert_eq!(remaining(&allocs, APP_A, 5, 2), 0);
-        assert_eq!(remaining(&allocs, APP_A, 4, 2), 1);
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 5, 4, 2), Ok(1));
+        assert_eq!(remaining(&alloc.allocations, APP_A, 5, 2), 0);
+        assert_eq!(remaining(&alloc.allocations, APP_A, 4, 2), 1);
         // Advancing the floor past 4 finally prunes it.
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 6, 5, 2), Ok(0));
-        assert!(allocs.iter().all(|a| a.epoch >= 5));
-        assert_eq!(floor, 5);
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 6, 5, 2), Ok(0));
+        assert!(alloc.allocations.iter().all(|a| a.epoch >= 5));
+        assert_eq!(alloc.prune_floor, 5);
     }
 
     #[test]
@@ -203,34 +202,31 @@ mod tests {
         // that map to epochs 10, 9, then 10 again. If reserving epoch 9 evicted
         // epoch 10's row, the second epoch-10 proof would reuse spent slot 0 —
         // the (epoch, message_id) collision that leaks the identity secret.
-        let mut allocs = Vec::new();
-        let mut floor = 0;
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 10, 9, 5), Ok(0));
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 9, 9, 5), Ok(0));
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 10, 9, 5), Ok(1));
-        assert_eq!(remaining(&allocs, APP_A, 10, 5), 3);
-        assert_eq!(remaining(&allocs, APP_A, 9, 5), 4);
+        let mut alloc = crate::keystore::AllocationState::default();
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 10, 9, 5), Ok(0));
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 9, 9, 5), Ok(0));
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 10, 9, 5), Ok(1));
+        assert_eq!(remaining(&alloc.allocations, APP_A, 10, 5), 3);
+        assert_eq!(remaining(&alloc.allocations, APP_A, 9, 5), 4);
     }
 
     #[test]
     fn applications_are_independent_within_an_epoch() {
-        let mut allocs = Vec::new();
-        let mut floor = 0;
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 1, 1, 2), Ok(0));
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_B, 1, 1, 2), Ok(0));
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 1, 1, 2), Ok(1));
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_B, 1, 1, 2), Ok(1));
-        assert_eq!(allocs.len(), 2);
-        assert_eq!(remaining(&allocs, APP_A, 1, 2), 0);
-        assert_eq!(remaining(&allocs, APP_B, 1, 2), 0);
+        let mut alloc = crate::keystore::AllocationState::default();
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 1, 1, 2), Ok(0));
+        assert_eq!(reserve_slot(&mut alloc, APP_B, 1, 1, 2), Ok(0));
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 1, 1, 2), Ok(1));
+        assert_eq!(reserve_slot(&mut alloc, APP_B, 1, 1, 2), Ok(1));
+        assert_eq!(alloc.allocations.len(), 2);
+        assert_eq!(remaining(&alloc.allocations, APP_A, 1, 2), 0);
+        assert_eq!(remaining(&alloc.allocations, APP_B, 1, 2), 0);
     }
 
     #[test]
     fn zero_rate_limit_never_allocates() {
-        let mut allocs = Vec::new();
-        let mut floor = 0;
+        let mut alloc = crate::keystore::AllocationState::default();
         assert_eq!(
-            reserve_slot(&mut allocs, &mut floor, APP_A, 1, 1, 0),
+            reserve_slot(&mut alloc, APP_A, 1, 1, 0),
             Err(AllocError::BudgetExhausted)
         );
     }
@@ -241,18 +237,17 @@ mod tests {
         // (candidate 11), pruning 10's row and recording floor 11. A later
         // backwards clock step re-admits epoch 10 at the window check — the
         // persisted floor must answer an error, never a reissued slot 0.
-        let mut allocs = Vec::new();
-        let mut floor = 0;
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 10, 9, 5), Ok(0));
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 12, 11, 5), Ok(0));
-        assert_eq!(floor, 11, "pruning epoch 10 must be recorded in the floor");
+        let mut alloc = crate::keystore::AllocationState::default();
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 10, 9, 5), Ok(0));
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 11, 5), Ok(0));
+        assert_eq!(alloc.prune_floor, 11, "pruning epoch 10 must be recorded in the floor");
         assert_eq!(
-            reserve_slot(&mut allocs, &mut floor, APP_A, 10, 9, 5),
+            reserve_slot(&mut alloc, APP_A, 10, 9, 5),
             Err(AllocError::EpochBelowFloor)
         );
-        assert_eq!(floor, 11, "a rewound candidate must never lower the floor");
+        assert_eq!(alloc.prune_floor, 11, "a rewound candidate must never lower the floor");
         // An epoch at/above the floor still continues its own counter.
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 12, 9, 5), Ok(1));
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 9, 5), Ok(1));
     }
 
     #[test]
@@ -261,21 +256,20 @@ mod tests {
         // spiked reservation). The threshold is capped one past the highest
         // allocated epoch, so after the clock is corrected only epochs whose
         // rows actually existed are refused — not months of future epochs.
-        let mut allocs = Vec::new();
-        let mut floor = 0;
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 10, 9, 5), Ok(0));
+        let mut alloc = crate::keystore::AllocationState::default();
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 10, 9, 5), Ok(0));
         // Spike: the candidate leaps far ahead; the floor advances only past
         // the allocated row (10 -> pruned, floor 11), never to the spike.
         assert_eq!(
-            reserve_slot(&mut allocs, &mut floor, APP_A, 1_000_000, 999_999, 5),
+            reserve_slot(&mut alloc, APP_A, 1_000_000, 999_999, 5),
             Ok(0)
         );
-        assert_eq!(floor, 11, "the spike must not persist a far-future floor");
+        assert_eq!(alloc.prune_floor, 11, "the spike must not persist a far-future floor");
         // Clock corrected: normal epochs keep allocating.
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 12, 11, 5), Ok(0));
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 11, 5), Ok(0));
         // The genuinely pruned epoch stays refused.
         assert_eq!(
-            reserve_slot(&mut allocs, &mut floor, APP_A, 10, 11, 5),
+            reserve_slot(&mut alloc, APP_A, 10, 11, 5),
             Err(AllocError::EpochBelowFloor)
         );
     }
@@ -286,31 +280,30 @@ mod tests {
         // path must leave allocations and the floor exactly as persisted —
         // otherwise a later unrelated persist writes state under a stale MAC
         // and the next unlock falsely quarantines an honest entry.
-        let mut allocs = Vec::new();
-        let mut floor = 0;
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 10, 9, 1), Ok(0));
-        let before = (allocs.clone(), floor);
+        let mut alloc = crate::keystore::AllocationState::default();
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 10, 9, 1), Ok(0));
+        let before = (alloc.allocations.clone(), alloc.prune_floor);
         // Budget exhausted, with a candidate that would otherwise advance the
         // floor and prune.
         assert_eq!(
-            reserve_slot(&mut allocs, &mut floor, APP_A, 10, 10, 1),
+            reserve_slot(&mut alloc, APP_A, 10, 10, 1),
             Err(AllocError::BudgetExhausted)
         );
-        assert_eq!((allocs.clone(), floor), before);
+        assert_eq!((alloc.allocations.clone(), alloc.prune_floor), before);
         // Zero-limit no-row path: same guarantee.
         assert_eq!(
-            reserve_slot(&mut allocs, &mut floor, APP_A, 11, 10, 0),
+            reserve_slot(&mut alloc, APP_A, 11, 10, 0),
             Err(AllocError::BudgetExhausted)
         );
-        assert_eq!((allocs.clone(), floor), before);
+        assert_eq!((alloc.allocations.clone(), alloc.prune_floor), before);
         // Below-floor path: same guarantee.
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 12, 11, 1), Ok(0));
-        let after_prune = (allocs.clone(), floor);
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 11, 1), Ok(0));
+        let after_prune = (alloc.allocations.clone(), alloc.prune_floor);
         assert_eq!(
-            reserve_slot(&mut allocs, &mut floor, APP_A, 10, 11, 1),
+            reserve_slot(&mut alloc, APP_A, 10, 11, 1),
             Err(AllocError::EpochBelowFloor)
         );
-        assert_eq!((allocs.clone(), floor), after_prune);
+        assert_eq!((alloc.allocations.clone(), alloc.prune_floor), after_prune);
     }
 
     #[test]
@@ -320,18 +313,17 @@ mod tests {
         // floor 10. A restart (or live start()) with gap=10 lowers the
         // candidate to 2 — epoch 9 passes the wall-clock window check but its
         // spent row is gone. The persisted floor must refuse it.
-        let mut allocs = Vec::new();
-        let mut floor = 0;
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 9, 8, 5), Ok(0));
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 12, 11, 5), Ok(0));
-        assert!(allocs.iter().all(|a| a.epoch >= 10), "epoch 9's row is pruned");
-        assert_eq!(floor, 10);
+        let mut alloc = crate::keystore::AllocationState::default();
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 9, 8, 5), Ok(0));
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 11, 5), Ok(0));
+        assert!(alloc.allocations.iter().all(|a| a.epoch >= 10), "epoch 9's row is pruned");
+        assert_eq!(alloc.prune_floor, 10);
         assert_eq!(
-            reserve_slot(&mut allocs, &mut floor, APP_A, 9, 2, 5),
+            reserve_slot(&mut alloc, APP_A, 9, 2, 5),
             Err(AllocError::EpochBelowFloor)
         );
         // Epochs at/above the floor keep allocating normally under the wider gap.
-        assert_eq!(reserve_slot(&mut allocs, &mut floor, APP_A, 12, 2, 5), Ok(1));
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 2, 5), Ok(1));
     }
 
     #[test]

@@ -28,10 +28,10 @@
 //!
 //! ## Sidecar authentication & its limits
 //!
-//! The reservation-critical sidecar fields (`allocations`, `epoch_size_sec`,
-//! `prune_floor`) are HMAC'd per entry (`allocations_mac`): HMAC-SHA256 under
-//! a PBKDF2 key derived at unlock from the keystore password + the file-level
-//! `metaMacSalt`, over a canonical payload bound to the entry's
+//! The reservation-critical sidecar state (`AllocationState` — the struct
+//! IS the covered set) is HMAC'd per entry (`allocations_mac`): HMAC-SHA256
+//! under a PBKDF2 key derived at unlock from the keystore password + the
+//! file-level `metaMacSalt`, over a canonical payload bound to the entry's
 //! membership_hash and a domain separator. Verified at every unlock: a
 //! missing or mismatched MAC quarantines the entry, and a non-empty file
 //! without `metaMacSalt` refuses to unlock — there is no MAC-less legacy
@@ -42,9 +42,9 @@
 //! process can read it — see `keychain`); (4) a COPIED keystore: the file
 //! is self-contained, so a second live instance verifies and forks the
 //! counters — migrate by moving, never copying (see README).
-//! `rate_limit`/`leaf_index` stay OUTSIDE the MAC by design: the
-//! locked-mode poller self-heals them, and tampering them is self-DoS, not
-//! disclosure.
+//! `CacheState` (`rate_limit`, `leaf_index`, …) stays OUTSIDE the MAC by
+//! design: the locked-mode poller self-heals it, and tampering it is
+//! self-DoS, not disclosure.
 //!
 //! ## Atomicity & durability
 //!
@@ -177,17 +177,12 @@ impl MembershipState {
     }
 }
 
-/// Plaintext-safe sidecar metadata stored NEXT TO the crypto envelope.
-/// `registry_id` + `identity_commitment` are tamper-bound by the entry's
-/// membership_hash key (recomputed at load) and duplicated inside the
-/// ciphertext. The reservation-critical fields (`allocations`,
-/// `epoch_size_sec`, `prune_floor`) are tamper-bound by `allocations_mac`,
-/// verified at unlock — they are local security state with NO authoritative
-/// source to re-read (see "Sidecar authentication" above). The rest are
-/// self-healing caches of registry state, deliberately OUTSIDE the MAC so
-/// the locked-mode poller can keep healing them.
-#[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct MembershipMeta {
+/// The MAC-covered reservation-critical state; this struct IS the covered
+/// set — a field added here is authenticated, a field added elsewhere is
+/// not. Local security state with NO authoritative source to re-read (see
+/// "Sidecar authentication" above), tamper-bound by `allocations_mac`.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub(crate) struct AllocationState {
     /// Per-application `message_id` allocation, one row per active
     /// `(rln_identifier, current epoch)`. Plaintext-safe counters (no
     /// secret), persisted with the sidecar — fsync-durably, under
@@ -197,12 +192,6 @@ pub(crate) struct MembershipMeta {
     /// Omitted from older files (serde default = empty).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) allocations: Vec<crate::rate_limit::EpochAllocation>,
-    /// HMAC (hex) over the reservation-critical sidecar state — see
-    /// `meta_mac`. Keyed by the unlock-derived store MAC key; stamped at
-    /// `insert` so entries are authenticated from birth. Missing or
-    /// mismatched = quarantined at unlock.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) allocations_mac: Option<String>,
     /// Epoch length (seconds) `allocations` and `prune_floor` are denominated
     /// in. 0 = unset (no reservation yet); adopted from the configured
     /// `epoch_size_sec` at the first successful reservation. A
@@ -212,12 +201,6 @@ pub(crate) struct MembershipMeta {
     /// can make safe. Recovery: register a fresh membership.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) epoch_size_sec: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) failed_reason: Option<String>,
-    pub(crate) identity_commitment: String,
-    /// Provisional while pending (pre-submit estimate); authoritative after
-    /// the pending→active re-read (spec MUST).
-    pub(crate) leaf_index: u64,
     /// Monotonically NON-DECREASING allocation floor, in units of
     /// `epoch_size_sec`: epochs below it may have had rows pruned, so a
     /// reservation there is permanently refused — even when the wall clock
@@ -225,24 +208,57 @@ pub(crate) struct MembershipMeta {
     /// Raised (never lowered) on every successful reservation.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) prune_floor: u64,
+}
+
+/// Registry-derived, poller-healed cache state, deliberately OUTSIDE the
+/// MAC — mutable while locked via `Store::update_cache`. Tampering it is
+/// self-DoS, not disclosure; the locked-mode poller heals it from the
+/// registry.
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct CacheState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) failed_reason: Option<String>,
+    /// Provisional while pending (pre-submit estimate); authoritative after
+    /// the pending→active re-read (spec MUST).
+    pub(crate) leaf_index: u64,
     pub(crate) rate_limit: u64,
-    pub(crate) registry_id: String,
     /// Whether a `failed` state is worth retrying (spec: a failed submission
     /// SHALL report whether it is retryable). `None` outside the failed
     /// state (never set, or cleared on the next successful observation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retryable: Option<bool>,
+    pub(crate) state: MembershipState,
+    pub(crate) state_history: Vec<StateChange>,
+    pub(crate) submitted_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tx_result: Option<String>,
+}
+
+/// Plaintext-safe sidecar metadata stored NEXT TO the crypto envelope.
+/// `registry_id` + `identity_commitment` are tamper-bound by the entry's
+/// membership_hash key (recomputed at load) and duplicated inside the
+/// ciphertext; `alloc` is MAC-bound (see `AllocationState`); `cache` is
+/// deliberately outside the MAC (see `CacheState`).
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct MembershipMeta {
+    #[serde(flatten)]
+    pub(crate) alloc: AllocationState,
+    /// HMAC (hex) over the reservation-critical sidecar state — see
+    /// `meta_mac`. Keyed by the unlock-derived store MAC key; stamped at
+    /// `insert` so entries are authenticated from birth. Missing or
+    /// mismatched = quarantined at unlock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) allocations_mac: Option<String>,
+    #[serde(flatten)]
+    pub(crate) cache: CacheState,
+    pub(crate) identity_commitment: String,
+    pub(crate) registry_id: String,
     /// The rln_identifier of the scope that REGISTERED this membership —
     /// register's per-scope idempotency key (spec: "idempotent for a scope").
     /// Local bookkeeping only: the membership_hash excludes it (Appendix B).
     /// Empty on pre-scope records — treated as matching ANY scope.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) rln_identifier: String,
-    pub(crate) state: MembershipState,
-    pub(crate) state_history: Vec<StateChange>,
-    pub(crate) submitted_at: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) tx_result: Option<String>,
 }
 
 /// serde `skip_serializing_if` for the defaulted u64 fields: they are
@@ -347,13 +363,13 @@ struct MetaMacPayload<'a> {
 }
 
 /// HMAC-SHA256 (hex) over the entry's reservation-critical sidecar state.
-pub(crate) fn meta_mac(key: &[u8; 32], membership_hash: &str, meta: &MembershipMeta) -> String {
+pub(crate) fn meta_mac(key: &[u8; 32], membership_hash: &str, alloc: &AllocationState) -> String {
     use hmac::Mac;
     let payload = MetaMacPayload {
-        allocations: &meta.allocations,
-        epoch_size_sec: meta.epoch_size_sec,
+        allocations: &alloc.allocations,
+        epoch_size_sec: alloc.epoch_size_sec,
         membership_hash,
-        prune_floor: meta.prune_floor,
+        prune_floor: alloc.prune_floor,
         v: "rln-meta-mac-1",
     };
     // Serializing a struct of ints/strs/derived-Serialize slices cannot fail,
@@ -368,7 +384,9 @@ pub(crate) fn meta_mac(key: &[u8; 32], membership_hash: &str, meta: &MembershipM
 /// malformed, or does not match the recomputation.
 pub(crate) fn meta_mac_ok(key: &[u8; 32], membership_hash: &str, meta: &MembershipMeta) -> bool {
     match &meta.allocations_mac {
-        Some(stored) => ct_eq(meta_mac(key, membership_hash, meta).as_bytes(), stored.as_bytes()),
+        Some(stored) => {
+            ct_eq(meta_mac(key, membership_hash, &meta.alloc).as_bytes(), stored.as_bytes())
+        }
         None => false,
     }
 }
@@ -528,40 +546,44 @@ mod tests {
         let key = [0x42u8; 32];
         let hash = "6fd7bb69f9d54371c1b26e57e0f4f108c018de65e4e214d8ec858e1d3855c0e2";
         let mut meta = MembershipMeta {
-            allocations: vec![
-                crate::rate_limit::EpochAllocation {
-                    rln_identifier: "ab".repeat(32),
-                    epoch: 41,
-                    used: 2,
-                },
-                crate::rate_limit::EpochAllocation {
-                    rln_identifier: "cd".repeat(32),
-                    epoch: 43,
-                    used: 1,
-                },
-            ],
+            alloc: AllocationState {
+                allocations: vec![
+                    crate::rate_limit::EpochAllocation {
+                        rln_identifier: "ab".repeat(32),
+                        epoch: 41,
+                        used: 2,
+                    },
+                    crate::rate_limit::EpochAllocation {
+                        rln_identifier: "cd".repeat(32),
+                        epoch: 43,
+                        used: 1,
+                    },
+                ],
+                epoch_size_sec: 600,
+                prune_floor: 7,
+            },
             allocations_mac: None,
-            epoch_size_sec: 600,
-            failed_reason: None,
+            cache: CacheState {
+                failed_reason: None,
+                leaf_index: 5,
+                rate_limit: 100,
+                retryable: None,
+                state: MembershipState::Active,
+                state_history: Vec::new(),
+                submitted_at: 1_700_000_000,
+                tx_result: None,
+            },
             identity_commitment: "11".repeat(32),
-            leaf_index: 5,
-            prune_floor: 7,
-            rate_limit: 100,
             registry_id: "logos:local:test".into(),
-            retryable: None,
             rln_identifier: "ab".repeat(32),
-            state: MembershipState::Active,
-            state_history: Vec::new(),
-            submitted_at: 1_700_000_000,
-            tx_result: None,
         };
-        let mac = meta_mac(&key, hash, &meta);
+        let mac = meta_mac(&key, hash, &meta.alloc);
         // Fields outside the covered set must not perturb the MAC.
-        meta.leaf_index = 999;
-        meta.rate_limit = 1;
-        meta.state = MembershipState::Failed;
-        meta.tx_result = Some("tx".into());
-        assert_eq!(meta_mac(&key, hash, &meta), mac, "non-covered fields leaked into the MAC");
+        meta.cache.leaf_index = 999;
+        meta.cache.rate_limit = 1;
+        meta.cache.state = MembershipState::Failed;
+        meta.cache.tx_result = Some("tx".into());
+        assert_eq!(meta_mac(&key, hash, &meta.alloc), mac, "non-covered fields leaked into the MAC");
         assert_eq!(mac, "577ba1b62829c35f52a406f06940de8005267ba96a4bfb4edbd13c1a78356472");
     }
 
