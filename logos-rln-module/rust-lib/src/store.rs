@@ -192,21 +192,7 @@ pub(crate) fn init(dir: PathBuf) {
 /// instance, not an arbitrary writer, and network/shared-volume filesystems
 /// may not honor it (see README).
 fn acquire_dir_lock(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
-    std::fs::create_dir_all(dir)?;
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dir.join(keystore::LOCK_FILE))?;
-    match f.try_lock() {
-        Ok(()) => Ok(f),
-        Err(std::fs::TryLockError::WouldBlock) => Err(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "another process holds the RLN keystore lock",
-        )),
-        Err(std::fs::TryLockError::Error(e)) => Err(e),
-    }
+    logos_keystore_core::acquire_dir_lock(dir, keystore::LOCK_FILE)
 }
 
 /// Run `f` against the store; `internal` error when `init` never succeeded —

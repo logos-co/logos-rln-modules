@@ -45,14 +45,16 @@ jobs:
           cache-on-failure: true
           workspaces: logos-rln-module/rust-lib
 
+      # --workspace covers the keystore-core member alongside the module.
       - name: cargo clippy
         working-directory: logos-rln-module/rust-lib
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-      # The keychain tests drive the live macOS keychain; always skipped in CI.
+      # The keychain tests drive the live macOS keychain; always skipped in
+      # CI (the filter is a no-op on the keystore-core test binary).
       - name: cargo test
         working-directory: logos-rln-module/rust-lib
-        run: cargo test --locked -- --skip keychain
+        run: cargo test --locked --workspace -- --skip keychain
 
   nix:
     name: nix build (.lgx)

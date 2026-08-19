@@ -775,6 +775,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "logos-keystore-core"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "ctr",
+ "getrandom 0.2.17",
+ "hmac",
+ "pbkdf2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sha3",
+ "zeroize",
+]
+
+[[package]]
 name = "logos-rust-sdk"
 version = "0.2.0"
 dependencies = [
@@ -1159,18 +1175,15 @@ dependencies = [
 name = "rln_module"
 version = "0.5.0"
 dependencies = [
- "aes",
- "ctr",
  "getrandom 0.2.17",
  "hmac",
+ "logos-keystore-core",
  "logos-rust-sdk",
- "pbkdf2",
  "rand_chacha 0.3.1",
  "rln",
  "serde",
  "serde_json",
  "sha2",
- "sha3",
  "zeroize",
 ]
 
