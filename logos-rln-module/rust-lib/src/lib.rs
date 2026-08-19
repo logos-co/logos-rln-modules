@@ -1237,7 +1237,7 @@ fn get_epoch_quota_impl(
     let store::MembershipRecord { hash, meta, .. } = &usable[0];
 
     let remaining = store::with_store(|s| {
-        Ok(s.remaining_budget(hash, &rln_id_hex, epoch_index, meta.cache.rate_limit, size))
+        s.remaining_budget(hash, &rln_id_hex, epoch_index, meta.cache.rate_limit, size)
     })?;
     ok_json(views::EpochQuotaView::new(epoch_index, meta.cache.rate_limit, remaining))
 }

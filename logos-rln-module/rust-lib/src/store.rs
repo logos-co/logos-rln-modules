@@ -556,11 +556,13 @@ impl Store {
     }
 
     /// Remaining slots for `(membership, rln_identifier, epoch)` — the quota
-    /// read's current-epoch budget. Read-only. Mirrors the reserve path's
-    /// permanent refusals: an epoch below the persisted floor, or a
-    /// configured epoch size the membership isn't bound to, reports 0 — the
-    /// wire contract's fallback cue — instead of advertising slots
-    /// `reserve_message_id` will refuse.
+    /// read's current-epoch budget. Read-only, but it mirrors the reserve
+    /// path's PERMANENT refusals with the same errors: an epoch below the
+    /// persisted floor, or a configured epoch size the membership isn't
+    /// bound to, is refused here exactly as `reserve_message_id` would
+    /// refuse it — never shown as an "exhausted" budget the consumer would
+    /// retry forever (`{rate_limit > 0, remaining: 0}` must always mean
+    /// spendable-next-epoch on the wire).
     pub(crate) fn remaining_budget(
         &self,
         hash: &str,
@@ -568,21 +570,31 @@ impl Store {
         epoch: u64,
         rate_limit: u64,
         epoch_size_sec: u64,
-    ) -> u64 {
-        self.file
-            .credentials
-            .get(hash)
-            .map(|e| {
-                let alloc = &e.membership.alloc;
-                if alloc.epoch_size_sec != 0 && alloc.epoch_size_sec != epoch_size_sec {
-                    return 0;
-                }
-                if epoch < alloc.prune_floor {
-                    return 0;
-                }
-                crate::rate_limit::remaining(&alloc.allocations, rln_identifier_hex, epoch, rate_limit)
-            })
-            .unwrap_or(0)
+    ) -> Result<u64, ApiError> {
+        let Some(entry) = self.file.credentials.get(hash) else {
+            return Ok(0);
+        };
+        let alloc = &entry.membership.alloc;
+        if alloc.epoch_size_sec != 0 && alloc.epoch_size_sec != epoch_size_sec {
+            return Err(ApiError::new(
+                ErrorKind::Permanent,
+                &format!(
+                    "configured epoch_size_sec {epoch_size_sec} differs from {} — the size this \
+                     membership's allocations are bound to; a rebased epoch numbering could \
+                     reissue spent slots. Register a fresh membership under the new size",
+                    alloc.epoch_size_sec
+                ),
+            ));
+        }
+        if epoch < alloc.prune_floor {
+            return Err(ApiError::new(
+                ErrorKind::Permanent,
+                "epoch is below the persisted allocation floor (backwards clock step or a \
+                 widened max_epoch_gap re-admitted a pruned epoch); refusing to reissue a \
+                 possibly spent slot",
+            ));
+        }
+        Ok(crate::rate_limit::remaining(&alloc.allocations, rln_identifier_hex, epoch, rate_limit))
     }
 
     /// Serialize + durably persist the keystore — the SINGLE MAC-stamping
@@ -911,6 +923,12 @@ mod tests {
         // reissuing slot 0.
         let rewound = with_store(|s| s.reserve_message_id(&hash, "aa", 10, 9, 5, 600));
         assert!(matches!(rewound, Err(e) if e.kind == ErrorKind::Permanent));
+        // The quota read mirrors the SAME permanent refusals — never an
+        // "exhausted budget" shape the consumer would retry forever.
+        let q_floor = with_store(|s| s.remaining_budget(&hash, "aa", 10, 5, 600));
+        assert!(matches!(q_floor, Err(e) if e.kind == ErrorKind::Permanent));
+        let q_size = with_store(|s| s.remaining_budget(&hash, "aa", 12, 5, 1200));
+        assert!(matches!(q_size, Err(e) if e.kind == ErrorKind::Permanent));
         // Epoch 12 continues its persisted counter — slot 1, never a fresh 0.
         assert_eq!(
             with_store(|s| s.reserve_message_id(&hash, "aa", 12, 11, 5, 600)).unwrap(),
