@@ -35,7 +35,8 @@
 //! membership_hash and a domain separator. Verified at every unlock: a
 //! missing or mismatched MAC quarantines the entry, and a non-empty file
 //! without `metaMacSalt` refuses to unlock — there is no MAC-less legacy
-//! shape; entries are MAC'd from birth (`insert`). It CANNOT detect:
+//! shape; entries are MAC'd from birth (every unlocked persist stamps every
+//! non-quarantined entry). It CANNOT detect:
 //! (1) whole-file rollback to an older honest snapshot; (2) per-entry
 //! splice of an older honest (state + MAC) block; (3) an attacker who also
 //! knows the password (with keychain auto-unlock in use, any same-user
@@ -243,10 +244,10 @@ pub(crate) struct CacheState {
 pub(crate) struct MembershipMeta {
     #[serde(flatten)]
     pub(crate) alloc: AllocationState,
-    /// HMAC (hex) over the reservation-critical sidecar state — see
-    /// `meta_mac`. Keyed by the unlock-derived store MAC key; stamped at
-    /// `insert` so entries are authenticated from birth. Missing or
-    /// mismatched = quarantined at unlock.
+    /// HMAC (hex) over `alloc` — see `meta_mac`. Keyed by the
+    /// unlock-derived store MAC key; recomputed for every non-quarantined
+    /// entry at every unlocked persist, so entries are authenticated from
+    /// birth. Missing or mismatched = quarantined at unlock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) allocations_mac: Option<String>,
     #[serde(flatten)]

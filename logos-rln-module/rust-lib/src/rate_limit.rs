@@ -81,9 +81,9 @@ pub(crate) fn current_epoch(now_unix: u64, epoch_size_sec: u64) -> u64 {
 /// against a rewound candidate, capped so a spiked candidate can only prune
 /// what was actually allocated, inert when no rows exist.
 ///
-/// Every error path leaves `alloc` EXACTLY as found (the store restamps the
-/// sidecar MAC only on success — do not add error-path mutation); pruning
-/// never drops an in-window epoch.
+/// Every error path leaves `alloc` EXACTLY as found — a refused reservation
+/// must never advance the floor or prune; pruning never drops an in-window
+/// epoch.
 ///
 /// The caller MUST durably persist `alloc` before using the returned slot.
 pub(crate) fn reserve_slot(
@@ -276,10 +276,9 @@ mod tests {
 
     #[test]
     fn failed_reservations_mutate_nothing() {
-        // The store restamps the sidecar MAC only on success, so every error
-        // path must leave allocations and the floor exactly as persisted —
-        // otherwise a later unrelated persist writes state under a stale MAC
-        // and the next unlock falsely quarantines an honest entry.
+        // Every error path must leave the allocation state exactly as
+        // persisted: a refused reservation that advanced the floor or pruned
+        // would silently destroy spent-slot records it had no right to touch.
         let mut alloc = crate::keystore::AllocationState::default();
         assert_eq!(reserve_slot(&mut alloc, APP_A, 10, 9, 1), Ok(0));
         let before = (alloc.allocations.clone(), alloc.prune_floor);

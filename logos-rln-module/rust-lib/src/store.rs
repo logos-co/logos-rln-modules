@@ -338,12 +338,14 @@ impl Store {
             .any(|hash| !self.quarantined.contains(hash))
     }
 
-    /// Encrypt + insert a new (or re-registered) membership and persist,
-    /// stamping the sidecar MAC so the entry is authenticated from birth.
+    /// Encrypt + insert a new (or re-registered) membership and persist —
+    /// which stamps the sidecar MAC, so the entry is authenticated from
+    /// birth. Unlock-gated: a locked insert would persist an unstamped
+    /// entry that the next unlock quarantines.
     pub(crate) fn insert(
         &mut self,
         hash: &str,
-        mut meta: MembershipMeta,
+        meta: MembershipMeta,
         credential: &StoredCredential,
     ) -> Result<(), ApiError> {
         let password = self.session_password.as_ref().ok_or_else(|| {
@@ -355,10 +357,9 @@ impl Store {
         );
         let crypto = keystore::encrypt(password, &plaintext)
             .map_err(|e| ApiError::internal(&format!("keystore encrypt: {e}")))?;
-        let key = self.meta_mac_key.as_ref().ok_or_else(|| {
-            ApiError::new(ErrorKind::Locked, "unlock_keystore before registering")
-        })?;
-        meta.allocations_mac = Some(keystore::meta_mac(key, hash, &meta.alloc));
+        if self.meta_mac_key.is_none() {
+            return Err(ApiError::new(ErrorKind::Locked, "unlock_keystore before registering"));
+        }
         self.file
             .credentials
             .insert(hash.to_string(), KeystoreEntry { crypto, membership: meta });
@@ -506,8 +507,8 @@ impl Store {
         epoch_size_sec: u64,
     ) -> Result<u64, ApiError> {
         // Guards FIRST — a refused call must leave the counters untouched,
-        // and reserving from a quarantined entry would stamp a fresh valid
-        // MAC over tampered counters.
+        // and a quarantined entry's counters are untrusted: refuse before
+        // any mutation (persist would also skip its restamp).
         if self.quarantined.contains(hash) {
             return Err(ApiError::internal("entry quarantined (metadata tamper)"));
         }
@@ -552,8 +553,6 @@ impl Store {
             ),
         })?;
         meta.alloc.epoch_size_sec = epoch_size_sec; // adopt-on-first-success
-        let key = self.meta_mac_key.as_ref().expect("checked above");
-        meta.allocations_mac = Some(keystore::meta_mac(key, hash, &meta.alloc));
         // On persist failure the counter/floor deliberately stay advanced:
         // no proof is issued, so the slot can only be WASTED, never reissued.
         self.persist()?;
@@ -600,7 +599,23 @@ impl Store {
             .unwrap_or(0)
     }
 
-    fn persist(&self) -> Result<(), ApiError> {
+    /// Serialize + durably persist the keystore — the SINGLE MAC-stamping
+    /// site. When unlocked, every non-quarantined entry's `allocations_mac`
+    /// is recomputed here (quarantined entries are never restamped: a fresh
+    /// MAC over tampered state would launder it). While locked, entries are
+    /// written with their stored MACs unchanged — covered state cannot
+    /// change while locked, since `update_cache` is cache-only by type and
+    /// `reserve_message_id` is unlock-gated.
+    fn persist(&mut self) -> Result<(), ApiError> {
+        if let Some(key) = self.meta_mac_key.as_ref() {
+            for (hash, entry) in &mut self.file.credentials {
+                if self.quarantined.contains(hash) {
+                    continue;
+                }
+                entry.membership.allocations_mac =
+                    Some(keystore::meta_mac(key, hash, &entry.membership.alloc));
+            }
+        }
         keystore::save_atomic(&self.dir, &self.file)
             .map_err(|e| ApiError::internal(&format!("keystore save: {e}")))
     }
@@ -919,6 +934,50 @@ mod tests {
         let rebased = with_store(|s| s.reserve_message_id(&hash, "aa", 12, 11, 5, 1200));
         assert!(matches!(rebased, Err(e) if e.kind == ErrorKind::Permanent));
 
+        reset_for_tests();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// persist() is the single MAC-stamping site, and while LOCKED it must
+    /// write entries with their stored MACs unchanged: a locked-mode cache
+    /// persist (the poller's path) must never invalidate an honest entry.
+    #[test]
+    fn locked_cache_updates_do_not_disturb_the_mac() {
+        let _serial = crate::lock(&TEST_STORE_LOCK);
+        let dir = test_store("locked-cache-mac");
+        init(dir.clone());
+        let registry = format!("logos:local:{}", "cc".repeat(32));
+        let commitment = [0x61u8; 32];
+        let hash = registry_id::membership_hash(&registry, &commitment);
+        let credential = StoredCredential {
+            identity_commitment: registry_id::bytes_to_hex(&commitment),
+            identity_nullifier: None,
+            identity_secret_hash: "77".repeat(32),
+            identity_trapdoor: None,
+            registry_id: registry.clone(),
+        };
+        with_store(|s| {
+            s.unlock("pw")?;
+            let mut m = meta(MembershipState::Active, crate::now_unix());
+            m.registry_id = registry.clone();
+            m.identity_commitment = registry_id::bytes_to_hex(&commitment);
+            s.insert(&hash, m, &credential)?;
+            // Cover live allocation state so the MAC is not over defaults.
+            s.reserve_message_id(&hash, "aa", 10, 9, 5, 600).map(|_| ())?;
+            s.lock();
+            // Locked-mode cache mutation persists without touching the MAC.
+            s.update_cache(&hash, |c| c.leaf_index = 7)
+        })
+        .unwrap();
+        // Reload from disk: the entry must still verify (not quarantined)
+        // and carry the cache change.
+        init(dir.clone());
+        with_store(|s| {
+            s.unlock("pw")?;
+            assert!(!s.is_quarantined(&hash), "locked persist must not disturb the MAC");
+            Ok(())
+        })
+        .unwrap();
         reset_for_tests();
         let _ = std::fs::remove_dir_all(&dir);
     }
