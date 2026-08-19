@@ -517,6 +517,54 @@ fn sync_or_warn(f: &fs::File, what: &str) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// Golden vector pinning the sidecar-MAC payload bytes: the covered set
+    /// (allocations, epoch_size_sec, prune_floor, bound to membership_hash and
+    /// the domain tag) and its serialized field order. If this assertion ever
+    /// fails, every stored `allocations_mac` in existing keystores is
+    /// invalidated — that must be a deliberate, versioned decision, never a
+    /// refactor side effect.
+    #[test]
+    fn meta_mac_golden_vector() {
+        let key = [0x42u8; 32];
+        let hash = "6fd7bb69f9d54371c1b26e57e0f4f108c018de65e4e214d8ec858e1d3855c0e2";
+        let mut meta = MembershipMeta {
+            allocations: vec![
+                crate::rate_limit::EpochAllocation {
+                    rln_identifier: "ab".repeat(32),
+                    epoch: 41,
+                    used: 2,
+                },
+                crate::rate_limit::EpochAllocation {
+                    rln_identifier: "cd".repeat(32),
+                    epoch: 43,
+                    used: 1,
+                },
+            ],
+            allocations_mac: None,
+            epoch_size_sec: 600,
+            failed_reason: None,
+            identity_commitment: "11".repeat(32),
+            leaf_index: 5,
+            prune_floor: 7,
+            rate_limit: 100,
+            registry_id: "logos:local:test".into(),
+            retryable: None,
+            rln_identifier: "ab".repeat(32),
+            state: MembershipState::Active,
+            state_history: Vec::new(),
+            submitted_at: 1_700_000_000,
+            tx_result: None,
+        };
+        let mac = meta_mac(&key, hash, &meta);
+        // Fields outside the covered set must not perturb the MAC.
+        meta.leaf_index = 999;
+        meta.rate_limit = 1;
+        meta.state = MembershipState::Failed;
+        meta.tx_result = Some("tx".into());
+        assert_eq!(meta_mac(&key, hash, &meta), mac, "non-covered fields leaked into the MAC");
+        assert_eq!(mac, "577ba1b62829c35f52a406f06940de8005267ba96a4bfb4edbd13c1a78356472");
+    }
+
     #[test]
     fn roundtrip_and_wrong_password() {
         let plaintext = br#"{"identity_secret_hash":"deadbeef"}"#;
