@@ -60,24 +60,25 @@ impl MembershipView {
         quarantined: bool,
         rate_limit_mismatch: bool,
     ) -> Self {
+        let cache = &meta.cache;
         let (failed_reason, retryable) = if quarantined {
             (Some("metadata_tamper".to_string()), None)
         } else {
-            (meta.failed_reason.clone(), meta.failed_reason.as_ref().and(meta.retryable))
+            (cache.failed_reason.clone(), cache.failed_reason.as_ref().and(cache.retryable))
         };
         MembershipView {
             credential: CredentialView { identity_commitment: meta.identity_commitment.clone() },
             failed_reason,
-            leaf_index: meta.leaf_index,
+            leaf_index: cache.leaf_index,
             membership_hash: hash.to_string(),
-            rate_limit: meta.rate_limit,
+            rate_limit: cache.rate_limit,
             rate_limit_mismatch: rate_limit_mismatch.then_some(true),
             registry_id: meta.registry_id.clone(),
             retryable,
             rln_identifier: (!meta.rln_identifier.is_empty()).then(|| meta.rln_identifier.clone()),
-            state: if quarantined { MembershipState::Failed } else { meta.state },
-            submitted_at: meta.submitted_at,
-            tx_result: meta.tx_result.clone(),
+            state: if quarantined { MembershipState::Failed } else { cache.state },
+            submitted_at: cache.submitted_at,
+            tx_result: cache.tx_result.clone(),
         }
     }
 }

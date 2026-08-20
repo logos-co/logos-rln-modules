@@ -6,24 +6,27 @@ over logos-core. The layering:
 
 ```
 consumer (e.g. WAKU2-RLN-RELAY relay code)
-    │  spec functions: Membership register(scope, …), bool verify_proof(…), …
+    │  spec functions: Membership register(scope, …), validate_proof(scope, signal, timestamp, proof), …
 shim (implements the spec API in the consumer's language)
     │  logos-core wire: the methods below (string args → QString-JSON reply)
 liblogos_rln_module
 ```
 
 The shim is intended to be **stateless**: every piece of state the spec
-functions need (epoch, allocations, root windows, credentials) lives in the
-module. The one thing the shim MUST still supply is the scope — every call
+functions need (epoch derivation, allocations, root windows, credentials)
+lives in the module. What the shim MUST still supply is the scope — every call
 passes its `(registry_id, rln_identifier_hex)` explicitly (spec: the Module
-holds no default).
+holds no default) — and, on the rate-limiting calls, the message's
+`timestamp` (Unix seconds): the module derives every epoch from that value,
+never from consumer-side epoch math.
 
 ## Call conventions
 
 - Every method takes positional string/int args. Replies come in two dialects,
   split by the method's declared return type:
   - **`result` methods** — the RLN-API surface (`start`, `stop`,
-    `generate_proof`, `verify_proof`, `get_registry_parameters`) — return a
+    `generate_proof`, `verify_proof`, `get_epoch_quota`,
+    `get_registry_parameters`) — return a
     real `LogosResult`. On the consumer (lp) wire that is the envelope
     `{"success": bool, "value": <reply>, "error": <string>}`; on failure
     `error` is the JSON-encoded typed object `{"class":…,"kind":…,
@@ -75,9 +78,9 @@ switch on `class`, log `kind`.
 | `stop()` | `stop()` | result | `{"stopped":true}` |
 | `register(scope, rate_limit, options)` | `register(registry_id, rln_identifier_hex, rate_limit, options_json)` | tstr | public Membership view (below), `"state":"pending"` on a fresh submit |
 | `get_membership_state(scope)` | `get_membership_state(registry_id, rln_identifier_hex)` | tstr | `{"state":…}` + `membership_hash`/`leaf_index`/`rate_limit` when known |
-| `generate_proof(scope, signal, timestamp)` | `generate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp)` | result | RateLimitProof (below) + `"message_id"`, `"epoch"`, `"membership_hash"`; epoch derives from `timestamp` (Unix s), must be within now ± `max_epoch_gap` |
-| `verify_proof(scope, signal, proof)` | `verify_proof(registry_id, rln_identifier_hex, signal_hex, proof_json)` | result | `{"verdict":str}` (see the verdict table); `rate_limit_violation` also carries `"recovered_secret":hex` |
-| `get_epoch_quota(scope)` | `get_epoch_quota(registry_id, rln_identifier_hex)` | result | `{"epoch_index":N,"rate_limit":N,"remaining":N}` — one epoch observation, purely local; `epoch_index` is a NUMBER (`floor(unix/epoch_size)`, what a QuotaProvider's `epochIndex` consumes); no usable membership → `rate_limit`/`remaining` both 0 (the wall-clock-fallback cue — never an exhausted budget) |
+| `generate_proof(scope, signal, timestamp)` | `generate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp)` | result | RateLimitProof (below) + `"message_id"`, `"epoch"`, `"membership_hash"`; epoch derives from `timestamp` (Unix s), must be within now ± `max_epoch_gap`. Fails `permanent` (kind `permanent`) for an epoch below the membership's persisted allocation floor (backwards clock / widened `max_epoch_gap`) or an `epoch_size_sec` its allocations are not bound to — re-register to recover |
+| `validate_proof(scope, signal, timestamp, proof)` | `verify_proof(registry_id, rln_identifier_hex, signal_hex, timestamp, proof_json)` | result | `{"verdict":str}` (see the verdict table); `rate_limit_violation` also carries `"recovered_secret":hex`. `timestamp` is the value stamped on the message under validation: the proof's epoch must EQUAL its epoch and be within now ± `max_epoch_gap`, else `"invalid"` |
+| `get_epoch_quota(scope, timestamp)` | `get_epoch_quota(registry_id, rln_identifier_hex, timestamp)` | result | `{"epoch_index":N,"rate_limit":N,"remaining":N}` — one observation of `timestamp`'s epoch, purely local; `epoch_index` is a NUMBER (`floor(timestamp/epoch_size)`, what a QuotaProvider's `epochIndex` consumes); no usable membership → `rate_limit`/`remaining` both 0 (the wall-clock-fallback cue — never an exhausted budget); a timestamp whose epoch is outside now ± `max_epoch_gap`, below the membership's persisted allocation floor, or denominated in an `epoch_size_sec` its allocations aren't bound to fails `permanent` — the same refusals `generate_proof` would answer (spec: test a timestamp before committing to it), so `{rate_limit>0, remaining:0}` always means spendable-next-epoch |
 | registry parameters read (optional ext.) | `get_registry_parameters(registry_id, rln_identifier_hex)` | result | `{"epoch_size_sec","max_rate_limit","min_rate_limit","max_total_rate_limit","price_per_unit"}` |
 | select (multiple-membership ext.) | `select_membership(registry_id, rln_identifier_hex, selector_json)` | tstr | public Membership view |
 | list (helper) | `get_memberships(registry_id)` | tstr | `{"memberships":[…]}` |
@@ -206,10 +209,15 @@ namespace (its registry keeps no recoverable deposit).
   `not_ready` rather than improvise an epoch base. It is an
   **application parameter** — every
   proof generator and verifier of a deployment must configure the same value.
-- `verify_proof` enforces application binding + epoch freshness: the proof's
-  external nullifier must match the scope's expected value for the current
-  epoch ± `max_epoch_gap`; anything else is `{"verdict":"invalid"}`. Consumers
-  do not implement their own epoch checks. **Double-signal detection across
+- `verify_proof` enforces application binding + epoch agreement + freshness:
+  the expected epoch derives from the supplied message `timestamp`; the
+  proof's carried epoch, when present, must equal it; the proof's external
+  nullifier must match the scope's expected value recomputed from it; and it
+  must fall within the current epoch ± `max_epoch_gap`. Anything else is
+  `{"verdict":"invalid"}`. Consumers implement no epoch math of their own —
+  they relay the message's timestamp on both `generate_proof` and
+  `verify_proof`, and the two ends agree on the epoch by construction.
+  **Double-signal detection across
   messages is now the Module's job, not the consumer's** (a spec change): the
   Module keeps an in-memory nullifier log (per epoch, retained at least
   `max_epoch_gap` epochs, never on disk) and, when a proof reuses a nullifier
@@ -218,9 +226,10 @@ namespace (its registry keeps no recoverable deposit).
 
 ### verify_proof verdicts
 
-A proof that fails any validity check (zk-invalid, root not in window, stale or
-cross-application binding) is `invalid`. A proof passing every check is then
-judged against the nullifier log:
+A proof that fails any validity check (zk-invalid, root not in window, stale,
+epoch not matching the message timestamp, or cross-application binding) is
+`invalid`. A proof passing every check is then judged against the nullifier
+log:
 
 | `verdict` | Meaning | Suggested consumer action |
 |---|---|---|

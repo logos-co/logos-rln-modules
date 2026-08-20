@@ -43,7 +43,9 @@ use crate::{ApiError, ErrorKind};
 /// Persisted schema types owned by `keystore.rs` (the on-disk format);
 /// re-exported so the crate addresses them as `store::` paths.
 /// `store → keystore` is the only dependency edge between the two modules.
-pub(crate) use crate::keystore::{MembershipMeta, MembershipState, StateChange};
+pub(crate) use crate::keystore::{
+    AllocationState, CacheState, MembershipMeta, MembershipState, StateChange,
+};
 
 /// Pending→Failed bound (spec MUST). Testnet confirmation runs 60–90s;
 /// 300s leaves margin.
@@ -52,7 +54,7 @@ const STATE_HISTORY_CAP: usize = 20;
 
 // ------------------------------------------------------------------- records
 
-impl MembershipMeta {
+impl CacheState {
     /// Records a failed submission: state → Failed, the "submit_failed: "
     /// failure-reason prefix consumers key on, and the spec's retryable flag.
     pub(crate) fn mark_submit_failed(&mut self, message: &str, retryable: bool) {
@@ -104,9 +106,16 @@ pub(crate) struct Store {
     file: KeystoreFile,
     session_password: Option<Zeroizing<String>>,
     /// membership_hash keys whose sidecar failed the load-time recomputation
-    /// — surfaced with failed_reason "metadata_tamper", never decrypted,
-    /// never selected.
+    /// or the unlock-time allocation-state MAC — surfaced with failed_reason
+    /// "metadata_tamper", never decrypted, never selected.
     quarantined: BTreeSet<String>,
+    /// Sidecar-MAC key, derived once per unlock (see keystore.rs "Sidecar
+    /// authentication"); cleared on lock alongside the password.
+    meta_mac_key: Option<Zeroizing<[u8; 32]>>,
+    /// Exclusive OS lock on the persistence dir's sentinel file, held for the
+    /// store's lifetime (released on drop). Guards the whole-file-rewrite
+    /// persistence against a second process on the same path.
+    _dir_lock: std::fs::File,
 }
 
 static STORE: Mutex<Option<Store>> = Mutex::new(None);
@@ -120,9 +129,30 @@ pub(crate) fn reset_for_tests() {
     *crate::lock(&STORE) = None;
 }
 
-/// Load (or create) the store. Called from `on_context_ready`; runs the
-/// tamper scan binding each entry's sidecar to its membership_hash key.
+/// Load (or create) the store. Called from `on_context_ready`; takes the
+/// exclusive persistence-dir lock, then runs the tamper scan binding each
+/// entry's sidecar to its membership_hash key.
 pub(crate) fn init(dir: PathBuf) {
+    let mut guard = crate::lock(&STORE);
+    // Drop any prior store FIRST: its directory lock releases on drop, so an
+    // in-process re-init (tests; a fresh on_context_ready) can reacquire —
+    // OS file locks conflict between file descriptions even within one
+    // process.
+    *guard = None;
+    let dir_lock = match acquire_dir_lock(&dir) {
+        Ok(f) => f,
+        Err(e) => {
+            // Fail closed: two stores on one path would last-writer-wins
+            // clobber each other's credentials and allocation counters.
+            eprintln!(
+                "store: could not take the exclusive keystore lock in {} ({e}); another \
+                 process may be using this persistence path; leaving store uninitialized \
+                 so every keystore op fails rather than corrupting shared state",
+                dir.display()
+            );
+            return;
+        }
+    };
     let file = match keystore::load(&dir) {
         Ok(file) => file,
         Err(e) => {
@@ -134,7 +164,6 @@ pub(crate) fn init(dir: PathBuf) {
                 "store: keystore read failed ({e}); leaving store uninitialized to avoid \
                  clobbering existing credentials — resolve the fault and restart"
             );
-            *crate::lock(&STORE) = None;
             return;
         }
     };
@@ -148,36 +177,53 @@ pub(crate) fn init(dir: PathBuf) {
             quarantined.insert(hash.clone());
         }
     }
-    *crate::lock(&STORE) = Some(Store {
+    *guard = Some(Store {
         dir,
         file,
         session_password: None,
         quarantined,
+        meta_mac_key: None,
+        _dir_lock: dir_lock,
     });
 }
 
-/// Run `f` against the store; `internal` error when no persistence path was
-/// provided at context time (no silent cwd fallback — see README).
+/// Exclusive advisory lock on the persistence dir, via its sentinel file
+/// (`keystore::LOCK_FILE`). Advisory: it stops a second WELL-BEHAVED module
+/// instance, not an arbitrary writer, and network/shared-volume filesystems
+/// may not honor it (see README).
+fn acquire_dir_lock(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    keystore_core::acquire_dir_lock(dir, keystore::LOCK_FILE)
+}
+
+/// Run `f` against the store; `internal` error when `init` never succeeded —
+/// no persistence path from the host (no silent cwd fallback — see README),
+/// an unreadable keystore, or another process holding the keystore lock.
 pub(crate) fn with_store<R>(f: impl FnOnce(&mut Store) -> Result<R, ApiError>) -> Result<R, ApiError> {
     let mut guard = crate::lock(&STORE);
     match guard.as_mut() {
         Some(store) => f(store),
         None => Err(ApiError::internal(
-            "store not initialized (host provided no instance persistence path)",
+            "store not initialized (no instance persistence path from the host, unreadable \
+             keystore, or another process holds the keystore lock)",
         )),
     }
 }
 
 impl Store {
+    /// Verify the password, then derive the sidecar-MAC key and authenticate
+    /// every entry's reservation-critical state (quarantining a missing or
+    /// mismatched MAC). Two 1M-round PBKDF2 runs — treat unlock as a
+    /// ~seconds operation. The session fields are set only after every
+    /// fallible step, so a failed unlock never leaves the store half
+    /// unlocked.
     pub(crate) fn unlock(&mut self, password: &str) -> Result<usize, ApiError> {
-        if let Some(entry) = self
+        match self
             .file
             .credentials
             .iter()
             .find(|(hash, _)| !self.quarantined.contains(*hash))
-            .map(|(_, e)| e)
         {
-            match keystore::decrypt(password, &entry.crypto) {
+            Some((_, entry)) => match keystore::decrypt(password, &entry.crypto) {
                 Ok(_) => {}
                 Err(keystore::KeystoreError::BadPassword) => {
                     return Err(ApiError::new(
@@ -186,14 +232,79 @@ impl Store {
                     ))
                 }
                 Err(e) => return Err(ApiError::internal(&format!("keystore decrypt: {e}"))),
+            },
+            // Refuse an all-quarantined store: with nothing to verify
+            // against, ANY password would "unlock" vacuously and become the
+            // session/MAC key.
+            None if !self.file.credentials.is_empty() => {
+                return Err(ApiError::internal(
+                    "every keystore entry is quarantined (metadata tamper); restore \
+                     rln_keystore.json from a backup",
+                ))
+            }
+            // Empty keystore: any password unlocks and becomes the
+            // encryption password at first write (see module docs).
+            None => {}
+        }
+
+        // Every non-empty keystore carries `metaMacSalt` and every entry is
+        // MAC'd from birth (persist stamps it); there is no MAC-less shape
+        // to adopt, so a missing salt over credentials is tamper or a
+        // foreign writer, never a migration.
+        let mut dirty = false;
+        let salt = match &self.file.meta_mac_salt {
+            Some(s) => s.clone(),
+            None if !self.file.credentials.is_empty() => {
+                return Err(ApiError::internal(
+                    "metaMacSalt is missing from a non-empty keystore — the file was \
+                     tampered with, partially restored, or written by a foreign tool; \
+                     restore rln_keystore.json from a consistent backup",
+                ))
+            }
+            // Empty keystore: initialize the salt at first unlock.
+            None => {
+                let mut raw = [0u8; 16];
+                getrandom::getrandom(&mut raw)
+                    .map_err(|_| ApiError::internal("no CSPRNG for the meta MAC salt"))?;
+                let s = registry_id::bytes_to_hex(&raw);
+                self.file.meta_mac_salt = Some(s.clone());
+                dirty = true;
+                s
+            }
+        };
+        // A present-but-malformed salt fails closed (never regenerate — a
+        // fresh salt would mass-quarantine every MAC'd entry).
+        let key = keystore::derive_meta_mac_key(password, &salt).map_err(|e| {
+            ApiError::internal(&format!(
+                "meta MAC key: {e}; if metaMacSalt is corrupt, restore rln_keystore.json \
+                 from a backup"
+            ))
+        })?;
+        for (hash, entry) in &self.file.credentials {
+            if self.quarantined.contains(hash) {
+                continue;
+            }
+            // meta_mac_ok is false for an ABSENT MAC too: entries are MAC'd
+            // from birth, so a missing tag is as much tamper as a mismatch.
+            if !keystore::meta_mac_ok(&key, hash, &entry.membership) {
+                eprintln!(
+                    "store: entry {hash} sidecar allocation state is missing its MAC or \
+                     fails verification — quarantined"
+                );
+                self.quarantined.insert(hash.clone());
             }
         }
+        if dirty {
+            self.persist()?;
+        }
         self.session_password = Some(Zeroizing::new(password.to_string()));
+        self.meta_mac_key = Some(key);
         Ok(self.file.credentials.len())
     }
 
     pub(crate) fn lock(&mut self) {
         self.session_password = None;
+        self.meta_mac_key = None;
     }
 
     /// The active session password, if unlocked — a Zeroizing clone for
@@ -212,7 +323,10 @@ impl Store {
             .any(|hash| !self.quarantined.contains(hash))
     }
 
-    /// Encrypt + insert a new (or re-registered) membership and persist.
+    /// Encrypt + insert a new (or re-registered) membership and persist —
+    /// which stamps the sidecar MAC, so the entry is authenticated from
+    /// birth. Unlock-gated: a locked insert would persist an unstamped
+    /// entry that the next unlock quarantines.
     pub(crate) fn insert(
         &mut self,
         hash: &str,
@@ -228,6 +342,9 @@ impl Store {
         );
         let crypto = keystore::encrypt(password, &plaintext)
             .map_err(|e| ApiError::internal(&format!("keystore encrypt: {e}")))?;
+        if self.meta_mac_key.is_none() {
+            return Err(ApiError::new(ErrorKind::Locked, "unlock_keystore before registering"));
+        }
         self.file
             .credentials
             .insert(hash.to_string(), KeystoreEntry { crypto, membership: meta });
@@ -301,7 +418,10 @@ impl Store {
         self.file
             .credentials
             .iter()
-            .filter(|(h, e)| e.membership.state == MembershipState::Pending && !self.quarantined.contains(*h))
+            .filter(|(h, e)| {
+                e.membership.cache.state == MembershipState::Pending
+                    && !self.quarantined.contains(*h)
+            })
             .map(|(h, e)| (h.clone(), e.membership.clone()))
             .collect()
     }
@@ -315,7 +435,7 @@ impl Store {
             .filter(|(h, e)| {
                 !self.quarantined.contains(*h)
                     && matches!(
-                        e.membership.state,
+                        e.membership.cache.state,
                         MembershipState::Active | MembershipState::GracePeriod | MembershipState::Expired
                     )
             })
@@ -323,37 +443,45 @@ impl Store {
             .collect()
     }
 
-    /// Mutate one record's metadata and persist. State changes go through
-    /// here so history stays consistent: pass the new state via
-    /// `MembershipMeta::state`; history appends automatically on change.
-    pub(crate) fn update(
+    /// Run a cache-only mutation against an entry and persist. The closure
+    /// receives `CacheState` ONLY — MAC-covered allocation state is not
+    /// reachable here by construction; the sole covered-mutation path is
+    /// `reserve_message_id`.
+    pub(crate) fn update_cache(
         &mut self,
         hash: &str,
-        f: impl FnOnce(&mut MembershipMeta),
+        f: impl FnOnce(&mut CacheState),
     ) -> Result<(), ApiError> {
         let entry = self.file.credentials.get_mut(hash).ok_or_else(|| {
             ApiError::new(ErrorKind::UnknownMembership, "no such membership_hash")
         })?;
-        let before = entry.membership.state;
-        f(&mut entry.membership);
-        if entry.membership.state != before {
-            entry.membership.state_history.push(StateChange {
+        let cache = &mut entry.membership.cache;
+        let before = cache.state;
+        f(cache);
+        if cache.state != before {
+            cache.state_history.push(StateChange {
                 at: crate::now_unix(),
-                state: entry.membership.state,
+                state: cache.state,
             });
-            if entry.membership.state_history.len() > STATE_HISTORY_CAP {
-                let drop_n = entry.membership.state_history.len() - STATE_HISTORY_CAP;
-                entry.membership.state_history.drain(..drop_n);
+            if cache.state_history.len() > STATE_HISTORY_CAP {
+                let drop_n = cache.state_history.len() - STATE_HISTORY_CAP;
+                cache.state_history.drain(..drop_n);
             }
         }
         self.persist()
     }
 
     /// Reserve the next `message_id` for `(membership, rln_identifier, epoch)`
-    /// and DURABLY PERSIST it before returning — the caller uses the slot only
+    /// and durably persist it before returning — the caller uses the slot only
     /// after this call succeeds, so a crash can waste a slot but never reissue
-    /// one. No unlock needed: allocations live in the plaintext
-    /// sidecar. `BudgetExhausted` when the epoch's `rate_limit` is spent.
+    /// one. Requires an unlocked keystore (the sidecar MAC key derives from
+    /// the session password).
+    ///
+    /// `BudgetExhausted` when the epoch's `rate_limit` is spent. `Permanent`
+    /// when `epoch` is below the persisted allocation floor, or when
+    /// `epoch_size_sec` differs from the size this membership's allocations
+    /// are bound to (an epoch-size change is not migratable — see
+    /// `AllocationState::epoch_size_sec`); recovery is a fresh membership.
     pub(crate) fn reserve_message_id(
         &mut self,
         hash: &str,
@@ -361,51 +489,130 @@ impl Store {
         epoch: u64,
         retain_floor: u64,
         rate_limit: u64,
+        epoch_size_sec: u64,
     ) -> Result<u64, ApiError> {
+        // Guards FIRST — a refused call must leave the counters untouched,
+        // and a quarantined entry's counters are untrusted: refuse before
+        // any mutation (persist would also skip its restamp).
+        if self.quarantined.contains(hash) {
+            return Err(ApiError::internal("entry quarantined (metadata tamper)"));
+        }
+        if self.meta_mac_key.is_none() {
+            return Err(ApiError::new(
+                ErrorKind::Locked,
+                "unlock_keystore before generate_proof",
+            ));
+        }
         let entry = self.file.credentials.get_mut(hash).ok_or_else(|| {
             ApiError::new(ErrorKind::UnknownMembership, "no such membership_hash")
         })?;
+        let meta = &mut entry.membership;
+        if meta.alloc.epoch_size_sec != 0 && meta.alloc.epoch_size_sec != epoch_size_sec {
+            return Err(ApiError::new(
+                ErrorKind::Permanent,
+                &format!(
+                    "configured epoch_size_sec {epoch_size_sec} differs from {} — the size this \
+                     membership's allocations are bound to; a rebased epoch numbering could \
+                     reissue spent slots. Register a fresh membership under the new size",
+                    meta.alloc.epoch_size_sec
+                ),
+            ));
+        }
         let slot = crate::rate_limit::reserve_slot(
-            &mut entry.membership.allocations,
+            &mut meta.alloc,
             rln_identifier_hex,
             epoch,
             retain_floor,
             rate_limit,
         )
-        .map_err(|_| {
-            ApiError::new(
+        .map_err(|e| match e {
+            crate::rate_limit::AllocError::BudgetExhausted => ApiError::new(
                 ErrorKind::BudgetExhausted,
                 "epoch rate-limit budget exhausted; retry next epoch",
-            )
+            ),
+            crate::rate_limit::AllocError::EpochBelowFloor => ApiError::new(
+                ErrorKind::Permanent,
+                "epoch is below the persisted allocation floor (backwards clock step or a \
+                 widened max_epoch_gap re-admitted a pruned epoch); refusing to reissue a \
+                 possibly spent slot",
+            ),
         })?;
+        meta.alloc.epoch_size_sec = epoch_size_sec; // adopt-on-first-success
+        // On persist failure the counter/floor deliberately stay advanced:
+        // no proof is issued, so the slot can only be WASTED, never reissued.
         self.persist()?;
         Ok(slot)
     }
 
+    /// Every entry's persisted epoch-size binding (0 = not yet bound) — the
+    /// input to `start()`'s configure-time mismatch warning.
+    pub(crate) fn epoch_size_bindings(&self) -> Vec<(String, u64)> {
+        self.file
+            .credentials
+            .iter()
+            .map(|(h, e)| (h.clone(), e.membership.alloc.epoch_size_sec))
+            .collect()
+    }
+
     /// Remaining slots for `(membership, rln_identifier, epoch)` — the quota
-    /// read's current-epoch budget. Read-only.
+    /// read's current-epoch budget. Read-only, but it mirrors the reserve
+    /// path's PERMANENT refusals with the same errors: an epoch below the
+    /// persisted floor, or a configured epoch size the membership isn't
+    /// bound to, is refused here exactly as `reserve_message_id` would
+    /// refuse it — never shown as an "exhausted" budget the consumer would
+    /// retry forever (`{rate_limit > 0, remaining: 0}` must always mean
+    /// spendable-next-epoch on the wire).
     pub(crate) fn remaining_budget(
         &self,
         hash: &str,
         rln_identifier_hex: &str,
         epoch: u64,
         rate_limit: u64,
-    ) -> u64 {
-        self.file
-            .credentials
-            .get(hash)
-            .map(|e| {
-                crate::rate_limit::remaining(
-                    &e.membership.allocations,
-                    rln_identifier_hex,
-                    epoch,
-                    rate_limit,
-                )
-            })
-            .unwrap_or(0)
+        epoch_size_sec: u64,
+    ) -> Result<u64, ApiError> {
+        let Some(entry) = self.file.credentials.get(hash) else {
+            return Ok(0);
+        };
+        let alloc = &entry.membership.alloc;
+        if alloc.epoch_size_sec != 0 && alloc.epoch_size_sec != epoch_size_sec {
+            return Err(ApiError::new(
+                ErrorKind::Permanent,
+                &format!(
+                    "configured epoch_size_sec {epoch_size_sec} differs from {} — the size this \
+                     membership's allocations are bound to; a rebased epoch numbering could \
+                     reissue spent slots. Register a fresh membership under the new size",
+                    alloc.epoch_size_sec
+                ),
+            ));
+        }
+        if epoch < alloc.prune_floor {
+            return Err(ApiError::new(
+                ErrorKind::Permanent,
+                "epoch is below the persisted allocation floor (backwards clock step or a \
+                 widened max_epoch_gap re-admitted a pruned epoch); refusing to reissue a \
+                 possibly spent slot",
+            ));
+        }
+        Ok(crate::rate_limit::remaining(&alloc.allocations, rln_identifier_hex, epoch, rate_limit))
     }
 
-    fn persist(&self) -> Result<(), ApiError> {
+    /// Serialize + durably persist the keystore — the SINGLE MAC-stamping
+    /// site. When unlocked, every non-quarantined entry's `allocations_mac`
+    /// is recomputed here (quarantined entries are never restamped: a fresh
+    /// MAC over tampered state would launder it). While locked, entries are
+    /// written with their stored MACs unchanged — covered state cannot
+    /// change while locked, since `update_cache` is cache-only by type and
+    /// `reserve_message_id` is unlock-gated.
+    fn persist(&mut self) -> Result<(), ApiError> {
+        if let Some(key) = self.meta_mac_key.as_ref() {
+            for (hash, entry) in &mut self.file.credentials {
+                if self.quarantined.contains(hash) {
+                    continue;
+                }
+                entry.membership.allocations_mac =
+                    Some(keystore::meta_mac(key, hash, &entry.membership.alloc));
+            }
+        }
         keystore::save_atomic(&self.dir, &self.file)
             .map_err(|e| ApiError::internal(&format!("keystore save: {e}")))
     }
@@ -416,7 +623,8 @@ impl Store {
 /// True once a record has ever been observed on the registry — the spec's
 /// "state becomes Unknown after having been Active" removal signal.
 fn has_been_active(meta: &MembershipMeta) -> bool {
-    meta.state.is_active_like() || meta.state_history.iter().any(|c| c.state.is_active_like())
+    meta.cache.state.is_active_like()
+        || meta.cache.state_history.iter().any(|c| c.state.is_active_like())
 }
 
 /// The spec's merged view, as a pure function: the registry's report
@@ -432,8 +640,8 @@ pub(crate) fn merge_state(
         // The registry has it: its chain-clock view wins outright.
         (_, Some(state)) => state,
         (Some(meta), None) => {
-            if meta.state == MembershipState::Pending {
-                if now.saturating_sub(meta.submitted_at) > CONFIRMATION_WINDOW_SECS {
+            if meta.cache.state == MembershipState::Pending {
+                if now.saturating_sub(meta.cache.submitted_at) > CONFIRMATION_WINDOW_SECS {
                     MembershipState::Failed
                 } else {
                     MembershipState::Pending
@@ -442,7 +650,7 @@ pub(crate) fn merge_state(
                 MembershipState::Erased
             } else {
                 // failed stays failed (visible until re-registered).
-                meta.state
+                meta.cache.state
             }
         }
     }
@@ -458,7 +666,7 @@ pub(crate) fn transition_event(
     meta: &MembershipMeta,
     new_state: MembershipState,
 ) -> Option<(String, String, String, String, String)> {
-    if new_state == meta.state {
+    if new_state == meta.cache.state {
         return None;
     }
     // Enum→wire string: serde's `rename_all = "snake_case"` on
@@ -474,7 +682,7 @@ pub(crate) fn transition_event(
         meta.rln_identifier.clone(),
         hash.to_string(),
         wire(new_state),
-        wire(meta.state),
+        wire(meta.cache.state),
     ))
 }
 
@@ -484,18 +692,21 @@ mod tests {
 
     fn meta(state: MembershipState, submitted_at: u64) -> MembershipMeta {
         MembershipMeta {
-            allocations: Vec::new(),
-            failed_reason: None,
+            alloc: AllocationState::default(),
+            allocations_mac: None,
+            cache: CacheState {
+                failed_reason: None,
+                leaf_index: 7,
+                rate_limit: 300,
+                retryable: None,
+                state,
+                state_history: vec![],
+                submitted_at,
+                tx_result: None,
+            },
             identity_commitment: "11".repeat(32),
-            leaf_index: 7,
-            rate_limit: 300,
             registry_id: format!("logos:local:{}", "ab".repeat(32)),
-            retryable: None,
             rln_identifier: String::new(),
-            state,
-            state_history: vec![],
-            submitted_at,
-            tx_result: None,
         }
     }
 
@@ -520,7 +731,7 @@ mod tests {
         let was_active = meta(Active, now - 1_000);
         assert_eq!(merge_state(Some(&was_active), None, now), Erased);
         let mut expired_history = meta(Failed, now - 1_000);
-        expired_history.state_history.push(StateChange {
+        expired_history.cache.state_history.push(StateChange {
             at: now - 500,
             state: Expired,
         });
@@ -588,6 +799,9 @@ mod tests {
         .unwrap();
 
         // Tamper the sidecar registry_id on disk, then re-init: quarantined.
+        // With every entry quarantined, unlock refuses outright — a vacuous
+        // password match would otherwise adopt ANY password as the session
+        // key.
         let path = dir.join(keystore::KEYSTORE_FILE);
         let tampered = std::fs::read_to_string(&path)
             .unwrap()
@@ -596,7 +810,11 @@ mod tests {
         init(dir.clone());
         with_store(|s| {
             assert!(s.is_quarantined(&hash), "tampered entry must be quarantined");
-            s.unlock("pw")?; // verification skips quarantined entries
+            let denied = s.unlock("pw");
+            assert!(
+                matches!(denied, Err(ref e) if e.message.contains("quarantined")),
+                "an all-quarantined store must refuse every password: {denied:?}"
+            );
             assert!(s.decrypt_credential(&hash).is_err());
             Ok(())
         })
@@ -616,6 +834,261 @@ mod tests {
             s.unlock("pw")?;
             let released = s.decrypt_credential(&hash)?;
             assert_eq!(released.identity_secret_hash, "33".repeat(32));
+            Ok(())
+        })
+        .unwrap();
+
+        reset_for_tests();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn second_locker_fails_closed_until_released() {
+        let _serial = crate::lock(&TEST_STORE_LOCK);
+        let dir = test_store("lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Simulate a second process: hold the sentinel lock on a separate
+        // file description (OS file locks conflict between descriptions even
+        // within one process — the same conflict a real second process hits).
+        let foreign = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(keystore::LOCK_FILE))
+            .unwrap();
+        foreign.try_lock().unwrap();
+
+        init(dir.clone());
+        let denied = with_store(|_| Ok(()));
+        assert!(
+            matches!(denied, Err(ref e) if e.message.contains("keystore lock")),
+            "init under a foreign lock must fail closed: {denied:?}"
+        );
+
+        // Release the foreign lock: init succeeds and the store operates.
+        foreign.unlock().unwrap();
+        drop(foreign);
+        init(dir.clone());
+        with_store(|_| Ok(())).unwrap();
+
+        reset_for_tests();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reservation_floor_and_epoch_size_survive_restart() {
+        let _serial = crate::lock(&TEST_STORE_LOCK);
+        let dir = test_store("floor");
+        init(dir.clone());
+        let registry = format!("logos:local:{}", "aa".repeat(32));
+        let commitment = [0x66u8; 32];
+        let hash = registry_id::membership_hash(&registry, &commitment);
+        let credential = StoredCredential {
+            identity_commitment: registry_id::bytes_to_hex(&commitment),
+            identity_nullifier: None,
+            identity_secret_hash: "77".repeat(32),
+            identity_trapdoor: None,
+            registry_id: registry.clone(),
+        };
+        with_store(|s| {
+            s.unlock("pw")?;
+            let mut m = meta(MembershipState::Active, crate::now_unix());
+            m.registry_id = registry.clone();
+            m.identity_commitment = credential.identity_commitment.clone();
+            s.insert(&hash, m, &credential)
+        })
+        .unwrap();
+
+        // Reserve in epoch 10, then in epoch 12 with the window floor at 11 —
+        // the second reservation prunes epoch 10's spent row and records
+        // floor 11, all under epoch_size 600.
+        assert_eq!(
+            with_store(|s| s.reserve_message_id(&hash, "aa", 10, 9, 5, 600)).unwrap(),
+            0
+        );
+        assert_eq!(
+            with_store(|s| s.reserve_message_id(&hash, "aa", 12, 11, 5, 600)).unwrap(),
+            0
+        );
+
+        // Restart: reload everything from disk (and unlock — reservation
+        // needs the sidecar-MAC key).
+        init(dir.clone());
+        with_store(|s| s.unlock("pw").map(|_| ())).unwrap();
+
+        // Audit cause B/D: a rewound (or gap-widened) window re-admits pruned
+        // epoch 10, but the persisted floor must refuse it instead of
+        // reissuing slot 0.
+        let rewound = with_store(|s| s.reserve_message_id(&hash, "aa", 10, 9, 5, 600));
+        assert!(matches!(rewound, Err(e) if e.kind == ErrorKind::Permanent));
+        // The quota read mirrors the SAME permanent refusals — never an
+        // "exhausted budget" shape the consumer would retry forever.
+        let q_floor = with_store(|s| s.remaining_budget(&hash, "aa", 10, 5, 600));
+        assert!(matches!(q_floor, Err(e) if e.kind == ErrorKind::Permanent));
+        let q_size = with_store(|s| s.remaining_budget(&hash, "aa", 12, 5, 1200));
+        assert!(matches!(q_size, Err(e) if e.kind == ErrorKind::Permanent));
+        // Epoch 12 continues its persisted counter — slot 1, never a fresh 0.
+        assert_eq!(
+            with_store(|s| s.reserve_message_id(&hash, "aa", 12, 11, 5, 600)).unwrap(),
+            1
+        );
+        // A different epoch_size_sec rebases the epoch numbering: permanently refused.
+        let rebased = with_store(|s| s.reserve_message_id(&hash, "aa", 12, 11, 5, 1200));
+        assert!(matches!(rebased, Err(e) if e.kind == ErrorKind::Permanent));
+
+        reset_for_tests();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// persist() is the single MAC-stamping site, and while LOCKED it must
+    /// write entries with their stored MACs unchanged: a locked-mode cache
+    /// persist (the poller's path) must never invalidate an honest entry.
+    #[test]
+    fn locked_cache_updates_do_not_disturb_the_mac() {
+        let _serial = crate::lock(&TEST_STORE_LOCK);
+        let dir = test_store("locked-cache-mac");
+        init(dir.clone());
+        let registry = format!("logos:local:{}", "cc".repeat(32));
+        let commitment = [0x61u8; 32];
+        let hash = registry_id::membership_hash(&registry, &commitment);
+        let credential = StoredCredential {
+            identity_commitment: registry_id::bytes_to_hex(&commitment),
+            identity_nullifier: None,
+            identity_secret_hash: "77".repeat(32),
+            identity_trapdoor: None,
+            registry_id: registry.clone(),
+        };
+        with_store(|s| {
+            s.unlock("pw")?;
+            let mut m = meta(MembershipState::Active, crate::now_unix());
+            m.registry_id = registry.clone();
+            m.identity_commitment = registry_id::bytes_to_hex(&commitment);
+            s.insert(&hash, m, &credential)?;
+            // Cover live allocation state so the MAC is not over defaults.
+            s.reserve_message_id(&hash, "aa", 10, 9, 5, 600).map(|_| ())?;
+            s.lock();
+            // Locked-mode cache mutation persists without touching the MAC.
+            s.update_cache(&hash, |c| c.leaf_index = 7)
+        })
+        .unwrap();
+        // Reload from disk: the entry must still verify (not quarantined)
+        // and carry the cache change.
+        init(dir.clone());
+        with_store(|s| {
+            s.unlock("pw")?;
+            assert!(!s.is_quarantined(&hash), "locked persist must not disturb the MAC");
+            Ok(())
+        })
+        .unwrap();
+        reset_for_tests();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tampered_sidecar_allocations_are_quarantined() {
+        let _serial = crate::lock(&TEST_STORE_LOCK);
+        let dir = test_store("meta-mac");
+        init(dir.clone());
+        let registry = format!("logos:local:{}", "bb".repeat(32));
+        let commitment_a = [0x51u8; 32];
+        let commitment_b = [0x52u8; 32];
+        let hash_a = registry_id::membership_hash(&registry, &commitment_a);
+        let hash_b = registry_id::membership_hash(&registry, &commitment_b);
+        let cred = |c: &[u8; 32]| StoredCredential {
+            identity_commitment: registry_id::bytes_to_hex(c),
+            identity_nullifier: None,
+            identity_secret_hash: "66".repeat(32),
+            identity_trapdoor: None,
+            registry_id: registry.clone(),
+        };
+        with_store(|s| {
+            s.unlock("pw")?;
+            for (h, c) in [(&hash_a, &commitment_a), (&hash_b, &commitment_b)] {
+                let mut m = meta(MembershipState::Active, crate::now_unix());
+                m.registry_id = registry.clone();
+                m.identity_commitment = registry_id::bytes_to_hex(c);
+                s.insert(h, m, &cred(c))?;
+            }
+            // Spend a slot on A so its MAC covers live allocation state.
+            s.reserve_message_id(&hash_a, "aa", 10, 9, 5, 600).map(|_| ())
+        })
+        .unwrap();
+
+        // The audit's cause-C attack: rewind A's spent counter on disk
+        // (file-write access, no password). The next unlock must quarantine
+        // A; untampered B stays usable.
+        let path = dir.join(keystore::KEYSTORE_FILE);
+        let honest = std::fs::read_to_string(&path).unwrap();
+        let tampered = honest.replace("\"used\": 1", "\"used\": 0");
+        assert_ne!(honest, tampered, "the tamper must hit a spent counter");
+        std::fs::write(&path, tampered).unwrap();
+        init(dir.clone());
+        with_store(|s| {
+            s.unlock("pw")?;
+            assert!(s.is_quarantined(&hash_a), "rewound counter must quarantine");
+            assert!(!s.is_quarantined(&hash_b), "untampered sibling stays usable");
+            assert!(s.decrypt_credential(&hash_a).is_err());
+            assert!(s.decrypt_credential(&hash_b).is_ok());
+            Ok(())
+        })
+        .unwrap();
+
+        // Deleting just one entry's MAC (keeping the rewound state and the
+        // file's salt) must be DETECTED: entries are MAC'd from birth, so a
+        // missing tag is tamper.
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["credentials"][hash_a.as_str()]["membership"]
+            .as_object_mut()
+            .unwrap()
+            .remove("allocations_mac");
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        init(dir.clone());
+        with_store(|s| {
+            s.unlock("pw")?;
+            assert!(s.is_quarantined(&hash_a), "a stripped MAC must quarantine");
+            assert!(!s.is_quarantined(&hash_b));
+            Ok(())
+        })
+        .unwrap();
+
+        // Stripping the salt from a non-empty keystore must refuse unlock
+        // loudly (restore-from-backup guidance) — with or without entry MACs
+        // remaining: there is no MAC-less legacy shape to fall back to.
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("metaMacSalt");
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        init(dir.clone());
+        with_store(|s| {
+            let denied = s.unlock("pw");
+            assert!(
+                matches!(denied, Err(ref e) if e.message.contains("metaMacSalt")),
+                "salt strip with MACs present must fail unlock: {denied:?}"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        // Stripping the salt together with EVERY entry's MAC used to reach
+        // an adoptable legacy shape (the old accepted residual 3); with
+        // legacy adoption gone it must refuse unlock exactly like the
+        // partial strip above.
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("metaMacSalt");
+        for (_, entry) in v["credentials"].as_object_mut().unwrap() {
+            entry["membership"].as_object_mut().unwrap().remove("allocations_mac");
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        init(dir.clone());
+        with_store(|s| {
+            let denied = s.unlock("pw");
+            assert!(
+                matches!(denied, Err(ref e) if e.message.contains("metaMacSalt")),
+                "full salt+MAC strip must refuse unlock, never re-adopt: {denied:?}"
+            );
             Ok(())
         })
         .unwrap();
@@ -647,15 +1120,15 @@ mod tests {
             s.insert(&hash, m, &credential)?;
             for i in 0..(STATE_HISTORY_CAP + 5) {
                 let next = if i % 2 == 0 { MembershipState::Active } else { MembershipState::GracePeriod };
-                s.update(&hash, |m| m.state = next)?;
+                s.update_cache(&hash, |m| m.state = next)?;
             }
             let meta = s.get(&hash).unwrap();
-            assert_eq!(meta.state_history.len(), STATE_HISTORY_CAP);
+            assert_eq!(meta.cache.state_history.len(), STATE_HISTORY_CAP);
             // Unchanged state must NOT append history.
-            let len_before = meta.state_history.len();
-            s.update(&hash, |m| m.leaf_index = 42)?;
-            assert_eq!(s.get(&hash).unwrap().state_history.len(), len_before);
-            assert_eq!(s.get(&hash).unwrap().leaf_index, 42);
+            let len_before = meta.cache.state_history.len();
+            s.update_cache(&hash, |m| m.leaf_index = 42)?;
+            assert_eq!(s.get(&hash).unwrap().cache.state_history.len(), len_before);
+            assert_eq!(s.get(&hash).unwrap().cache.leaf_index, 42);
             Ok(())
         })
         .unwrap();

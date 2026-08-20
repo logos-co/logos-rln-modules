@@ -310,18 +310,21 @@ mod tests {
         store::with_store(|s| {
             s.unlock(password)?;
             let meta = store::MembershipMeta {
-                allocations: Vec::new(),
-                failed_reason: None,
+                alloc: store::AllocationState::default(),
+                allocations_mac: None,
+                cache: store::CacheState {
+                    failed_reason: None,
+                    leaf_index: 7,
+                    rate_limit: 300,
+                    retryable: None,
+                    state: store::MembershipState::Active,
+                    state_history: vec![],
+                    submitted_at: 1,
+                    tx_result: None,
+                },
                 identity_commitment: "11".repeat(32),
-                leaf_index: 7,
-                rate_limit: 300,
                 registry_id: format!("logos:local:{}", "ab".repeat(32)),
-                retryable: None,
                 rln_identifier: String::new(),
-                state: store::MembershipState::Active,
-                state_history: vec![],
-                submitted_at: 1,
-                tx_result: None,
             };
             let credential = store::StoredCredential {
                 identity_commitment: "11".repeat(32),

@@ -1,7 +1,9 @@
 [package]
 name = "rln_module"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
+# std File::try_lock / TryLockError (keystore process lock) stabilized in 1.89.
+rust-version = "1.89"
 
 [lib]
 name = "liblogos_rln_module"
@@ -19,14 +21,9 @@ panic = "abort"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Keystore crypto (WAKU-RLN-KEYSTORE): PBKDF2-HMAC-SHA256 + AES-128-CTR +
-# keccak256 MAC (the Ethereum-V3 keyfile construction). The spec prose says
-# SHA256 but its own test vector uses keccak256 — see keystore.rs.
+keystore-core = { path = "keystore-core" }
+
 sha2 = "0.10"
-sha3 = "0.10"
-aes = "0.8"
-ctr = "0.9"
-pbkdf2 = { version = "0.12", default-features = false }
 hmac = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 getrandom = "0.2"

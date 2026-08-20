@@ -63,8 +63,8 @@ pub(crate) fn select_hash(
 ) -> Result<String, ApiError> {
     let mut candidates: Vec<(&str, u64)> = records
         .iter()
-        .filter(|r| !r.quarantined && r.meta.state.is_usable())
-        .map(|r| (r.hash.as_str(), r.meta.rate_limit))
+        .filter(|r| !r.quarantined && r.meta.cache.state.is_usable())
+        .map(|r| (r.hash.as_str(), r.meta.cache.rate_limit))
         .collect();
     // Hash order makes every strategy deterministic and churn-stable.
     candidates.sort_by(|a, b| a.0.cmp(b.0));
@@ -132,18 +132,21 @@ mod tests {
         MembershipRecord {
             hash: hash.to_string(),
             meta: MembershipMeta {
-                allocations: Vec::new(),
-                failed_reason: None,
+                alloc: crate::store::AllocationState::default(),
+                allocations_mac: None,
+                cache: crate::store::CacheState {
+                    failed_reason: None,
+                    leaf_index: 0,
+                    rate_limit: rate,
+                    retryable: None,
+                    state,
+                    state_history: vec![],
+                    submitted_at: 0,
+                    tx_result: None,
+                },
                 identity_commitment: "11".repeat(32),
-                leaf_index: 0,
-                rate_limit: rate,
                 registry_id: "logos:local:aa".to_string(),
-                retryable: None,
                 rln_identifier: String::new(),
-                state,
-                state_history: vec![],
-                submitted_at: 0,
-                tx_result: None,
             },
             quarantined,
         }

@@ -110,7 +110,7 @@ fn apply_observed(
     rate_limit: u64,
 ) -> Result<(), crate::ApiError> {
     store::with_store(|s| {
-        s.update(hash, |m| {
+        s.update_cache(hash, |m| {
             m.state = state;
             m.leaf_index = leaf_index;
             m.rate_limit = rate_limit;
@@ -166,10 +166,10 @@ fn tick(refresh_states: bool) {
                 }
             },
             Some(RecordUpdate::Absent)
-                if now.saturating_sub(meta.submitted_at) > CONFIRMATION_WINDOW_SECS =>
+                if now.saturating_sub(meta.cache.submitted_at) > CONFIRMATION_WINDOW_SECS =>
             {
                 let result = store::with_store(|s| {
-                    s.update(&hash, |m| {
+                    s.update_cache(&hash, |m| {
                         m.state = MembershipState::Failed;
                         m.failed_reason = Some("confirmation_window_elapsed".to_string());
                         // Re-registration can be attempted (spec: a failed
@@ -206,7 +206,7 @@ fn tick(refresh_states: bool) {
                 // Was on the registry (state ∈ active/grace/expired), now
                 // gone: erased/slashed. Consumers MUST stop using it.
                 let updated = store::with_store(|s| {
-                    s.update(&hash, |m| {
+                    s.update_cache(&hash, |m| {
                         m.state = MembershipState::Erased;
                         m.failed_reason = Some("removed_from_registry".to_string());
                     })
@@ -236,7 +236,7 @@ pub(crate) fn refresh_paths() {
         Ok(records) => records,
         Err(_) => return,
     };
-    for (hash, meta) in usable.into_iter().filter(|(_, m)| m.state.is_usable()) {
+    for (hash, meta) in usable.into_iter().filter(|(_, m)| m.cache.state.is_usable()) {
         let registry = match registry_id::parse(&meta.registry_id) {
             Ok(r) => r,
             Err(e) => {
@@ -245,7 +245,7 @@ pub(crate) fn refresh_paths() {
             }
         };
         let Some(provider) = provider_for(&registry.namespace) else { continue };
-        if let Err(e) = path_cache::fill_path_cache(&registry, &hash, meta.leaf_index, provider) {
+        if let Err(e) = path_cache::fill_path_cache(&registry, &hash, meta.cache.leaf_index, provider) {
             // Keep the previous cache entry — a slightly-stale but still
             // verifiable path beats none.
             eprintln!("membership poller: {hash} path refresh failed: {}", e.message);
