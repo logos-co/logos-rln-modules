@@ -1,8 +1,7 @@
 //! The sealed-store runtime: session state over the format/crypto/fs layers —
 //! open-time census, unlock-time keyed verification, credential sealing, the
 //! MAC-covered allocation ledger, the plaintext cache sidecar, and the
-//! persist-before-issue `message_id` reservation. Lives side by side with the
-//! old `store.rs` until the cutover; no shared state between the two.
+//! persist-before-issue `message_id` reservation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -10,11 +9,10 @@ use std::sync::{Arc, Mutex, Weak};
 
 use zeroize::Zeroizing;
 
-use crate::keystore::AllocationState;
 use crate::lifecycle::{
     CacheFile, CacheState, MembershipRecord, MembershipState, StoredCredential, FORMAT_CACHE,
 };
-use crate::rate_limit::{remaining, reserve_slot, AllocError, EpochAllocation};
+use crate::rate_limit::{remaining, reserve_slot, AllocError, AllocationState, EpochAllocation};
 use crate::registry_id;
 use crate::sealed_store::crypto::{self, KdfParams, MasterKey, SubKeys};
 use crate::sealed_store::format::{
@@ -61,6 +59,18 @@ pub(crate) fn publish(store: Option<&Arc<Store>>) {
 
 pub(crate) fn current() -> Option<Arc<Store>> {
     crate::lock(&CURRENT).upgrade()
+}
+
+/// The refusal every keystore op surfaces when no store was ever opened —
+/// no persistence path from the host (no silent cwd fallback — see README),
+/// an unreadable keystore, or another process holding the keystore lock.
+pub(crate) const UNINIT_MSG: &str =
+    "store not initialized (no instance persistence path from the host, unreadable \
+     keystore, or another process holds the keystore lock)";
+
+/// The published store, or the uninitialized `internal` error.
+pub(crate) fn current_or_uninit() -> Result<Arc<Store>, ApiError> {
+    current().ok_or_else(|| ApiError::internal(UNINIT_MSG))
 }
 
 // -------------------------------------------------------------------- state
@@ -387,6 +397,7 @@ impl Store {
         &self.dir
     }
 
+    #[allow(dead_code)] // consumer surface: views read the record's flag; the tests read this
     pub fn is_quarantined(&self, hash: &str) -> bool {
         self.snapshot_arc().records.get(hash).map(|r| r.quarantined).unwrap_or(false)
     }

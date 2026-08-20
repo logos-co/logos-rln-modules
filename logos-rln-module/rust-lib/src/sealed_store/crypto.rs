@@ -18,7 +18,9 @@ pub enum CryptoError {
     BadPassword,
     /// Hex/length problems in stored fields.
     Malformed(&'static str),
-    /// Header declares parameters this crate doesn't speak.
+    /// Header declares parameters this crate doesn't speak. Reserved for
+    /// format evolution — nothing constructs it yet.
+    #[allow(dead_code)]
     Unsupported(&'static str),
     /// No CSPRNG available (seal/generate only).
     NoEntropy,

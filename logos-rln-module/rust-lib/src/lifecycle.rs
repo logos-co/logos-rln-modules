@@ -4,11 +4,62 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
-// Definitions move here at the sealed-store cutover.
-pub(crate) use crate::keystore::MembershipState;
-#[allow(unused_imports)] // consumed at the sealed-store cutover
-pub(crate) use crate::store::StoredCredential;
+/// The module-local lifecycle state, persisted in the cache sidecar.
+/// `#[serde(rename_all = "snake_case")]` serializes
+/// each variant to the EXACT wire string logos-lez-rln-module's
+/// `rln_core::membership_status` returns (`GracePeriod → "grace_period"`);
+/// the crates deliberately share no type — the `membership_state_wire_strings`
+/// test anchors the contract. No `#[serde(other)]`: a stray persisted string
+/// loud-fails deserialize rather than silently degrading.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MembershipState {
+    Unknown,
+    Pending,
+    Failed,
+    Active,
+    GracePeriod,
+    Expired,
+    Erased,
+}
+
+impl MembershipState {
+    /// The usable ("selectable") states: a membership that can currently back
+    /// a proof — the one predicate selection, scope resolution, and the quota
+    /// read all share.
+    pub(crate) fn is_usable(self) -> bool {
+        matches!(self, Self::Active | Self::GracePeriod)
+    }
+
+    /// The live states (spec): a membership that blocks a new registration for
+    /// its scope — usable, or still awaiting confirmation. Terminal states
+    /// (failed, expired, erased, unknown) never block a fresh registration.
+    pub(crate) fn is_live(self) -> bool {
+        matches!(self, Self::Pending) || self.is_usable()
+    }
+
+    /// Ever observed on the registry — the "was Active, now gone → erased"
+    /// removal signal's building block (see `merge_state`).
+    pub(crate) fn is_active_like(self) -> bool {
+        matches!(self, Self::Active | Self::GracePeriod | Self::Expired | Self::Erased)
+    }
+}
+
+/// The decrypted credential plaintext.
+/// Alphabetical field order = the encrypted JSON's key order.
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+pub(crate) struct StoredCredential {
+    pub(crate) identity_commitment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) identity_nullifier: Option<String>,
+    pub(crate) identity_secret_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) identity_trapdoor: Option<String>,
+    /// Authoritative copy for post-decrypt cross-checks against the sidecar.
+    pub(crate) registry_id: String,
+}
 
 /// Pending→Failed bound (spec MUST). Testnet confirmation runs 60–90s;
 /// 300s leaves margin.
@@ -92,7 +143,7 @@ pub struct MembershipRecord {
     pub hash: String,
     pub identity: crate::sealed_store::format::IdentityBlock,
     pub cache: CacheState,
-    pub alloc: crate::keystore::AllocationState,
+    pub alloc: crate::rate_limit::AllocationState,
     pub quarantined: bool,
 }
 
@@ -214,7 +265,7 @@ mod tests {
                 rate_limit: Some(300),
                 ..CacheState::default()
             },
-            alloc: crate::keystore::AllocationState::default(),
+            alloc: crate::rate_limit::AllocationState::default(),
             quarantined: false,
         }
     }

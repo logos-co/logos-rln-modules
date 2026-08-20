@@ -14,7 +14,7 @@
 
 use serde::Serialize;
 
-use crate::store::{MembershipMeta, MembershipState};
+use crate::lifecycle::{MembershipRecord, MembershipState};
 
 /// The `credential` object inside [`MembershipView`] — mirrors the nested
 /// shape inside the `.lidl` `Membership` record. Exposes only the
@@ -56,28 +56,32 @@ impl MembershipView {
     /// only as `true`, never `false`.
     pub(crate) fn new(
         hash: &str,
-        meta: &MembershipMeta,
+        record: &MembershipRecord,
         quarantined: bool,
         rate_limit_mismatch: bool,
     ) -> Self {
-        let cache = &meta.cache;
+        let cache = &record.cache;
+        let identity = &record.identity;
         let (failed_reason, retryable) = if quarantined {
             (Some("metadata_tamper".to_string()), None)
         } else {
             (cache.failed_reason.clone(), cache.failed_reason.as_ref().and(cache.retryable))
         };
         MembershipView {
-            credential: CredentialView { identity_commitment: meta.identity_commitment.clone() },
+            credential: CredentialView {
+                identity_commitment: identity.identity_commitment.clone(),
+            },
             failed_reason,
-            leaf_index: cache.leaf_index,
+            leaf_index: cache.leaf_index.unwrap_or(0),
             membership_hash: hash.to_string(),
-            rate_limit: cache.rate_limit,
+            rate_limit: cache.rate_limit.unwrap_or(0),
             rate_limit_mismatch: rate_limit_mismatch.then_some(true),
-            registry_id: meta.registry_id.clone(),
+            registry_id: identity.registry_id.clone(),
             retryable,
-            rln_identifier: (!meta.rln_identifier.is_empty()).then(|| meta.rln_identifier.clone()),
+            rln_identifier: (!identity.rln_identifier.is_empty())
+                .then(|| identity.rln_identifier.clone()),
             state: if quarantined { MembershipState::Failed } else { cache.state },
-            submitted_at: cache.submitted_at,
+            submitted_at: identity.submitted_at,
             tx_result: cache.tx_result.clone(),
         }
     }
