@@ -39,6 +39,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod keychain;
 mod keystore;
+#[allow(dead_code)] // consumed at the sealed-store cutover
+mod lifecycle;
 mod nullifier_log;
 mod panic_hook;
 mod path_cache;
