@@ -22,8 +22,10 @@
 //! destroys the only record that a pruned epoch's slots were spent, so every
 //! prune is recorded in a persisted, monotonically non-decreasing floor
 //! (`AllocationState::prune_floor`, capped at one past the highest allocated
-//! epoch so a spiked clock cannot brick the future): once an epoch falls below
-//! it, reservation there is refused forever (`AllocError::EpochBelowFloor`) —
+//! epoch *at or below the retain candidate* so a spiked clock — which allocates
+//! a far-future row — cannot brick the future on a later reservation): once an
+//! epoch falls below it, reservation there is refused forever
+//! (`AllocError::EpochBelowFloor`) —
 //! even when the wall clock rewinds past the window or a widened
 //! `max_epoch_gap` would re-admit it. The index's wire encoding (the spec's `epoch[32]`) lives in
 //! the proof engine (`proof::epoch_to_bytes`); this module deals only in the
@@ -132,7 +134,18 @@ pub(crate) fn reserve_slot(
     retain_floor_candidate: u64,
     rate_limit: u64,
 ) -> Result<u64, AllocError> {
-    let highest = alloc.allocations.iter().map(|a| a.epoch.saturating_add(1)).max();
+    // Cap the advance at one past the highest allocated epoch AT OR BELOW the
+    // candidate. Rows above the candidate are future allocations (a caller may
+    // prove in an in-window future epoch); excluding them stops a single spiked
+    // clock reading — which creates such a row — from dragging the floor up to
+    // that far-future value on a subsequent reservation and bricking every real
+    // epoch below it.
+    let highest = alloc
+        .allocations
+        .iter()
+        .filter(|a| a.epoch <= retain_floor_candidate)
+        .map(|a| a.epoch.saturating_add(1))
+        .max();
     let threshold = match highest {
         Some(h) => alloc.prune_floor.max(retain_floor_candidate.min(h)),
         None => alloc.prune_floor,
@@ -311,6 +324,21 @@ mod tests {
             reserve_slot(&mut alloc, APP_A, 10, 11, 5),
             Err(AllocError::EpochBelowFloor)
         );
+    }
+
+    #[test]
+    fn two_forward_spikes_do_not_brick_future_epochs() {
+        // The regression: the first spike allocates a far-future row, and a
+        // naive `highest`-over-all-rows cap would then let the SECOND spike drag
+        // the floor up to the spiked clock value — refusing every real epoch
+        // forever. Excluding rows above the candidate keeps the floor honest.
+        let mut alloc = AllocationState::default();
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 10, 9, 5), Ok(0));
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 1_000_000, 999_999, 5), Ok(0));
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 1_000_000, 999_999, 5), Ok(1));
+        assert_eq!(alloc.prune_floor, 11, "a second spike must not drag the floor to the spiked clock");
+        // Clock corrected: real future epochs still allocate.
+        assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 11, 5), Ok(0));
     }
 
     #[test]
