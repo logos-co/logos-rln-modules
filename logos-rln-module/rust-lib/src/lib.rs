@@ -48,6 +48,8 @@ mod provider;
 mod rate_limit;
 mod registry_id;
 mod roots;
+#[allow(dead_code)] // consumed at the sealed-store cutover
+mod sealed_store;
 mod select;
 mod store;
 mod views;

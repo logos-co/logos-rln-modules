@@ -28,6 +28,12 @@ hmac = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 getrandom = "0.2"
 
+# Sealed-store crypto (src/sealed_store): Argon2id KDF, HKDF sub-keys,
+# XChaCha20-Poly1305 AEAD.
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+
 # RLN zk proof generation & verification (spec generate_proof/verify_proof).
 # The identity secret stays in this module — it never crosses to the sibling.
 rln = { version = "3.0.0", default-features = false }
