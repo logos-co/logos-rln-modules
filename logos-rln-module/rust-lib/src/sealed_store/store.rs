@@ -609,6 +609,22 @@ impl Store {
         let Some(alloc) = inner.sections.get_mut(hash) else {
             return Err(ApiError::new(ErrorKind::UnknownMembership, "no such membership_hash"));
         };
+        // Never grow a section past the row cap the read path enforces: a file
+        // the reader rejects would quarantine the whole store at the next open.
+        // `rln_identifier` is caller-supplied, so distinct scopes in one live
+        // epoch are the unbounded axis. A reservation for an existing row only
+        // increments it (no growth); a new row must fit under the cap.
+        let row_exists = alloc
+            .allocations
+            .iter()
+            .any(|a| a.rln_identifier == rln_identifier_hex && a.epoch == epoch);
+        if !row_exists && alloc.allocations.len() >= WRITE_ROW_CAP {
+            return Err(ApiError::new(
+                ErrorKind::Permanent,
+                "allocation section is full (too many distinct rln_identifier/epoch rows); \
+                 register a fresh membership",
+            ));
+        }
         let slot = reserve_slot(alloc, rln_identifier_hex, epoch, retain_floor, rate_limit)
             .map_err(|e| match e {
                 AllocError::BudgetExhausted => ApiError::new(
@@ -717,6 +733,14 @@ fn section_mac_ok(keys: &SubKeys, hash: &str, section: &Section, uuid: &[u8; 16]
 /// The shared reserve/quota guards: quarantined counters are untrusted, a
 /// missing membership is unknown, and an epoch-size mismatch is permanently
 /// refused (a rebased epoch numbering could reissue spent slots).
+// The reservation write-path row cap. MUST stay <= format::MAX_ROWS_PER_SECTION
+// (the read-path cap) so the module never writes a file it cannot re-read; a
+// small test value keeps the cap regression fast.
+#[cfg(not(test))]
+const WRITE_ROW_CAP: usize = format::MAX_ROWS_PER_SECTION;
+#[cfg(test)]
+const WRITE_ROW_CAP: usize = 8;
+
 fn reservation_guards(
     quarantined: bool,
     alloc: Option<&AllocationState>,
@@ -1432,6 +1456,36 @@ mod tests {
         assert!(store.is_quarantined(&hash_a), "the spliced entry must not ride through B's quarantine");
         assert!(store.is_quarantined(&hash_b));
 
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reservation_refuses_growth_past_the_write_row_cap() {
+        // A caller controls rln_identifier, so distinct scopes in one live epoch
+        // are an unbounded row axis. The write path must refuse before the
+        // section exceeds the read-path cap, or the next open() would classify
+        // the file as corrupt and quarantine the whole store.
+        let _serial = crate::lock(&SERIAL);
+        let dir = test_dir("row-cap");
+        let registry = format!("logos:local:{}", "cc".repeat(32));
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &[0x71u8; 32]);
+        for i in 0..WRITE_ROW_CAP {
+            let rid = format!("{i:02x}");
+            assert_eq!(store.reserve_message_id(&hash, &rid, 10, 9, 5, 600).unwrap(), 0);
+        }
+        let over = store.reserve_message_id(&hash, "ff", 10, 9, 5, 600);
+        assert!(matches!(over, Err(ref e) if e.kind == ErrorKind::Permanent), "a new row past the cap is refused");
+        // An existing row still increments — no growth, so no refusal.
+        assert_eq!(store.reserve_message_id(&hash, "00", 10, 9, 5, 600).unwrap(), 1);
+        store.close();
+        drop(store);
+        // The persisted file stays within the read cap: reopen is clean.
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(!store.is_quarantined(&hash), "the capped file must remain readable");
+        assert_eq!(store.unlock("pw").unwrap(), 1);
         store.close();
         let _ = std::fs::remove_dir_all(&dir);
     }
