@@ -76,13 +76,15 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   never a false reject.
 - `rust-lib/src/registry_id.rs` — CAIP-10 parse/canonicalize +
   `membership_hash` (the spec's SHA256 construction; frozen test vector).
-- `rust-lib/src/keystore.rs` — WAKU-RLN-KEYSTORE-format encrypted store:
-  PBKDF2-HMAC-SHA256, AES-128-CTR, **keccak256** MAC (the construction the
-  spec's own test vector actually uses — its prose says SHA256; the pinned
-  `spec_test_vector_decrypts` keeps us honest), atomic tmp+rename saves.
-- `rust-lib/src/store.rs` — runtime store: unlock state, lifecycle state
-  machine (pending→active/failed, erased inference), merged-state view,
-  load-time tamper quarantine.
+- `rust-lib/src/sealed_store/` — the keystore: Argon2id → HKDF sub-keys →
+  XChaCha20-Poly1305-sealed credentials with identity-binding AAD, an O(1)
+  password verifier, per-membership + root-MAC'd allocation counters, and
+  fsync-atomic 0600 file I/O. One file per trust class; the format and its
+  frozen canonical encodings are documented in `docs/keystore-format.md`.
+- `rust-lib/src/lifecycle.rs` — the storage-agnostic membership state
+  machine: the frozen wire-state enum, merged-state view (pending→failed
+  confirmation window, erased inference), change-gated transition events,
+  submit-error recording policy.
 - `rust-lib/src/provider.rs` — the spec's Registry Provider Interface as a
   trait + namespace routing; the lez-rln provider is a raw `lp_*` wire
   client of the sibling module (owner-thread-bound, explicit per-call
@@ -117,19 +119,24 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
 
 ## Design constraints
 
-- **Persistence path is mandatory.** The keystore lives at
-  `<instance_persistence_path>/rln_keystore.json`. If the host provides no
-  path, keystore ops fail with an `internal` error — there is deliberately
-  no cwd fallback (a keystore in an unknown directory is worse than a hard
-  error).
-- **Unlock model.** Reads, lifecycle polling, selection, and `verify_proof`
-  never need the password (sidecar metadata is plaintext-safe; verification
-  uses no credential at all). `unlock_keystore` is required to `register`
-  (encrypts the freshly generated credential) and to `generate_proof`
-  (decrypts it in-module for the witness). With zero stored credentials any
-  password unlocks and becomes the encryption password at first write — the
-  keystore format has no keystore-level verifier; later unlocks verify
-  against the first stored envelope's MAC.
+- **Persistence path is mandatory.** The keystore lives in
+  `<instance_persistence_path>/` as three files — `rln_sealed.json`
+  (encrypted credentials + header), `rln_allocations.json` (authenticated
+  counters), `rln_cache.json` (registry-healed cache) — one per trust
+  class (`docs/keystore-format.md`). If the host provides no path, keystore
+  ops fail with an `internal` error — there is deliberately no cwd
+  fallback (a keystore in an unknown directory is worse than a hard error).
+  A pre-0.6.0 `rln_keystore.json` is refused with guidance, never read or
+  migrated.
+- **Unlock model.** Reads, lifecycle polling, selection, `get_epoch_quota`,
+  and `verify_proof` never need the password (identity/cache/counter
+  plaintext is locked-readable; verification uses no credential at all).
+  `unlock_keystore` is required to `register` (seals the freshly generated
+  credential) and to `generate_proof` (unseals it in-module for the
+  witness). With zero stored credentials any password unlocks and becomes
+  the store password — re-provisioning the header — until the first insert
+  freezes the stored verifier; from then on unlock is exactly one Argon2id
+  run checked in constant time, independent of entry count.
 - **Slot allocation is persist-before-issue, and the allocator is
   monotonic.** `generate_proof` durably records the `(rln_identifier, epoch,
   message_id)` allocation before the proof leaves the module (fsync'd write —
@@ -141,21 +148,22 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   widened `max_epoch_gap`, or a changed `epoch_size_sec` would otherwise
   re-admit after its rows were pruned; recovery from a deliberate epoch-size
   change is a fresh registration. The epoch-size binding is adopted per
-  membership at its first reservation. The allocation counters are HMAC'd
-  inside the keystore sidecar (entries are authenticated from birth and
-  verified at unlock; tampered entries are quarantined) — though a
-  whole-file rollback from a backup is inherently undetectable by a local
-  MAC (see `keystore.rs` docs). One process per
-  persistence path is enforced with an exclusive lock on
-  `rln_keystore.lock`, failing closed; the lock is advisory, so
-  network/shared-volume filesystems that don't honor OS file locks must
-  enforce single-process at the deployment layer. The no-reissue guarantee
-  is likewise per keystore INSTANCE: copying `rln_keystore.json` to a
-  second device (or importing it into another RLN stack — the envelope is
-  deliberately portable) forks the allocation counters, and concurrent use
-  of both copies discloses the identity secret; migrate a keystore by
-  moving it, never by copying. `budget_exhausted` when the epoch's
-  `rate_limit` slots are gone.
+  membership at its first reservation. The allocation counters are
+  authenticated from birth: each membership's section carries an HMAC bound
+  to its membership hash and the store instance, and a root MAC over the
+  section MACs detects a spliced-in older section (partial rollback) —
+  attributable tamper quarantines one membership, a detected splice
+  quarantines them all, and a whole-file rollback from a backup remains
+  inherently undetectable by any local MAC (`docs/keystore-format.md`
+  records the accepted limits). One process per persistence path is
+  enforced with an exclusive lock on `rln_keystore.lock`, failing closed;
+  the lock is advisory, so network/shared-volume filesystems that don't
+  honor OS file locks must enforce single-process at the deployment layer.
+  The no-reissue guarantee is likewise per keystore INSTANCE: copying the
+  keystore files to a second device forks the allocation counters, and
+  concurrent use of both copies discloses the identity secret; migrate a
+  keystore by moving it, never by copying. `budget_exhausted` when the
+  epoch's `rate_limit` slots are gone.
 - **Verification is hot-path-only.** `verify_proof` reads the locally
   maintained valid-root window and performs zero registry calls; a cold or
   stale window answers `not_ready` rather than serving a false reject.
@@ -198,10 +206,12 @@ cd rust-lib && cargo test
 ```
 
 Covers: CAIP-10 canonicalization vectors, the frozen membership_hash
-vector, keystore roundtrip/tamper/wrong-password plus the WAKU-RLN-KEYSTORE
-spec test vector (password `sup3rsecure`), the merged-state matrix, and
-metadata-tamper quarantine. The PBKDF2 tests run ~1M rounds each, so the
-suite takes ~30–40s.
+vector, the sealed-store adversarial matrix (seal/unseal + AAD tamper,
+counter tamper/splice/deletion, crash-window and concurrency storms,
+persist-failure waste-not-reissue), the canonical-encoding golden vectors,
+the merged-state matrix, and the empty-store verifier flow. Tests derive
+keys with reduced Argon2id parameters, so the suite runs in under two
+minutes.
 
 ### End-to-end registration
 
