@@ -202,7 +202,9 @@ pub(crate) fn auto_unlock_impl() -> Result<serde_json::Value, ApiError> {
     // remembers itself).
     if store.has_credentials() {
         return Err(keychain_err(
-            "no keychain item, but the keystore already has credentials — unlock manually once and it will be remembered",
+            "no keychain item, but the keystore already has credentials — unlock manually once \
+             (restoring the keystore files from a backup first if entries are quarantined) and \
+             it will be remembered",
         ));
     }
 

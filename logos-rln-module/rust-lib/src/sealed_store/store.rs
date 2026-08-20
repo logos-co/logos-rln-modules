@@ -221,9 +221,14 @@ impl Store {
     }
 
     /// Release the directory lock deterministically (drop order is otherwise
-    /// tied to the last Arc), so a re-open can reacquire it.
+    /// tied to the last Arc), so a re-open can reacquire it, and drop the
+    /// session so a stale Arc to a closed store can neither release a plaintext
+    /// credential nor hand out the password (the key material is zeroized now,
+    /// not whenever the last Arc happens to drop).
     pub fn close(&self) {
-        crate::lock(&self.write).lock.take();
+        let mut guard = crate::lock(&self.write);
+        guard.lock.take();
+        guard.session = None;
     }
 
     /// Verify the password and authenticate every entry. The ordering is
@@ -1556,6 +1561,10 @@ mod tests {
         assert!(matches!(store.unlock("pw"), Err(ref e) if e.message.contains("closed")));
         assert!(matches!(store.update_cache("00", |_| {}), Err(ref e) if e.message.contains("closed")));
         assert!(matches!(store.reserve_message_id("00", "aa", 10, 9, 5, 600), Err(ref e) if e.message.contains("closed")));
+        // close() drops the session, so a stale Arc releases neither the
+        // password nor a plaintext credential.
+        assert!(store.session_password().is_none());
+        assert!(matches!(store.unseal_credential("00"), Err(ref e) if e.kind == ErrorKind::Locked));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
