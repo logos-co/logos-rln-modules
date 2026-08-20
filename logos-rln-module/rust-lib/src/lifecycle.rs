@@ -57,7 +57,8 @@ pub(crate) struct StoredCredential {
     pub(crate) identity_secret_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) identity_trapdoor: Option<String>,
-    /// Authoritative copy for post-decrypt cross-checks against the sidecar.
+    /// The sealed plaintext's own registry_id. The identity is authenticated
+    /// by the credential AEAD's AAD, so no separate cross-check is needed.
     pub(crate) registry_id: String,
 }
 

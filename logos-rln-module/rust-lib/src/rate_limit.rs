@@ -33,9 +33,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// One application's slot usage within one epoch, persisted in the membership
-/// sidecar (plaintext-safe — counters, no secret). `used` is both the count
-/// issued and the next unused `message_id`.
+/// One application's slot usage within one epoch, persisted in the allocations
+/// ledger's MAC'd section (plaintext-safe — counters, no secret). `used` is
+/// both the count issued and the next unused `message_id`.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct EpochAllocation {
     /// The application scope, lowercase hex of the 32-byte `rln_identifier`.
@@ -54,11 +54,10 @@ pub(crate) struct EpochAllocation {
 pub(crate) struct AllocationState {
     /// Per-application `message_id` allocation, one row per active
     /// `(rln_identifier, current epoch)`. Plaintext-safe counters (no
-    /// secret), persisted with the sidecar — fsync-durably, MAC-covered,
-    /// and floored by `prune_floor` — so neither a
-    /// restart, power loss, sidecar edit, clock rewind, nor gap/size
-    /// reconfiguration reissues a spent slot.
-    /// Omitted from older files (serde default = empty).
+    /// secret), persisted in the allocations ledger's section — fsync-durably,
+    /// MAC-covered, and floored by `prune_floor` — so neither a restart, power
+    /// loss, a tampered ledger, a clock rewind, nor a gap/size reconfiguration
+    /// reissues a spent slot.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) allocations: Vec<EpochAllocation>,
     /// Epoch length (seconds) `allocations` and `prune_floor` are denominated

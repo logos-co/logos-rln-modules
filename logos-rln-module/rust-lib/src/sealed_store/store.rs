@@ -247,8 +247,8 @@ impl Store {
             })
         {
             return Err(ApiError::internal(
-                "every keystore entry is quarantined (metadata tamper); restore \
-                 rln_sealed.json from a backup",
+                "every keystore entry is quarantined (metadata tamper or a missing/rolled-back \
+                 rln_allocations.json); restore the keystore files from a backup",
             ));
         }
 

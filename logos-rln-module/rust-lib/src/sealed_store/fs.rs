@@ -2,7 +2,10 @@
 //! with corrupt-file evidence preservation, and an exclusive per-directory
 //! process lock. The write → fsync(tmp) → rename → fsync(dir) ordering in
 //! `write_durable` is power-loss-durability-critical and untestable in CI —
-//! do not reorder or drop a sync.
+//! do not reorder or drop a sync. The power-loss guarantee rests on Rust std
+//! mapping `File::sync_all` to `fcntl(F_FULLFSYNC)` on Apple targets (plain
+//! `fsync` does not survive a power cut on APFS); the only build targets are
+//! darwin and linux, so that mapping always applies.
 
 use std::fs;
 use std::io;

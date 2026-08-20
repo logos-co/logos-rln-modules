@@ -1,8 +1,8 @@
 //! OS-keychain auto-unlock: generate-or-fetch the keystore password from the
 //! macOS Keychain so a GUI can unlock without prompting. The keystore itself
 //! is untouched — `Store::unlock` stays the single verification seam
-//! (BadPassword on MAC mismatch, adopt-on-empty), this module only decides
-//! WHERE the password comes from.
+//! (bad_password from the constant-time verifier, adopt-on-empty), this
+//! module only decides WHERE the password comes from.
 //!
 //! Backend: the `/usr/bin/security` CLI (absolute path — env -i'd daemons
 //! strip PATH; env otherwise inherited because the login keychain needs

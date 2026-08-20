@@ -3,7 +3,7 @@
 ; docs/anoncomms/raw/). Registry-agnostic membership management AND rate
 ; limiting: CAIP-10 registry ids routed per namespace to a registry
 ; provider; identity credentials generated in-module, held in an encrypted
-; keystore (WAKU-RLN-KEYSTORE format), and never released across this wire;
+; keystore, and never released across this wire;
 ; lifecycle tracked with a bounded Pending confirmation window; RLN proof
 ; generation with persisted per-epoch message_id allocation; verification
 ; from a locally maintained valid-root window (no registry access on the
@@ -122,12 +122,12 @@ module liblogos_rln_module {
   }
 
   ; Open (create-if-absent) the keystore at the instance persistence path
-  ; and hold the session password in memory (needed to write credentials on
-  ; register and decrypt them on select). {"membership_count":N,
-  ; "unlocked":true}; bad_password when an existing credential envelope
-  ; fails its MAC under this password. Reads (get_memberships,
-  ; get_membership_state) work without unlocking — the sidecar metadata is
-  ; plaintext-safe by design.
+  ; and hold the session password in memory (needed to seal credentials on
+  ; register and unseal them on generate_proof). {"membership_count":N,
+  ; "unlocked":true}; bad_password when the password fails the keystore's
+  ; constant-time verifier. Reads (get_memberships, get_membership_state)
+  ; work without unlocking — the identity and counter metadata is
+  ; plaintext-readable by design.
   method unlock_keystore(password: tstr) -> tstr
 
   ; Drop the session password (zeroized). Lifecycle polling continues — it

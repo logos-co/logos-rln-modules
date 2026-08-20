@@ -18,7 +18,7 @@ All files live in `<instance_persistence_path>/`, mode 0600.
 | `rln_sealed.json` | encrypted + AEAD-authenticated: header (KDF params, salt, verifier, store_uuid) and, per membership, a plaintext identity block + the XChaCha20-Poly1305-sealed credential | fsync ordering; rewritten only on insert and empty-store provisioning |
 | `rln_allocations.json` | plaintext but authenticated: per-membership counter sections (allocations, epoch_size_sec, prune_floor) each with an HMAC, plus a root MAC over the section MACs | fsync ordering; one small rewrite per reservation, completed **before** the slot is returned |
 | `rln_cache.json` | plaintext, unauthenticated, poller-owned: registry-derived state the poller re-heals (state, leaf_index, rate_limit, failure fields, first_active_at) | rename-atomic only, no fsync — loss is always recoverable from the registry |
-| `rln_keystore.lock` | advisory OS lock sentinel; the name is shared with the old format so old and new binaries can never run concurrently in one directory | — |
+| `rln_keystore.lock` | advisory OS lock sentinel; the name is shared with the ≥0.5.0 formats so those binaries and this one cannot run concurrently in one directory (the audited 0.4.0 had no lock, but its file set is disjoint) | — |
 
 The durable write ordering (tmp 0600 → write → fsync(tmp) → rename →
 fsync(dir)) is power-loss-critical and untestable in CI; it degrades only
@@ -57,9 +57,11 @@ on filesystems that report fsync unsupported, loudly.
 4. Keyed pass, only after the verifier passes: every credential is
    AEAD-opened (failure → that membership quarantined), every section MAC
    verified (failure → that membership quarantined), then the root MAC over
-   the stored section MACs — a mismatch while every section individually
-   verified means a spliced-in older section (targeted counter rollback):
-   attribution is impossible, so every membership is quarantined,
+   the stored section MACs. A content-only edit leaves the stored MAC (and
+   thus the root) valid and stays attributable to its section; any root-MAC
+   failure — a spliced older section, a stripped or edited MAC, a section
+   added or removed — is unattributable (a decoy tamper must never mask a
+   splice), so every not-already-attributed membership is quarantined,
    fail-closed.
 5. The session (password + three sub-keys) commits all-or-nothing.
 
@@ -83,10 +85,12 @@ aborting the process.
   secret. Migrate by moving, never by copying.
 - A whole-file rollback of `rln_allocations.json` (or the whole directory)
   to an older self-consistent backup is undetectable by any purely local
-  MAC. The root MAC narrows the local attack from "splice one membership's
-  old section" (now detected) to "roll back the whole counter file", but
-  cannot close it. The real fix is an OS-keychain freshness anchor
-  (per-store monotone counter held outside the filesystem), on the roadmap.
+  MAC. The root MAC catches every partial edit — including a splice hidden
+  behind a decoy tamper elsewhere — so the residual local attack is reduced
+  to a rollback of the entire counter file to a byte-consistent past state;
+  the root cannot close that (an old file is internally valid). The real fix
+  is an OS-keychain freshness anchor (a per-store monotone counter held
+  outside the filesystem, bound into the root), on the roadmap.
 - The directory lock is advisory; deployments on filesystems that do not
   honor OS locks must enforce single-process externally.
 - `rln_cache.json` is deliberately loose: a crash can lose cache updates

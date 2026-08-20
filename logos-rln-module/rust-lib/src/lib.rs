@@ -9,9 +9,10 @@
 //!
 //! Architecture (spec concept → crate):
 //! - registry_id (CAIP-10) parse/canonicalize/route → `registry_id.rs`
-//! - storage backend (WAKU-RLN-KEYSTORE format) → `keystore.rs` (crypto +
-//!   file) and `store.rs` (runtime state, lifecycle machine, merged view,
-//!   persist-before-issue message_id reservation)
+//! - storage backend → `sealed_store/` (the sealed keystore: crypto,
+//!   on-disk format, durable files, runtime Store with persist-before-issue
+//!   message_id reservation) and `lifecycle.rs` (the state machine, merged
+//!   view)
 //! - registry provider → `provider.rs` (trait + the lez-rln provider, a raw
 //!   lp_* wire client of the sibling liblogos_lez_rln_module; also the lazy
 //!   gifter client for delegated registration)
