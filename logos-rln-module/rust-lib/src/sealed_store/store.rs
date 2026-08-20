@@ -1591,4 +1591,459 @@ mod tests {
         store.close();
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn identity_field_tamper_matrix() {
+        let _serial = crate::lock(&SERIAL);
+        let dir = test_dir("aad-tamper");
+        let registry = format!("logos:local:{}", "fa".repeat(32));
+        let commitment_a = [0x53u8; 32];
+        let commitment_b = [0x54u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash_a = insert_membership(&store, &registry, &commitment_a);
+        let hash_b = insert_membership(&store, &registry, &commitment_b);
+        store.close();
+        drop(store);
+
+        let sealed_path = dir.join(format::SEALED_FILE);
+        let honest = std::fs::read_to_string(&sealed_path).unwrap();
+
+        // Every identity field is covered, by one of two mechanisms:
+        // registry_id and identity_commitment feed the membership_hash, so
+        // the unkeyed census catches them at OPEN; rln_identifier and
+        // submitted_at live only under the credential AEAD's AAD, caught at
+        // unlock. Either way: quarantined, sibling usable, no plaintext.
+        let other_registry = format!("logos:local:{}", "fb".repeat(32));
+        let cases: [(&str, serde_json::Value, bool); 4] = [
+            ("registry_id", other_registry.into(), true),
+            ("identity_commitment", "fd".repeat(32).into(), true),
+            ("rln_identifier", "de".repeat(32).into(), false),
+            ("submitted_at", 12_345.into(), false),
+        ];
+        for (field, value, census_caught) in cases {
+            edit_json(&sealed_path, |v| {
+                v["credentials"][hash_a.as_str()]["identity"][field] = value;
+            });
+            let store = Store::open(dir.clone()).unwrap();
+            assert_eq!(
+                store.is_quarantined(&hash_a),
+                census_caught,
+                "{field}: pre-unlock quarantine marks the census-caught fields"
+            );
+            assert_eq!(store.unlock("pw").unwrap(), 1, "{field}: the sibling must unlock");
+            assert!(store.is_quarantined(&hash_a), "{field} tamper must quarantine");
+            assert!(!store.is_quarantined(&hash_b), "{field}: the sibling stays usable");
+            let denied = store.unseal_credential(&hash_a);
+            assert!(
+                matches!(denied, Err(ref e) if e.message.contains("quarantined")),
+                "{field}: unseal must refuse without plaintext release"
+            );
+            assert!(store.unseal_credential(&hash_b).is_ok());
+            store.close();
+            drop(store);
+            std::fs::write(&sealed_path, &honest).unwrap();
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_failure_wastes_slot_never_reissues() {
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = crate::lock(&SERIAL);
+        let dir = test_dir("persist-fail");
+        let registry = format!("logos:local:{}", "fc".repeat(32));
+        let commitment = [0x55u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &commitment);
+        assert_eq!(store.reserve_message_id(&hash, "aa", 10, 9, 5, 600).unwrap(), 0);
+
+        // An unwritable dir fails the durable persist AFTER the in-memory
+        // counter advanced: the reservation errors and slot 1 stays spent.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let denied = store.reserve_message_id(&hash, "aa", 10, 9, 5, 600);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(denied, Err(ref e) if e.kind == ErrorKind::Internal), "{denied:?}");
+
+        // The wasted slot is spent, never reissued: the quota already
+        // reflects it and the next reservation skips to slot 2.
+        assert_eq!(store.remaining_budget(&hash, "aa", 10, 5, 600).unwrap(), 3);
+        assert_eq!(store.reserve_message_id(&hash, "aa", 10, 9, 5, 600).unwrap(), 2);
+        assert_eq!(store.remaining_budget(&hash, "aa", 10, 5, 600).unwrap(), 2);
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_storm_holds_the_one_write_mutex_rule() {
+        let _serial = crate::lock(&SERIAL);
+        let dir = test_dir("storm");
+        let registry = format!("logos:local:{}", "fd".repeat(32));
+        let commitment = [0x56u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &commitment);
+
+        let writer = {
+            let store = Arc::clone(&store);
+            let hash = hash.clone();
+            std::thread::spawn(move || {
+                let states = [
+                    MembershipState::Pending,
+                    MembershipState::Active,
+                    MembershipState::Failed,
+                ];
+                for state in states.iter().cycle().take(50) {
+                    store.update_cache(&hash, |c| c.state = *state).unwrap();
+                }
+            })
+        };
+        // 20 reservations across epochs 10..14, racing the cache storm.
+        let mut issued = BTreeSet::new();
+        for i in 0..20u64 {
+            let epoch = 10 + i / 4;
+            let slot = store.reserve_message_id(&hash, "aa", epoch, 9, 10, 600).unwrap();
+            assert!(issued.insert((epoch, slot)), "reissued ({epoch}, {slot})");
+        }
+        writer.join().unwrap();
+
+        // No lost updates: the final snapshot's counters equal the
+        // reservations made.
+        let rec = store.membership(&hash).unwrap();
+        assert_eq!(rec.alloc.allocations.iter().map(|a| a.used).sum::<u64>(), 20);
+        store.close();
+        drop(store);
+
+        // And the persisted state re-verifies wholesale.
+        let store = Store::open(dir.clone()).unwrap();
+        assert_eq!(store.unlock("pw").unwrap(), 1, "zero quarantined after the storm");
+        assert!(!store.is_quarantined(&hash));
+        let rec = store.membership(&hash).unwrap();
+        assert_eq!(rec.alloc.allocations.iter().map(|a| a.used).sum::<u64>(), 20);
+        // Continuation, never reissue: epoch 10's next slot is 4.
+        assert_eq!(store.reserve_message_id(&hash, "aa", 10, 9, 10, 600).unwrap(), 4);
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overcap_allocations_file_quarantines_all() {
+        let _serial = crate::lock(&SERIAL);
+        let dir = test_dir("overcap-alloc");
+        let registry = format!("logos:local:{}", "fe".repeat(32));
+        let commitment_a = [0x57u8; 32];
+        let commitment_b = [0x58u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash_a = insert_membership(&store, &registry, &commitment_a);
+        let hash_b = insert_membership(&store, &registry, &commitment_b);
+        store.close();
+        drop(store);
+
+        // A section count over the cap degrades to .bad + quarantine-all —
+        // never a panic or an unbounded parse.
+        let mut sections = serde_json::Map::new();
+        for i in 0..=format::MAX_SECTIONS {
+            sections.insert(
+                format!("hash{i:04}"),
+                serde_json::json!({
+                    "epoch_size_sec": 600, "prune_floor": 0,
+                    "allocations": [], "mac": "00".repeat(32),
+                }),
+            );
+        }
+        let file = serde_json::json!({
+            "format": format::FORMAT_ALLOCATIONS,
+            "version": format::FORMAT_VERSION,
+            "store_uuid": "00".repeat(16),
+            "sections": sections,
+            "root_mac": "00".repeat(32),
+        });
+        std::fs::write(
+            dir.join(format::ALLOCATIONS_FILE),
+            serde_json::to_string(&file).unwrap(),
+        )
+        .unwrap();
+
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(has_bad_file(&dir, format::ALLOCATIONS_FILE));
+        assert!(store.is_quarantined(&hash_a));
+        assert!(store.is_quarantined(&hash_b));
+        let denied = store.unlock("pw");
+        assert!(matches!(denied, Err(ref e) if e.message.contains("quarantined")), "{denied:?}");
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overcap_cache_file_degrades_to_defaults() {
+        let _serial = crate::lock(&SERIAL);
+        let dir = test_dir("overcap-cache");
+        let registry = format!("logos:local:{}", "df".repeat(32));
+        let commitment = [0x5du8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &commitment);
+        store.close();
+        drop(store);
+
+        let oversize = vec![b' '; format::MAX_FILE_BYTES as usize + 1];
+        std::fs::write(dir.join(format::CACHE_FILE), oversize).unwrap();
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(has_bad_file(&dir, format::CACHE_FILE));
+        let rec = store.membership(&hash).unwrap();
+        assert!(!rec.quarantined, "cache over-cap is self-DoS, never quarantine");
+        assert_eq!(rec.cache.state, MembershipState::Unknown);
+        assert_eq!(store.unlock("pw").unwrap(), 1);
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversize_sealed_file_refuses_open() {
+        let _serial = crate::lock(&SERIAL);
+        let dir = test_dir("oversize-sealed");
+        let registry = format!("logos:local:{}", "ea".repeat(32));
+        let commitment = [0x5eu8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        insert_membership(&store, &registry, &commitment);
+        store.close();
+        drop(store);
+
+        // >4MiB of padding inside a JSON field: the byte cap fires before
+        // any parse, and open() fails closed as Unreadable — the file is
+        // never renamed or adopted (this pins the impl's actual behavior;
+        // the .bad + fresh-empty path is the PARSE-cap breach's, below).
+        let sealed_path = dir.join(format::SEALED_FILE);
+        edit_json(&sealed_path, |v| {
+            v["padding"] = " ".repeat(format::MAX_FILE_BYTES as usize + 1).into();
+        });
+        let denied = Store::open(dir.clone());
+        assert!(
+            matches!(denied, Err(OpenError::Unreadable(ref m)) if m.contains("size cap")),
+            "an over-cap sealed file must refuse open as Unreadable"
+        );
+        assert!(sealed_path.exists(), "the oversized file stays in place");
+        assert!(!has_bad_file(&dir, format::SEALED_FILE));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overcount_sealed_credentials_starts_fresh() {
+        let _serial = crate::lock(&SERIAL);
+        let dir = test_dir("overcount-sealed");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A parse-cap breach (too many credentials) is corrupt, not a
+        // refusal: .bad + fresh empty (I2b).
+        let mut credentials = serde_json::Map::new();
+        for i in 0..=format::MAX_CREDENTIALS {
+            credentials.insert(
+                format!("hash{i:04}"),
+                serde_json::json!({
+                    "identity": {
+                        "registry_id": "r", "rln_identifier": "",
+                        "identity_commitment": "11", "submitted_at": 1,
+                    },
+                    "nonce": "22".repeat(24), "ct": "33",
+                }),
+            );
+        }
+        let file = serde_json::json!({
+            "format": format::FORMAT_SEALED,
+            "version": format::FORMAT_VERSION,
+            "kdf": {"m_cost_kib": 8, "t_cost": 1, "p_cost": 1, "salt": "44".repeat(16)},
+            "verifier": "55".repeat(32),
+            "store_uuid": "66".repeat(16),
+            "credentials": credentials,
+        });
+        std::fs::write(dir.join(format::SEALED_FILE), serde_json::to_string(&file).unwrap())
+            .unwrap();
+
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(has_bad_file(&dir, format::SEALED_FILE));
+        assert!(!store.has_credentials());
+        assert_eq!(store.unlock("pw").unwrap(), 0, "a fresh empty store provisions");
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn insert_crash_windows_are_inert_or_healed() {
+        let _serial = crate::lock(&SERIAL);
+        let dir = test_dir("crash-windows");
+        let registry = format!("logos:local:{}", "da".repeat(32));
+        let commitment_a = [0x59u8; 32];
+        let commitment_b = [0x5au8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash_a = insert_membership(&store, &registry, &commitment_a);
+        let hash_b = insert_membership(&store, &registry, &commitment_b);
+        store.close();
+        drop(store);
+
+        // (a) Crash BEFORE the sealed commit point: B's section and cache
+        // row landed but no sealed entry. Both leftovers are inert, nothing
+        // quarantines, and B is registerable from scratch.
+        edit_json(&dir.join(format::SEALED_FILE), |v| {
+            v["credentials"].as_object_mut().unwrap().remove(hash_b.as_str());
+        });
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(store.membership(&hash_b).is_none(), "the orphan is not a membership");
+        assert_eq!(store.unlock("pw").unwrap(), 1, "zero quarantined");
+        assert!(!store.is_quarantined(&hash_a));
+        assert_eq!(insert_membership(&store, &registry, &commitment_b), hash_b);
+        assert!(store.unseal_credential(&hash_b).is_ok());
+        assert_eq!(store.reserve_message_id(&hash_b, "aa", 10, 9, 5, 600).unwrap(), 0);
+        store.close();
+        drop(store);
+
+        // (b) Post-commit cache loss: the row vanishes while the sealed
+        // entry and section stay. Open synthesizes state Unknown and routes
+        // the record to the heal path.
+        edit_json(&dir.join(format::CACHE_FILE), |v| {
+            v["entries"].as_object_mut().unwrap().remove(hash_b.as_str());
+        });
+        let store = Store::open(dir.clone()).unwrap();
+        let rec = store.membership(&hash_b).unwrap();
+        assert!(!rec.quarantined);
+        assert_eq!(rec.cache.state, MembershipState::Unknown);
+        assert!(store.refreshable_records().iter().any(|r| r.hash == hash_b));
+        assert_eq!(store.unlock("pw").unwrap(), 2, "zero quarantined");
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_reads_stay_consistent_during_persist() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _serial = crate::lock(&SERIAL);
+        let dir = test_dir("snapshot-reads");
+        let registry = format!("logos:local:{}", "db".repeat(32));
+        let commitment = [0x5bu8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &commitment);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let store = Arc::clone(&store);
+            let done = Arc::clone(&done);
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                // Bounded: readers only clone the published Arc, so the loop
+                // ends with the writer instead of waiting on any fsync.
+                let mut last_total = 0u64;
+                let mut reads = 0u64;
+                loop {
+                    let recs = store.records_for(&registry);
+                    assert_eq!(recs.len(), 1, "a snapshot is always whole");
+                    let rec = &recs[0];
+                    // Never torn: counters within the limit, rows above the
+                    // floor, totals monotone across observations.
+                    for row in &rec.alloc.allocations {
+                        assert!((1..=5).contains(&row.used));
+                        assert!(row.epoch >= rec.alloc.prune_floor);
+                    }
+                    let total: u64 = rec.alloc.allocations.iter().map(|a| a.used).sum();
+                    assert!(total >= last_total, "a snapshot went backwards");
+                    last_total = total;
+                    reads += 1;
+                    if done.load(Ordering::Relaxed) || reads >= 5_000_000 {
+                        return (reads, last_total);
+                    }
+                }
+            })
+        };
+        for i in 0..20u64 {
+            store.reserve_message_id(&hash, "aa", 10 + i / 5, 9, 5, 600).unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        let (reads, last_total) = reader.join().unwrap();
+        assert!(reads > 0 && reads < 5_000_000, "the reader must terminate with the writer");
+        assert!(last_total <= 20);
+        let rec = store.membership(&hash).unwrap();
+        assert_eq!(rec.alloc.allocations.iter().map(|a| a.used).sum::<u64>(), 20);
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_updates_never_touch_covered_bytes() {
+        let _serial = crate::lock(&SERIAL);
+        let dir = test_dir("cache-bytes");
+        let registry = format!("logos:local:{}", "dc".repeat(32));
+        let commitment = [0x5cu8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &commitment);
+        assert_eq!(store.reserve_message_id(&hash, "aa", 10, 9, 5, 600).unwrap(), 0);
+
+        let sealed_before = std::fs::read(dir.join(format::SEALED_FILE)).unwrap();
+        let alloc_before = std::fs::read(dir.join(format::ALLOCATIONS_FILE)).unwrap();
+
+        // Unlocked and locked cache mutations alike: the covered files'
+        // bytes are untouchable by construction.
+        store.update_cache(&hash, |c| c.state = MembershipState::Active).unwrap();
+        store.update_cache(&hash, |c| c.leaf_index = Some(9)).unwrap();
+        store.lock();
+        store.update_cache(&hash, |c| c.rate_limit = Some(100)).unwrap();
+        store.update_cache(&hash, |c| c.state = MembershipState::Failed).unwrap();
+
+        assert_eq!(std::fs::read(dir.join(format::SEALED_FILE)).unwrap(), sealed_before);
+        assert_eq!(std::fs::read(dir.join(format::ALLOCATIONS_FILE)).unwrap(), alloc_before);
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_active_at_is_monotone_through_update_cache() {
+        let _serial = crate::lock(&SERIAL);
+        let dir = test_dir("first-active");
+        let registry = format!("logos:local:{}", "dd".repeat(32));
+        let commitment = [0x5fu8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &commitment);
+        assert!(store.membership(&hash).unwrap().cache.first_active_at.is_none());
+
+        store.update_cache(&hash, |c| c.state = MembershipState::Active).unwrap();
+        assert!(store.membership(&hash).unwrap().cache.first_active_at.is_some());
+        // Pin a sentinel through the same seam so a (buggy) re-stamp with
+        // the wall clock would be visible regardless of test timing.
+        store.update_cache(&hash, |c| c.first_active_at = Some(12_345)).unwrap();
+        store.update_cache(&hash, |c| c.state = MembershipState::Failed).unwrap();
+        store.update_cache(&hash, |c| c.state = MembershipState::Active).unwrap();
+        assert_eq!(
+            store.membership(&hash).unwrap().cache.first_active_at,
+            Some(12_345),
+            "a second activation must not restamp the monotone timestamp"
+        );
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
