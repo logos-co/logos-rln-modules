@@ -330,12 +330,15 @@ impl Store {
                 keyed.insert(hash.clone());
             }
         }
-        // …then the root, recomputed over the section MACs AS STORED. A
-        // mismatch with every section individually valid means a section was
-        // spliced in from another version of the file (or the root itself was
-        // rolled back) — unattributable, so everything quarantines. When a
-        // section already failed on its own, the root necessarily fails too:
-        // attribute to that section, never escalate.
+        // …then the root, recomputed over the section MACs AS STORED. A clean
+        // write always restamps every section MAC and the root together, and a
+        // content-only edit leaves the stored MAC (and thus the root) valid and
+        // attributable — so a root mismatch can only mean an unforgeable-MAC or
+        // structural change: a section spliced in from an older file, a MAC
+        // stripped or edited, a section added or removed, or the root itself
+        // rolled back. None of those is attributable to a single section (a
+        // decoy tamper elsewhere would otherwise mask a splice), so the whole
+        // store fails closed: every not-yet-attributed entry quarantines.
         if !inner.raw_sections.is_empty() {
             let mut stored_macs = BTreeMap::new();
             for (hash, s) in &inner.raw_sections {
@@ -349,14 +352,15 @@ impl Store {
                         format::mac(&keys.ledger, &format::root_mac_payload(&stored_macs, &uuid));
                     crypto::ct_eq(&recomputed, &stored)
                 });
-            if !root_ok && keyed.is_empty() && inner.census_quarantined.is_empty() {
+            if !root_ok {
                 eprintln!(
-                    "sealed store: allocations root MAC mismatch with every section \
-                     individually valid — splice or rollback detected; quarantining every \
-                     membership"
+                    "sealed store: allocations root MAC mismatch — splice, rollback, or \
+                     structural tamper; quarantining every membership not already attributed"
                 );
                 for hash in sealed.credentials.keys() {
-                    keyed.insert(hash.clone());
+                    if !inner.census_quarantined.contains(hash) {
+                        keyed.insert(hash.clone());
+                    }
                 }
             }
         }
@@ -1346,15 +1350,16 @@ mod tests {
         drop(store);
         std::fs::write(&alloc_path, &honest).unwrap();
 
-        // (b) Strip A's section MAC (entries are MAC'd from birth, so a
-        // missing tag is as much tamper as a mismatch).
+        // (b) Strip A's section MAC. A stripped tag breaks the root binding
+        // (the set of section MACs no longer matches the root), which is
+        // unattributable — so the store fails closed and BOTH quarantine.
         edit_json(&alloc_path, |v| {
             v["sections"][hash_a.as_str()]["mac"] = "".into();
         });
         let store = Store::open(dir.clone()).unwrap();
-        assert_eq!(store.unlock("pw").unwrap(), 1);
+        assert_eq!(store.unlock("pw").unwrap(), 0);
         assert!(store.is_quarantined(&hash_a), "a stripped MAC must quarantine");
-        assert!(!store.is_quarantined(&hash_b));
+        assert!(store.is_quarantined(&hash_b), "a broken root binding fails closed store-wide");
         store.close();
         drop(store);
         std::fs::write(&alloc_path, &honest).unwrap();
@@ -1392,17 +1397,40 @@ mod tests {
         drop(store);
         std::fs::write(&alloc_path, &honest).unwrap();
 
-        // (e) Removing one section quarantines exactly that membership: the
-        // root mismatch is attributable to the missing section, so the
-        // sibling survives.
+        // (e) Removing one section: A census-quarantines at open (a credential
+        // with no section), and the root no longer covers the surviving set —
+        // unattributable, so B fails closed too.
         edit_json(&alloc_path, |v| {
             v["sections"].as_object_mut().unwrap().remove(hash_a.as_str());
         });
         let store = Store::open(dir.clone()).unwrap();
-        assert!(store.is_quarantined(&hash_a));
-        assert!(!store.is_quarantined(&hash_b));
-        assert_eq!(store.unlock("pw").unwrap(), 1);
-        assert!(store.unseal_credential(&hash_b).is_ok());
+        assert!(store.is_quarantined(&hash_a), "a credential with no section census-quarantines at open");
+        assert_eq!(store.unlock("pw").unwrap(), 0);
+        assert!(store.is_quarantined(&hash_b), "a broken root binding fails closed store-wide");
+        assert!(store.unseal_credential(&hash_b).is_err());
+        store.close();
+        drop(store);
+        std::fs::write(&alloc_path, &honest).unwrap();
+
+        // (f) Splice A's older section WHILE B is independently quarantined by
+        // a decoy tamper. The decoy must not mask the splice: A — individually
+        // valid and would-be-usable — must still quarantine (regression for the
+        // suppressed-escalation reissue path).
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        assert_eq!(store.reserve_message_id(&hash_a, "aa", 10, 9, 5, 600).unwrap(), 1);
+        store.close();
+        drop(store);
+        let old: serde_json::Value = serde_json::from_str(&honest).unwrap();
+        edit_json(&alloc_path, |v| {
+            v["sections"][hash_a.as_str()] = old["sections"][hash_a.as_str()].clone();
+            // decoy: corrupt B's own section content so B quarantines on its own
+            v["sections"][hash_b.as_str()]["prune_floor"] = 999u64.into();
+        });
+        let store = Store::open(dir.clone()).unwrap();
+        assert_eq!(store.unlock("pw").unwrap(), 0, "a splice behind a decoy must still be caught");
+        assert!(store.is_quarantined(&hash_a), "the spliced entry must not ride through B's quarantine");
+        assert!(store.is_quarantined(&hash_b));
 
         store.close();
         let _ = std::fs::remove_dir_all(&dir);
