@@ -238,6 +238,7 @@ impl Store {
     pub fn unlock(&self, password: &str) -> Result<usize, ApiError> {
         let mut guard = crate::lock(&self.write);
         let inner = &mut *guard;
+        ensure_open(inner)?;
 
         let cred_count = inner.sealed.as_ref().map_or(0, |f| f.credentials.len());
         if cred_count > 0
@@ -390,8 +391,11 @@ impl Store {
         crate::lock(&self.write).session.as_ref().map(|s| s.password.clone())
     }
 
-    /// True when unlock() would actually VERIFY a password (a non-quarantined
-    /// credential exists).
+    /// True when the sealed file holds any credential entry, quarantined or
+    /// not — i.e. the keystore is NOT fresh. Keychain auto-unlock keys on this
+    /// to decide whether inventing a secret is safe: a store whose credentials
+    /// are all quarantined (e.g. the allocations file was deleted) must NOT
+    /// look fresh, or auto-unlock would generate a secret it can never verify.
     pub fn has_credentials(&self) -> bool {
         self.snapshot_arc().has_credentials
     }
@@ -422,9 +426,14 @@ impl Store {
     ) -> Result<(), ApiError> {
         let mut guard = crate::lock(&self.write);
         let inner = &mut *guard;
+        ensure_open(inner)?;
         if inner.session.is_none() {
             return Err(ApiError::new(ErrorKind::Locked, "unlock_keystore before registering"));
         }
+        // Resetting a quarantined hash's counters is safe ONLY because the sole
+        // caller (register) mints a fresh random identity, so the same hash
+        // never recurs with real spent slots. A future import/restore path that
+        // reuses a hash would make this a slot-reissue footgun — gate it there.
         let was_quarantined =
             inner.census_quarantined.remove(hash) | inner.keyed_quarantined.remove(hash);
         if was_quarantined {
@@ -571,6 +580,7 @@ impl Store {
     ) -> Result<(), ApiError> {
         let mut guard = crate::lock(&self.write);
         let inner = &mut *guard;
+        ensure_open(inner)?;
         if !inner.sealed.as_ref().is_some_and(|s| s.credentials.contains_key(hash)) {
             return Err(ApiError::new(ErrorKind::UnknownMembership, "no such membership_hash"));
         }
@@ -600,12 +610,15 @@ impl Store {
     ) -> Result<u64, ApiError> {
         let mut guard = crate::lock(&self.write);
         let inner = &mut *guard;
-        let quarantined =
-            inner.census_quarantined.contains(hash) || inner.keyed_quarantined.contains(hash);
-        reservation_guards(quarantined, inner.sections.get(hash), epoch_size_sec)?;
+        ensure_open(inner)?;
+        // Unlock-gated: report Locked before the entry-state guards, so a locked
+        // store answers Locked rather than leaking quarantine/missing/size state.
         if inner.session.is_none() {
             return Err(ApiError::new(ErrorKind::Locked, "unlock_keystore before generate_proof"));
         }
+        let quarantined =
+            inner.census_quarantined.contains(hash) || inner.keyed_quarantined.contains(hash);
+        reservation_guards(quarantined, inner.sections.get(hash), epoch_size_sec)?;
         let Some(alloc) = inner.sections.get_mut(hash) else {
             return Err(ApiError::new(ErrorKind::UnknownMembership, "no such membership_hash"));
         };
@@ -733,6 +746,16 @@ fn section_mac_ok(keys: &SubKeys, hash: &str, section: &Section, uuid: &[u8; 16]
 /// The shared reserve/quota guards: quarantined counters are untrusted, a
 /// missing membership is unknown, and an epoch-size mismatch is permanently
 /// refused (a rebased epoch numbering could reissue spent slots).
+// A closed store has released its directory lock (`close()` took it), so any
+// further write would land OUTSIDE the exclusion a re-opened store holds.
+// Refuse fail-closed: a stale Arc surviving a re-init cannot mutate on disk.
+fn ensure_open(inner: &Inner) -> Result<(), ApiError> {
+    if inner.lock.is_none() {
+        return Err(ApiError::internal("keystore is closed"));
+    }
+    Ok(())
+}
+
 // The reservation write-path row cap. MUST stay <= format::MAX_ROWS_PER_SECTION
 // (the read-path cap) so the module never writes a file it cannot re-read; a
 // small test value keeps the cap regression fast.
@@ -1118,7 +1141,9 @@ fn build_snapshot(inner: &Inner) -> Snapshot {
             );
         }
     }
-    let has_credentials = records.values().any(|r| !r.quarantined);
+    // Quarantine-independent: an all-quarantined store is still not fresh (see
+    // Store::has_credentials — the keychain auto-unlock safety gate).
+    let has_credentials = !records.is_empty();
     Snapshot { records, has_credentials }
 }
 
@@ -1486,6 +1511,71 @@ mod tests {
         let store = Store::open(dir.clone()).unwrap();
         assert!(!store.is_quarantined(&hash), "the capped file must remain readable");
         assert_eq!(store.unlock("pw").unwrap(), 1);
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn second_open_is_refused_while_the_first_holds_the_lock() {
+        let _serial = crate::lock(&SERIAL);
+        let dir = test_dir("dir-lock");
+        let first = Store::open(dir.clone()).unwrap();
+        let second = Store::open(dir.clone());
+        assert!(matches!(second, Err(OpenError::DirLockHeld(_))), "the second opener fails closed");
+        first.close();
+        Store::open(dir.clone()).unwrap().close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn close_then_reopen_preserves_state() {
+        let _serial = crate::lock(&SERIAL);
+        let dir = test_dir("reinit");
+        let registry = format!("logos:local:{}", "ab".repeat(32));
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &[0x33u8; 32]);
+        store.close();
+        drop(store);
+        let store = Store::open(dir.clone()).unwrap();
+        assert_eq!(store.unlock("pw").unwrap(), 1);
+        assert!(store.membership(&hash).is_some());
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_closed_store_refuses_writes() {
+        // A stale Arc surviving a re-init must not write outside the re-opened
+        // store's directory lock.
+        let _serial = crate::lock(&SERIAL);
+        let dir = test_dir("closed-writes");
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        store.close();
+        assert!(matches!(store.unlock("pw"), Err(ref e) if e.message.contains("closed")));
+        assert!(matches!(store.update_cache("00", |_| {}), Err(ref e) if e.message.contains("closed")));
+        assert!(matches!(store.reserve_message_id("00", "aa", 10, 9, 5, 600), Err(ref e) if e.message.contains("closed")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn all_quarantined_store_is_not_fresh() {
+        // L1: deleting the allocations file quarantines every credential, but
+        // the keystore is NOT fresh — has_credentials must stay true so
+        // keychain auto-unlock never invents a secret it can never verify.
+        let _serial = crate::lock(&SERIAL);
+        let dir = test_dir("not-fresh");
+        let registry = format!("logos:local:{}", "ef".repeat(32));
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &[0x44u8; 32]);
+        store.close();
+        drop(store);
+        std::fs::remove_file(dir.join(format::ALLOCATIONS_FILE)).unwrap();
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(store.is_quarantined(&hash));
+        assert!(store.has_credentials(), "an all-quarantined store must not look fresh");
         store.close();
         let _ = std::fs::remove_dir_all(&dir);
     }
