@@ -7,12 +7,11 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// The module-local lifecycle state, persisted in the cache sidecar.
-/// `#[serde(rename_all = "snake_case")]` serializes
-/// each variant to the EXACT wire string logos-lez-rln-module's
-/// `rln_core::membership_status` returns (`GracePeriod → "grace_period"`);
-/// the crates deliberately share no type — the `membership_state_wire_strings`
-/// test anchors the contract. No `#[serde(other)]`: a stray persisted string
-/// loud-fails deserialize rather than silently degrading.
+/// `rename_all = "snake_case"` yields the EXACT wire strings
+/// logos-lez-rln-module's `rln_core::membership_status` returns
+/// (`GracePeriod → "grace_period"`); the crates deliberately share no type.
+/// No `#[serde(other)]`: a stray persisted string loud-fails deserialize
+/// rather than silently degrading.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MembershipState {
@@ -26,22 +25,20 @@ pub(crate) enum MembershipState {
 }
 
 impl MembershipState {
-    /// The usable ("selectable") states: a membership that can currently back
-    /// a proof — the one predicate selection, scope resolution, and the quota
-    /// read all share.
+    /// Can currently back a proof — the ONE predicate selection, scope
+    /// resolution, and the quota read all share.
     pub(crate) fn is_usable(self) -> bool {
         matches!(self, Self::Active | Self::GracePeriod)
     }
 
-    /// The live states (spec): a membership that blocks a new registration for
-    /// its scope — usable, or still awaiting confirmation. Terminal states
-    /// (failed, expired, erased, unknown) never block a fresh registration.
+    /// The spec's live states: blocks a new registration for its scope;
+    /// terminal states never do.
     pub(crate) fn is_live(self) -> bool {
         matches!(self, Self::Pending) || self.is_usable()
     }
 
     /// Ever observed on the registry — the "was Active, now gone → erased"
-    /// removal signal's building block (see `merge_state`).
+    /// inference's building block (see `merge_state`).
     pub(crate) fn is_active_like(self) -> bool {
         matches!(self, Self::Active | Self::GracePeriod | Self::Expired | Self::Erased)
     }
@@ -57,8 +54,7 @@ pub(crate) struct StoredCredential {
     pub(crate) identity_secret_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) identity_trapdoor: Option<String>,
-    /// The sealed plaintext's own registry_id. The identity is authenticated
-    /// by the credential AEAD's AAD, so no separate cross-check is needed.
+    /// Authenticated by the credential AEAD's AAD — no separate cross-check.
     pub(crate) registry_id: String,
 }
 
@@ -68,12 +64,9 @@ pub const CONFIRMATION_WINDOW_SECS: u64 = 300;
 
 // ------------------------------------------------------------------- records
 
-/// Registry-derived, poller-healed cache state, deliberately outside the
-/// authenticated surface — tampering it is self-DoS, not disclosure; the
-/// poller heals it from the registry. Unlike the old sidecar cache this
-/// carries no `submitted_at` (it lives in `IdentityBlock`) and no
-/// `state_history` — the monotone `first_active_at` stamp is the one
-/// ever-active signal `merge_state` needs.
+/// Registry-derived cache state, deliberately outside the authenticated
+/// surface — tampering it is self-DoS, not disclosure; the poller heals it
+/// from the registry.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CacheState {
     pub state: MembershipState,
@@ -85,16 +78,14 @@ pub struct CacheState {
     pub rate_limit: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_reason: Option<String>,
-    /// Whether a `failed` state is worth retrying (spec: a failed submission
-    /// SHALL report whether it is retryable). `None` outside the failed
-    /// state (never set, or cleared on the next successful observation).
+    /// Spec: a failed submission SHALL report whether it is retryable.
+    /// `None` outside the failed state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retryable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tx_result: Option<String>,
-    /// Stamped at the first active-like observation and never cleared —
-    /// monotone, so a later `failed` still remembers the membership was once
-    /// on the registry (the "was Active, now gone → erased" inference).
+    /// Stamped at the first active-like observation, never cleared: a later
+    /// `failed` still remembers the membership was once on the registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_active_at: Option<u64>,
 }
@@ -115,18 +106,16 @@ impl Default for CacheState {
 }
 
 impl CacheState {
-    /// Records a failed submission: state → Failed, the "submit_failed: "
-    /// failure-reason prefix consumers key on, and the spec's retryable flag.
+    /// The "submit_failed: " failure-reason prefix is a consumer contract.
     pub(crate) fn mark_submit_failed(&mut self, message: &str, retryable: bool) {
         self.state = MembershipState::Failed;
         self.failed_reason = Some(format!("submit_failed: {message}"));
         self.retryable = Some(retryable);
     }
 
-    /// Record a late/async submission error without clobbering a state already
-    /// advanced past `Pending` (the registry may have confirmed the submission).
-    /// Only a non-retryable error fails a still-`Pending` record; retryable
-    /// ones stay `Pending` for `merge_state` to confirm or time out.
+    /// A late/async submission error must not clobber a state already past
+    /// `Pending` (the registry may have confirmed); a retryable one leaves
+    /// `Pending` for `merge_state` to confirm or time out.
     pub(crate) fn record_async_submit_error(&mut self, message: &str, retryable: bool) {
         if self.state != MembershipState::Pending || retryable {
             return;
@@ -135,10 +124,8 @@ impl CacheState {
     }
 }
 
-/// One registry's local record as consumers see it: the membership_hash, the
-/// sealed entry's plaintext identity header, the cache sidecar, the
-/// MAC-covered allocation state, and whether the load-time tamper scan
-/// quarantined it. In-memory only — never persisted as a unit.
+/// One membership's local record as consumers see it. In-memory only —
+/// never persisted as a unit.
 #[derive(Clone)]
 pub struct MembershipRecord {
     pub hash: String,
@@ -166,13 +153,10 @@ pub fn merge_state(
 ) -> MembershipState {
     match (local, registry_state) {
         (None, None) => MembershipState::Unknown,
-        // The registry has it: its chain-clock view wins outright.
         (_, Some(state)) => state,
         (Some(record), None) => {
             if record.cache.state == MembershipState::Pending {
-                // submitted_at 0 = unset: maximally stale, so a pending
-                // record with no submission time fails once now passes the
-                // window — exactly the old plain-u64 arithmetic.
+                // submitted_at 0 = unset behaves as maximally stale.
                 if now.saturating_sub(record.identity.submitted_at) > CONFIRMATION_WINDOW_SECS {
                     MembershipState::Failed
                 } else {
@@ -181,7 +165,6 @@ pub fn merge_state(
             } else if has_been_active(record) {
                 MembershipState::Erased
             } else {
-                // failed stays failed (visible until re-registered).
                 record.cache.state
             }
         }
@@ -201,8 +184,8 @@ pub fn transition_event(
     if new_state == record.cache.state {
         return None;
     }
-    // Enum→wire string: serde's `rename_all = "snake_case"` on
-    // MembershipState is the single source of truth for the wire strings.
+    // Serde's `rename_all` on MembershipState is the single source of truth
+    // for the wire strings.
     let wire = |s: MembershipState| {
         serde_json::to_value(s)
             .ok()
@@ -275,26 +258,19 @@ mod tests {
     fn merge_state_matrix() {
         use MembershipState::*;
         let now = 10_000;
-        // No local record.
         assert_eq!(merge_state(None, None, now), Unknown);
         assert_eq!(merge_state(None, Some(Active), now), Active);
-        // Pending inside/outside the confirmation window.
         let fresh = rec(Pending, now - 10);
         assert_eq!(merge_state(Some(&fresh), None, now), Pending);
         let stale = rec(Pending, now - CONFIRMATION_WINDOW_SECS - 1);
         assert_eq!(merge_state(Some(&stale), None, now), Failed);
-        // submitted_at 0 = unset behaves as maximally stale.
         let unset = rec(Pending, 0);
         assert_eq!(merge_state(Some(&unset), None, now), Failed);
-        // Registry view wins when present.
         assert_eq!(merge_state(Some(&stale), Some(GracePeriod), now), GracePeriod);
-        // Failed stays failed while absent.
         let failed = rec(Failed, now - 1_000);
         assert_eq!(merge_state(Some(&failed), None, now), Failed);
-        // Was active, now gone from the registry → inferred erased.
         let was_active = rec(Active, now - 1_000);
         assert_eq!(merge_state(Some(&was_active), None, now), Erased);
-        // Ever-active is remembered via first_active_at (old: state_history).
         let mut ever_active = rec(Failed, now - 1_000);
         ever_active.cache.first_active_at = Some(now - 500);
         assert_eq!(merge_state(Some(&ever_active), None, now), Erased);
@@ -303,11 +279,9 @@ mod tests {
     #[test]
     fn transition_event_gates_on_actual_state_change() {
         use MembershipState::*;
-        // A mere re-observation of the same state must not emit.
         let active = rec(Active, 0);
         assert!(transition_event("h", &active, Active).is_none());
 
-        // pending -> active: previous carries the pre-transition state.
         let pending = rec(Pending, 0);
         let (registry_id, rln_identifier, hash, state, previous) =
             transition_event("h1", &pending, Active).expect("real transition");
@@ -317,7 +291,6 @@ mod tests {
         assert_eq!(state, "active");
         assert_eq!(previous, "pending");
 
-        // A scoped record's rln_identifier is carried through verbatim.
         let mut scoped = rec(Pending, 0);
         scoped.identity.rln_identifier = "ab".repeat(32);
         let (_, rln_identifier, ..) =
@@ -329,12 +302,10 @@ mod tests {
     fn first_active_at_semantics() {
         use MembershipState::*;
         let now = 10_000;
-        // Some(first_active_at) marks ever-active even from a failed state:
-        // absent from the registry ⇒ the erased inference.
+        // Ever-active survives via first_active_at even from a failed state.
         let mut once_active = rec(Failed, now - 1_000);
         once_active.cache.first_active_at = Some(now - 500);
         assert_eq!(merge_state(Some(&once_active), None, now), Erased);
-        // None + a state never seen on the registry ⇒ not ever-active.
         let never_active = rec(Failed, now - 1_000);
         assert_eq!(merge_state(Some(&never_active), None, now), Failed);
     }
@@ -342,19 +313,14 @@ mod tests {
     #[test]
     fn async_submit_error_policy() {
         use MembershipState::*;
-        // A late error never clobbers a state already past Pending.
         let mut confirmed = rec(Active, 0).cache;
         confirmed.record_async_submit_error("boom", false);
         assert_eq!(confirmed.state, Active);
         assert!(confirmed.failed_reason.is_none());
-        // A retryable error leaves Pending for merge_state to confirm or
-        // time out.
         let mut retryable = rec(Pending, 0).cache;
         retryable.record_async_submit_error("boom", true);
         assert_eq!(retryable.state, Pending);
         assert!(retryable.failed_reason.is_none());
-        // A non-retryable error fails a still-Pending record, with the
-        // "submit_failed: " prefix consumers key on.
         let mut fatal = rec(Pending, 0).cache;
         fatal.record_async_submit_error("boom", false);
         assert_eq!(fatal.state, Failed);

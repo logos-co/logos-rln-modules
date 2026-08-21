@@ -61,14 +61,11 @@ pub(crate) fn current() -> Option<Arc<Store>> {
     crate::lock(&CURRENT).upgrade()
 }
 
-/// The refusal every keystore op surfaces when no store was ever opened —
-/// no persistence path from the host (no silent cwd fallback — see README),
-/// an unreadable keystore, or another process holding the keystore lock.
+/// The refusal every keystore op surfaces when no store was ever opened.
 pub(crate) const UNINIT_MSG: &str =
     "store not initialized (no instance persistence path from the host, unreadable \
      keystore, or another process holds the keystore lock)";
 
-/// The published store, or the uninitialized `internal` error.
 pub(crate) fn current_or_uninit() -> Result<Arc<Store>, ApiError> {
     current().ok_or_else(|| ApiError::internal(UNINIT_MSG))
 }
@@ -86,7 +83,6 @@ struct Inner {
     /// `None` until the first unlock provisions the sealed file.
     sealed: Option<SealedFile>,
     store_uuid: Option<[u8; 16]>,
-    /// The live allocation ledger, one entry per credentialed membership.
     sections: BTreeMap<String, AllocationState>,
     cache: BTreeMap<String, CacheState>,
     /// Failed the unkeyed open-time census (membership_hash recomputation,
@@ -124,9 +120,8 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open (never create-then-write: the first unlock provisions) the store
-    /// in `dir`: refuse an old-format dir, take the exclusive dir lock, load
-    /// the three files with pre-unlock caps, and run the unkeyed census.
+    /// Open the store in `dir` — never create-then-write: the first unlock
+    /// provisions.
     pub fn open(dir: PathBuf) -> Result<Arc<Store>, OpenError> {
         match format::detect(&dir) {
             format::FormatPresence::OldOnly => {
@@ -232,14 +227,10 @@ impl Store {
     }
 
     /// Verify the password and authenticate every entry. The ordering is
-    /// wire-frozen:
-    /// 1. an all-census-quarantined store refuses BEFORE any KDF (nothing
-    ///    could verify the password; a vacuous match would adopt it),
-    /// 2. exactly ONE KDF run — an empty store (re-)provisions and returns,
-    /// 3. a non-empty store checks the verifier (constant-time),
-    /// 4. keyed pass: credential AEAD per entry, then every non-quarantined
-    ///    section's MAC, then the root over the stored section MACs,
-    /// 5. all-or-nothing commit of quarantine sets + session.
+    /// WIRE-FROZEN: the all-quarantined refusal runs BEFORE any KDF (nothing
+    /// could verify the password — a vacuous match would adopt it), exactly
+    /// one KDF run follows, and the quarantine sets + session commit
+    /// all-or-nothing.
     pub fn unlock(&self, password: &str) -> Result<usize, ApiError> {
         let mut guard = crate::lock(&self.write);
         let inner = &mut *guard;
@@ -305,7 +296,6 @@ impl Store {
             ));
         }
 
-        // Keyed pass, only after the verifier passed. Credential AEAD first…
         let mut keyed = BTreeSet::new();
         for (hash, entry) in &sealed.credentials {
             if inner.census_quarantined.contains(hash) {
@@ -319,7 +309,6 @@ impl Store {
                 keyed.insert(hash.clone());
             }
         }
-        // …then every non-quarantined membership's section MAC…
         for hash in sealed.credentials.keys() {
             if inner.census_quarantined.contains(hash) || keyed.contains(hash) {
                 continue;
@@ -336,15 +325,12 @@ impl Store {
                 keyed.insert(hash.clone());
             }
         }
-        // …then the root, recomputed over the section MACs AS STORED. A clean
-        // write always restamps every section MAC and the root together, and a
-        // content-only edit leaves the stored MAC (and thus the root) valid and
-        // attributable — so a root mismatch can only mean an unforgeable-MAC or
-        // structural change: a section spliced in from an older file, a MAC
-        // stripped or edited, a section added or removed, or the root itself
-        // rolled back. None of those is attributable to a single section (a
-        // decoy tamper elsewhere would otherwise mask a splice), so the whole
-        // store fails closed: every not-yet-attributed entry quarantines.
+        // The root, recomputed over the section MACs AS STORED. A content-only
+        // edit leaves the stored MAC (and thus the root) valid and attributable
+        // to its one section; a root mismatch can only be an unforgeable-MAC or
+        // structural change (splice, stripped MAC, added/removed section,
+        // rolled-back root) — unattributable, and a decoy tamper elsewhere must
+        // not mask a splice, so the whole store fails closed.
         if !inner.raw_sections.is_empty() {
             let mut stored_macs = BTreeMap::new();
             for (hash, s) in &inner.raw_sections {
@@ -405,7 +391,6 @@ impl Store {
         self.snapshot_arc().has_credentials
     }
 
-    /// The host-stamped persistence dir this store lives in.
     pub fn base_dir(&self) -> &Path {
         &self.dir
     }
@@ -522,7 +507,6 @@ impl Store {
         self.snapshot_arc().records.get(hash).cloned()
     }
 
-    /// All records for one canonical registry_id.
     pub fn records_for(&self, canonical_registry: &str) -> Vec<MembershipRecord> {
         self.snapshot_arc()
             .records
@@ -542,9 +526,8 @@ impl Store {
             .collect()
     }
 
-    /// The state-refresh work list: the old set (Active/GracePeriod/Expired)
-    /// PLUS Unknown — a heal-only widening so a lost cache file's defaulted
-    /// rows are re-read from the registry instead of staying dark.
+    /// The state-refresh work list, widened to include Unknown — heal-only,
+    /// so a lost cache file's defaulted rows are re-read from the registry.
     pub fn refreshable_records(&self) -> Vec<MembershipRecord> {
         self.snapshot_arc()
             .records
@@ -748,9 +731,6 @@ fn section_mac_ok(keys: &SubKeys, hash: &str, section: &Section, uuid: &[u8; 16]
     }
 }
 
-/// The shared reserve/quota guards: quarantined counters are untrusted, a
-/// missing membership is unknown, and an epoch-size mismatch is permanently
-/// refused (a rebased epoch numbering could reissue spent slots).
 // A closed store has released its directory lock (`close()` took it), so any
 // further write would land OUTSIDE the exclusion a re-opened store holds.
 // Refuse fail-closed: a stale Arc surviving a re-init cannot mutate on disk.
@@ -1242,9 +1222,6 @@ mod tests {
         let store = Store::open(dir.clone()).unwrap();
         store.unlock("pw").unwrap();
         let hash = insert_membership(&store, &registry, &commitment);
-        // Reserve in epoch 10, then in epoch 12 with the window floor at 11 —
-        // the second reservation prunes epoch 10's spent row and records
-        // floor 11, all under epoch_size 600.
         assert_eq!(store.reserve_message_id(&hash, "aa", 10, 9, 5, 600).unwrap(), 0);
         assert_eq!(store.reserve_message_id(&hash, "aa", 12, 11, 5, 600).unwrap(), 0);
         store.close();
@@ -1253,18 +1230,13 @@ mod tests {
         let store = Store::open(dir.clone()).unwrap();
         assert_eq!(store.unlock("pw").unwrap(), 1);
         assert_eq!(store.epoch_size_bindings(), vec![(hash.clone(), 600)]);
-        // A rewound (or gap-widened) window re-admits pruned epoch 10, but
-        // the persisted floor must refuse it instead of reissuing slot 0.
         let rewound = store.reserve_message_id(&hash, "aa", 10, 9, 5, 600);
         assert!(matches!(rewound, Err(e) if e.kind == ErrorKind::Permanent));
-        // The quota read mirrors the SAME permanent refusals.
         let q_floor = store.remaining_budget(&hash, "aa", 10, 5, 600);
         assert!(matches!(q_floor, Err(e) if e.kind == ErrorKind::Permanent));
         let q_size = store.remaining_budget(&hash, "aa", 12, 5, 1200);
         assert!(matches!(q_size, Err(e) if e.kind == ErrorKind::Permanent));
-        // Epoch 12 continues its persisted counter — slot 1, never a fresh 0.
         assert_eq!(store.reserve_message_id(&hash, "aa", 12, 11, 5, 600).unwrap(), 1);
-        // A different epoch_size_sec rebases the epoch numbering: refused.
         let rebased = store.reserve_message_id(&hash, "aa", 12, 11, 5, 1200);
         assert!(matches!(rebased, Err(e) if e.kind == ErrorKind::Permanent));
 
@@ -1284,8 +1256,6 @@ mod tests {
         let hash = insert_membership(&store, &registry, &commitment);
         assert_eq!(store.reserve_message_id(&hash, "aa", 10, 9, 5, 600).unwrap(), 0);
         store.lock();
-        // Locked-mode cache mutations (the poller's path) must never touch
-        // the authenticated files.
         store.update_cache(&hash, |c| c.leaf_index = Some(7)).unwrap();
         store.update_cache(&hash, |c| c.state = MembershipState::Active).unwrap();
         store.update_cache(&hash, |c| c.rate_limit = Some(100)).unwrap();
@@ -1300,7 +1270,6 @@ mod tests {
         assert_eq!(rec.cache.leaf_index, Some(7));
         assert_eq!(rec.cache.rate_limit, Some(100));
         assert!(rec.cache.first_active_at.is_some(), "active observation must stamp it");
-        // Counters intact: the next slot continues, never a fresh 0.
         assert_eq!(store.reserve_message_id(&hash, "aa", 10, 9, 5, 600).unwrap(), 1);
 
         store.close();
@@ -1323,8 +1292,6 @@ mod tests {
         store.close();
         drop(store);
 
-        // Tamper A's identity block on disk: the open-time census quarantines
-        // it without any password; the sibling still verifies and unseals.
         let sealed_path = dir.join(format::SEALED_FILE);
         edit_json(&sealed_path, |v| {
             v["credentials"][hash_a.as_str()]["identity"]["identity_commitment"] =
@@ -1340,15 +1307,12 @@ mod tests {
         store.close();
         drop(store);
 
-        // Wrong password against the surviving envelope is rejected.
         let store = Store::open(dir.clone()).unwrap();
         let bad = store.unlock("not-pw");
         assert!(matches!(bad, Err(e) if e.kind == ErrorKind::BadPassword));
         store.close();
         drop(store);
 
-        // All-census-quarantined: with nothing left to verify against, ANY
-        // password is refused — and BEFORE any KDF runs.
         edit_json(&sealed_path, |v| {
             v["credentials"][hash_b.as_str()]["identity"]["identity_commitment"] =
                 "ee".repeat(32).into();
@@ -1381,7 +1345,6 @@ mod tests {
         store.unlock("pw").unwrap();
         let hash_a = insert_membership(&store, &registry, &commitment_a);
         let hash_b = insert_membership(&store, &registry, &commitment_b);
-        // Spend a slot on A so its MAC covers live allocation state.
         assert_eq!(store.reserve_message_id(&hash_a, "aa", 10, 9, 5, 600).unwrap(), 0);
         store.close();
         drop(store);
@@ -1389,8 +1352,6 @@ mod tests {
         let alloc_path = dir.join(format::ALLOCATIONS_FILE);
         let honest = std::fs::read_to_string(&alloc_path).unwrap();
 
-        // (a) Rewind A's spent counter on disk (file-write access, no
-        // password): unlock must quarantine A; untampered B stays usable.
         edit_json(&alloc_path, |v| {
             v["sections"][hash_a.as_str()]["allocations"][0]["used"] = 0.into();
         });
@@ -1404,9 +1365,6 @@ mod tests {
         drop(store);
         std::fs::write(&alloc_path, &honest).unwrap();
 
-        // (b) Strip A's section MAC. A stripped tag breaks the root binding
-        // (the set of section MACs no longer matches the root), which is
-        // unattributable — so the store fails closed and BOTH quarantine.
         edit_json(&alloc_path, |v| {
             v["sections"][hash_a.as_str()]["mac"] = "".into();
         });
@@ -1418,10 +1376,7 @@ mod tests {
         drop(store);
         std::fs::write(&alloc_path, &honest).unwrap();
 
-        // (c) SPLICE: advance A's counter, then graft the older (individually
-        // valid) section back into the newer file. Every section verifies on
-        // its own, but the root doesn't — unattributable, so EVERYTHING
-        // quarantines.
+        // Splice: every section verifies on its own, but the root doesn't.
         let store = Store::open(dir.clone()).unwrap();
         store.unlock("pw").unwrap();
         assert_eq!(store.reserve_message_id(&hash_a, "aa", 10, 9, 5, 600).unwrap(), 1);
@@ -1439,8 +1394,6 @@ mod tests {
         drop(store);
         std::fs::write(&alloc_path, &honest).unwrap();
 
-        // (d) Deleting the ledger while credentials exist is tamper: all
-        // quarantined at OPEN, and unlock refuses outright.
         std::fs::remove_file(&alloc_path).unwrap();
         let store = Store::open(dir.clone()).unwrap();
         assert!(store.is_quarantined(&hash_a));
@@ -1451,9 +1404,6 @@ mod tests {
         drop(store);
         std::fs::write(&alloc_path, &honest).unwrap();
 
-        // (e) Removing one section: A census-quarantines at open (a credential
-        // with no section), and the root no longer covers the surviving set —
-        // unattributable, so B fails closed too.
         edit_json(&alloc_path, |v| {
             v["sections"].as_object_mut().unwrap().remove(hash_a.as_str());
         });
@@ -1466,10 +1416,8 @@ mod tests {
         drop(store);
         std::fs::write(&alloc_path, &honest).unwrap();
 
-        // (f) Splice A's older section WHILE B is independently quarantined by
-        // a decoy tamper. The decoy must not mask the splice: A — individually
-        // valid and would-be-usable — must still quarantine (regression for the
-        // suppressed-escalation reissue path).
+        // Regression for the suppressed-escalation reissue path: a decoy
+        // tamper on B must not mask A's splice.
         let store = Store::open(dir.clone()).unwrap();
         store.unlock("pw").unwrap();
         assert_eq!(store.reserve_message_id(&hash_a, "aa", 10, 9, 5, 600).unwrap(), 1);
@@ -1478,7 +1426,6 @@ mod tests {
         let old: serde_json::Value = serde_json::from_str(&honest).unwrap();
         edit_json(&alloc_path, |v| {
             v["sections"][hash_a.as_str()] = old["sections"][hash_a.as_str()].clone();
-            // decoy: corrupt B's own section content so B quarantines on its own
             v["sections"][hash_b.as_str()]["prune_floor"] = 999u64.into();
         });
         let store = Store::open(dir.clone()).unwrap();
@@ -1492,10 +1439,6 @@ mod tests {
 
     #[test]
     fn reservation_refuses_growth_past_the_write_row_cap() {
-        // A caller controls rln_identifier, so distinct scopes in one live epoch
-        // are an unbounded row axis. The write path must refuse before the
-        // section exceeds the read-path cap, or the next open() would classify
-        // the file as corrupt and quarantine the whole store.
         let _serial = crate::lock(&SERIAL);
         let dir = test_dir("row-cap");
         let registry = format!("logos:local:{}", "cc".repeat(32));
@@ -1508,11 +1451,9 @@ mod tests {
         }
         let over = store.reserve_message_id(&hash, "ff", 10, 9, 5, 600);
         assert!(matches!(over, Err(ref e) if e.kind == ErrorKind::Permanent), "a new row past the cap is refused");
-        // An existing row still increments — no growth, so no refusal.
         assert_eq!(store.reserve_message_id(&hash, "00", 10, 9, 5, 600).unwrap(), 1);
         store.close();
         drop(store);
-        // The persisted file stays within the read cap: reopen is clean.
         let store = Store::open(dir.clone()).unwrap();
         assert!(!store.is_quarantined(&hash), "the capped file must remain readable");
         assert_eq!(store.unlock("pw").unwrap(), 1);
@@ -1551,8 +1492,6 @@ mod tests {
 
     #[test]
     fn a_closed_store_refuses_writes() {
-        // A stale Arc surviving a re-init must not write outside the re-opened
-        // store's directory lock.
         let _serial = crate::lock(&SERIAL);
         let dir = test_dir("closed-writes");
         let store = Store::open(dir.clone()).unwrap();
@@ -1561,8 +1500,6 @@ mod tests {
         assert!(matches!(store.unlock("pw"), Err(ref e) if e.message.contains("closed")));
         assert!(matches!(store.update_cache("00", |_| {}), Err(ref e) if e.message.contains("closed")));
         assert!(matches!(store.reserve_message_id("00", "aa", 10, 9, 5, 600), Err(ref e) if e.message.contains("closed")));
-        // close() drops the session, so a stale Arc releases neither the
-        // password nor a plaintext credential.
         assert!(store.session_password().is_none());
         assert!(matches!(store.unseal_credential("00"), Err(ref e) if e.kind == ErrorKind::Locked));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1570,9 +1507,7 @@ mod tests {
 
     #[test]
     fn all_quarantined_store_is_not_fresh() {
-        // L1: deleting the allocations file quarantines every credential, but
-        // the keystore is NOT fresh — has_credentials must stay true so
-        // keychain auto-unlock never invents a secret it can never verify.
+        // L1: auto-unlock must never invent a secret it can never verify.
         let _serial = crate::lock(&SERIAL);
         let dir = test_dir("not-fresh");
         let registry = format!("logos:local:{}", "ef".repeat(32));
@@ -1605,8 +1540,6 @@ mod tests {
         let uuid1 = uuid_of(&sealed_path);
         store.lock();
 
-        // Re-provision while still empty: a different password is adopted,
-        // the store_uuid survives.
         let before = crypto::kdf_runs();
         assert_eq!(store.unlock("pw2").unwrap(), 0);
         assert_eq!(crypto::kdf_runs(), before + 1);
@@ -1644,9 +1577,8 @@ mod tests {
         store.close();
         drop(store);
 
-        // Simulate a crash between the allocations/cache writes and the
-        // sealed commit point: B's credential never landed, leaving an orphan
-        // section and cache row. Both must be inert.
+        // Simulate a crash before the sealed commit point: B's credential
+        // never landed, leaving an orphan section and cache row.
         edit_json(&dir.join(format::SEALED_FILE), |v| {
             v["credentials"].as_object_mut().unwrap().remove(hash_b.as_str());
         });
@@ -1655,8 +1587,6 @@ mod tests {
         assert_eq!(store.unlock("pw").unwrap(), 1, "the orphan must not quarantine A");
         assert!(!store.is_quarantined(&hash_a));
 
-        // Re-inserting the same hash keeps the spent counters: the next
-        // reservation continues at slot 1, never a fresh 0.
         store
             .insert(
                 &hash_a,
@@ -1666,7 +1596,6 @@ mod tests {
             .unwrap();
         assert_eq!(store.reserve_message_id(&hash_a, "aa", 10, 9, 5, 600).unwrap(), 1);
 
-        // The insert's writes pruned the orphans from both sidecars.
         let alloc = read_json(&dir.join(format::ALLOCATIONS_FILE));
         assert!(alloc["sections"].get(hash_b.as_str()).is_none());
         let cache = read_json(&dir.join(format::CACHE_FILE));
@@ -1680,7 +1609,6 @@ mod tests {
     fn old_format_refusal() {
         let _serial = crate::lock(&SERIAL);
 
-        // Only an old-format keystore present: refused, bytes untouched.
         let dir = test_dir("oldfmt-only");
         std::fs::create_dir_all(&dir).unwrap();
         let old_bytes: &[u8] = b"{\"credentials\":{\"legacy\":true}}";
@@ -1694,8 +1622,6 @@ mod tests {
         assert_eq!(std::fs::read(dir.join(format::OLD_FORMAT_FILE)).unwrap(), old_bytes);
         let _ = std::fs::remove_dir_all(&dir);
 
-        // Both formats present: the sealed store opens, the old file is
-        // ignored and untouched.
         let dir = test_dir("oldfmt-both");
         let store = Store::open(dir.clone()).unwrap();
         store.unlock("pw").unwrap();
@@ -1734,7 +1660,6 @@ mod tests {
         assert!(matches!(denied, Err(e) if e.kind == ErrorKind::Locked));
         let denied = store.reserve_message_id(&hash_a, "aa", 10, 9, 5, 600);
         assert!(matches!(denied, Err(e) if e.kind == ErrorKind::Locked));
-        // The structural reads and the cache path stay open while locked.
         store.update_cache(&hash_a, |c| c.leaf_index = Some(3)).unwrap();
         assert_eq!(store.pending_records().len(), 1);
         assert_eq!(store.remaining_budget(&hash_a, "aa", 10, 5, 600).unwrap(), 5);
@@ -1765,8 +1690,6 @@ mod tests {
         let rec = store.membership(&hash).unwrap();
         assert!(!rec.quarantined, "cache corruption is self-DoS, never quarantine");
         assert_eq!(rec.cache.state, MembershipState::Unknown);
-        // Unknown is refreshable — the heal-only widening — so the poller
-        // re-reads the state from the registry.
         assert!(store.refreshable_records().iter().any(|r| r.hash == hash));
 
         store.close();
@@ -1791,11 +1714,9 @@ mod tests {
         let sealed_path = dir.join(format::SEALED_FILE);
         let honest = std::fs::read_to_string(&sealed_path).unwrap();
 
-        // Every identity field is covered, by one of two mechanisms:
-        // registry_id and identity_commitment feed the membership_hash, so
-        // the unkeyed census catches them at OPEN; rln_identifier and
-        // submitted_at live only under the credential AEAD's AAD, caught at
-        // unlock. Either way: quarantined, sibling usable, no plaintext.
+        // registry_id and identity_commitment feed the membership_hash
+        // (census-caught at open); rln_identifier and submitted_at sit only
+        // under the credential AAD (caught at unlock).
         let other_registry = format!("logos:local:{}", "fb".repeat(32));
         let cases: [(&str, serde_json::Value, bool); 4] = [
             ("registry_id", other_registry.into(), true),
@@ -1844,15 +1765,11 @@ mod tests {
         let hash = insert_membership(&store, &registry, &commitment);
         assert_eq!(store.reserve_message_id(&hash, "aa", 10, 9, 5, 600).unwrap(), 0);
 
-        // An unwritable dir fails the durable persist AFTER the in-memory
-        // counter advanced: the reservation errors and slot 1 stays spent.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
         let denied = store.reserve_message_id(&hash, "aa", 10, 9, 5, 600);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(denied, Err(ref e) if e.kind == ErrorKind::Internal), "{denied:?}");
 
-        // The wasted slot is spent, never reissued: the quota already
-        // reflects it and the next reservation skips to slot 2.
         assert_eq!(store.remaining_budget(&hash, "aa", 10, 5, 600).unwrap(), 3);
         assert_eq!(store.reserve_message_id(&hash, "aa", 10, 9, 5, 600).unwrap(), 2);
         assert_eq!(store.remaining_budget(&hash, "aa", 10, 5, 600).unwrap(), 2);
@@ -1886,7 +1803,6 @@ mod tests {
                 }
             })
         };
-        // 20 reservations across epochs 10..14, racing the cache storm.
         let mut issued = BTreeSet::new();
         for i in 0..20u64 {
             let epoch = 10 + i / 4;
@@ -1895,20 +1811,16 @@ mod tests {
         }
         writer.join().unwrap();
 
-        // No lost updates: the final snapshot's counters equal the
-        // reservations made.
         let rec = store.membership(&hash).unwrap();
         assert_eq!(rec.alloc.allocations.iter().map(|a| a.used).sum::<u64>(), 20);
         store.close();
         drop(store);
 
-        // And the persisted state re-verifies wholesale.
         let store = Store::open(dir.clone()).unwrap();
         assert_eq!(store.unlock("pw").unwrap(), 1, "zero quarantined after the storm");
         assert!(!store.is_quarantined(&hash));
         let rec = store.membership(&hash).unwrap();
         assert_eq!(rec.alloc.allocations.iter().map(|a| a.used).sum::<u64>(), 20);
-        // Continuation, never reissue: epoch 10's next slot is 4.
         assert_eq!(store.reserve_message_id(&hash, "aa", 10, 9, 10, 600).unwrap(), 4);
 
         store.close();
@@ -1930,8 +1842,6 @@ mod tests {
         store.close();
         drop(store);
 
-        // A section count over the cap degrades to .bad + quarantine-all —
-        // never a panic or an unbounded parse.
         let mut sections = serde_json::Map::new();
         for i in 0..=format::MAX_SECTIONS {
             sections.insert(
@@ -2005,10 +1915,8 @@ mod tests {
         store.close();
         drop(store);
 
-        // >4MiB of padding inside a JSON field: the byte cap fires before
-        // any parse, and open() fails closed as Unreadable — the file is
-        // never renamed or adopted (this pins the impl's actual behavior;
-        // the .bad + fresh-empty path is the PARSE-cap breach's, below).
+        // The byte cap refuses open as Unreadable (never renamed or adopted);
+        // the .bad + fresh-empty path is the parse-cap breach's, below.
         let sealed_path = dir.join(format::SEALED_FILE);
         edit_json(&sealed_path, |v| {
             v["padding"] = " ".repeat(format::MAX_FILE_BYTES as usize + 1).into();
@@ -2030,8 +1938,8 @@ mod tests {
         let dir = test_dir("overcount-sealed");
         std::fs::create_dir_all(&dir).unwrap();
 
-        // A parse-cap breach (too many credentials) is corrupt, not a
-        // refusal: .bad + fresh empty (I2b).
+        // A parse-cap breach is corrupt, not a refusal: .bad + fresh empty
+        // (I2b).
         let mut credentials = serde_json::Map::new();
         for i in 0..=format::MAX_CREDENTIALS {
             credentials.insert(
@@ -2080,9 +1988,7 @@ mod tests {
         store.close();
         drop(store);
 
-        // (a) Crash BEFORE the sealed commit point: B's section and cache
-        // row landed but no sealed entry. Both leftovers are inert, nothing
-        // quarantines, and B is registerable from scratch.
+        // Crash before the sealed commit point: the leftovers are inert.
         edit_json(&dir.join(format::SEALED_FILE), |v| {
             v["credentials"].as_object_mut().unwrap().remove(hash_b.as_str());
         });
@@ -2096,9 +2002,7 @@ mod tests {
         store.close();
         drop(store);
 
-        // (b) Post-commit cache loss: the row vanishes while the sealed
-        // entry and section stay. Open synthesizes state Unknown and routes
-        // the record to the heal path.
+        // Post-commit cache loss heals: state Unknown, routed to refresh.
         edit_json(&dir.join(format::CACHE_FILE), |v| {
             v["entries"].as_object_mut().unwrap().remove(hash_b.as_str());
         });
@@ -2131,16 +2035,14 @@ mod tests {
             let done = Arc::clone(&done);
             let registry = registry.clone();
             std::thread::spawn(move || {
-                // Bounded: readers only clone the published Arc, so the loop
-                // ends with the writer instead of waiting on any fsync.
+                // Readers only clone the published Arc, so the loop ends with
+                // the writer instead of waiting on any fsync.
                 let mut last_total = 0u64;
                 let mut reads = 0u64;
                 loop {
                     let recs = store.records_for(&registry);
                     assert_eq!(recs.len(), 1, "a snapshot is always whole");
                     let rec = &recs[0];
-                    // Never torn: counters within the limit, rows above the
-                    // floor, totals monotone across observations.
                     for row in &rec.alloc.allocations {
                         assert!((1..=5).contains(&row.used));
                         assert!(row.epoch >= rec.alloc.prune_floor);
@@ -2184,8 +2086,6 @@ mod tests {
         let sealed_before = std::fs::read(dir.join(format::SEALED_FILE)).unwrap();
         let alloc_before = std::fs::read(dir.join(format::ALLOCATIONS_FILE)).unwrap();
 
-        // Unlocked and locked cache mutations alike: the covered files'
-        // bytes are untouchable by construction.
         store.update_cache(&hash, |c| c.state = MembershipState::Active).unwrap();
         store.update_cache(&hash, |c| c.leaf_index = Some(9)).unwrap();
         store.lock();

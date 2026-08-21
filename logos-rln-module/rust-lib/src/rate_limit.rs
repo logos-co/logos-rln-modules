@@ -1,46 +1,29 @@
 //! Rate-limit tracking: epoch derivation and per-application `message_id`
-//! allocation — the security-critical state the spec's rate-limiting portion
-//! rests on.
+//! allocation.
 //!
-//! Two proofs that reuse an `(epoch, message_id)` pair under one external
-//! nullifier expose Shamir shares that reconstruct the identity secret (which,
-//! on a slashing registry, burns the credential). So the allocator MUST never
-//! hand out the same slot twice — including across a process restart, a
-//! backwards wall-clock step, or a `max_epoch_gap` reconfiguration. This
-//! module owns the pure allocation algorithm; the store durably persists the
-//! result **before** the proof is returned (see `store::reserve_message_id`),
-//! so a crash after issuing a proof but before persisting can only ever
-//! *waste* a slot, never reuse one.
-//!
-//! Granularity: the external nullifier is `poseidon(epoch, rln_identifier)`,
-//! so the same `message_id` is safe to reuse across different applications
-//! (distinct `rln_identifier`s) but never within one. Allocation is therefore
-//! keyed by `(rln_identifier, epoch)`. The epoch derives from the caller's
-//! message timestamp and `generate_proof` accepts anything within
-//! `now ± max_epoch_gap`, so several epochs are live at once and each keeps its
-//! own counter; rows below the window floor are pruned to bound growth. Pruning
-//! destroys the only record that a pruned epoch's slots were spent, so every
-//! prune is recorded in a persisted, monotonically non-decreasing floor
-//! (`AllocationState::prune_floor`, capped at one past the highest allocated
-//! epoch *at or below the retain candidate* so a spiked clock — which allocates
-//! a far-future row — cannot brick the future on a later reservation): once an
-//! epoch falls below it, reservation there is refused forever
-//! (`AllocError::EpochBelowFloor`) —
-//! even when the wall clock rewinds past the window or a widened
-//! `max_epoch_gap` would re-admit it. The index's wire encoding (the spec's `epoch[32]`) lives in
-//! the proof engine (`proof::epoch_to_bytes`); this module deals only in the
-//! `u64`.
+//! Two proofs reusing an `(epoch, message_id)` pair under one external
+//! nullifier expose Shamir shares that reconstruct the identity secret, so a
+//! slot is NEVER reissued — across a restart, a backwards clock step, or a
+//! `max_epoch_gap` reconfiguration. The store persists a reservation durably
+//! BEFORE the proof is returned, so a crash can only waste a slot, never
+//! reuse one. The external nullifier is `poseidon(epoch, rln_identifier)`,
+//! so allocation is keyed by `(rln_identifier, epoch)`; several epochs are
+//! live at once (`now ± max_epoch_gap`), and rows below the window floor are
+//! pruned to bound growth. A pruned row was the only record its slots were
+//! spent, so every prune is recorded in a persisted, monotone floor — capped
+//! at one past the highest allocated epoch at or below the retain candidate,
+//! so a spiked clock cannot brick the future — below which reservation is
+//! refused forever, even when the wall clock rewinds or a widened gap would
+//! re-admit the epoch.
 
 use serde::{Deserialize, Serialize};
 
-/// One application's slot usage within one epoch, persisted in the allocations
-/// ledger's MAC'd section (plaintext-safe — counters, no secret). `used` is
-/// both the count issued and the next unused `message_id`.
+/// One application's slot usage within one epoch. Plaintext-safe: counters,
+/// no secret.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct EpochAllocation {
-    /// The application scope, lowercase hex of the 32-byte `rln_identifier`.
+    /// Lowercase hex of the 32-byte `rln_identifier`.
     pub(crate) rln_identifier: String,
-    /// The epoch index these slots were issued in.
     pub(crate) epoch: u64,
     /// Next unused `message_id` (== slots already issued this epoch).
     pub(crate) used: u64,
@@ -52,80 +35,46 @@ pub(crate) struct EpochAllocation {
 /// tamper-bound by the allocations ledger's section MAC.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub(crate) struct AllocationState {
-    /// Per-application `message_id` allocation, one row per active
-    /// `(rln_identifier, current epoch)`. Plaintext-safe counters (no
-    /// secret), persisted in the allocations ledger's section — fsync-durably,
-    /// MAC-covered, and floored by `prune_floor` — so neither a restart, power
-    /// loss, a tampered ledger, a clock rewind, nor a gap/size reconfiguration
-    /// reissues a spent slot.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) allocations: Vec<EpochAllocation>,
-    /// Epoch length (seconds) `allocations` and `prune_floor` are denominated
-    /// in. 0 = unset (no reservation yet); adopted from the configured
-    /// `epoch_size_sec` at the first successful reservation. A
-    /// reservation under a DIFFERENT configured size fails `permanent`:
-    /// changing the epoch size rebases the numeric epoch indexing that keys
-    /// spent slots (and their external nullifiers), which no floor conversion
-    /// can make safe. Recovery: register a fresh membership.
+    /// Epoch length (seconds) the counters and floor are denominated in.
+    /// 0 = unset; adopted at the first successful reservation. A DIFFERENT
+    /// configured size fails `permanent`: it rebases the epoch numbering
+    /// that keys spent slots, which no floor conversion can make safe.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) epoch_size_sec: u64,
-    /// Monotonically NON-DECREASING allocation floor, in units of
-    /// `epoch_size_sec`: epochs below it may have had rows pruned, so a
-    /// reservation there is permanently refused — even when the wall clock
-    /// rewinds past the window or `max_epoch_gap` is widened across restarts.
-    /// Raised (never lowered) on every successful reservation.
+    /// Monotone NON-DECREASING floor: epochs below it may have had rows
+    /// pruned, so reservation there is permanently refused — even after a
+    /// clock rewind or a widened `max_epoch_gap`.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) prune_floor: u64,
 }
 
-/// serde `skip_serializing_if` for the defaulted u64 fields: they are
-/// omitted while unset (0).
 fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
-/// Outcome of a reservation attempt that did not yield a slot.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AllocError {
-    /// The epoch's `rate_limit` slots are all spent; retry next epoch.
     BudgetExhausted,
-    /// The requested epoch is below the persisted monotone floor — its row
-    /// was (or may have been) pruned, so reissuing could double-spend a
-    /// slot. Permanent for this epoch.
+    /// Below the persisted floor — the row may have been pruned, so
+    /// reissuing could double-spend a slot. Permanent for this epoch.
     EpochBelowFloor,
 }
 
-/// The current epoch index: `floor(now_unix / epoch_size_sec)` — the ONE
-/// place the division (and its zero-size guard) lives.
-///
-/// Wall-clock based. Verifiers MUST share the same `epoch_size` and time base
-/// — per the spec's Appendix A the `logos` time base is the on-chain clock;
-/// which time source feeds this is a `start()` configuration item.
+/// `floor(now_unix / epoch_size_sec)` — the ONE place the division (and its
+/// zero-size guard) lives. Verifiers must share the same `epoch_size` and
+/// time base.
 pub(crate) fn current_epoch(now_unix: u64, epoch_size_sec: u64) -> u64 {
     now_unix / epoch_size_sec.max(1)
 }
 
 /// Reserve the next `message_id` for `(rln_identifier, epoch)` within
-/// `rate_limit`, mutating `alloc` in place ONLY on success. The counters
-/// and their floor are a transactional pair, so they travel as ONE value —
-/// the MAC-covered `AllocationState`. Returns the slot,
-/// `BudgetExhausted` when that epoch's budget is spent, or
-/// `EpochBelowFloor` when `epoch` is below the effective floor.
-///
-/// `retain_floor_candidate` is wall-clock-derived (`now_epoch -
-/// max_epoch_gap`) and untrusted: it can rewind, drop (widened gap), or
-/// spike forward. `alloc.prune_floor` is the persisted monotone floor:
-/// epochs strictly below it may have had rows pruned and are refused
-/// forever. The threshold a call may advance the floor to is
-/// `max(floor, min(candidate, highest allocated epoch + 1))` — monotone
-/// against a rewound candidate, capped so a spiked candidate can only prune
-/// what was actually allocated, inert when no rows exist.
-///
-/// Every error path leaves `alloc` EXACTLY as found — a refused reservation
-/// must never advance the floor or prune; pruning never drops an in-window
-/// epoch.
-///
-/// The caller MUST durably persist `alloc` before using the returned slot.
+/// `rate_limit`, mutating `alloc` ONLY on success — every error path leaves
+/// it EXACTLY as found. `retain_floor_candidate` is wall-clock-derived and
+/// untrusted (it can rewind, drop, or spike forward); the floor may advance
+/// to `max(floor, min(candidate, highest allocated epoch + 1))`. The caller
+/// MUST durably persist `alloc` before using the returned slot.
 pub(crate) fn reserve_slot(
     alloc: &mut AllocationState,
     rln_identifier_hex: &str,
@@ -133,12 +82,11 @@ pub(crate) fn reserve_slot(
     retain_floor_candidate: u64,
     rate_limit: u64,
 ) -> Result<u64, AllocError> {
-    // Cap the advance at one past the highest allocated epoch AT OR BELOW the
-    // candidate. Rows above the candidate are future allocations (a caller may
-    // prove in an in-window future epoch); excluding them stops a single spiked
-    // clock reading — which creates such a row — from dragging the floor up to
-    // that far-future value on a subsequent reservation and bricking every real
-    // epoch below it.
+    // Cap the advance at one past the highest allocated epoch AT OR BELOW
+    // the candidate: rows above it are future allocations, and excluding
+    // them stops a single spiked clock reading — which creates such a row —
+    // from dragging the floor to that far-future value on a later
+    // reservation and bricking every real epoch below it.
     let highest = alloc
         .allocations
         .iter()
@@ -183,8 +131,6 @@ pub(crate) fn reserve_slot(
     Ok(slot)
 }
 
-/// Remaining slots for `(rln_identifier, epoch)` under `rate_limit` — the
-/// quota read's current-epoch budget.
 pub(crate) fn remaining(
     allocations: &[EpochAllocation],
     rln_identifier_hex: &str,
@@ -232,16 +178,12 @@ mod tests {
     #[test]
     fn below_floor_epochs_are_pruned_but_in_window_ones_survive() {
         let mut alloc = AllocationState::default();
-        // Window floor 4: epochs 4 and 5 are both live and keep independent
-        // budgets — reserving 4 does NOT evict epoch 5's row.
         assert_eq!(reserve_slot(&mut alloc, APP_A, 5, 4, 2), Ok(0));
         assert_eq!(reserve_slot(&mut alloc, APP_A, 4, 4, 2), Ok(0));
         assert_eq!(alloc.allocations.len(), 2);
-        // Revisiting epoch 5 continues its counter — slot 1, never a reissued 0.
         assert_eq!(reserve_slot(&mut alloc, APP_A, 5, 4, 2), Ok(1));
         assert_eq!(remaining(&alloc.allocations, APP_A, 5, 2), 0);
         assert_eq!(remaining(&alloc.allocations, APP_A, 4, 2), 1);
-        // Advancing the floor past 4 finally prunes it.
         assert_eq!(reserve_slot(&mut alloc, APP_A, 6, 5, 2), Ok(0));
         assert!(alloc.allocations.iter().all(|a| a.epoch >= 5));
         assert_eq!(alloc.prune_floor, 5);
@@ -249,10 +191,6 @@ mod tests {
 
     #[test]
     fn interleaved_in_window_epochs_never_reissue_a_slot() {
-        // now_epoch 10, max_epoch_gap 1 -> floor 9. A caller stamps timestamps
-        // that map to epochs 10, 9, then 10 again. If reserving epoch 9 evicted
-        // epoch 10's row, the second epoch-10 proof would reuse spent slot 0 —
-        // the (epoch, message_id) collision that leaks the identity secret.
         let mut alloc = AllocationState::default();
         assert_eq!(reserve_slot(&mut alloc, APP_A, 10, 9, 5), Ok(0));
         assert_eq!(reserve_slot(&mut alloc, APP_A, 9, 9, 5), Ok(0));
@@ -284,10 +222,8 @@ mod tests {
 
     #[test]
     fn rewound_clock_never_reissues_a_pruned_epoch() {
-        // Audit cause B: epoch 10 is spent; the window then advances
-        // (candidate 11), pruning 10's row and recording floor 11. A later
-        // backwards clock step re-admits epoch 10 at the window check — the
-        // persisted floor must answer an error, never a reissued slot 0.
+        // Audit cause B: a rewound clock re-admits pruned epoch 10 at the
+        // window check; the persisted floor must refuse it.
         let mut alloc = AllocationState::default();
         assert_eq!(reserve_slot(&mut alloc, APP_A, 10, 9, 5), Ok(0));
         assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 11, 5), Ok(0));
@@ -297,28 +233,19 @@ mod tests {
             Err(AllocError::EpochBelowFloor)
         );
         assert_eq!(alloc.prune_floor, 11, "a rewound candidate must never lower the floor");
-        // An epoch at/above the floor still continues its own counter.
         assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 9, 5), Ok(1));
     }
 
     #[test]
     fn forward_clock_spike_cannot_brick_future_epochs() {
-        // A spiked clock supplies an enormous candidate floor (and possibly a
-        // spiked reservation). The threshold is capped one past the highest
-        // allocated epoch, so after the clock is corrected only epochs whose
-        // rows actually existed are refused — not months of future epochs.
         let mut alloc = AllocationState::default();
         assert_eq!(reserve_slot(&mut alloc, APP_A, 10, 9, 5), Ok(0));
-        // Spike: the candidate leaps far ahead; the floor advances only past
-        // the allocated row (10 -> pruned, floor 11), never to the spike.
         assert_eq!(
             reserve_slot(&mut alloc, APP_A, 1_000_000, 999_999, 5),
             Ok(0)
         );
         assert_eq!(alloc.prune_floor, 11, "the spike must not persist a far-future floor");
-        // Clock corrected: normal epochs keep allocating.
         assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 11, 5), Ok(0));
-        // The genuinely pruned epoch stays refused.
         assert_eq!(
             reserve_slot(&mut alloc, APP_A, 10, 11, 5),
             Err(AllocError::EpochBelowFloor)
@@ -327,41 +254,32 @@ mod tests {
 
     #[test]
     fn two_forward_spikes_do_not_brick_future_epochs() {
-        // The regression: the first spike allocates a far-future row, and a
-        // naive `highest`-over-all-rows cap would then let the SECOND spike drag
-        // the floor up to the spiked clock value — refusing every real epoch
-        // forever. Excluding rows above the candidate keeps the floor honest.
+        // The regression: with a naive `highest`-over-all-rows cap, the first
+        // spike's far-future row lets the SECOND spike drag the floor up to
+        // the spiked clock value.
         let mut alloc = AllocationState::default();
         assert_eq!(reserve_slot(&mut alloc, APP_A, 10, 9, 5), Ok(0));
         assert_eq!(reserve_slot(&mut alloc, APP_A, 1_000_000, 999_999, 5), Ok(0));
         assert_eq!(reserve_slot(&mut alloc, APP_A, 1_000_000, 999_999, 5), Ok(1));
         assert_eq!(alloc.prune_floor, 11, "a second spike must not drag the floor to the spiked clock");
-        // Clock corrected: real future epochs still allocate.
         assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 11, 5), Ok(0));
     }
 
     #[test]
     fn failed_reservations_mutate_nothing() {
-        // Every error path must leave the allocation state exactly as
-        // persisted: a refused reservation that advanced the floor or pruned
-        // would silently destroy spent-slot records it had no right to touch.
         let mut alloc = AllocationState::default();
         assert_eq!(reserve_slot(&mut alloc, APP_A, 10, 9, 1), Ok(0));
         let before = (alloc.allocations.clone(), alloc.prune_floor);
-        // Budget exhausted, with a candidate that would otherwise advance the
-        // floor and prune.
         assert_eq!(
             reserve_slot(&mut alloc, APP_A, 10, 10, 1),
             Err(AllocError::BudgetExhausted)
         );
         assert_eq!((alloc.allocations.clone(), alloc.prune_floor), before);
-        // Zero-limit no-row path: same guarantee.
         assert_eq!(
             reserve_slot(&mut alloc, APP_A, 11, 10, 0),
             Err(AllocError::BudgetExhausted)
         );
         assert_eq!((alloc.allocations.clone(), alloc.prune_floor), before);
-        // Below-floor path: same guarantee.
         assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 11, 1), Ok(0));
         let after_prune = (alloc.allocations.clone(), alloc.prune_floor);
         assert_eq!(
@@ -373,11 +291,8 @@ mod tests {
 
     #[test]
     fn widened_epoch_gap_never_resurrects_pruned_epochs() {
-        // Audit cause D: a gap=1 run reaches epoch 12 (candidate floor 11,
-        // capped at highest-row+1 = 10), pruning spent epoch 9 and recording
-        // floor 10. A restart (or live start()) with gap=10 lowers the
-        // candidate to 2 — epoch 9 passes the wall-clock window check but its
-        // spent row is gone. The persisted floor must refuse it.
+        // Audit cause D: a restart with a wider gap re-admits pruned epoch 9
+        // past the window check; the persisted floor must refuse it.
         let mut alloc = AllocationState::default();
         assert_eq!(reserve_slot(&mut alloc, APP_A, 9, 8, 5), Ok(0));
         assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 11, 5), Ok(0));
@@ -387,7 +302,6 @@ mod tests {
             reserve_slot(&mut alloc, APP_A, 9, 2, 5),
             Err(AllocError::EpochBelowFloor)
         );
-        // Epochs at/above the floor keep allocating normally under the wider gap.
         assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 2, 5), Ok(1));
     }
 
