@@ -1,5 +1,5 @@
 //! Valid-root window: a per-registry cache of acceptable Merkle roots,
-//! refreshed on a background thread so `verify_proof` never touches the
+//! refreshed on a background thread so `validate_proof` never touches the
 //! registry (spec: "SHALL NOT perform registry access on the verification
 //! path"). Kept per registry, independent of the keystore — verification
 //! requires no membership.

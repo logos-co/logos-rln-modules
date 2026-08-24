@@ -29,13 +29,13 @@ JSON replies; `scope` = the `registry_id` + `rln_identifier_hex` arg pair):
 | `register(scope, rate_limit, options)` | `register(registry_id, rln_identifier_hex, rate_limit, options_json)` |
 | `get_membership_state(scope)` | `get_membership_state(registry_id, rln_identifier_hex)` |
 | `generate_proof(scope, signal, timestamp)` | `generate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp)` |
-| `validate_proof(scope, signal, timestamp, proof)` | `verify_proof(registry_id, rln_identifier_hex, signal_hex, timestamp, proof_json)` |
+| `validate_proof(scope, signal, timestamp, proof)` | `validate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp, proof_json)` |
 | `get_epoch_quota(scope, timestamp)` | `get_epoch_quota(registry_id, rln_identifier_hex, timestamp)` |
 | registry parameters read (optional ext.) | `get_registry_parameters(registry_id, rln_identifier_hex)` |
 | membership state subscriptions (optional ext.) | `event membership_state_changed(registry_id, rln_identifier, membership_hash, state, previous)` — see `docs/wire-binding.md` |
 | `RlnErrorKind` | the `class` field of every typed error object: `not_ready` \| `transient` \| `budget_exhausted` \| `permanent` |
 
-A validator that only checks messages calls `start` + `verify_proof` and
+A validator that only checks messages calls `start` + `validate_proof` and
 never registers or unlocks anything. The pinned wire constructions
 (`external_nullifier = poseidon(hash_to_field_le(epoch[32]),
 hash_to_field_le(rln_identifier))`, where `epoch[32]` is the epoch index as
@@ -68,7 +68,7 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   the proof is returned, so a crash can waste a slot but never reissue one
   (reuse would leak the identity secret via the Shamir shares).
 - `rust-lib/src/roots.rs` — the valid-root window: a background-refreshed
-  per-registry cache (10s tick; >60s-stale = cold) that `verify_proof`
+  per-registry cache (10s tick; >60s-stale = cold) that `validate_proof`
   serves from with no registry access on the hot path; cold = `not_ready`,
   never a false reject.
 - `rust-lib/src/registry_id.rs` — CAIP-10 parse/canonicalize +
@@ -119,7 +119,7 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   path, keystore ops fail with an `internal` error — there is deliberately
   no cwd fallback (a keystore in an unknown directory is worse than a hard
   error).
-- **Unlock model.** Reads, lifecycle polling, selection, and `verify_proof`
+- **Unlock model.** Reads, lifecycle polling, selection, and `validate_proof`
   never need the password (sidecar metadata is plaintext-safe; verification
   uses no credential at all). `unlock_keystore` is required to `register`
   (encrypts the freshly generated credential) and to `generate_proof`
@@ -132,7 +132,7 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   proof leaves the module; two proofs on one slot reconstruct the identity
   secret, so a crash may waste a slot but never double-spends one.
   `budget_exhausted` when the epoch's `rate_limit` slots are gone.
-- **Verification is hot-path-only.** `verify_proof` reads the locally
+- **Verification is hot-path-only.** `validate_proof` reads the locally
   maintained valid-root window and performs zero registry calls; a cold or
   stale window answers `not_ready` rather than serving a false reject.
   `start` warms the windows of its configured registries.

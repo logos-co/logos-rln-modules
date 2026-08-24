@@ -25,7 +25,7 @@ never from consumer-side epoch math.
 - Every method takes positional string/int args. Replies come in two dialects,
   split by the method's declared return type:
   - **`result` methods** — the RLN-API surface (`start`, `stop`,
-    `generate_proof`, `verify_proof`, `get_epoch_quota`,
+    `generate_proof`, `validate_proof`, `get_epoch_quota`,
     `get_registry_parameters`) — return a
     real `LogosResult`. On the consumer (lp) wire that is the envelope
     `{"success": bool, "value": <reply>, "error": <string>}`; on failure
@@ -79,7 +79,7 @@ switch on `class`, log `kind`.
 | `register(scope, rate_limit, options)` | `register(registry_id, rln_identifier_hex, rate_limit, options_json)` | tstr | public Membership view (below), `"state":"pending"` on a fresh submit |
 | `get_membership_state(scope)` | `get_membership_state(registry_id, rln_identifier_hex)` | tstr | `{"state":…}` + `membership_hash`/`leaf_index`/`rate_limit` when known |
 | `generate_proof(scope, signal, timestamp)` | `generate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp)` | result | RateLimitProof (below) + `"message_id"`, `"epoch"`, `"membership_hash"`; epoch derives from `timestamp` (Unix s), must be within now ± `max_epoch_gap`. Fails `permanent` (kind `permanent`) for an epoch below the membership's persisted allocation floor (backwards clock / widened `max_epoch_gap`) or an `epoch_size_sec` its allocations are not bound to — re-register to recover |
-| `validate_proof(scope, signal, timestamp, proof)` | `verify_proof(registry_id, rln_identifier_hex, signal_hex, timestamp, proof_json)` | result | `{"verdict":str}` (see the verdict table); `rate_limit_violation` also carries `"recovered_secret":hex`. `timestamp` is the value stamped on the message under validation: the proof's epoch must EQUAL its epoch and be within now ± `max_epoch_gap`, else `"invalid"` |
+| `validate_proof(scope, signal, timestamp, proof)` | `validate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp, proof_json)` | result | `{"verdict":str}` (see the verdict table); `rate_limit_violation` also carries `"recovered_secret":hex`. `timestamp` is the value stamped on the message under validation: the proof's epoch must EQUAL its epoch and be within now ± `max_epoch_gap`, else `"invalid"` |
 | `get_epoch_quota(scope, timestamp)` | `get_epoch_quota(registry_id, rln_identifier_hex, timestamp)` | result | `{"epoch_index":N,"rate_limit":N,"remaining":N}` — one observation of `timestamp`'s epoch, purely local; `epoch_index` is a NUMBER (`floor(timestamp/epoch_size)`, what a QuotaProvider's `epochIndex` consumes); no usable membership → `rate_limit`/`remaining` both 0 (the wall-clock-fallback cue — never an exhausted budget); a timestamp whose epoch is outside now ± `max_epoch_gap` fails `permanent` (spec: test a timestamp before committing to it) |
 | registry parameters read (optional ext.) | `get_registry_parameters(registry_id, rln_identifier_hex)` | result | `{"epoch_size_sec","max_rate_limit","min_rate_limit","max_total_rate_limit","price_per_unit"}` |
 | select (multiple-membership ext.) | `select_membership(registry_id, rln_identifier_hex, selector_json)` | tstr | public Membership view |
@@ -115,7 +115,7 @@ lp timeouts for (the logos-core default is ~20 s):
 | `get_registry_parameters` | 90 s | one registry read (≤70 s worst case) |
 | `get_membership_state` | 90 s | one registry read |
 | `get_merkle_proof` / `get_valid_roots` | 90 s | one registry read |
-| `verify_proof` | 5 s | pure local computation |
+| `validate_proof` | 5 s | pure local computation |
 | `get_epoch_quota` | 5 s | pure local state |
 
 ## Events
@@ -185,7 +185,7 @@ namespace (its registry keeps no recoverable deposit).
   nullifier ‖ x ‖ external_nullifier (all 32-byte LE) — 289 bytes total. The
   spec struct's `proof[128]` is bytes `0..128`; its `share_x` is the
   circuit's signal hash `x`, `share_y` is `y`.
-- `verify_proof` accepts **either** shape: the object above (canonical bytes
+- `validate_proof` accepts **either** shape: the object above (canonical bytes
   trusted, decoded fields ignored), or the spec's decomposed struct — `proof`
   as the bare 128-byte Groth16 hex plus the five field values — which is what
   a shim reassembles from fields carried in its own network message format.
@@ -204,19 +204,19 @@ namespace (its registry keeps no recoverable deposit).
   hash_to_field_le(rln_identifier))` — byte-identical to logos-delivery's
   `generateExternalNullifier`. (Note: NOT nwaku's keccak-based construction.)
 - `epoch_size_sec` is a **required `start()` parameter** with no default:
-  until `start()` configures it, `generate_proof` / `verify_proof` /
+  until `start()` configures it, `generate_proof` / `validate_proof` /
   `get_epoch_quota` (and the `get_registry_parameters` echo) fail
   `not_ready` rather than improvise an epoch base. It is an
   **application parameter** — every
   proof generator and verifier of a deployment must configure the same value.
-- `verify_proof` enforces application binding + epoch agreement + freshness:
+- `validate_proof` enforces application binding + epoch agreement + freshness:
   the expected epoch derives from the supplied message `timestamp`; the
   proof's carried epoch, when present, must equal it; the proof's external
   nullifier must match the scope's expected value recomputed from it; and it
   must fall within the current epoch ± `max_epoch_gap`. Anything else is
   `{"verdict":"invalid"}`. Consumers implement no epoch math of their own —
   they relay the message's timestamp on both `generate_proof` and
-  `verify_proof`, and the two ends agree on the epoch by construction.
+  `validate_proof`, and the two ends agree on the epoch by construction.
   **Double-signal detection across
   messages is now the Module's job, not the consumer's** (a spec change): the
   Module keeps an in-memory nullifier log (per epoch, retained at least
@@ -224,7 +224,7 @@ namespace (its registry keeps no recoverable deposit).
   under a different `share_x`, reconstructs the offender's identity secret from
   the two colliding shares and returns it as `recovered_secret`.
 
-### verify_proof verdicts
+### validate_proof verdicts
 
 A proof that fails any validity check (zk-invalid, root not in window, stale,
 epoch not matching the message timestamp, or cross-application binding) is

@@ -1090,7 +1090,7 @@ fn epoch_binding_holds(
 /// VIOLATOR'S OWN identity secret reconstructed from the colliding shares
 /// (never one of this module's credentials). An invalid proof never mutates
 /// the log.
-fn verify_proof_impl(
+fn validate_proof_impl(
     registry_id_raw: &str,
     rln_identifier_hex: &str,
     signal_hex: &str,
@@ -1353,7 +1353,7 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
         ))
     }
 
-    fn verify_proof(
+    fn validate_proof(
         &mut self,
         registry_id: String,
         rln_identifier_hex: String,
@@ -1361,7 +1361,7 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
         timestamp: String,
         proof_json: String,
     ) -> Result<serde_json::Value, String> {
-        reply_result(verify_proof_impl(
+        reply_result(validate_proof_impl(
             &registry_id,
             &rln_identifier_hex,
             &signal_hex,
@@ -1432,7 +1432,7 @@ mod tests {
         let _serial = crate::lock(&store::TEST_STORE_LOCK);
         let mut imp = LogosRlnModuleImpl;
         let err = imp
-            .verify_proof("not-caip10".into(), "ef".repeat(32), "00".into(), "0".into(), "{}".into())
+            .validate_proof("not-caip10".into(), "ef".repeat(32), "00".into(), "0".into(), "{}".into())
             .unwrap_err();
         assert_eq!(
             err,
@@ -1485,17 +1485,17 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::NotReady);
         let err = generate_proof_impl(&registry, &rln_id_hex, signal_hex, &ts).unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotReady);
-        let err = verify_proof_impl(&registry, &rln_id_hex, signal_hex, &ts, "{}").unwrap_err();
+        let err = validate_proof_impl(&registry, &rln_id_hex, signal_hex, &ts, "{}").unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotReady);
 
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
     }
 
-    // verify_proof end to end, entirely offline: a real synthetic proof, a
+    // validate_proof end to end, entirely offline: a real synthetic proof, a
     // locally injected root window, no registry access. Proofs carry the
     // CURRENT epoch's external nullifier, so generate against the live epoch.
     #[test]
-    fn verify_proof_impl_serves_from_local_window() {
+    fn validate_proof_impl_serves_from_local_window() {
         let _serial = crate::lock(&store::TEST_STORE_LOCK);
         // This scope's proof shares seed 7 / rln_id 9 / epoch-now (thus one
         // nullifier) with other verify tests; clear the shared log so the first
@@ -1518,17 +1518,17 @@ mod tests {
 
         // Cold window → NOT_READY (never a false reject from an empty view).
         let cold =
-            verify_proof_impl(&registry, &rln_id_hex, &signal_hex, &ts, &proof_json).unwrap_err();
+            validate_proof_impl(&registry, &rln_id_hex, &signal_hex, &ts, &proof_json).unwrap_err();
         assert_eq!(cold.kind, ErrorKind::NotReady);
 
         // Warm the window with the proof's own root → valid.
         roots::set_window_for_test(&canonical, vec![root], now_unix());
-        let ok = verify_proof_impl(&registry, &rln_id_hex, &signal_hex, &ts, &proof_json).unwrap();
+        let ok = validate_proof_impl(&registry, &rln_id_hex, &signal_hex, &ts, &proof_json).unwrap();
         assert_eq!(ok, serde_json::json!({ "verdict": "valid" }));
 
         // A different signal is invalid, not an error.
         let other = registry_id::bytes_to_hex(b"another-signal");
-        let bad = verify_proof_impl(&registry, &rln_id_hex, &other, &ts, &proof_json).unwrap();
+        let bad = validate_proof_impl(&registry, &rln_id_hex, &other, &ts, &proof_json).unwrap();
         assert_eq!(bad, serde_json::json!({ "verdict": "invalid" }));
 
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
@@ -1538,7 +1538,7 @@ mod tests {
     // DIFFERENT rln_identifier are both `invalid` (the window stays warm here
     // to prove the rejection comes from the binding, not the window).
     #[test]
-    fn verify_proof_impl_rejects_stale_epoch_and_foreign_application() {
+    fn validate_proof_impl_rejects_stale_epoch_and_foreign_application() {
         let _serial = crate::lock(&store::TEST_STORE_LOCK);
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
         let registry = format!("logos:local:{}", "ba".repeat(32));
@@ -1552,7 +1552,7 @@ mod tests {
         let stale = proof::generate_for_test(&[7u8; 32], signal, 1, &rln_id);
         let stale_ts = (600u64).to_string(); // a timestamp inside epoch 1
         roots::set_window_for_test(&registry, vec![stale.root()], now_unix());
-        let out = verify_proof_impl(
+        let out = validate_proof_impl(
             &registry,
             &rln_id_hex,
             &signal_hex,
@@ -1567,7 +1567,7 @@ mod tests {
         let epoch = rate_limit::current_epoch(now_unix(), epoch_size().unwrap());
         let foreign = proof::generate_for_test(&[7u8; 32], signal, epoch, &[8u8; 32]);
         roots::set_window_for_test(&registry, vec![foreign.root()], now_unix());
-        let out = verify_proof_impl(
+        let out = validate_proof_impl(
             &registry,
             &rln_id_hex,
             &signal_hex,
@@ -1587,7 +1587,7 @@ mod tests {
     // generated for — epoch_binding_holds' nullifier recomputation must
     // still catch the mismatch and reject.
     #[test]
-    fn verify_proof_impl_rejects_tampered_carried_epoch() {
+    fn validate_proof_impl_rejects_tampered_carried_epoch() {
         let _serial = crate::lock(&store::TEST_STORE_LOCK);
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
         let registry = format!("logos:local:{}", "ca".repeat(32));
@@ -1607,7 +1607,7 @@ mod tests {
         let mut tampered = rlp.to_json();
         tampered["epoch"] = serde_json::json!(registry_id::bytes_to_hex(&epoch_bytes));
 
-        let out = verify_proof_impl(
+        let out = validate_proof_impl(
             &registry,
             &rln_id_hex,
             &signal_hex,
@@ -1624,7 +1624,7 @@ mod tests {
     // exactly at the configured gap still verifies, one epoch further does
     // not.
     #[test]
-    fn verify_proof_impl_respects_configured_epoch_gap() {
+    fn validate_proof_impl_respects_configured_epoch_gap() {
         let _serial = crate::lock(&store::TEST_STORE_LOCK);
         // The `within` proof is accepted and logged; clear the shared log so it
         // reads `valid` rather than a `duplicate` left by a sibling verify test.
@@ -1645,7 +1645,7 @@ mod tests {
         // would.
         let within = proof::generate_for_test(&[7u8; 32], signal, now_epoch - 2, &rln_id);
         roots::set_window_for_test(&registry, vec![within.root()], now_unix());
-        let ok = verify_proof_impl(
+        let ok = validate_proof_impl(
             &registry,
             &rln_id_hex,
             &signal_hex,
@@ -1658,7 +1658,7 @@ mod tests {
         // One epoch beyond the configured gap → rejected.
         let beyond = proof::generate_for_test(&[7u8; 32], signal, now_epoch - 3, &rln_id);
         roots::set_window_for_test(&registry, vec![beyond.root()], now_unix());
-        let out = verify_proof_impl(
+        let out = validate_proof_impl(
             &registry,
             &rln_id_hex,
             &signal_hex,
@@ -1676,7 +1676,7 @@ mod tests {
     // correctly bound to ITS OWN epoch still reads `invalid` when the
     // message's timestamp names a different (also in-window) epoch.
     #[test]
-    fn verify_proof_impl_requires_proof_epoch_to_match_timestamp() {
+    fn validate_proof_impl_requires_proof_epoch_to_match_timestamp() {
         let _serial = crate::lock(&store::TEST_STORE_LOCK);
         nullifier_log::reset_for_test();
         start_impl(r#"{"epoch_size_sec": 600, "max_epoch_gap": 2}"#).unwrap();
@@ -1695,13 +1695,13 @@ mod tests {
         // passes; the equality requirement is what rejects.
         let earlier = ((now_epoch - 1) * 600).to_string();
         let out =
-            verify_proof_impl(&registry, &rln_id_hex, &signal_hex, &earlier, &proof_json).unwrap();
+            validate_proof_impl(&registry, &rln_id_hex, &signal_hex, &earlier, &proof_json).unwrap();
         assert_eq!(out, serde_json::json!({ "verdict": "invalid" }));
 
         // The honest timestamp verifies.
         let honest = (now_epoch * 600).to_string();
         let ok =
-            verify_proof_impl(&registry, &rln_id_hex, &signal_hex, &honest, &proof_json).unwrap();
+            validate_proof_impl(&registry, &rln_id_hex, &signal_hex, &honest, &proof_json).unwrap();
         assert_eq!(ok, serde_json::json!({ "verdict": "valid" }));
 
         // Symmetric tamper: the proof's nullifier IS honestly bound to the
@@ -1712,7 +1712,7 @@ mod tests {
         roots::set_window_for_test(&registry, vec![bound.root()], now_unix());
         let mut rewritten = bound.to_json();
         rewritten["epoch"] = serde_json::json!(now_epoch);
-        let out = verify_proof_impl(
+        let out = validate_proof_impl(
             &registry,
             &rln_id_hex,
             &signal_hex,
@@ -1731,7 +1731,7 @@ mod tests {
     // (still fresh) one — the expected external nullifier is recomputed from
     // the timestamp's epoch, never scanned for across the window.
     #[test]
-    fn verify_proof_impl_resolves_epochless_proof_from_timestamp() {
+    fn validate_proof_impl_resolves_epochless_proof_from_timestamp() {
         let _serial = crate::lock(&store::TEST_STORE_LOCK);
         nullifier_log::reset_for_test();
         start_impl(r#"{"epoch_size_sec": 600, "max_epoch_gap": 2}"#).unwrap();
@@ -1750,12 +1750,12 @@ mod tests {
 
         let neighbor = (now_epoch * 600).to_string();
         let out =
-            verify_proof_impl(&registry, &rln_id_hex, &signal_hex, &neighbor, &proof_json).unwrap();
+            validate_proof_impl(&registry, &rln_id_hex, &signal_hex, &neighbor, &proof_json).unwrap();
         assert_eq!(out, serde_json::json!({ "verdict": "invalid" }));
 
         let honest = ((now_epoch - 1) * 600).to_string();
         let ok =
-            verify_proof_impl(&registry, &rln_id_hex, &signal_hex, &honest, &proof_json).unwrap();
+            validate_proof_impl(&registry, &rln_id_hex, &signal_hex, &honest, &proof_json).unwrap();
         assert_eq!(ok, serde_json::json!({ "verdict": "valid" }));
 
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
@@ -1768,7 +1768,7 @@ mod tests {
     // from the two colliding shares. Serialized + reset like its neighbors, as
     // it and the sibling verify tests share the seed-7 / epoch-now nullifier.
     #[test]
-    fn verify_proof_rate_limit_violation_recovers_secret() {
+    fn validate_proof_rate_limit_violation_recovers_secret() {
         let _serial = crate::lock(&store::TEST_STORE_LOCK);
         nullifier_log::reset_for_test();
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
@@ -1786,13 +1786,13 @@ mod tests {
         let ts = (epoch * 600).to_string();
         let sig_a = registry_id::bytes_to_hex(b"sig-A");
         let first =
-            verify_proof_impl(&registry, &rln_id_hex, &sig_a, &ts, &pa.to_json().to_string())
+            validate_proof_impl(&registry, &rln_id_hex, &sig_a, &ts, &pa.to_json().to_string())
                 .unwrap();
         assert_eq!(first, serde_json::json!({ "verdict": "valid" }));
 
         let sig_b = registry_id::bytes_to_hex(b"sig-B");
         let second =
-            verify_proof_impl(&registry, &rln_id_hex, &sig_b, &ts, &pb.to_json().to_string())
+            validate_proof_impl(&registry, &rln_id_hex, &sig_b, &ts, &pb.to_json().to_string())
                 .unwrap();
         assert_eq!(second["verdict"], serde_json::json!("rate_limit_violation"));
         assert_eq!(
@@ -1807,7 +1807,7 @@ mod tests {
     // `duplicate` (equal share_x ⇒ no violation), and the duplicate reply
     // carries NO recovered_secret.
     #[test]
-    fn verify_proof_duplicate_on_retransmission() {
+    fn validate_proof_duplicate_on_retransmission() {
         let _serial = crate::lock(&store::TEST_STORE_LOCK);
         nullifier_log::reset_for_test();
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
@@ -1822,10 +1822,10 @@ mod tests {
         let sig = registry_id::bytes_to_hex(b"dup-sig");
         let proof_json = p.to_json().to_string();
 
-        let first = verify_proof_impl(&registry, &rln_id_hex, &sig, &ts, &proof_json).unwrap();
+        let first = validate_proof_impl(&registry, &rln_id_hex, &sig, &ts, &proof_json).unwrap();
         assert_eq!(first, serde_json::json!({ "verdict": "valid" }));
 
-        let second = verify_proof_impl(&registry, &rln_id_hex, &sig, &ts, &proof_json).unwrap();
+        let second = validate_proof_impl(&registry, &rln_id_hex, &sig, &ts, &proof_json).unwrap();
         assert_eq!(second["verdict"], serde_json::json!("duplicate"));
         assert!(second.get("recovered_secret").is_none());
 
@@ -1836,7 +1836,7 @@ mod tests {
     // `invalid` (not `duplicate`), and the correct signal afterward is `valid`
     // — proof that the failed attempts left the nullifier unrecorded.
     #[test]
-    fn verify_proof_invalid_never_logs() {
+    fn validate_proof_invalid_never_logs() {
         let _serial = crate::lock(&store::TEST_STORE_LOCK);
         nullifier_log::reset_for_test();
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
@@ -1852,12 +1852,12 @@ mod tests {
 
         let wrong = registry_id::bytes_to_hex(b"wrong-sig");
         for _ in 0..2 {
-            let out = verify_proof_impl(&registry, &rln_id_hex, &wrong, &ts, &proof_json).unwrap();
+            let out = validate_proof_impl(&registry, &rln_id_hex, &wrong, &ts, &proof_json).unwrap();
             assert_eq!(out, serde_json::json!({ "verdict": "invalid" }));
         }
 
         let correct = registry_id::bytes_to_hex(b"correct-sig");
-        let ok = verify_proof_impl(&registry, &rln_id_hex, &correct, &ts, &proof_json).unwrap();
+        let ok = validate_proof_impl(&registry, &rln_id_hex, &correct, &ts, &proof_json).unwrap();
         assert_eq!(ok, serde_json::json!({ "verdict": "valid" }));
 
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
@@ -1984,27 +1984,27 @@ mod tests {
         let err = get_membership_state_impl("", &rln_id).unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument, "got: {}", err.message);
 
-        let err = verify_proof_impl("", "", "00", "0", "{}").unwrap_err();
+        let err = validate_proof_impl("", "", "00", "0", "{}").unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument, "got: {}", err.message);
-        let err = verify_proof_impl(&registry, "", "00", "0", "{}").unwrap_err();
+        let err = validate_proof_impl(&registry, "", "00", "0", "{}").unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument, "got: {}", err.message);
     }
 
     // The readiness gate runs before input validation, so start() first,
     // then probe the malformed inputs.
     #[test]
-    fn verify_proof_impl_rejects_malformed_input() {
+    fn validate_proof_impl_rejects_malformed_input() {
         let _serial = crate::lock(&store::TEST_STORE_LOCK);
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
         let registry = format!("logos:local:{}", "cd".repeat(32));
         let rln_id_hex = "ef".repeat(32);
         let ts = now_unix().to_string();
-        let e1 = verify_proof_impl(&registry, &rln_id_hex, "zz", &ts, "{}").unwrap_err();
+        let e1 = validate_proof_impl(&registry, &rln_id_hex, "zz", &ts, "{}").unwrap_err();
         assert_eq!(e1.kind, ErrorKind::InvalidArgument);
-        let e2 = verify_proof_impl(&registry, &rln_id_hex, "00", &ts, "not json").unwrap_err();
+        let e2 = validate_proof_impl(&registry, &rln_id_hex, "00", &ts, "not json").unwrap_err();
         assert_eq!(e2.kind, ErrorKind::InvalidArgument);
         // A non-integer timestamp is malformed input too, on both methods.
-        let e3 = verify_proof_impl(&registry, &rln_id_hex, "00", "later", "{}").unwrap_err();
+        let e3 = validate_proof_impl(&registry, &rln_id_hex, "00", "later", "{}").unwrap_err();
         assert_eq!(e3.kind, ErrorKind::InvalidArgument);
         assert!(e3.message.contains("timestamp"), "got: {}", e3.message);
         let e4 = get_epoch_quota_impl(&registry, &rln_id_hex, "later").unwrap_err();

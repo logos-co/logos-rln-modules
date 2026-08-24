@@ -200,7 +200,7 @@ impl RegistryParametersView {
     }
 }
 
-/// `verify_proof`'s reply — mirrors the `.lidl` `VerificationResult` record.
+/// `validate_proof`'s reply — mirrors the `.lidl` `VerificationResult` record.
 /// `recovered_secret` is present only for the `"rate_limit_violation"`
 /// verdict.
 #[derive(Serialize)]
