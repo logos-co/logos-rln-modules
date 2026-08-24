@@ -10,7 +10,8 @@
 //! config is never rewritten — a second call with a different
 //! sequencer_addr must not silently re-point a wallet.
 
-use crate::{store, ApiError, ErrorKind};
+use crate::sealed_store::store as sealed;
+use crate::{ApiError, ErrorKind};
 
 pub(crate) fn provision_impl(options_json: &str) -> Result<serde_json::Value, ApiError> {
     let raw = options_json.trim();
@@ -27,7 +28,7 @@ pub(crate) fn provision_impl(options_json: &str) -> Result<serde_json::Value, Ap
         ));
     }
 
-    let home = store::with_store(|s| Ok(s.base_dir().join("wallet-home")))?;
+    let home = sealed::current_or_uninit()?.base_dir().join("wallet-home");
     std::fs::create_dir_all(&home)
         .map_err(|e| ApiError::internal(&format!("create {}: {e}", home.display())))?;
 
@@ -96,17 +97,17 @@ mod tests {
 
     #[test]
     fn no_persistence_path_reports_internal() {
-        let _serial = crate::lock(&store::TEST_STORE_LOCK);
-        store::reset_for_tests();
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        sealed::publish(None);
         let err = provision_impl(r#"{"sequencer_addr":"https://seq.example/"}"#).unwrap_err();
         assert!(err.to_json().contains(r#""kind":"internal""#), "got: {}", err.to_json());
     }
 
     #[test]
     fn provisions_once_and_never_rewrites_the_config() {
-        let _serial = crate::lock(&store::TEST_STORE_LOCK);
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         let dir = temp_store_dir("once");
-        store::init(dir.clone());
+        let _store = crate::publish_test_store(dir.clone());
 
         let first = provision_impl(r#"{"sequencer_addr":"https://seq.example/"}"#).unwrap();
         // Reply-shape pin: compact alphabetical keys, storage NOT created.
@@ -150,9 +151,9 @@ mod tests {
 
     #[test]
     fn storage_exists_reflects_the_file() {
-        let _serial = crate::lock(&store::TEST_STORE_LOCK);
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         let dir = temp_store_dir("storage");
-        store::init(dir.clone());
+        let _store = crate::publish_test_store(dir.clone());
 
         let opts = r#"{"sequencer_addr":"https://seq.example/"}"#;
         assert_eq!(provision_impl(opts).unwrap()["storage_exists"], false);

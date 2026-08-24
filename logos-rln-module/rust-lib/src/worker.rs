@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn stop_joins_workers_quickly() {
-        let _serial = crate::lock(&crate::store::TEST_STORE_LOCK);
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
         ensure_poller();
         ensure_refresher();
@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn start_after_stop_respawns_with_new_generation() {
-        let _serial = crate::lock(&crate::store::TEST_STORE_LOCK);
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
         start(|| {});
         let g1 = generation();
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn spawn_is_forbidden_while_stopped_but_interest_is_recorded() {
-        let _serial = crate::lock(&crate::store::TEST_STORE_LOCK);
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
         stop();
         crate::poller::ensure_running();
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn on_demand_spawn_before_start_is_idempotent() {
-        let _serial = crate::lock(&crate::store::TEST_STORE_LOCK);
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
         crate::poller::ensure_running();
         assert_eq!(live_worker_count(), 1);
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn stop_detaches_blocked_worker_without_duplicating_it() {
-        let _serial = crate::lock(&crate::store::TEST_STORE_LOCK);
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let exited = Arc::new(AtomicBool::new(false));
