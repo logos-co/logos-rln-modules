@@ -14,7 +14,7 @@
 ; Reply conventions (this module only — the sibling keeps its ""-on-error).
 ; Two dialects, split by declared return type:
 ; - `result` methods (the RLN-API rate-limiting + lifecycle surface: start,
-;   stop, generate_proof, verify_proof, get_registry_parameters) return a
+;   stop, generate_proof, validate_proof, get_registry_parameters) return a
 ;   real LogosResult — on the consumer wire the envelope
 ;   {"success":bool,"value":<reply>,"error":<string>}, where on failure
 ;   `error` is the JSON-encoded typed object {"class":…,"kind":…,
@@ -59,7 +59,7 @@ module liblogos_rln_module {
   ; unused by this module today) WOULD render a referenced `type` as a
   ; `serde_json::Value` parameter/return — still no struct — if one of the
   ; methods below ever adopted `-> Membership` in place of `-> tstr`.
-  ; RateLimitProof (generate_proof's/verify_proof's proof object) is
+  ; RateLimitProof (generate_proof's/validate_proof's proof object) is
   ; documented on `RateLimitProof::to_json` in proof.rs, not restated as a
   ; record here — its canonical hex bytes have no meaningful LIDL primitive
   ; breakdown, and it is mutated post-construction by generate_proof_impl
@@ -114,7 +114,7 @@ module liblogos_rln_module {
     ? min_rate_limit: int
     ? price_per_unit: any
   }
-  ; verify_proof's reply. recovered_secret is present only for the
+  ; validate_proof's reply. recovered_secret is present only for the
   ; "rate_limit_violation" verdict.
   type VerificationResult {
     ? recovered_secret: tstr
@@ -259,7 +259,7 @@ module liblogos_rln_module {
   ; in-memory) — double-signal detection is the Module's job, not the
   ; consumer's. not_ready while the root window is cold/stale; invalid_argument
   ; on malformed input (a non-integer timestamp included).
-  method verify_proof(registry_id: tstr, rln_identifier_hex: tstr, signal_hex: tstr, timestamp: tstr, proof_json: tstr) -> result
+  method validate_proof(registry_id: tstr, rln_identifier_hex: tstr, signal_hex: tstr, timestamp: tstr, proof_json: tstr) -> result
 
   ; Spec get_epoch_quota(scope, timestamp): the epoch of the supplied
   ; timestamp, the scope's membership rate limit, and the budget still
@@ -350,7 +350,7 @@ module liblogos_rln_module {
   ; {"epoch_size_sec":N (REQUIRED — the application rate-limit epoch, an
   ; APPLICATION parameter every proof generator and verifier of a deployment
   ; must share; it has no safe default, so until start() sets it the
-  ; rate-limiting methods — generate_proof, verify_proof, get_epoch_quota —
+  ; rate-limiting methods — generate_proof, validate_proof, get_epoch_quota —
   ; fail not_ready), "max_epoch_gap"?:N (default 1),
   ; "registries"?:["<caip10>",…] (their root windows are warmed immediately)}.
   ; Idempotent — safe to re-call to reconfigure. No default scope: every

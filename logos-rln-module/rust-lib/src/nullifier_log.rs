@@ -1,12 +1,12 @@
 //! Per-epoch nullifier log: the in-memory record of every nullifier
-//! `verify_proof` has accepted. Keyed epoch → nullifier → the accepted
+//! `validate_proof` has accepted. Keyed epoch → nullifier → the accepted
 //! proof's `(share_x, share_y)`, it turns a second proof reusing a nullifier
 //! into a verdict: the same `share_x` is a retransmission (duplicate), a
 //! different `share_x` is a double-signal (rate-limit violation) whose two
 //! Shamir shares reconstruct the violator's identity secret.
 //!
 //! Crypto-free by design — it stores and compares raw 32-byte values only, so
-//! it stays on `verify_proof`'s hot path: no registry access, no disk, no
+//! it stays on `validate_proof`'s hot path: no registry access, no disk, no
 //! field arithmetic. Retention is bounded to the freshness window: an epoch
 //! that can no longer host a fresh proof (below `now − max_epoch_gap`) is
 //! pruned, since a collision there is already undetectable.

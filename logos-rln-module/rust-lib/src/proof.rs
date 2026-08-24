@@ -1,4 +1,4 @@
-//! RLN rate-limit proof engine: the spec's `generate_proof` / `verify_proof`
+//! RLN rate-limit proof engine: the spec's `generate_proof` / `validate_proof`
 //! crypto, over stateless zerokit `rln`.
 //!
 //! Identity secrets touch the RLN circuit only here, and are never persisted,
@@ -49,7 +49,7 @@ pub(crate) const RLN_TREE_DEPTH: usize = DEFAULT_TREE_DEPTH;
 /// Failures the proof engine can raise. `Invalid` is NOT modelled here — a
 /// proof that simply does not verify is `Ok(false)` from [`verify`], so the
 /// hot path can distinguish "invalid message" from "engine could not run"
-/// (the spec's `verify_proof` bool vs `RLN_ERR_*` split).
+/// (the spec's `validate_proof` bool vs `RLN_ERR_*` split).
 #[derive(Debug)]
 pub(crate) enum ProofError {
     /// Malformed caller input (bad hex, wrong path length, out-of-range
@@ -93,7 +93,7 @@ pub(crate) struct RateLimitProof {
     nullifier: [u8; 32],
     /// The spec's `epoch[32]`, decoded — carried on proofs this module
     /// generates; `None` for a wire proof reconstructed without one, which
-    /// `verify_proof` resolves by scanning instead of checking directly.
+    /// `validate_proof` resolves by scanning instead of checking directly.
     epoch: Option<u64>,
 }
 
@@ -123,7 +123,7 @@ impl RateLimitProof {
         })
     }
 
-    /// The root the proof was generated against — the value `verify_proof`
+    /// The root the proof was generated against — the value `validate_proof`
     /// checks against its valid-root window. Production verification reads
     /// the root out of the canonical bytes inside zerokit; this decoded view
     /// serves tests.
@@ -236,7 +236,7 @@ impl RateLimitProof {
     }
 
     /// The external nullifier the proof was bound to — checked by
-    /// `verify_proof` against the scope's expected epoch window.
+    /// `validate_proof` against the scope's expected epoch window.
     pub(crate) fn external_nullifier(&self) -> [u8; 32] {
         self.external_nullifier
     }
@@ -261,7 +261,7 @@ impl RateLimitProof {
     }
 
     /// The epoch this proof carries (the spec's `epoch[32]`, decoded), or
-    /// `None` for a wire proof reconstructed without one — `verify_proof`
+    /// `None` for a wire proof reconstructed without one — `validate_proof`
     /// checks the former directly and resolves the latter by scanning.
     pub(crate) fn epoch(&self) -> Option<u64> {
         self.epoch
@@ -514,7 +514,7 @@ pub(crate) fn recover_identity_secret_hex(
 }
 
 /// Build a proof from a seed over a synthetic zero-sibling depth-20 path — for
-/// cross-module wiring tests (e.g. `verify_proof_impl`) that need a real,
+/// cross-module wiring tests (e.g. `validate_proof_impl`) that need a real,
 /// verifiable proof without an on-chain tree.
 #[cfg(test)]
 pub(crate) fn generate_for_test(
@@ -781,7 +781,7 @@ mod tests {
     }
 
     // The generate_proof handler's reply carries "epoch" as a u64 index, and
-    // verify_proof accepts that object as-is — so from_json must decode a
+    // validate_proof accepts that object as-is — so from_json must decode a
     // numeric epoch identically to the epoch[32] hex form.
     #[test]
     fn from_json_accepts_numeric_epoch_from_the_handler_reply() {

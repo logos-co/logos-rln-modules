@@ -28,7 +28,7 @@ hmac = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 getrandom = "0.2"
 
-# RLN zk proof generation & verification (spec generate_proof/verify_proof).
+# RLN zk proof generation & verification (spec generate_proof/validate_proof).
 # The identity secret stays in this module — it never crosses to the sibling.
 rln = { version = "3.0.0", default-features = false }
 
