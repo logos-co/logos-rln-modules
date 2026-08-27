@@ -1374,6 +1374,14 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
                 if !store.pending_records().is_empty() {
                     poller::ensure_running();
                 }
+                // Full-lazy module-owned custody (keychain.rs): resume the
+                // auto-owned session or self-provision on a fresh store, so
+                // the keystore works with zero unlock calls. Opt out with
+                // LOGOS_RLN_DISABLE_AUTO_UNLOCK=1 (user-password
+                // deployments and the e2e manual-unlock probes).
+                if std::env::var_os("LOGOS_RLN_DISABLE_AUTO_UNLOCK").is_none() {
+                    keychain::lazy_auto_unlock();
+                }
             }
         }
     }

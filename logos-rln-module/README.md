@@ -131,12 +131,23 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
 - **Unlock model.** Reads, lifecycle polling, selection, `get_epoch_quota`,
   and `validate_proof` never need the password (identity/cache/counter
   plaintext is locked-readable; verification uses no credential at all).
-  `unlock_keystore` is required to `register` (seals the freshly generated
-  credential) and to `generate_proof` (unseals it in-module for the
-  witness). With zero stored credentials any password unlocks and becomes
-  the store password — re-provisioning the header — until the first insert
-  freezes the stored verifier; from then on unlock is exactly one Argon2id
-  run checked in constant time, independent of entry count.
+  An unlocked keystore is required to `register` a fresh scope (seals the
+  freshly generated credential) and to `generate_proof` (unseals it
+  in-module for the witness); a live-scope re-register short-circuits and
+  works locked. With zero stored credentials any password unlocks and
+  becomes the store password — re-provisioning the header — until the
+  first insert freezes the stored verifier; from then on unlock is exactly
+  one Argon2id run checked in constant time, independent of entry count.
+  **Custody default is module-owned (full-lazy)**: at init the module
+  resumes or self-provisions its own random password
+  (`rln_autounlock.secret`, 0600, in the store dir — see
+  `docs/keystore-format.md`), so a headless host needs ZERO unlock calls;
+  `LOGOS_RLN_DISABLE_AUTO_UNLOCK=1` opts a deployment back into
+  user-password custody, and a store that already has credentials but no
+  stored secret is never adopted (stays locked until manual unlock).
+  File-mode custody trades at-rest confidentiality down to filesystem
+  ACLs; the OS keychain (macOS) and a manual password are the stronger
+  modes.
 - **Slot allocation is persist-before-issue, and the allocator is
   monotonic.** `generate_proof` durably records the `(rln_identifier, epoch,
   message_id)` allocation before the proof leaves the module (fsync'd write —
