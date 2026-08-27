@@ -178,7 +178,11 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
 - **Verification is hot-path-only.** `validate_proof` reads the locally
   maintained valid-root window and performs zero registry calls; a cold or
   stale window answers `not_ready` rather than serving a false reject.
-  `start` warms the windows of its configured registries.
+  `start` warms the windows of its configured registries. A warm window
+  missing the proof's root answers `invalid` and nudges the background
+  refresher (rate-limited) for one immediate refresh, so a just-published
+  root resolves on the caller's retry; `generate_proof`'s Merkle snapshot
+  also feeds its `valid_roots` into the window.
 - **Wire conventions.** Every reply is a compact JSON object (alphabetical
   keys); failures are `{"error":{"kind":…,"message":…}}`. The sibling
   module's `""`-on-error convention is NOT used here.

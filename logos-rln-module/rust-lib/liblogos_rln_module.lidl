@@ -268,7 +268,12 @@ module liblogos_rln_module {
   ; in-module nullifier log (per epoch, retained max_epoch_gap epochs,
   ; in-memory) — double-signal detection is the Module's job, not the
   ; consumer's. not_ready while the root window is cold/stale; invalid_argument
-  ; on malformed input (a non-integer timestamp included).
+  ; on malformed input (a non-integer timestamp included). A WARM window
+  ; that misses the proof's root still answers "invalid" (this path never
+  ; reads the registry) but asks the background refresher for one
+  ; rate-limited out-of-band refresh — a just-published root (a freshly
+  ; activated membership's first proofs) typically validates on the
+  ; caller's next retry rather than after a full refresh interval.
   method validate_proof(registry_id: tstr, rln_identifier_hex: tstr, signal_hex: tstr, timestamp: tstr, proof_json: tstr) -> result
 
   ; Spec get_epoch_quota(scope, timestamp): the epoch of the supplied

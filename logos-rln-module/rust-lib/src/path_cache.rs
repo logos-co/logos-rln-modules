@@ -45,6 +45,16 @@ pub(crate) fn fill_path_cache(
     let merkle = prov.get_merkle_proof(registry, leaf_index)?;
     let path_elements_hex = json_str_array(&merkle, "path_elements")?;
     let path_indices = json_u8_array(&merkle, "path_indices")?;
+    // The same snapshot carries valid_roots — adopt them into the root
+    // window (same provider, same trust as the refresher's read), so a
+    // proof generated from this path validates locally without waiting for
+    // the next refresher tick. Tolerates absence: older providers may omit
+    // the field.
+    if let Ok(roots_hex) = json_str_array(&merkle, "valid_roots") {
+        let roots: Vec<[u8; 32]> =
+            roots_hex.iter().filter_map(|h| crate::registry_id::hex_to_bytes32(h)).collect();
+        crate::roots::adopt(&registry.canonical, roots);
+    }
     lock(&PATHS).get_or_insert_with(HashMap::new).insert(
         hash.to_string(),
         CachedPath { path_elements_hex, path_indices, leaf_index },

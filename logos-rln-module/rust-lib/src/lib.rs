@@ -1362,6 +1362,16 @@ fn validate_proof_impl(
     let window = roots::window(&registry.canonical).ok_or_else(|| {
         ApiError::new(ErrorKind::NotReady, "valid-root window not warm yet; retry")
     })?;
+    // A WARM window that simply doesn't carry the proof's root is the
+    // freshly-published-root race (a just-activated membership's first
+    // proofs) as often as it is a bad proof. The verdict stays "invalid"
+    // (spec: zero registry access on this path), but nudge the refresher
+    // for one out-of-band tick so the caller's retry lands against a fresh
+    // window instead of waiting out the refresh interval.
+    if !window.contains(&rlp.root()) {
+        roots::nudge();
+        return ok_json(views::VerdictReply::verdict("invalid"));
+    }
     if !proof::verify(&rlp, &signal, &window).map_err(proof_error)? {
         // Invalid proofs are NOT logged — only a validated nullifier counts.
         return ok_json(views::VerdictReply::verdict("invalid"));
@@ -1949,6 +1959,55 @@ mod tests {
         let bad = validate_proof_impl(&registry, &rln_id_hex, &other, &ts, &proof_json).unwrap();
         assert_eq!(bad, serde_json::json!({ "verdict": "invalid" }));
 
+        start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
+    }
+
+    // A WARM window that misses the proof's root answers `invalid` AND asks
+    // the refresher for one out-of-band tick — the freshly-published-root
+    // race resolves on the caller's retry instead of a full refresh
+    // interval. The verification path itself still never reads the registry.
+    #[test]
+    fn root_window_miss_answers_invalid_and_nudges_the_refresher() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
+        let registry = format!("logos:local:{}", "bc".repeat(32));
+        let rln_id = [9u8; 32];
+        let rln_id_hex = registry_id::bytes_to_hex(&rln_id);
+        let signal = b"root-miss-check";
+        let signal_hex = registry_id::bytes_to_hex(signal);
+        let epoch = rate_limit::current_epoch(now_unix(), epoch_size().unwrap());
+        let rlp = proof::generate_for_test(&[7u8; 32], signal, epoch, &rln_id);
+
+        // Warm window WITHOUT the proof's root.
+        roots::set_window_for_test(&registry, vec![[3u8; 32]], now_unix());
+        roots::reset_nudge_for_test();
+        let before = crate::worker::nudges_for_test();
+        let out = validate_proof_impl(
+            &registry,
+            &rln_id_hex,
+            &signal_hex,
+            &(epoch * 600).to_string(),
+            &rlp.to_json().to_string(),
+        )
+        .unwrap();
+        assert_eq!(out, serde_json::json!({ "verdict": "invalid" }));
+        assert_eq!(crate::worker::nudges_for_test(), before + 1, "a root miss must nudge");
+
+        // An in-window root that fails crypto is plain invalid — NO nudge.
+        roots::set_window_for_test(&registry, vec![rlp.root()], now_unix());
+        roots::reset_nudge_for_test();
+        let before = crate::worker::nudges_for_test();
+        let other = registry_id::bytes_to_hex(b"a-different-signal");
+        let out = validate_proof_impl(
+            &registry,
+            &rln_id_hex,
+            &other,
+            &(epoch * 600).to_string(),
+            &rlp.to_json().to_string(),
+        )
+        .unwrap();
+        assert_eq!(out, serde_json::json!({ "verdict": "invalid" }));
+        assert_eq!(crate::worker::nudges_for_test(), before, "a crypto-invalid proof must not nudge");
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
     }
 
