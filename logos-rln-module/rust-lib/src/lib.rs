@@ -1238,11 +1238,14 @@ fn generate_proof_impl(
     let mut out = rlp.to_json();
     if let Some(obj) = out.as_object_mut() {
         // Extras beyond the spec struct: the spent slot, the u64 epoch index
-        // (`epoch` itself stays the spec's epoch[32] LE hex), and the local
-        // handle. Opaque to consumers, tolerated by from_json.
+        // (`epoch` itself stays the spec's epoch[32] LE hex), the local
+        // handle, and the full canonical bytes for consumers that carry ONE
+        // opaque blob on their own message wire (validate_proof accepts it
+        // as `{"proof": <hex>}` alone). Tolerated/ignored by from_json.
         obj.insert("message_id".to_string(), message_id.into());
         obj.insert("epoch_index".to_string(), epoch.into());
         obj.insert("membership_hash".to_string(), hash.into());
+        obj.insert("proof_canonical".to_string(), rlp.canonical_hex().into());
     }
     Ok(out)
 }
@@ -2606,6 +2609,14 @@ mod tests {
             Some(now_epoch - 1),
             "epoch must derive from the supplied timestamp, not the module clock: {out}"
         );
+        // The reply's message-wire extra: the full canonical blob, whose
+        // leading segment is the bare proof[128].
+        let canonical = out
+            .get("proof_canonical")
+            .and_then(|v| v.as_str())
+            .expect("reply carries proof_canonical");
+        assert_eq!(canonical.len(), 289 * 2);
+        assert!(canonical.starts_with(out["proof"].as_str().unwrap()));
 
         sealed_store::store::publish(None);
         let _ = std::fs::remove_dir_all(&dir);

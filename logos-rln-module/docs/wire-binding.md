@@ -182,15 +182,20 @@ extras:
   "root": "<32B hex>", "external_nullifier": "<32B hex>",
   "share_x": "<32B hex>", "share_y": "<32B hex>", "nullifier": "<32B hex>",
   "epoch": "<32B LE hex — spec epoch[32]>",
-  "message_id": N, "epoch_index": N, "membership_hash": "<hex>"
+  "message_id": N, "epoch_index": N, "membership_hash": "<hex>",
+  "proof_canonical": "<289B hex — the full zerokit serialization>"
 }
 ```
 
 - `share_x` is the circuit's signal hash `x`, `share_y` is `y`; `epoch` is
   the spec's `epoch[32]` (the u64 `epoch_index` alongside is a convenience,
   as is the spent `message_id` and the local `membership_hash` — from_json
-  tolerates and ignores all three).
-- `validate_proof` accepts this shape AND the pre-0.6.0 canonical-blob form
+  tolerates and ignores the extras).
+- `proof_canonical` (0.6.1) is the message-wire transport shortcut: a
+  consumer that carries ONE opaque blob on its own wire ships these bytes
+  and validates with `{"proof": "<that hex>"}` alone — the canonical path
+  below recovers every public value from the blob.
+- `validate_proof` accepts this shape AND the canonical-blob form
   (`proof` = zerokit's full `RLNProof` LE serialization: proof[128] ‖ mode
   tag ‖ y ‖ root ‖ nullifier ‖ x ‖ external_nullifier — 289 bytes; canonical
   bytes trusted, decoded fields ignored). A decomposed proof is rebuilt and

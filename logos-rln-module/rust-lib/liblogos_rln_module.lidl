@@ -41,7 +41,7 @@
 ; Events are a third channel, pushed over the lp event stream rather than
 ; returned from a call — see the events section below.
 module liblogos_rln_module {
-  version "0.6.0"
+  version "0.6.1"
   description "RLN Membership Management Module"
   category "blockchain"
   depends [liblogos_lez_rln_module]
@@ -228,8 +228,11 @@ module liblogos_rln_module {
   ; fetches the Merkle path, and proves. Returns the spec RateLimitProof —
   ; {"proof":<128-byte compressed Groth16 hex>,"root","epoch" (32-byte LE
   ; field hex),"external_nullifier","share_x","share_y","nullifier"} (all
-  ; hex) — plus the spent "message_id", the "epoch_index" (u64), and the
-  ; "membership_hash". Errors: no_usable_membership,
+  ; hex) — plus the spent "message_id", the "epoch_index" (u64), the
+  ; "membership_hash", and "proof_canonical" (the full 289-byte zerokit
+  ; serialization as hex — a consumer that carries ONE opaque blob on its
+  ; own message wire ships these bytes and validates with {"proof":<that
+  ; hex>} alone). Errors: no_usable_membership,
   ; ambiguous_selection (multiple; select first), locked, budget_exhausted
   ; (epoch rate limit spent), invalid_argument (bad signal/timestamp, or a
   ; timestamp whose epoch is outside now ± max_epoch_gap), permanent (the
@@ -245,11 +248,13 @@ module liblogos_rln_module {
   ; the message under validation; the expected epoch derives from it (epoch =
   ; timestamp / epoch_size_sec), so the budget the proof spends provably
   ; belongs to the epoch the message claims — the generator bound the same
-  ; value in generate_proof. proof_json accepts EITHER shape: the object
-  ; generate_proof returns (canonical "proof" bytes trusted, other fields
-  ; ignored) OR the spec's decomposed RateLimitProof struct — "proof" as the
-  ; bare 128-byte Groth16 hex plus root/external_nullifier/share_x/share_y/
-  ; nullifier — the shape a consumer reassembles from its own network message.
+  ; value in generate_proof. proof_json accepts EITHER shape: "proof" as the
+  ; full canonical blob (generate_proof's "proof_canonical" — canonical bytes
+  ; trusted, every public value recomputed from them) OR the spec's
+  ; decomposed RateLimitProof struct — "proof" as the bare 128-byte Groth16
+  ; hex plus root/external_nullifier/share_x/share_y/nullifier — the shape
+  ; generate_proof's reply carries and a consumer reassembles from its own
+  ; network message.
   ; In both, "epoch" may be the u64 index (generate_proof's reply) or
   ; epoch[32] LE hex, and when carried it must EQUAL the timestamp's epoch.
   ; Checks, in order: the timestamp's epoch is within the current epoch
