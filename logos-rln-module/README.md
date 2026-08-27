@@ -149,15 +149,10 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   re-admit after its rows were pruned; recovery from a deliberate epoch-size
   change is a fresh registration. The epoch-size binding is adopted per
   membership at its first reservation. The allocation counters are
-  authenticated from birth: each membership's section carries an HMAC bound
-  to its membership hash and the store instance, and a root MAC over the
-  section MACs. Attributable tamper (a content edit that leaves the root
-  valid) quarantines just that membership; any root-MAC failure — a spliced
-  older section, a stripped MAC, an added or removed section — is
-  unattributable and fails closed, quarantining every membership. Only a
-  whole-file rollback to an older self-consistent backup remains
-  inherently undetectable by a local MAC (`docs/keystore-format.md` records
-  the accepted limits). One process per persistence path is
+  authenticated from birth: attributable tamper quarantines that
+  membership, unattributable tamper fails closed and quarantines every
+  membership (`docs/keystore-format.md` specifies the format, the tamper
+  taxonomy, and the accepted limits). One process per persistence path is
   enforced with an exclusive lock on `rln_keystore.lock`, failing closed;
   the lock is advisory, so network/shared-volume filesystems that don't
   honor OS file locks must enforce single-process at the deployment layer.

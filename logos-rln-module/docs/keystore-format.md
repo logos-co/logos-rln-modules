@@ -1,13 +1,10 @@
 # The sealed-store keystore format
 
-Version 1 (`rln-sealed-store`), introduced with module 0.6.0. This is a
-clean break from the pre-0.6.0 WAKU-RLN-KEYSTORE-derived format: there is
-no migration and no nwaku-keyfile compatibility — abandoning keyfile
-portability was a deliberate product decision (no consumers existed), not
-a side effect. A directory holding only an old `rln_keystore.json` fails
-`open()` with explicit guidance; the old file is never read, renamed, or
-deleted. If a consumer ever needs nwaku portability again, it becomes an
-explicit import/export converter tool, not a property of this format.
+Version 1 (`rln-sealed-store`), introduced with module 0.6.0. Clean break
+from the pre-0.6.0 WAKU-RLN-KEYSTORE-derived format: no migration, no
+nwaku-keyfile compatibility. A directory holding only an old
+`rln_keystore.json` fails `open()` with explicit guidance; the old file is
+never read, renamed, or deleted.
 
 ## One file per trust class
 
@@ -18,7 +15,7 @@ All files live in `<instance_persistence_path>/`, mode 0600.
 | `rln_sealed.json` | encrypted + AEAD-authenticated: header (KDF params, salt, verifier, store_uuid) and, per membership, a plaintext identity block + the XChaCha20-Poly1305-sealed credential | fsync ordering; rewritten only on insert and empty-store provisioning |
 | `rln_allocations.json` | plaintext but authenticated: per-membership counter sections (allocations, epoch_size_sec, prune_floor) each with an HMAC, plus a root MAC over the section MACs | fsync ordering; one small rewrite per reservation, completed **before** the slot is returned |
 | `rln_cache.json` | plaintext, unauthenticated, poller-owned: registry-derived state the poller re-heals (state, leaf_index, rate_limit, failure fields, first_active_at) | rename-atomic only, no fsync — loss is always recoverable from the registry |
-| `rln_keystore.lock` | advisory OS lock sentinel; the name is shared with the ≥0.5.0 formats so those binaries and this one cannot run concurrently in one directory (the audited 0.4.0 had no lock, but its file set is disjoint) | — |
+| `rln_keystore.lock` | advisory OS lock sentinel; the name is shared with the ≥0.5.0 formats so those binaries and this one cannot run concurrently in one directory — never rename it | — |
 
 The durable write ordering (tmp 0600 → write → fsync(tmp) → rename →
 fsync(dir)) is power-loss-critical and untestable in CI; it degrades only
@@ -78,19 +75,16 @@ nothing files are moved aside as `.bad.<unix-ts>` evidence, never
 overwritten. Oversized files fail their parse caps closed rather than
 aborting the process.
 
-## Accepted limits (unchanged in kind from the previous format)
+## Accepted limits
 
 - The no-reissue guarantee is per keystore instance. Copying the files
   forks the counters; concurrent use of both copies discloses the identity
   secret. Migrate by moving, never by copying.
 - A whole-file rollback of `rln_allocations.json` (or the whole directory)
-  to an older self-consistent backup is undetectable by any purely local
-  MAC. The root MAC catches every partial edit — including a splice hidden
-  behind a decoy tamper elsewhere — so the residual local attack is reduced
-  to a rollback of the entire counter file to a byte-consistent past state;
-  the root cannot close that (an old file is internally valid). The real fix
-  is an OS-keychain freshness anchor (a per-store monotone counter held
-  outside the filesystem, bound into the root), on the roadmap.
+  to an older self-consistent backup is undetectable: an old file is
+  internally valid, and no purely local MAC can prove freshness. Every
+  partial edit — including a splice hidden behind a decoy tamper elsewhere —
+  is caught by the section and root MACs.
 - The directory lock is advisory; deployments on filesystems that do not
   honor OS locks must enforce single-process externally.
 - `rln_cache.json` is deliberately loose: a crash can lose cache updates

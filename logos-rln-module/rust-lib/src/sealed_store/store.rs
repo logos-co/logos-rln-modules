@@ -467,8 +467,7 @@ impl Store {
 
     /// Unseal one credential — the module's single plaintext release path.
     /// The AAD is recomputed from the CURRENT identity block, so a swapped
-    /// identity header fails the AEAD (the old sidecar cross-check, now
-    /// enforced by construction).
+    /// identity header fails the AEAD.
     pub fn unseal_credential(&self, hash: &str) -> Result<StoredCredential, ApiError> {
         let guard = crate::lock(&self.write);
         let inner = &*guard;

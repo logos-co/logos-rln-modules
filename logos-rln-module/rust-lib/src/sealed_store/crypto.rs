@@ -1,7 +1,6 @@
 //! The sealed-store crypto layer: Argon2id password KDF → HKDF-SHA256
 //! sub-keys → XChaCha20-Poly1305 AEAD. Nonce and AAD both sit under the
-//! AEAD tag, so every tamper is a hard failure — deliberately unlike the
-//! old envelope's CTR IV, which lived outside the MAC.
+//! AEAD tag, so every tamper is a hard failure.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
