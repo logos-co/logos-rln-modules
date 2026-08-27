@@ -53,6 +53,11 @@ struct Supervisor {
     /// captured generation no longer matches is from a superseded run and
     /// exits at its next check — the mechanism that makes detaching safe.
     generation: u64,
+    /// Bumped by nudge(): asks every sleeping tick loop for one immediate
+    /// out-of-band tick (e.g. a root-window miss on the verification path
+    /// wants the refresher NOW, not in up to one refresh interval). An
+    /// early poller tick is a harmless idempotent re-poll.
+    nudges: u64,
     /// Live (spawned, not yet returned) workers — stop()'s join condition
     /// and the tests' observability seam.
     running: usize,
@@ -64,6 +69,7 @@ struct Supervisor {
 static SUP: Mutex<Supervisor> = Mutex::new(Supervisor {
     state: WorkerState::NeverStarted,
     generation: 0,
+    nudges: 0,
     running: 0,
     poller: None,
     refresher: None,
@@ -81,12 +87,32 @@ pub(crate) fn is_stopped() -> bool {
 /// generation). A `stop()` or restart wakes the wait immediately.
 pub(crate) fn wait_tick(my_gen: u64, dur: Duration) -> bool {
     let guard = crate::lock(&SUP);
+    let entry_nudges = guard.nudges;
     let (sup, timeout) = CVAR
         .wait_timeout_while(guard, dur, |s| {
-            s.generation == my_gen && s.state != WorkerState::Stopped
+            s.generation == my_gen && s.state != WorkerState::Stopped && s.nudges == entry_nudges
         })
         .unwrap_or_else(|p| p.into_inner());
-    timeout.timed_out() && sup.generation == my_gen && sup.state != WorkerState::Stopped
+    (timeout.timed_out() || sup.nudges != entry_nudges)
+        && sup.generation == my_gen
+        && sup.state != WorkerState::Stopped
+}
+
+/// Wake every sleeping tick loop for one immediate tick. Callers rate-limit
+/// themselves (see roots::nudge) — this is the raw wake.
+pub(crate) fn nudge() {
+    crate::lock(&SUP).nudges += 1;
+    CVAR.notify_all();
+}
+
+#[cfg(test)]
+pub(crate) fn nudges_for_test() -> u64 {
+    crate::lock(&SUP).nudges
+}
+
+#[cfg(test)]
+pub(crate) fn generation_for_test() -> u64 {
+    crate::lock(&SUP).generation
 }
 
 /// Spawn `body(generation)` into `slot` if permitted and not already alive.
@@ -275,6 +301,27 @@ mod tests {
 
     // The supervisor is process-global; every test here serializes on the
     // crate's designated global-state lock and starts from a clean reset.
+
+    #[test]
+    fn nudge_wakes_wait_tick_early_as_a_due_tick() {
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        reset_for_test();
+        let gen = generation_for_test();
+        let woke = Arc::new(AtomicBool::new(false));
+        let woke2 = woke.clone();
+        let h = std::thread::spawn(move || {
+            // Far longer than the assertion bound: only a nudge (not the
+            // timeout) can return this within the test's lifetime.
+            woke2.store(wait_tick(gen, Duration::from_secs(60)), Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(100)); // let it park
+        let began = Instant::now();
+        nudge();
+        h.join().unwrap();
+        assert!(woke.load(Ordering::SeqCst), "a nudge must count as a DUE tick, not a spurious wake");
+        assert!(began.elapsed() < Duration::from_secs(5), "nudge wake took {:?}", began.elapsed());
+        reset_for_test();
+    }
 
     #[test]
     fn stop_joins_workers_quickly() {

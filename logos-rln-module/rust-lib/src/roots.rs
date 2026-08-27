@@ -32,6 +32,51 @@ struct Window {
 static WINDOWS: Mutex<Option<HashMap<String, Window>>> = Mutex::new(None);
 static TRACKED: Mutex<Option<HashMap<String, CanonicalRegistryId>>> = Mutex::new(None);
 
+/// On-demand refresh floor: a root-window miss on the verification path may
+/// ask for one out-of-band refresher tick, at most this often — a stream of
+/// invalid proofs must never become registry-read spam. Matches the sibling
+/// stacks' minimum root-refresh interval.
+const NUDGE_MIN_INTERVAL_SECS: u64 = 2;
+
+static LAST_NUDGE_UNIX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Ask the refresher for one immediate out-of-band tick (called on a
+/// root-window MISS in `validate_proof`). The verification path itself
+/// still performs zero registry access — this only wakes the worker, whose
+/// read lands within its own thread — and it is rate-limited by
+/// `NUDGE_MIN_INTERVAL_SECS`. Shrinks the freshly-published-root
+/// false-`invalid` window from up to one refresh interval to roughly one
+/// provider round-trip (the caller still retries the `invalid`).
+pub(crate) fn nudge() {
+    use std::sync::atomic::Ordering;
+    let now = crate::now_unix();
+    let last = LAST_NUDGE_UNIX.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < NUDGE_MIN_INTERVAL_SECS {
+        return;
+    }
+    if LAST_NUDGE_UNIX
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        crate::worker::nudge();
+    }
+}
+
+/// Adopt a provider-fetched root set into the window. NON-verification
+/// paths only (the poller's path refresh and `generate_proof`'s Merkle
+/// fetch both receive `valid_roots` from the SAME provider snapshot) —
+/// same trust as the refresher's own read, so a node that just generated
+/// a proof can validate it without waiting for the next tick.
+pub(crate) fn adopt(canonical: &str, roots: Vec<[u8; 32]>) {
+    if roots.is_empty() {
+        return;
+    }
+    lock(&WINDOWS).get_or_insert_with(HashMap::new).insert(
+        canonical.to_string(),
+        Window { roots, updated_at: crate::now_unix() },
+    );
+}
+
 /// Track a registry's roots and ensure the background refresher is running.
 /// Hot-path-safe: records interest and returns without a registry read.
 /// After `stop()` interest is still recorded; the next `start()` picks it up.
@@ -129,6 +174,11 @@ fn refresh_one(registry: &CanonicalRegistryId) -> Result<(), ApiError> {
 }
 
 #[cfg(test)]
+pub(crate) fn reset_nudge_for_test() {
+    LAST_NUDGE_UNIX.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
 pub(crate) fn set_window_for_test(canonical: &str, roots: Vec<[u8; 32]>, updated_at: u64) {
     lock(&WINDOWS).get_or_insert_with(HashMap::new).insert(
         canonical.to_string(),
@@ -143,6 +193,29 @@ mod tests {
     #[test]
     fn cold_registry_has_no_window() {
         assert!(window("logos:local:never-refreshed").is_none());
+    }
+
+    #[test]
+    fn adopt_installs_a_fresh_window_and_skips_empty() {
+        let canonical = "logos:local:adopt-test";
+        adopt(canonical, vec![]);
+        assert!(window(canonical).is_none(), "empty adoption must be a no-op");
+        adopt(canonical, vec![[7u8; 32]]);
+        assert_eq!(window(canonical).expect("adopted window"), vec![[7u8; 32]]);
+    }
+
+    #[test]
+    fn nudge_is_rate_limited() {
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        reset_nudge_for_test();
+        let before = crate::worker::nudges_for_test();
+        nudge();
+        nudge();
+        assert_eq!(
+            crate::worker::nudges_for_test(),
+            before + 1,
+            "a second nudge inside the floor must be dropped"
+        );
     }
 
     #[test]
