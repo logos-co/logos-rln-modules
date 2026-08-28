@@ -74,11 +74,11 @@ switch on `class`, log `kind`.
 
 | Spec function | Method (args) | Dialect | Success reply (the `value` for result methods) |
 |---|---|---|---|
-| `start(config)` | `start(config_json)` | result | `{"started":true,"epoch_size_sec":N,"registries":[…]}` |
+| `start(config)` | `start(config_json)` | result | `{"started":true,"epoch_size_sec":N,"max_epoch_gap":N,"registries":[…]}` + `"overrides":{registry:{…}}` when any registries entry set per-registry values. config: `{"epoch_size_sec":N (required default), "max_epoch_gap"?:N, "registries"?:[caip10 \| {"registry_id","epoch_size_sec"?,"max_epoch_gap"?}]}` — spec: epoch size and max gap are per-REGISTRY configuration; an object entry overrides the defaults for that registry |
 | `stop()` | `stop()` | result | `{"stopped":true}` |
-| `register(scope, rate_limit, options)` | `register(registry_id, rln_identifier_hex, rate_limit, options_json)` | tstr | public Membership view (below), `"state":"pending"` on a fresh submit |
+| `register(scope, options)` | `register(registry_id, rln_identifier_hex, options_json)` | tstr | public Membership view (below), `"state":"pending"` on a fresh submit; `options_json` is the RegistryOptions ARRAY (below), the common `rate_limit` key defaulted when absent |
 | `get_membership_state(scope)` | `get_membership_state(registry_id, rln_identifier_hex)` | tstr | `{"state":…}` + `membership_hash`/`leaf_index`/`rate_limit` when known |
-| `generate_proof(scope, signal, timestamp)` | `generate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp)` | result | RateLimitProof (below) + `"message_id"`, `"epoch"`, `"membership_hash"`; epoch derives from `timestamp` (Unix s), must be within now ± `max_epoch_gap`. Fails `permanent` (kind `permanent`) for an epoch below the membership's persisted allocation floor (backwards clock / widened `max_epoch_gap`) or an `epoch_size_sec` its allocations are not bound to — re-register to recover |
+| `generate_proof(scope, signal, timestamp)` | `generate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp)` | result | RateLimitProof (below) + `"message_id"`, `"epoch_index"`, `"membership_hash"`; epoch derives from `timestamp` (Unix s), must be within now ± `max_epoch_gap`. Fails `permanent` (kind `permanent`) for an epoch below the membership's persisted allocation floor (backwards clock / widened `max_epoch_gap`) or an `epoch_size_sec` its allocations are not bound to — re-register to recover |
 | `validate_proof(scope, signal, timestamp, proof)` | `validate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp, proof_json)` | result | `{"verdict":str}` (see the verdict table); `rate_limit_violation` also carries `"recovered_secret":hex`. `timestamp` is the value stamped on the message under validation: the proof's epoch must EQUAL its epoch and be within now ± `max_epoch_gap`, else `"invalid"` |
 | `get_epoch_quota(scope, timestamp)` | `get_epoch_quota(registry_id, rln_identifier_hex, timestamp)` | result | `{"epoch_index":N,"rate_limit":N,"remaining":N}` — one observation of `timestamp`'s epoch, purely local; `epoch_index` is a NUMBER (`floor(timestamp/epoch_size)`, what a QuotaProvider's `epochIndex` consumes); no usable membership → `rate_limit`/`remaining` both 0 (the wall-clock-fallback cue — never an exhausted budget); a timestamp whose epoch is outside now ± `max_epoch_gap`, below the membership's persisted allocation floor, or denominated in an `epoch_size_sec` its allocations aren't bound to fails `permanent` — the same refusals `generate_proof` would answer (spec: test a timestamp before committing to it), so `{rate_limit>0, remaining:0}` always means spendable-next-epoch |
 | registry parameters read (optional ext.) | `get_registry_parameters(registry_id, rln_identifier_hex)` | result | `{"epoch_size_sec","max_rate_limit","min_rate_limit","max_total_rate_limit","price_per_unit"}` |
@@ -162,34 +162,40 @@ remains the portable path every consumer can rely on.
 | `active` | `MEMBERSHIP_ACTIVE` |
 | `grace_period` | `MEMBERSHIP_GRACE_PERIOD` |
 | `expired` | `MEMBERSHIP_EXPIRED` |
+| `erased_awaits_withdrawal` | `MEMBERSHIP_ERASED_AWAITS_WITHDRAWAL` |
 | `erased` | `MEMBERSHIP_ERASED` |
+| `slashed` | `MEMBERSHIP_SLASHED` |
 
-`MEMBERSHIP_ERASED_AWAITS_WITHDRAWAL` is never reported by the `logos`
-namespace (its registry keeps no recoverable deposit).
+`erased_awaits_withdrawal` and `slashed` are in the vocabulary for spec
+completeness but are never reported by the `logos` namespace: its registry
+keeps no recoverable deposit and does not expose slashing as a removal
+cause, so every removal surfaces as `erased` (spec-sanctioned).
 
 ## RateLimitProof
 
-`generate_proof` returns every spec-struct field plus the canonical form:
+`generate_proof` returns the spec's DECOMPOSED `RateLimitProof` plus three
+extras:
 
 ```json
 {
-  "proof": "<canonical hex — the authoritative bytes>",
+  "proof": "<128B hex — the compressed Groth16 proof, spec proof[128]>",
   "root": "<32B hex>", "external_nullifier": "<32B hex>",
   "share_x": "<32B hex>", "share_y": "<32B hex>", "nullifier": "<32B hex>",
-  "message_id": N, "epoch": N, "membership_hash": "<hex>"
+  "epoch": "<32B LE hex — spec epoch[32]>",
+  "message_id": N, "epoch_index": N, "membership_hash": "<hex>"
 }
 ```
 
-- The **canonical** `proof` is zerokit's `RLNProof` LE serialization:
-  128-byte compressed Groth16 proof ‖ mode tag (`0x00` Single) ‖ y ‖ root ‖
-  nullifier ‖ x ‖ external_nullifier (all 32-byte LE) — 289 bytes total. The
-  spec struct's `proof[128]` is bytes `0..128`; its `share_x` is the
-  circuit's signal hash `x`, `share_y` is `y`.
-- `validate_proof` accepts **either** shape: the object above (canonical bytes
-  trusted, decoded fields ignored), or the spec's decomposed struct — `proof`
-  as the bare 128-byte Groth16 hex plus the five field values — which is what
-  a shim reassembles from fields carried in its own network message format.
-  Both land in the identical verified representation.
+- `share_x` is the circuit's signal hash `x`, `share_y` is `y`; `epoch` is
+  the spec's `epoch[32]` (the u64 `epoch_index` alongside is a convenience,
+  as is the spent `message_id` and the local `membership_hash` — from_json
+  tolerates and ignores all three).
+- `validate_proof` accepts this shape AND the pre-0.6.0 canonical-blob form
+  (`proof` = zerokit's full `RLNProof` LE serialization: proof[128] ‖ mode
+  tag ‖ y ‖ root ‖ nullifier ‖ x ‖ external_nullifier — 289 bytes; canonical
+  bytes trusted, decoded fields ignored). A decomposed proof is rebuilt and
+  re-serialized, so both shapes land in the identical verified
+  representation. `epoch` may cross as the 32-byte LE hex or the u64 index.
 - Frozen byte-exact vectors (identity derivation, external nullifier, signal
   hash, public values, layout): `rust-lib/src/proof.rs`,
   `proof::tests::frozen_interop_vectors`.
@@ -197,7 +203,7 @@ namespace (its registry keeps no recoverable deposit).
 ## Epoch semantics
 
 - `epoch = floor(unix_seconds / epoch_size_sec)`, a `u64` index on this wire
-  (the `"epoch"` reply field and `get_epoch_quota`'s `epoch_index`). Inside
+  (the `"epoch_index"` reply fields). Inside
   the crypto it is the spec's `epoch[32]`: the index as a 32-byte
   little-endian integer (logos-delivery's `toEpoch`), and
   `external_nullifier = poseidon(hash_to_field_le(epoch[32]),
@@ -209,6 +215,9 @@ namespace (its registry keeps no recoverable deposit).
   `not_ready` rather than improvise an epoch base. It is an
   **application parameter** — every
   proof generator and verifier of a deployment must configure the same value.
+  Both it and `max_epoch_gap` are per-REGISTRY (spec): a `registries` entry
+  may override the instance defaults for its registry, and every
+  epoch-dependent call resolves the values by the scope's registry.
 - `validate_proof` enforces application binding + epoch agreement + freshness:
   the expected epoch derives from the supplied message `timestamp`; the
   proof's carried epoch, when present, must equal it; the proof's external
@@ -240,15 +249,22 @@ log:
 
 ## RegistryOptions (`options_json`)
 
-The spec's flat `{key, value}` options translate to a JSON object:
+The spec's `RegistryOptions` pair list crosses the wire verbatim as a JSON
+ARRAY of `{"key": "<tstr>", "value": "<tstr>"}` entries — every value a
+string (`char*` pairs), a non-string value, a non-array `options_json`, or a
+duplicate key is `invalid_argument`. The common key `rate_limit` (decimal
+string) requests the per-epoch rate; ABSENT, the module applies
+`DEFAULT_RATE_LIMIT` (= 100) — the lez registry declares no default yet
+(planned as a registry-declared parameter in logos-lez-rln). The remaining
+keys are registry-specific:
 
-- **`logos` namespace, direct**: `{"funding_holding_account_id": "<account>"}` —
-  the holding that pays `rate_limit × price_per_unit`.
+- **`logos` namespace, direct**: `{"key":"funding_holding_account_id",
+  "value":"<account>"}` — the holding that pays `rate_limit ×
+  price_per_unit`.
 - **`logos` namespace, delegated** (RLN Membership Allocation Protocol):
-  `{"delegated": "true", "gifter_peer_id": …, "gifter_multiaddr": …,
-  "auth_type"?, "auth_payload"?, "auth_provider"?, "auth_args"?}` — all
-  values are strings, per the spec's flat `char*` pairs. register drives
-  `rln_gifter_module` with the module-generated commitment.
+  `delegated`=`"true"` plus `gifter_peer_id`, `gifter_multiaddr` and the
+  optional `auth_type`/`auth_payload`/`auth_provider`/`auth_args` pairs.
+  register drives `rln_gifter_module` with the module-generated commitment.
 
   The auth surface is fully vector-agnostic — this module knows **no vector
   by name**. `auth_type` names the gifter auth vector verbatim in the wire's
@@ -267,21 +283,28 @@ The spec's flat `{key, value}` options translate to a JSON object:
   Rejected as `invalid_argument` **before a credential is minted** (the
   gifter client's own rules, checked early): payload material without
   `auth_type`; a named vector with no payload source, or with both at once;
-  a non-hex `auth_payload`; auth options on the funded (non-delegated) path;
-  a JSON boolean for `delegated` (or any non-string auth value) rather than
-  silently coerced.
+  a non-hex `auth_payload`; auth options on the funded (non-delegated) path.
+  Non-string values never coerce — they are rejected at the array binding
+  ("value for '<key>' must be a string").
 
 ## start() config
 
 ```json
 {
   "epoch_size_sec": 600,
-  "registries": ["logos:testnet:<64-hex>"]
+  "max_epoch_gap": 1,
+  "registries": [
+    "logos:testnet:<64-hex>",
+    { "registry_id": "logos:local:<64-hex>", "epoch_size_sec": 120, "max_epoch_gap": 2 }
+  ]
 }
 ```
 
 Listed registries get their valid-root windows warmed immediately
-(`epoch_size_sec` is required — see Epoch semantics). There is no
+(`epoch_size_sec` is required — see Epoch semantics). A `registries` entry
+is either a CAIP-10 string or an object overriding `epoch_size_sec` /
+`max_epoch_gap` for that registry; the reply echoes active overrides under
+an `overrides` key. There is no
 default-scope key: every other method takes its
 `(registry_id, rln_identifier_hex)` scope explicitly. `stop()` tears the
 maintenance workers down: sleeping workers join within a ~200 ms grace; a

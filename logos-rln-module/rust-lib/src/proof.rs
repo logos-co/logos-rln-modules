@@ -97,6 +97,10 @@ pub(crate) struct RateLimitProof {
     epoch: Option<u64>,
 }
 
+/// The compressed Groth16 proof's byte length — the spec's `proof[128]`,
+/// and the canonical zerokit serialization's leading segment.
+const GROTH16_LEN: usize = 128;
+
 impl RateLimitProof {
     /// Bundle the Groth16 proof with its public values and capture both the
     /// canonical bytes and the decoded field view. `epoch` is `None` here —
@@ -132,13 +136,15 @@ impl RateLimitProof {
         self.root
     }
 
-    /// The spec `RateLimitProof` as a JSON object: `proof` is the canonical
-    /// hex the consumer round-trips unchanged, the rest a decoded view.
-    /// `epoch` (the spec's `epoch[32]`, 32-byte LE hex) is present only when
-    /// this proof carries one.
+    /// The spec `RateLimitProof` as a JSON object — the DECOMPOSED shape:
+    /// `proof` is the bare compressed Groth16 proof (spec `proof[128]`),
+    /// and `root`/`external_nullifier`/`share_x`/`share_y`/`nullifier` carry
+    /// the public values. `epoch` (the spec's `epoch[32]`, 32-byte LE hex)
+    /// is present only when this proof carries one. [`Self::from_json`]
+    /// accepts this shape and the pre-0.6.0 canonical-blob form alike.
     pub(crate) fn to_json(&self) -> serde_json::Value {
         let mut out = serde_json::json!({
-            "proof": bytes_to_hex(&self.canonical),
+            "proof": bytes_to_hex(&self.canonical[..GROTH16_LEN.min(self.canonical.len())]),
             "root": bytes_to_hex(&self.root),
             "external_nullifier": bytes_to_hex(&self.external_nullifier),
             "share_x": bytes_to_hex(&self.share_x),
@@ -176,7 +182,6 @@ impl RateLimitProof {
         let bytes = hex_to_vec(proof_hex)
             .ok_or_else(|| ProofError::BadInput("proof: not valid hex".into()))?;
 
-        const GROTH16_LEN: usize = 128;
         let canonical: Vec<u8> = if bytes.len() == GROTH16_LEN {
             // Spec-struct shape: rebuild the zerokit proof around the bare
             // Groth16 proof and re-serialize it into the canonical form.
@@ -634,12 +639,11 @@ mod tests {
             "cbf8daa2f4d16e31165c6789a738681b0871a5cc775206af276ad4295e185e1e"
         );
 
-        // Canonical serialization layout (zerokit's `RLNProof` LE format):
-        // the 128-byte compressed Groth16 proof, the Single-mode tag byte,
-        // then the 160-byte LE public values — 289 bytes total.
-        let canonical = hex_to_vec(j["proof"].as_str().unwrap()).unwrap();
-        assert_eq!(canonical.len(), 289);
-        assert_eq!(canonical[128], 0x00);
+        // The spec's proof[128]: to_json emits the bare compressed Groth16
+        // proof (the canonical zerokit blob's leading segment); the public
+        // values travel as the decomposed fields asserted above.
+        let bare = hex_to_vec(j["proof"].as_str().unwrap()).unwrap();
+        assert_eq!(bare.len(), 128);
     }
 
     #[test]
@@ -698,12 +702,11 @@ mod tests {
         let root = proof.root();
         let j = proof.to_json();
 
-        // Slice the bare Groth16 proof out of the canonical bytes — exactly
-        // what the spec's proof[128] carries.
-        let canonical = hex_to_vec(j["proof"].as_str().unwrap()).unwrap();
-        let bare = bytes_to_hex(&canonical[..128]);
+        // to_json now IS the decomposed spec shape — proof[128] plus the
+        // five public values; reassemble from the fields a consumer would
+        // carry in its own network message.
         let decomposed = serde_json::json!({
-            "proof": bare,
+            "proof": j["proof"],
             "root": j["root"],
             "external_nullifier": j["external_nullifier"],
             "share_x": j["share_x"],

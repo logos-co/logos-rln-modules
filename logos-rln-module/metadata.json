@@ -1,7 +1,7 @@
 {
   "name": "liblogos_rln_module",
   "display_name": "RLN Module",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Registry-agnostic RLN membership management (RLN-MEMBERSHIP-MANAGEMENT)",
   "author": "Logos Blockchain Team",
   "type": "core",

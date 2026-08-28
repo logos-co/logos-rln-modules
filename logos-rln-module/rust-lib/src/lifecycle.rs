@@ -21,7 +21,18 @@ pub(crate) enum MembershipState {
     Active,
     GracePeriod,
     Expired,
+    /// Spec MEMBERSHIP_ERASED_AWAITS_WITHDRAWAL: removed, deposit still
+    /// recoverable. In the vocabulary for spec completeness — the logos
+    /// registry exposes no recoverable-deposit state, so the provider never
+    /// reports it today.
+    ErasedAwaitsWithdrawal,
     Erased,
+    /// Spec MEMBERSHIP_SLASHED: removed by slashing, identity secret
+    /// publicly revealed. In the vocabulary for spec completeness — the
+    /// logos registry does not expose slashing as a removal cause, so
+    /// removals surface as `Erased` (spec-sanctioned) and the provider
+    /// never reports this today.
+    Slashed,
 }
 
 impl MembershipState {
@@ -38,9 +49,19 @@ impl MembershipState {
     }
 
     /// Ever observed on the registry — the "was Active, now gone → erased"
-    /// inference's building block (see `merge_state`).
+    /// inference's building block (see `merge_state`). The removal states
+    /// (`ErasedAwaitsWithdrawal`, `Erased`, `Slashed`) all imply a prior
+    /// registry sighting.
     pub(crate) fn is_active_like(self) -> bool {
-        matches!(self, Self::Active | Self::GracePeriod | Self::Expired | Self::Erased)
+        matches!(
+            self,
+            Self::Active
+                | Self::GracePeriod
+                | Self::Expired
+                | Self::ErasedAwaitsWithdrawal
+                | Self::Erased
+                | Self::Slashed
+        )
     }
 }
 
