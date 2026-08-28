@@ -1,8 +1,8 @@
 //! OS-keychain auto-unlock: generate-or-fetch the keystore password from the
 //! macOS Keychain so a GUI can unlock without prompting. The keystore itself
 //! is untouched — `Store::unlock` stays the single verification seam
-//! (BadPassword on MAC mismatch, adopt-on-empty), this module only decides
-//! WHERE the password comes from.
+//! (bad_password from the constant-time verifier, adopt-on-empty), this
+//! module only decides WHERE the password comes from.
 //!
 //! Backend: the `/usr/bin/security` CLI (absolute path — env -i'd daemons
 //! strip PATH; env otherwise inherited because the login keychain needs
@@ -21,7 +21,8 @@
 //! orphans its credentials — the user never saw the secret.
 
 use crate::registry_id;
-use crate::{store, ApiError, ErrorKind};
+use crate::sealed_store::store as sealed;
+use crate::{ApiError, ErrorKind};
 use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 use zeroize::Zeroizing;
@@ -173,7 +174,8 @@ fn keychain_err(message: &str) -> ApiError {
 /// persist FIRST) the session password from the keychain, then unlock
 /// through the store's normal verification seam.
 pub(crate) fn auto_unlock_impl() -> Result<serde_json::Value, ApiError> {
-    let dir = store::with_store(|s| Ok(s.base_dir().to_string_lossy().into_owned()))?;
+    let store = sealed::current_or_uninit()?;
+    let dir = store.base_dir().to_string_lossy().into_owned();
     let account = account_for_dir(&dir);
 
     let existing = with_backend(|k| k.read(SERVICE, &account)).map_err(|e| keychain_err(&e))?;
@@ -186,7 +188,7 @@ pub(crate) fn auto_unlock_impl() -> Result<serde_json::Value, ApiError> {
             String::from_utf8(bytes.to_vec())
                 .map_err(|_| keychain_err("keychain item payload is not a utf-8 password"))?,
         );
-        let count = store::with_store(|s| s.unlock(&password))?;
+        let count = store.unlock(&password)?;
         return Ok(serde_json::json!({
             "membership_count": count,
             "secret": password.as_str(),
@@ -198,9 +200,11 @@ pub(crate) fn auto_unlock_impl() -> Result<serde_json::Value, ApiError> {
     // No item. Inventing a secret over an existing keystore would guarantee
     // bad_password forever — require one manual unlock instead (which then
     // remembers itself).
-    if store::with_store(|s| Ok(s.has_credentials()))? {
+    if store.has_credentials() {
         return Err(keychain_err(
-            "no keychain item, but the keystore already has credentials — unlock manually once and it will be remembered",
+            "no keychain item, but the keystore already has credentials — unlock manually once \
+             (restoring the keystore files from a backup first if entries are quarantined) and \
+             it will be remembered",
         ));
     }
 
@@ -213,7 +217,7 @@ pub(crate) fn auto_unlock_impl() -> Result<serde_json::Value, ApiError> {
     // reached the keychain would be a guaranteed future lockout.
     with_backend(|k| k.write(SERVICE, &account, &payload))
         .map_err(|e| keychain_err(&format!("could not save the generated secret: {e}")))?;
-    let count = store::with_store(|s| s.unlock(&secret))?;
+    let count = store.unlock(&secret)?;
     Ok(serde_json::json!({
         "membership_count": count,
         "secret": secret.as_str(),
@@ -226,10 +230,9 @@ pub(crate) fn auto_unlock_impl() -> Result<serde_json::Value, ApiError> {
 /// next launch unlocks silently — the manual-to-auto migration hook. The
 /// plaintext never re-crosses the wire; it is read from the store here.
 pub(crate) fn remember_impl() -> Result<serde_json::Value, ApiError> {
-    let (dir, password) = store::with_store(|s| {
-        Ok((s.base_dir().to_string_lossy().into_owned(), s.session_password()))
-    })?;
-    let password = password.ok_or_else(|| {
+    let store = sealed::current_or_uninit()?;
+    let dir = store.base_dir().to_string_lossy().into_owned();
+    let password = store.session_password().ok_or_else(|| {
         ApiError::new(ErrorKind::Locked, "keystore is locked — unlock before remembering")
     })?;
     let account = account_for_dir(&dir);
@@ -271,6 +274,7 @@ mod tests {
         items: Arc<Mutex<HashMap<String, String>>>,
         fail_writes: Arc<AtomicBool>,
         dir: std::path::PathBuf,
+        store: Arc<sealed::Store>,
     }
 
     fn setup(tag: &str) -> Fixture {
@@ -282,12 +286,13 @@ mod tests {
         }));
         let dir = std::env::temp_dir().join(format!("rln-ms-keychain-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        store::init(dir.clone());
-        Fixture { items, fail_writes, dir }
+        let store = crate::publish_test_store(dir.clone());
+        Fixture { items, fail_writes, dir, store }
     }
 
     fn teardown(fixture: &Fixture) {
         reset_backend_for_tests();
+        sealed::publish(None);
         let _ = std::fs::remove_dir_all(&fixture.dir);
     }
 
@@ -307,39 +312,29 @@ mod tests {
     /// A stored credential so unlock() actually verifies (empty keystores
     /// adopt any password).
     fn store_credential(password: &str) {
-        store::with_store(|s| {
-            s.unlock(password)?;
-            let meta = store::MembershipMeta {
-                allocations: Vec::new(),
-                failed_reason: None,
-                identity_commitment: "11".repeat(32),
-                leaf_index: 7,
-                rate_limit: 300,
-                registry_id: format!("logos:local:{}", "ab".repeat(32)),
-                retryable: None,
-                rln_identifier: String::new(),
-                state: store::MembershipState::Active,
-                state_history: vec![],
-                submitted_at: 1,
-                tx_result: None,
-            };
-            let credential = store::StoredCredential {
-                identity_commitment: "11".repeat(32),
-                identity_nullifier: None,
-                identity_secret_hash: "22".repeat(32),
-                identity_trapdoor: None,
-                registry_id: format!("logos:local:{}", "ab".repeat(32)),
-            };
-            s.insert(&"cd".repeat(32), meta, &credential)?;
-            s.lock();
-            Ok(())
-        })
-        .expect("fixture credential");
+        let store = sealed::current().expect("published test store");
+        store.unlock(password).expect("fixture unlock");
+        let registry = format!("logos:local:{}", "ab".repeat(32));
+        let identity = crate::sealed_store::format::IdentityBlock {
+            registry_id: registry.clone(),
+            rln_identifier: String::new(),
+            identity_commitment: "11".repeat(32),
+            submitted_at: 1,
+        };
+        let credential = crate::lifecycle::StoredCredential {
+            identity_commitment: "11".repeat(32),
+            identity_nullifier: None,
+            identity_secret_hash: "22".repeat(32),
+            identity_trapdoor: None,
+            registry_id: registry,
+        };
+        store.insert(&"cd".repeat(32), identity, &credential).expect("fixture credential");
+        store.lock();
     }
 
     #[test]
     fn fresh_create_then_relaunch_reuses_the_item() {
-        let _serial = crate::lock(&store::TEST_STORE_LOCK);
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         let fixture = setup("fresh");
 
         let first = auto_unlock_impl().expect("fresh auto-unlock");
@@ -355,8 +350,8 @@ mod tests {
         );
 
         // Relaunch: same dir, fresh store — the item is reused, not recreated.
-        store::reset_for_tests();
-        store::init(fixture.dir.clone());
+        fixture.store.close();
+        let _relaunched = crate::publish_test_store(fixture.dir.clone());
         let second = auto_unlock_impl().expect("relaunch auto-unlock");
         assert_eq!(second["source"], "existing");
         assert_eq!(second["secret"].as_str(), Some(secret.as_str()));
@@ -366,7 +361,7 @@ mod tests {
 
     #[test]
     fn existing_item_unlocks_a_matching_keystore() {
-        let _serial = crate::lock(&store::TEST_STORE_LOCK);
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         let fixture = setup("match");
         store_credential("pw-manual");
         seed_item(&fixture, "pw-manual");
@@ -381,14 +376,14 @@ mod tests {
 
     #[test]
     fn mismatched_item_is_bad_password_and_stays_locked() {
-        let _serial = crate::lock(&store::TEST_STORE_LOCK);
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         let fixture = setup("mismatch");
         store_credential("pw-real");
         seed_item(&fixture, "pw-wrong");
 
         let err = auto_unlock_impl().unwrap_err();
         assert!(err.to_json().contains(r#""kind":"bad_password""#), "got: {}", err.to_json());
-        let locked = store::with_store(|s| Ok(s.session_password().is_none())).unwrap();
+        let locked = fixture.store.session_password().is_none();
         assert!(locked, "a failed auto-unlock must leave the store locked");
 
         teardown(&fixture);
@@ -396,7 +391,7 @@ mod tests {
 
     #[test]
     fn missing_item_with_credentials_never_invents_a_secret() {
-        let _serial = crate::lock(&store::TEST_STORE_LOCK);
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         let fixture = setup("no-item");
         store_credential("pw-manual");
 
@@ -413,7 +408,7 @@ mod tests {
 
     #[test]
     fn foreign_payload_is_keychain_unavailable() {
-        let _serial = crate::lock(&store::TEST_STORE_LOCK);
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         let fixture = setup("foreign");
         let account = account_for_dir(&fixture.dir.to_string_lossy());
         crate::lock(&fixture.items)
@@ -431,20 +426,20 @@ mod tests {
 
     #[test]
     fn remember_requires_unlock_then_persists_and_overwrites() {
-        let _serial = crate::lock(&store::TEST_STORE_LOCK);
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         let fixture = setup("remember");
 
         let err = remember_impl().unwrap_err();
         assert!(err.to_json().contains(r#""kind":"locked""#), "got: {}", err.to_json());
 
-        store::with_store(|s| s.unlock("pw-one")).unwrap();
+        fixture.store.unlock("pw-one").unwrap();
         assert_eq!(remember_impl().unwrap().to_string(), r#"{"remembered":true}"#);
         assert_eq!(
             item_payload(&fixture).unwrap(),
             registry_id::bytes_to_hex("pw-one".as_bytes())
         );
 
-        store::with_store(|s| s.unlock("pw-two")).unwrap();
+        fixture.store.unlock("pw-two").unwrap();
         remember_impl().unwrap();
         assert_eq!(
             item_payload(&fixture).unwrap(),
@@ -457,9 +452,9 @@ mod tests {
 
     #[test]
     fn no_store_reports_internal() {
-        let _serial = crate::lock(&store::TEST_STORE_LOCK);
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         reset_backend_for_tests();
-        store::reset_for_tests();
+        sealed::publish(None);
         let err = auto_unlock_impl().unwrap_err();
         assert!(err.to_json().contains(r#""kind":"internal""#), "got: {}", err.to_json());
         let err = remember_impl().unwrap_err();
@@ -468,7 +463,7 @@ mod tests {
 
     #[test]
     fn backend_failure_maps_to_keychain_unavailable() {
-        let _serial = crate::lock(&store::TEST_STORE_LOCK);
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         let fixture = setup("denied");
         fixture.fail_writes.store(true, Ordering::SeqCst);
 
@@ -480,7 +475,7 @@ mod tests {
             "got: {}",
             err.to_json()
         );
-        let locked = store::with_store(|s| Ok(s.session_password().is_none())).unwrap();
+        let locked = fixture.store.session_password().is_none();
         assert!(locked, "write-before-unlock: denied write must not unlock");
 
         teardown(&fixture);

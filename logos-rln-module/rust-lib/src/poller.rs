@@ -29,10 +29,11 @@
 
 use std::time::Duration;
 
+use crate::lifecycle::{self, MembershipRecord, MembershipState, CONFIRMATION_WINDOW_SECS};
 use crate::path_cache;
 use crate::provider::provider_for;
 use crate::registry_id;
-use crate::store::{self, MembershipMeta, MembershipState, CONFIRMATION_WINDOW_SECS};
+use crate::sealed_store::store as sealed;
 use crate::worker;
 
 const TICK: Duration = Duration::from_secs(15);
@@ -65,16 +66,19 @@ pub(crate) fn run_loop(my_gen: u64) {
 
 /// One registry read for one record; returns the update to apply, or None
 /// to leave the record untouched (provider failure).
-fn observe(meta: &MembershipMeta) -> Option<RecordUpdate> {
-    let registry = match registry_id::parse(&meta.registry_id) {
+fn observe(record: &MembershipRecord) -> Option<RecordUpdate> {
+    let registry = match registry_id::parse(&record.identity.registry_id) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("membership poller: bad stored registry_id {}: {e}", meta.registry_id);
+            eprintln!(
+                "membership poller: bad stored registry_id {}: {e}",
+                record.identity.registry_id
+            );
             return None;
         }
     };
     let provider = provider_for(&registry.namespace)?;
-    match provider.get_membership(&registry, &meta.identity_commitment) {
+    match provider.get_membership(&registry, &record.identity.identity_commitment) {
         Ok(pm) if pm.registered => Some(RecordUpdate::Observed {
             state: pm.state,
             leaf_index: pm.leaf_index,
@@ -84,7 +88,7 @@ fn observe(meta: &MembershipMeta) -> Option<RecordUpdate> {
         Err(e) => {
             eprintln!(
                 "membership poller: {} read failed: {}",
-                meta.registry_id, e.message
+                record.identity.registry_id, e.message
             );
             None
         }
@@ -109,26 +113,24 @@ fn apply_observed(
     leaf_index: u64,
     rate_limit: u64,
 ) -> Result<(), crate::ApiError> {
-    store::with_store(|s| {
-        s.update(hash, |m| {
-            m.state = state;
-            m.leaf_index = leaf_index;
-            m.rate_limit = rate_limit;
-            m.failed_reason = None;
-            m.retryable = None;
-        })
+    sealed::current_or_uninit()?.update_cache(hash, |m| {
+        m.state = state;
+        m.leaf_index = Some(leaf_index);
+        m.rate_limit = Some(rate_limit);
+        m.failed_reason = None;
+        m.retryable = None;
     })
 }
 
 /// Fire `membership_state_changed` (module docs: LIDL events section) after
-/// a successful, change-gated store write — called OUTSIDE any
-/// `store::with_store` closure, holding no locks. `meta` is the
-/// pre-transition snapshot the caller already had in hand from
-/// `pending_records`/`refreshable_records`; `store::transition_event`
-/// no-ops when `new_state` didn't actually change anything.
-fn emit_transition(hash: &str, meta: &MembershipMeta, new_state: MembershipState) {
+/// a successful, change-gated store write — called with no store lock held.
+/// `record` is the pre-transition snapshot the caller already had in hand
+/// from `pending_records`/`refreshable_records`;
+/// `lifecycle::transition_event` no-ops when `new_state` didn't actually
+/// change anything.
+fn emit_transition(hash: &str, record: &MembershipRecord, new_state: MembershipState) {
     if let Some((registry_id, rln_identifier, membership_hash, state, previous)) =
-        store::transition_event(hash, meta, new_state)
+        lifecycle::transition_event(hash, record, new_state)
     {
         crate::emit_membership_state_changed(
             &registry_id,
@@ -144,32 +146,34 @@ fn tick(refresh_states: bool) {
     if crate::worker::is_stopped() {
         return;
     }
-    let pending = match store::with_store(|s| Ok(s.pending_records())) {
-        Ok(records) => records,
+    let pending = match sealed::current() {
+        Some(store) => store.pending_records(),
         // Store not initialized (no persistence path) — nothing to poll.
-        Err(_) => return,
+        None => return,
     };
     let now = crate::now_unix();
-    for (hash, meta) in pending {
-        match observe(&meta) {
+    for record in pending {
+        let hash = &record.hash;
+        match observe(&record) {
             Some(RecordUpdate::Observed {
                 state,
                 leaf_index,
                 rate_limit,
-            }) => match apply_observed(&hash, state, leaf_index, rate_limit) {
+            }) => match apply_observed(hash, state, leaf_index, rate_limit) {
                 Err(e) => {
                     eprintln!("membership poller: confirm update failed: {}", e.message)
                 }
                 Ok(()) => {
-                    emit_transition(&hash, &meta, state);
+                    emit_transition(hash, &record, state);
                     eprintln!("membership poller: {hash} confirmed {state:?} at leaf {leaf_index}")
                 }
             },
             Some(RecordUpdate::Absent)
-                if now.saturating_sub(meta.submitted_at) > CONFIRMATION_WINDOW_SECS =>
+                if now.saturating_sub(record.identity.submitted_at)
+                    > CONFIRMATION_WINDOW_SECS =>
             {
-                let result = store::with_store(|s| {
-                    s.update(&hash, |m| {
+                let result = sealed::current_or_uninit().and_then(|s| {
+                    s.update_cache(hash, |m| {
                         m.state = MembershipState::Failed;
                         m.failed_reason = Some("confirmation_window_elapsed".to_string());
                         // Re-registration can be attempted (spec: a failed
@@ -180,7 +184,7 @@ fn tick(refresh_states: bool) {
                 if let Err(e) = result {
                     eprintln!("membership poller: fail update failed: {}", e.message);
                 } else {
-                    emit_transition(&hash, &meta, MembershipState::Failed);
+                    emit_transition(hash, &record, MembershipState::Failed);
                     eprintln!("membership poller: {hash} failed (window elapsed)");
                 }
             }
@@ -191,29 +195,31 @@ fn tick(refresh_states: bool) {
     if !refresh_states {
         return;
     }
-    let refreshable = match store::with_store(|s| Ok(s.refreshable_records())) {
-        Ok(records) => records,
-        Err(_) => return,
+    let refreshable = match sealed::current() {
+        Some(store) => store.refreshable_records(),
+        None => return,
     };
-    for (hash, meta) in refreshable {
-        match observe(&meta) {
+    for record in refreshable {
+        let hash = &record.hash;
+        match observe(&record) {
             Some(RecordUpdate::Observed { state, leaf_index, rate_limit }) => {
-                if apply_observed(&hash, state, leaf_index, rate_limit).is_ok() {
-                    emit_transition(&hash, &meta, state);
+                if apply_observed(hash, state, leaf_index, rate_limit).is_ok() {
+                    emit_transition(hash, &record, state);
                 }
             }
             Some(RecordUpdate::Absent) => {
                 // Was on the registry (state ∈ active/grace/expired), now
                 // gone: erased/slashed. Consumers MUST stop using it.
-                let updated = store::with_store(|s| {
-                    s.update(&hash, |m| {
-                        m.state = MembershipState::Erased;
-                        m.failed_reason = Some("removed_from_registry".to_string());
+                let updated = sealed::current_or_uninit()
+                    .and_then(|s| {
+                        s.update_cache(hash, |m| {
+                            m.state = MembershipState::Erased;
+                            m.failed_reason = Some("removed_from_registry".to_string());
+                        })
                     })
-                })
-                .is_ok();
+                    .is_ok();
                 if updated {
-                    emit_transition(&hash, &meta, MembershipState::Erased);
+                    emit_transition(hash, &record, MembershipState::Erased);
                 }
                 eprintln!("membership poller: {hash} vanished from registry — erased");
             }
@@ -232,20 +238,29 @@ pub(crate) fn refresh_paths() {
     if crate::worker::is_stopped() {
         return;
     }
-    let usable = match store::with_store(|s| Ok(s.refreshable_records())) {
-        Ok(records) => records,
-        Err(_) => return,
+    let usable = match sealed::current() {
+        Some(store) => store.refreshable_records(),
+        None => return,
     };
-    for (hash, meta) in usable.into_iter().filter(|(_, m)| m.state.is_usable()) {
-        let registry = match registry_id::parse(&meta.registry_id) {
+    for record in usable.into_iter().filter(|r| r.cache.state.is_usable()) {
+        let hash = &record.hash;
+        let registry = match registry_id::parse(&record.identity.registry_id) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("membership poller: bad stored registry_id {}: {e}", meta.registry_id);
+                eprintln!(
+                    "membership poller: bad stored registry_id {}: {e}",
+                    record.identity.registry_id
+                );
                 continue;
             }
         };
         let Some(provider) = provider_for(&registry.namespace) else { continue };
-        if let Err(e) = path_cache::fill_path_cache(&registry, &hash, meta.leaf_index, provider) {
+        if let Err(e) = path_cache::fill_path_cache(
+            &registry,
+            hash,
+            record.cache.leaf_index.unwrap_or(0),
+            provider,
+        ) {
             // Keep the previous cache entry — a slightly-stale but still
             // verifiable path beats none.
             eprintln!("membership poller: {hash} path refresh failed: {}", e.message);

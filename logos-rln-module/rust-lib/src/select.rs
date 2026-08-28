@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::store::MembershipRecord;
+use crate::lifecycle::MembershipRecord;
 use crate::{lock, ApiError, ErrorKind};
 
 pub(crate) enum Selector {
@@ -63,8 +63,8 @@ pub(crate) fn select_hash(
 ) -> Result<String, ApiError> {
     let mut candidates: Vec<(&str, u64)> = records
         .iter()
-        .filter(|r| !r.quarantined && r.meta.state.is_usable())
-        .map(|r| (r.hash.as_str(), r.meta.rate_limit))
+        .filter(|r| !r.quarantined && r.cache.state.is_usable())
+        .map(|r| (r.hash.as_str(), r.cache.rate_limit.unwrap_or(0)))
         .collect();
     // Hash order makes every strategy deterministic and churn-stable.
     candidates.sort_by(|a, b| a.0.cmp(b.0));
@@ -126,25 +126,23 @@ pub(crate) fn select_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{MembershipMeta, MembershipState};
+    use crate::lifecycle::{CacheState, MembershipState};
 
     fn record(hash: &str, state: MembershipState, rate: u64, quarantined: bool) -> MembershipRecord {
         MembershipRecord {
             hash: hash.to_string(),
-            meta: MembershipMeta {
-                allocations: Vec::new(),
-                failed_reason: None,
-                identity_commitment: "11".repeat(32),
-                leaf_index: 0,
-                rate_limit: rate,
+            identity: crate::sealed_store::format::IdentityBlock {
                 registry_id: "logos:local:aa".to_string(),
-                retryable: None,
                 rln_identifier: String::new(),
-                state,
-                state_history: vec![],
+                identity_commitment: "11".repeat(32),
                 submitted_at: 0,
-                tx_result: None,
             },
+            cache: CacheState {
+                state,
+                rate_limit: Some(rate),
+                ..CacheState::default()
+            },
+            alloc: crate::rate_limit::AllocationState::default(),
             quarantined,
         }
     }

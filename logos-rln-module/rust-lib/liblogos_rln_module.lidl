@@ -3,7 +3,7 @@
 ; docs/anoncomms/raw/). Registry-agnostic membership management AND rate
 ; limiting: CAIP-10 registry ids routed per namespace to a registry
 ; provider; identity credentials generated in-module, held in an encrypted
-; keystore (WAKU-RLN-KEYSTORE format), and never released across this wire;
+; keystore, and never released across this wire;
 ; lifecycle tracked with a bounded Pending confirmation window; RLN proof
 ; generation with persisted per-epoch message_id allocation; verification
 ; from a locally maintained valid-root window (no registry access on the
@@ -41,7 +41,7 @@
 ; Events are a third channel, pushed over the lp event stream rather than
 ; returned from a call — see the events section below.
 module liblogos_rln_module {
-  version "0.4.0"
+  version "0.5.0"
   description "RLN Membership Management Module"
   category "blockchain"
   depends [liblogos_lez_rln_module]
@@ -122,12 +122,12 @@ module liblogos_rln_module {
   }
 
   ; Open (create-if-absent) the keystore at the instance persistence path
-  ; and hold the session password in memory (needed to write credentials on
-  ; register and decrypt them on select). {"membership_count":N,
-  ; "unlocked":true}; bad_password when an existing credential envelope
-  ; fails its MAC under this password. Reads (get_memberships,
-  ; get_membership_state) work without unlocking — the sidecar metadata is
-  ; plaintext-safe by design.
+  ; and hold the session password in memory (needed to seal credentials on
+  ; register and unseal them on generate_proof). {"membership_count":N,
+  ; "unlocked":true}; bad_password when the password fails the keystore's
+  ; constant-time verifier. Reads (get_memberships, get_membership_state)
+  ; work without unlocking — the identity and counter metadata is
+  ; plaintext-readable by design.
   method unlock_keystore(password: tstr) -> tstr
 
   ; Drop the session password (zeroized). Lifecycle polling continues — it
@@ -222,7 +222,10 @@ module liblogos_rln_module {
   ; index), and the "membership_hash". Errors: no_usable_membership,
   ; ambiguous_selection (multiple; select first), locked, budget_exhausted
   ; (epoch rate limit spent), invalid_argument (bad signal/timestamp, or a
-  ; timestamp whose epoch is outside now ± max_epoch_gap), transient.
+  ; timestamp whose epoch is outside now ± max_epoch_gap), permanent (the
+  ; epoch is below the persisted allocation floor — a backwards clock step or
+  ; widened max_epoch_gap — or epoch_size_sec differs from the size this
+  ; membership's allocations are bound to; re-register to recover), transient.
   method generate_proof(registry_id: tstr, rln_identifier_hex: tstr, signal_hex: tstr, timestamp: tstr) -> result
 
   ; Spec validate_proof(scope, signal, timestamp, proof). The message hot
@@ -279,7 +282,11 @@ module liblogos_rln_module {
   ; 0 — rate_limit 0 always means "no usable membership", never an exhausted
   ; budget (disambiguate via get_membership_state). Errors:
   ; ambiguous_selection, invalid_argument (malformed timestamp, or one whose
-  ; epoch is outside the window — permanent class either way).
+  ; epoch is outside the window — permanent class either way), permanent
+  ; (the epoch is below the membership's persisted allocation floor, or the
+  ; configured epoch_size_sec differs from the one its allocations are bound
+  ; to — the same refusals generate_proof would answer, so a timestamp can
+  ; be tested before committing to it).
   method get_epoch_quota(registry_id: tstr, rln_identifier_hex: tstr, timestamp: tstr) -> result
 
   ; Registry parameters read (spec's optional extension): the

@@ -24,7 +24,7 @@ use std::thread::ThreadId;
 use std::time::Duration;
 
 use crate::registry_id::CanonicalRegistryId;
-use crate::store::MembershipState;
+use crate::lifecycle::MembershipState;
 use crate::{lock, ApiError, ErrorKind};
 
 const TARGET_MODULE: &str = "liblogos_lez_rln_module";
