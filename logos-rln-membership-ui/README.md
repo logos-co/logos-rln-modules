@@ -57,7 +57,7 @@ reference implementation `logos-package-manager-ui`):
 | GUI action | call |
 |---|---|
 | Unlock / lock keystore | `liblogos_rln_module.unlock_keystore(password)` / `lock_keystore()` |
-| Register (generates the identity in-module) | `liblogos_rln_module.register(registry_id, rln_identifier_hex, rate_limit, options_json)` with `options_json = {"funding_holding_account_id": …}`; the credential never leaves the module |
+| Register (generates the identity in-module) | `liblogos_rln_module.register(registry_id, rln_identifier_hex, options_json)` with `options_json` = the RegistryOptions array `[{"key":"rate_limit","value":"…"},{"key":"funding_holding_account_id","value":"…"}]` (built by `M.registryOptions`); the credential never leaves the module |
 | Confirmation poll | `liblogos_rln_module.get_membership_state(registry_id, rln_identifier_hex)` every 10s until the pending window settles |
 | Memberships list | `liblogos_rln_module.get_memberships(registry_id)` (public view, works locked) |
 | One-click wallet | `liblogos_rln_module.provision_wallet_home({"sequencer_addr":…})` → wallet-home under the module's basecamp data dir, then `open` when `storage_exists`, else `create_new` + `save` |

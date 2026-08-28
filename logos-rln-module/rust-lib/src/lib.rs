@@ -366,6 +366,89 @@ fn flat_str_option(options: &serde_json::Value, key: &str) -> Result<Option<Stri
     }
 }
 
+/// The logos-namespace default when the common "rate_limit" option key is
+/// absent (spec register(): "absent, the registry … applies its default").
+/// The lez registry declares no default today, so the module supplies one.
+/// TODO: investigate a registry-declared default in logos-lez-rln (surfaced
+/// via get_registry_parameters, e.g. default_rate_limit) and prefer it over
+/// this constant when present.
+const DEFAULT_RATE_LIMIT: u64 = 100;
+
+/// Parse the wire's options_json — the JSON binding of the spec's
+/// RegistryOptions: an ARRAY of {"key","value"} pairs, both strings (char*
+/// pairs in the C type, so a non-string value is a type error, never a
+/// coercion). Empty input means "no options". Duplicate keys are a caller
+/// bug and rejected. Returns the requested rate_limit (the common key,
+/// defaulted when absent/empty) and the remaining options as a flat object
+/// — the shape the option validators and the provider consume.
+fn parse_registry_options(options_json: &str) -> Result<(u64, serde_json::Value), ApiError> {
+    let trimmed = options_json.trim();
+    let entries = if trimmed.is_empty() {
+        Vec::new()
+    } else {
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(serde_json::Value::Array(a)) => a,
+            Ok(_) => {
+                return Err(ApiError::new(
+                    ErrorKind::InvalidArgument,
+                    "options_json must be a RegistryOptions array of {\"key\",\"value\"} string pairs",
+                ))
+            }
+            Err(e) => {
+                return Err(ApiError::new(
+                    ErrorKind::InvalidArgument,
+                    &format!("options_json: {e}"),
+                ))
+            }
+        }
+    };
+    let mut map = serde_json::Map::new();
+    for entry in &entries {
+        let key = match entry.get("key").and_then(|k| k.as_str()) {
+            Some(k) if !k.is_empty() => k,
+            _ => {
+                return Err(ApiError::new(
+                    ErrorKind::InvalidArgument,
+                    "every RegistryOptions entry needs a string \"key\"",
+                ))
+            }
+        };
+        let value = match entry.get("value").and_then(|v| v.as_str()) {
+            Some(v) => v,
+            None => {
+                return Err(ApiError::new(
+                    ErrorKind::InvalidArgument,
+                    &format!("RegistryOptions value for '{key}' must be a string (char* pair)"),
+                ))
+            }
+        };
+        let prior = map.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+        if prior.is_some() {
+            return Err(ApiError::new(
+                ErrorKind::InvalidArgument,
+                &format!("duplicate RegistryOptions key '{key}'"),
+            ));
+        }
+    }
+    let rate_limit = match map.remove("rate_limit") {
+        None => DEFAULT_RATE_LIMIT,
+        Some(v) => {
+            let s = v.as_str().unwrap_or_default().trim().to_string();
+            if s.is_empty() {
+                DEFAULT_RATE_LIMIT
+            } else {
+                s.parse::<u64>().ok().filter(|r| *r > 0).ok_or_else(|| {
+                    ApiError::new(
+                        ErrorKind::InvalidArgument,
+                        "rate_limit option must be a positive decimal string",
+                    )
+                })?
+            }
+        }
+    };
+    Ok((rate_limit, serde_json::Value::Object(map)))
+}
+
 /// Gifter `request` args for a delegated registration: the module-generated
 /// commitment (never the secret) plus the caller's gifter and auth-vector
 /// selection, passed through verbatim. With an auth_provider the gifter
@@ -493,32 +576,23 @@ fn register_impl(
     store: Result<&Arc<Store>, ApiError>,
     registry_id_raw: &str,
     rln_identifier_hex: &str,
-    rate_limit: i64,
     options_json: &str,
 ) -> Result<serde_json::Value, ApiError> {
     let (registry, _, rln_id_hex) = parse_scope(registry_id_raw, rln_identifier_hex)?;
     let prov = provider_of(&registry)?;
-    if rate_limit <= 0 {
-        return Err(ApiError::new(ErrorKind::InvalidArgument, "rate_limit must be positive"));
-    }
-    let rate_limit = rate_limit as u64;
 
-    // Delegated registration (spec RegistryOptions selecting the RLN
-    // Membership Allocation Protocol): a FLAT string key/value map (spec:
-    // char* pairs) — {"delegated":"true","gifter_peer_id":…,
-    // "gifter_multiaddr":…,"auth_type"?,"auth_payload"?,"auth_provider"?,
-    // "auth_args"?}. Only "delegated":"true" selects the delegated path.
-    // "auth_type" names the gifter auth vector (OPEN vocabulary); its
-    // payload comes from "auth_payload" (hex) or an "auth_provider" module,
-    // with "auth_args" forwarded verbatim. No auth_type is an
-    // unauthenticated request. Validated up front so a malformed request
-    // never mints a credential.
-    let opts = if options_json.trim().is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::from_str::<serde_json::Value>(options_json)
-            .map_err(|e| ApiError::new(ErrorKind::InvalidArgument, &format!("options_json: {e}")))?
-    };
+    // Spec register(scope, RegistryOptions): options_json is the
+    // RegistryOptions ARRAY binding; the common "rate_limit" key is lifted
+    // out here (defaulted when absent) and the remaining pairs become the
+    // flat option map. Delegated registration (selecting the RLN Membership
+    // Allocation Protocol) is the "delegated":"true" pair plus
+    // "gifter_peer_id"/"gifter_multiaddr" and the optional "auth_type"/
+    // "auth_payload"/"auth_provider"/"auth_args" vector selection (OPEN
+    // vocabulary; payload from auth_payload hex or an auth_provider module,
+    // auth_args forwarded verbatim). No auth_type is an unauthenticated
+    // request. Validated up front so a malformed request never mints a
+    // credential.
+    let (rate_limit, opts) = parse_registry_options(options_json)?;
     let delegated = if flat_bool_option(&opts, "delegated")? {
         Some(DelegatedOptions {
             gifter_peer_id: opts
@@ -670,7 +744,9 @@ fn register_impl(
         ),
         None => prov.register_async(
             &registry,
-            options_json,
+            // The provider consumes the flat option OBJECT (its wire is
+            // unchanged); the RegistryOptions array was flattened above.
+            &opts.to_string(),
             &commitment_hex,
             rate_limit,
             funded_submit_callback(Arc::downgrade(store), hash.clone()),
@@ -831,10 +907,20 @@ fn get_memberships_impl(
 /// Default `max_epoch_gap` (see [`epoch_gap`]) when `start()` sets none.
 const DEFAULT_MAX_EPOCH_GAP: u64 = 1;
 
-/// Runtime configuration applied by `start()`.
+/// A registry's deviation from the instance defaults (spec: the epoch size
+/// and the maximum epoch gap are per-REGISTRY configuration).
+#[derive(Clone, Copy, Default)]
+struct RegistryOverride {
+    epoch_size_sec: Option<u64>,
+    max_epoch_gap: Option<u64>,
+}
+
+/// Runtime configuration applied by `start()`: instance defaults plus
+/// per-registry overrides, keyed by canonical registry_id.
 struct ModuleConfig {
     epoch_size_sec: u64,
     max_epoch_gap: u64,
+    overrides: std::collections::BTreeMap<String, RegistryOverride>,
 }
 
 static CONFIG: Mutex<Option<ModuleConfig>> = Mutex::new(None);
@@ -842,7 +928,9 @@ static CONFIG: Mutex<Option<ModuleConfig>> = Mutex::new(None);
 /// The configured epoch length — an APPLICATION parameter every proof
 /// generator and verifier must share, so there is deliberately NO default:
 /// before `start()` configures it, the epoch-dependent functions fail
-/// `not_ready` (spec: RLN_ERR_NOT_READY).
+/// `not_ready` (spec: RLN_ERR_NOT_READY). Production code resolves
+/// per-registry via `epoch_size_for`; tests use this default-path view.
+#[cfg(test)]
 fn epoch_size() -> Result<u64, ApiError> {
     lock(&CONFIG).as_ref().map(|c| c.epoch_size_sec).ok_or_else(|| {
         ApiError::new(
@@ -850,6 +938,40 @@ fn epoch_size() -> Result<u64, ApiError> {
             "start() has not configured epoch_size_sec; rate limiting is not ready",
         )
     })
+}
+
+/// The epoch length in force for one registry: its start() override when
+/// given, else the instance default (spec: per-registry configuration).
+fn epoch_size_for(registry_canonical: &str) -> Result<u64, ApiError> {
+    lock(&CONFIG)
+        .as_ref()
+        .map(|c| {
+            c.overrides
+                .get(registry_canonical)
+                .and_then(|o| o.epoch_size_sec)
+                .unwrap_or(c.epoch_size_sec)
+        })
+        .ok_or_else(|| {
+            ApiError::new(
+                ErrorKind::NotReady,
+                "start() has not configured epoch_size_sec; rate limiting is not ready",
+            )
+        })
+}
+
+/// [`epoch_gap`], per registry: the start() override when given, else the
+/// instance default.
+fn epoch_gap_for(registry_canonical: &str) -> u64 {
+    lock(&CONFIG)
+        .as_ref()
+        .map(|c| {
+            c.overrides
+                .get(registry_canonical)
+                .and_then(|o| o.max_epoch_gap)
+                .unwrap_or(c.max_epoch_gap)
+        })
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_EPOCH_GAP)
 }
 
 #[cfg(test)]
@@ -860,8 +982,11 @@ pub(crate) fn reset_config_for_test() {
 /// Spec start(): apply configuration, warm the configured registries' root
 /// windows, begin maintenance, and clear any prior stop(). Idempotent —
 /// safe to call again to reconfigure. config_json:
-/// {"epoch_size_sec":N (required), "max_epoch_gap"?:N,
-/// "registries"?:["<caip10>",…]}.
+/// {"epoch_size_sec":N (required — the instance default), "max_epoch_gap"?:N,
+/// "registries"?:[<entry>,…]} where an entry is a CAIP-10 string, or an
+/// object {"registry_id":caip10, "epoch_size_sec"?:N, "max_epoch_gap"?:N}
+/// overriding the defaults for that registry (spec: epoch size and max gap
+/// are per-registry configuration).
 fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
     panic_hook::install_once();
     let cfg: serde_json::Value = if config_json.trim().is_empty() {
@@ -888,32 +1013,72 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_MAX_EPOCH_GAP);
 
-    // Warm the root window for every configured registry.
+    // Warm the root window for every configured registry; an object entry
+    // additionally carries that registry's overrides. Unparseable entries
+    // are skipped, as ever.
     let mut tracked: Vec<String> = Vec::new();
-    let mut track = |raw: &str| {
+    let mut overrides: std::collections::BTreeMap<String, RegistryOverride> =
+        std::collections::BTreeMap::new();
+    let mut track = |raw: &str, over: Option<RegistryOverride>| {
         if let Ok(registry) = registry_id::parse(raw) {
             roots::track(&registry);
+            if let Some(o) = over {
+                if o.epoch_size_sec.is_some() || o.max_epoch_gap.is_some() {
+                    overrides.insert(registry.canonical.clone(), o);
+                }
+            }
             if !tracked.contains(&registry.canonical) {
                 tracked.push(registry.canonical);
             }
         }
     };
     if let Some(arr) = cfg.get("registries").and_then(|x| x.as_array()) {
-        for r in arr.iter().filter_map(|r| r.as_str()) {
-            track(r);
+        for entry in arr {
+            match entry {
+                serde_json::Value::String(raw) => track(raw, None),
+                serde_json::Value::Object(o) => {
+                    let raw = o.get("registry_id").and_then(|x| x.as_str()).unwrap_or_default();
+                    let over = RegistryOverride {
+                        epoch_size_sec: o
+                            .get("epoch_size_sec")
+                            .and_then(|x| x.as_u64())
+                            .filter(|n| *n > 0),
+                        max_epoch_gap: o
+                            .get("max_epoch_gap")
+                            .and_then(|x| x.as_u64())
+                            .filter(|n| *n > 0),
+                    };
+                    track(raw, Some(over));
+                }
+                _ => {}
+            }
         }
     }
 
-    *lock(&CONFIG) = Some(ModuleConfig { epoch_size_sec, max_epoch_gap });
+    let overrides_view = views::start_overrides_view(
+        overrides.iter().map(|(k, o)| (k.as_str(), o.epoch_size_sec, o.max_epoch_gap)),
+    );
+    *lock(&CONFIG) = Some(ModuleConfig { epoch_size_sec, max_epoch_gap, overrides });
     // A membership whose persisted allocations are bound to a DIFFERENT
     // epoch_size_sec can no longer generate proofs (the store fails those
     // reservations `permanent`); surface that at configure time. Warn-only:
     // rejecting start() would DoS validate_proof for every scope over one
     // stale local membership. Ignore an uninitialized store (pre-context) —
     // read the published slot, exactly like the worker loops.
+    // Effective-size check is approximate under overrides: a binding that
+    // matches ANY configured size passes (the record's own registry is not
+    // threaded through epoch_size_bindings).
     if let Some(store) = sealed_store::store::current() {
+        let effective: Vec<u64> = std::iter::once(epoch_size_sec)
+            .chain(
+                lock(&CONFIG)
+                    .as_ref()
+                    .map(|c| c.overrides.values().filter_map(|o| o.epoch_size_sec).collect::<Vec<u64>>())
+                    .unwrap_or_default(),
+            )
+            .collect();
         for (hash, bound) in store.epoch_size_bindings() {
-            if bound != 0 && bound != epoch_size_sec {
+            if bound != 0 && !effective.contains(&bound) {
                 eprintln!(
                     "membership start: entry {hash} allocations are bound to \
                      epoch_size_sec={bound}, config says {epoch_size_sec}; \
@@ -937,7 +1102,7 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
         }
     });
 
-    ok_json(views::StartReply::new(epoch_size_sec, max_epoch_gap, tracked))
+    ok_json(views::StartReply::new(epoch_size_sec, max_epoch_gap, overrides_view, tracked))
 }
 
 /// Spec stop(): halt the maintenance tasks. Sleeping workers are joined
@@ -985,7 +1150,9 @@ pub(crate) fn json_u8_array(v: &serde_json::Value, key: &str) -> Result<Vec<u8>,
 /// identity secret never leaves the module. The proof's epoch derives from
 /// the caller-supplied `timestamp` (Unix seconds), NOT this module's clock,
 /// and must land within now ± `max_epoch_gap`. Returns the `RateLimitProof`
-/// plus the spent `message_id` and `epoch`.
+/// (spec shape: `proof` = compressed Groth16 proof[128], `epoch` = epoch[32]
+/// LE hex) plus the spent `message_id`, the u64 `epoch_index`, and the
+/// `membership_hash`.
 fn generate_proof_impl(
     store: Result<&Arc<Store>, ApiError>,
     registry_id_raw: &str,
@@ -996,8 +1163,10 @@ fn generate_proof_impl(
     let (registry, rln_identifier, rln_id_hex) =
         parse_scope(registry_id_raw, rln_identifier_hex)?;
     let prov = provider_of(&registry)?;
-    // Readiness gate FIRST (spec: not_ready before anything else).
-    let size = epoch_size()?;
+    // Readiness gate FIRST (spec: not_ready before anything else). Size and
+    // gap are the REGISTRY's (start() override or instance default).
+    let size = epoch_size_for(&registry.canonical)?;
+    let gap = epoch_gap_for(&registry.canonical);
     // The epoch derives from the CONSUMER's timestamp — the value stamped on
     // the message — so the receiver's timestamp->epoch check lines up by
     // construction.
@@ -1005,7 +1174,7 @@ fn generate_proof_impl(
     // A stale or future timestamp fails fast instead of minting a proof the
     // verifier would reject as not fresh.
     let now_epoch = rate_limit::current_epoch(now_unix(), size);
-    if !epoch_in_window(epoch, now_epoch) {
+    if !epoch_in_window(epoch, now_epoch, gap) {
         return Err(ApiError::new(
             ErrorKind::InvalidArgument,
             "timestamp is outside the acceptable epoch window (now ± max_epoch_gap)",
@@ -1052,7 +1221,7 @@ fn generate_proof_impl(
     // waste a slot but never reissue one. `retain_floor` is only the
     // window's CANDIDATE; the store's persisted monotone floor decides what
     // may be pruned or served.
-    let retain_floor = now_epoch.saturating_sub(epoch_gap());
+    let retain_floor = now_epoch.saturating_sub(gap);
     let message_id =
         store.reserve_message_id(&hash, &rln_id_hex, epoch, retain_floor, rate_limit, size)?;
 
@@ -1068,8 +1237,11 @@ fn generate_proof_impl(
 
     let mut out = rlp.to_json();
     if let Some(obj) = out.as_object_mut() {
+        // Extras beyond the spec struct: the spent slot, the u64 epoch index
+        // (`epoch` itself stays the spec's epoch[32] LE hex), and the local
+        // handle. Opaque to consumers, tolerated by from_json.
         obj.insert("message_id".to_string(), message_id.into());
-        obj.insert("epoch".to_string(), epoch.into());
+        obj.insert("epoch_index".to_string(), epoch.into());
         obj.insert("membership_hash".to_string(), hash.into());
     }
     Ok(out)
@@ -1079,7 +1251,9 @@ fn generate_proof_impl(
 /// current one — absorbs clock skew and propagation latency. A start()
 /// parameter (default 1); generator and verifiers must share it AND
 /// epoch_size for the binding check to line up. Also the retention floor
-/// for verification-side state keyed by epoch.
+/// for verification-side state keyed by epoch. Production code resolves
+/// per-registry via `epoch_gap_for`; tests use this default-path view.
+#[cfg(test)]
 fn epoch_gap() -> u64 {
     lock(&CONFIG)
         .as_ref()
@@ -1102,8 +1276,7 @@ fn epoch_of_timestamp(timestamp: &str, epoch_size_sec: u64) -> Result<u64, ApiEr
 
 /// The freshness window every rate-limiting method enforces: an epoch is
 /// acceptable when within now ± max_epoch_gap of the module clock.
-fn epoch_in_window(epoch: u64, now_epoch: u64) -> bool {
-    let gap = epoch_gap();
+fn epoch_in_window(epoch: u64, now_epoch: u64, gap: u64) -> bool {
     (now_epoch.saturating_sub(gap)..=now_epoch.saturating_add(gap)).contains(&epoch)
 }
 
@@ -1120,8 +1293,9 @@ fn epoch_binding_holds(
     rln_identifier: &[u8; 32],
     expected_epoch: u64,
     now_epoch: u64,
+    gap: u64,
 ) -> bool {
-    epoch_in_window(expected_epoch, now_epoch)
+    epoch_in_window(expected_epoch, now_epoch, gap)
         && carried.is_none_or(|e| e == expected_epoch)
         && proof::expected_external_nullifier(expected_epoch, rln_identifier) == *bound
 }
@@ -1161,8 +1335,10 @@ fn validate_proof_impl(
     let (registry, rln_identifier, _) = parse_scope(registry_id_raw, rln_identifier_hex)?;
     // Namespace support check only — no registry I/O on the verify path.
     provider_of(&registry)?;
-    // Readiness gate FIRST (spec: not_ready before anything else).
-    let size = epoch_size()?;
+    // Readiness gate FIRST (spec: not_ready before anything else). Size and
+    // gap are the REGISTRY's (start() override or instance default).
+    let size = epoch_size_for(&registry.canonical)?;
+    let gap = epoch_gap_for(&registry.canonical);
     let now_epoch = rate_limit::current_epoch(now_unix(), size);
     let expected_epoch = epoch_of_timestamp(timestamp, size)?;
     let signal = registry_id::hex_to_vec(signal_hex)
@@ -1175,7 +1351,8 @@ fn validate_proof_impl(
     // or wrong-application proof rejects definitively even before the root
     // window is consulted.
     let bound = rlp.external_nullifier();
-    if !epoch_binding_holds(rlp.epoch(), &bound, &rln_identifier, expected_epoch, now_epoch) {
+    if !epoch_binding_holds(rlp.epoch(), &bound, &rln_identifier, expected_epoch, now_epoch, gap)
+    {
         return ok_json(views::VerdictReply::verdict("invalid"));
     }
 
@@ -1192,7 +1369,7 @@ fn validate_proof_impl(
 
     // The retention floor stays wall-clock-derived: a caller-chosen
     // timestamp must never move the nullifier log's prune floor.
-    let retain_floor = now_epoch.saturating_sub(epoch_gap());
+    let retain_floor = now_epoch.saturating_sub(gap);
     let view = match nullifier_log::record_verified(
         expected_epoch,
         rlp.nullifier(),
@@ -1234,11 +1411,12 @@ fn get_epoch_quota_impl(
     // Namespace support check only — the quota is served from local state.
     provider_of(&registry)?;
     // Readiness gate FIRST. The single epoch observation is fixed by the
-    // caller's timestamp: taken once, it keys the remaining lookup.
-    let size = epoch_size()?;
+    // caller's timestamp: taken once, it keys the remaining lookup. Size and
+    // gap are the REGISTRY's (start() override or instance default).
+    let size = epoch_size_for(&registry.canonical)?;
     let epoch_index = epoch_of_timestamp(timestamp, size)?;
     let now_epoch = rate_limit::current_epoch(now_unix(), size);
-    if !epoch_in_window(epoch_index, now_epoch) {
+    if !epoch_in_window(epoch_index, now_epoch, epoch_gap_for(&registry.canonical)) {
         return Err(ApiError::new(
             ErrorKind::InvalidArgument,
             "timestamp is outside the acceptable epoch window (now ± max_epoch_gap)",
@@ -1282,7 +1460,8 @@ fn get_registry_parameters_impl(
     let prov = provider_of(&registry)?;
 
     let bounds = prov.get_registry_bounds(&registry)?;
-    let view = views::RegistryParametersView::from_bounds(epoch_size()?, &bounds);
+    let view =
+        views::RegistryParametersView::from_bounds(epoch_size_for(&registry.canonical)?, &bounds);
     ok_json(view)
 }
 
@@ -1419,16 +1598,9 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
         &mut self,
         registry_id: String,
         rln_identifier_hex: String,
-        rate_limit: i64,
         options_json: String,
     ) -> String {
-        reply(register_impl(
-            self.store(),
-            &registry_id,
-            &rln_identifier_hex,
-            rate_limit,
-            &options_json,
-        ))
+        reply(register_impl(self.store(), &registry_id, &rln_identifier_hex, &options_json))
     }
 
     fn get_membership_state(
@@ -1556,6 +1728,18 @@ mod tests {
         Err(ApiError::internal(sealed_store::store::UNINIT_MSG))
     }
 
+    /// The wire's RegistryOptions array from (key, value) pairs — the LIP
+    /// binding every register call site speaks.
+    fn opts_arr(pairs: &[(&str, &str)]) -> String {
+        serde_json::Value::Array(
+            pairs
+                .iter()
+                .map(|(k, v)| serde_json::json!({"key": k, "value": v}))
+                .collect(),
+        )
+        .to_string()
+    }
+
     /// Seed one membership the way the old tests seeded a MembershipMeta
     /// literal: insert (Pending), then push the cache row to the wanted
     /// state/leaf/rate. Needs the store unlocked.
@@ -1666,6 +1850,42 @@ mod tests {
         let err = start_impl(r#"{"max_epoch_gap": 2}"#).unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument);
         assert!(err.message.contains("epoch_size_sec"), "got: {}", err.message);
+    }
+
+    // Spec: epoch size and max gap are per-REGISTRY configuration. A
+    // registries entry may be an object carrying overrides; a plain string
+    // entry inherits the instance defaults. The reply surfaces only the
+    // overrides actually set.
+    #[test]
+    fn start_per_registry_overrides_select_epoch_config() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let reg_a = format!("logos:local:{}", "ab".repeat(32));
+        let reg_b = format!("logos:local:{}", "cd".repeat(32));
+        let cfg = serde_json::json!({
+            "epoch_size_sec": 600,
+            "max_epoch_gap": 2,
+            "registries": [
+                reg_a,
+                {"registry_id": reg_b, "epoch_size_sec": 60, "max_epoch_gap": 5},
+            ],
+        })
+        .to_string();
+        let out = start_impl(&cfg).unwrap();
+        assert_eq!(out["overrides"][reg_b.as_str()]["epoch_size_sec"], serde_json::json!(60));
+        assert_eq!(out["overrides"][reg_b.as_str()]["max_epoch_gap"], serde_json::json!(5));
+        assert!(
+            out["overrides"].get(reg_a.as_str()).is_none(),
+            "a plain string entry carries no override: {out}"
+        );
+        assert_eq!(epoch_size_for(&reg_a).unwrap(), 600);
+        assert_eq!(epoch_gap_for(&reg_a), 2);
+        assert_eq!(epoch_size_for(&reg_b).unwrap(), 60);
+        assert_eq!(epoch_gap_for(&reg_b), 5);
+
+        // Reconfiguring without overrides clears them (idempotent start).
+        let out = start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
+        assert!(out.get("overrides").is_none(), "no overrides key when none are set: {out}");
+        assert_eq!(epoch_size_for(&reg_b).unwrap(), 600);
     }
 
     // Spec: before start() configures the epoch size, the epoch-dependent
@@ -2323,7 +2543,7 @@ mod tests {
         let out = generate_proof_impl(Ok(&store), &reg, &rln_id_hex, "aa", &ts)
             .expect("a past-but-in-window timestamp still proves");
         assert_eq!(
-            out.get("epoch").and_then(|v| v.as_u64()),
+            out.get("epoch_index").and_then(|v| v.as_u64()),
             Some(now_epoch - 1),
             "epoch must derive from the supplied timestamp, not the module clock: {out}"
         );
@@ -2363,7 +2583,12 @@ mod tests {
         assert_eq!(serde_json::to_value(MembershipState::Active).unwrap(), serde_json::json!("active"));
         assert_eq!(serde_json::to_value(MembershipState::GracePeriod).unwrap(), serde_json::json!("grace_period"));
         assert_eq!(serde_json::to_value(MembershipState::Expired).unwrap(), serde_json::json!("expired"));
+        assert_eq!(
+            serde_json::to_value(MembershipState::ErasedAwaitsWithdrawal).unwrap(),
+            serde_json::json!("erased_awaits_withdrawal")
+        );
         assert_eq!(serde_json::to_value(MembershipState::Erased).unwrap(), serde_json::json!("erased"));
+        assert_eq!(serde_json::to_value(MembershipState::Slashed).unwrap(), serde_json::json!("slashed"));
     }
 
     #[test]
@@ -2381,24 +2606,52 @@ mod tests {
         let mut imp = LogosRlnModuleImpl::default();
         let rln_id = "ef".repeat(32);
 
-        let out = imp.register("not-caip10".into(), rln_id.clone(), 300, String::new());
+        let out = imp.register("not-caip10".into(), rln_id.clone(), String::new());
         assert!(out.contains(r#""kind":"invalid_argument""#), "got: {out}");
 
         let out = imp.register(
             "eip155:1:0xB9cd878C90E49F797B4431fBF4fb333108CB90e6".into(),
             rln_id.clone(),
-            300,
             String::new(),
         );
         assert!(out.contains(r#""kind":"unknown_registry""#), "got: {out}");
 
         let logos = format!("logos:local:{}", "ab".repeat(32));
-        let out = imp.register(logos.clone(), rln_id, 0, String::new());
+        let out = imp.register(logos.clone(), rln_id, opts_arr(&[("rate_limit", "0")]));
         assert!(out.contains(r#""kind":"invalid_argument""#), "got: {out}");
 
         // A malformed rln_identifier is rejected before any state work.
-        let out = imp.register(logos, "xyz".into(), 300, String::new());
+        let out = imp.register(logos, "xyz".into(), String::new());
         assert!(out.contains(r#""kind":"invalid_argument""#), "got: {out}");
+    }
+
+    // The common rate_limit key is optional: absent, the module applies
+    // DEFAULT_RATE_LIMIT (the registry declares no default today — see the
+    // constant's TODO). The defaulted value lands on the Pending record.
+    #[test]
+    fn register_defaults_rate_limit_when_option_absent() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir =
+            std::env::temp_dir().join(format!("rln-ms-default-rate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut imp, _store) = imp_with_store(dir.clone());
+        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+        let registry = format!("logos:local:{}", "ab".repeat(32));
+
+        let out = imp.register(
+            registry.clone(),
+            "ef".repeat(32),
+            opts_arr(&[("funding_holding_account_id", &"cd".repeat(32))]),
+        );
+        assert!(out.contains(r#""kind":"provider_failure""#), "dead transport: {out}");
+        let listed = imp.get_memberships(registry);
+        assert!(
+            listed.contains(&format!(r#""rate_limit":{DEFAULT_RATE_LIMIT}"#)),
+            "absent rate_limit option must apply the module default: {listed}"
+        );
+
+        sealed_store::store::publish(None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // A fresh register mints + persists a credential, records Pending, then
@@ -2419,8 +2672,8 @@ mod tests {
         // stub → provider_failure; the record remains (marked failed).
         let reg_a = format!("logos:local:{}", "ab".repeat(32));
         let funding =
-            serde_json::json!({ "funding_holding_account_id": "cd".repeat(32) }).to_string();
-        let out = imp.register(reg_a.clone(), rln_id.clone(), 300, funding);
+            opts_arr(&[("rate_limit", "300"), ("funding_holding_account_id", &"cd".repeat(32))]);
+        let out = imp.register(reg_a.clone(), rln_id.clone(), funding);
         assert!(out.contains(r#""kind":"provider_failure""#), "got: {out}");
         let listed = imp.get_memberships(reg_a);
         assert!(listed.contains("membership_hash"), "a credential was generated and persisted");
@@ -2447,7 +2700,7 @@ mod tests {
             300,
         );
 
-        let out = imp.register(reg_b.clone(), rln_id, 250, String::new());
+        let out = imp.register(reg_b.clone(), rln_id, opts_arr(&[("rate_limit", "250")]));
         assert!(!out.contains(r#""error""#), "idempotent short-circuit, no provider call: {out}");
         assert!(out.contains(r#""state":"active""#), "got: {out}");
         assert!(out.contains(r#""rate_limit":300"#), "existing registration's rate wins: {out}");
@@ -2459,8 +2712,8 @@ mod tests {
         // fresh credential for it (and then fails at the dead-transport
         // submit), leaving TWO records on the registry.
         let funding =
-            serde_json::json!({ "funding_holding_account_id": "cd".repeat(32) }).to_string();
-        let out = imp.register(reg_b.clone(), "aa".repeat(32), 300, funding);
+            opts_arr(&[("rate_limit", "300"), ("funding_holding_account_id", &"cd".repeat(32))]);
+        let out = imp.register(reg_b.clone(), "aa".repeat(32), funding);
         assert!(out.contains(r#""kind":"provider_failure""#), "got: {out}");
         let listed = imp.get_memberships(reg_b);
         assert_eq!(
@@ -2486,7 +2739,7 @@ mod tests {
         assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
         let rln_id = "ef".repeat(32);
         let funding =
-            serde_json::json!({ "funding_holding_account_id": "cd".repeat(32) }).to_string();
+            opts_arr(&[("rate_limit", "300"), ("funding_holding_account_id", &"cd".repeat(32))]);
 
         // An EXPIRED record for the scope: register must not short-circuit
         // to it.
@@ -2505,7 +2758,7 @@ mod tests {
             300,
         );
 
-        let out = imp.register(reg_expired.clone(), rln_id.clone(), 300, funding.clone());
+        let out = imp.register(reg_expired.clone(), rln_id.clone(), funding.clone());
         assert!(
             out.contains(r#""kind":"provider_failure""#),
             "no short-circuit — the fresh submit hits the dead transport: {out}"
@@ -2539,7 +2792,7 @@ mod tests {
             300,
         );
 
-        let out = imp.register(reg_erased.clone(), rln_id, 300, funding);
+        let out = imp.register(reg_erased.clone(), rln_id, funding);
         assert!(out.contains(r#""kind":"provider_failure""#), "got: {out}");
         let records = store.records_for(&reg_erased);
         assert_eq!(records.len(), 2, "the erased record is retained AND a fresh one was minted");
@@ -2564,7 +2817,7 @@ mod tests {
         let rln_id = "ef".repeat(32);
 
         let out =
-            imp.register(registry.clone(), rln_id.clone(), 300, r#"{"delegated":"true"}"#.into());
+            imp.register(registry.clone(), rln_id.clone(), opts_arr(&[("delegated", "true")]));
         assert!(out.contains(r#""kind":"invalid_argument""#), "got: {out}");
         assert_eq!(
             imp.get_memberships(registry.clone()),
@@ -2572,15 +2825,14 @@ mod tests {
             "invalid delegated options must not mint a credential"
         );
 
-        let opts = serde_json::json!({
-            "delegated": "true",
-            "gifter_peer_id": "12D3KooWTest",
-            "gifter_multiaddr": "/ip4/127.0.0.1/tcp/1",
-            "auth_type": "keycard-attestation",
-            "auth_provider": "keycard_capture_module",
-        })
-        .to_string();
-        let out = imp.register(registry.clone(), rln_id.clone(), 300, opts);
+        let opts = opts_arr(&[
+            ("delegated", "true"),
+            ("gifter_peer_id", "12D3KooWTest"),
+            ("gifter_multiaddr", "/ip4/127.0.0.1/tcp/1"),
+            ("auth_type", "keycard-attestation"),
+            ("auth_provider", "keycard_capture_module"),
+        ]);
+        let out = imp.register(registry.clone(), rln_id.clone(), opts);
         assert!(out.contains(r#""kind":"provider_failure""#), "got: {out}");
         assert!(
             imp.get_memberships(registry.clone()).contains("membership_hash"),
@@ -2590,35 +2842,51 @@ mod tests {
         // A plugin auth vector this module has never heard of passes the same
         // validation (open vocabulary) and reaches the gifter dispatch — the
         // prior failed record is terminal, so a fresh credential is minted.
-        let opts = serde_json::json!({
-            "delegated": "true",
-            "gifter_peer_id": "12D3KooWTest",
-            "gifter_multiaddr": "/ip4/127.0.0.1/tcp/1",
-            "auth_type": "voucher-v1",
-            "auth_payload": "deadbeef",
-        })
-        .to_string();
-        let out = imp.register(registry.clone(), rln_id, 300, opts);
+        let opts = opts_arr(&[
+            ("delegated", "true"),
+            ("gifter_peer_id", "12D3KooWTest"),
+            ("gifter_multiaddr", "/ip4/127.0.0.1/tcp/1"),
+            ("auth_type", "voucher-v1"),
+            ("auth_payload", "deadbeef"),
+        ]);
+        let out = imp.register(registry.clone(), rln_id, opts);
         assert!(out.contains(r#""kind":"provider_failure""#), "got: {out}");
 
         sealed_store::store::publish(None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // RegistryOptions is the spec's flat char* key/value map: "delegated"
-    // must be the STRING "true"; a JSON bool is a type error. Fails before
-    // any store access, so no unlock/init needed.
+    // RegistryOptions is the spec's char* key/value pair list: every value
+    // is a STRING; a JSON bool (or any non-string) is a type error at the
+    // array binding, never a coercion. A non-array options_json — including
+    // the retired 0.5.0 object encoding — is rejected outright, and
+    // duplicate keys are a caller bug. Fails before any store access, so no
+    // unlock/init needed.
     #[test]
-    fn delegated_register_rejects_json_bool_delegated_flag() {
+    fn register_rejects_non_string_values_and_non_array_options() {
         let mut imp = LogosRlnModuleImpl::default();
         let registry = format!("logos:local:{}", "ab".repeat(32));
         let rln_id = "ef".repeat(32);
 
-        let out = imp.register(registry, rln_id, 300, r#"{"delegated":true}"#.into());
+        let out = imp.register(
+            registry.clone(),
+            rln_id.clone(),
+            r#"[{"key":"delegated","value":true}]"#.into(),
+        );
         assert!(out.contains(r#""kind":"invalid_argument""#), "got: {out}");
-        assert!(out.contains("options_json.delegated"), "got: {out}");
-        assert!(out.contains("must be the string"), "got: {out}");
-        assert!(out.contains("not a JSON boolean"), "got: {out}");
+        assert!(out.contains("'delegated' must be a string"), "got: {out}");
+
+        let out =
+            imp.register(registry.clone(), rln_id.clone(), r#"{"delegated":"true"}"#.into());
+        assert!(out.contains(r#""kind":"invalid_argument""#), "got: {out}");
+        assert!(out.contains("must be a RegistryOptions array"), "got: {out}");
+
+        let out = imp.register(
+            registry,
+            rln_id,
+            r#"[{"key":"rate_limit","value":"5"},{"key":"rate_limit","value":"9"}]"#.into(),
+        );
+        assert!(out.contains("duplicate RegistryOptions key 'rate_limit'"), "got: {out}");
     }
 
     // Shape-only auth validation (the vocabulary is OPEN): every rejection
@@ -2635,23 +2903,30 @@ mod tests {
         let rln_id = "ef".repeat(32);
         let opts = |extra: &str| {
             format!(
-                r#"{{"delegated":"true","gifter_peer_id":"12D3KooWTest",
-                     "gifter_multiaddr":"/ip4/127.0.0.1/tcp/1",{extra}}}"#
+                r#"[{{"key":"delegated","value":"true"}},
+                    {{"key":"gifter_peer_id","value":"12D3KooWTest"}},
+                    {{"key":"gifter_multiaddr","value":"/ip4/127.0.0.1/tcp/1"}},{extra}]"#
             )
         };
         let reg = |imp: &mut LogosRlnModuleImpl, extra: &str| {
-            imp.register(registry.clone(), rln_id.clone(), 300, opts(extra))
+            imp.register(registry.clone(), rln_id.clone(), opts(extra))
         };
 
         for (extra, expect) in [
-            (r#""auth_type":42"#, "auth_type must be a string"),
-            (r#""auth_payload":"deadbeef""#, "need auth_type"),
-            (r#""auth_type":"voucher-v1""#, "needs auth_payload or auth_provider"),
+            (r#"{"key":"auth_type","value":42}"#, "'auth_type' must be a string"),
+            (r#"{"key":"auth_payload","value":"deadbeef"}"#, "need auth_type"),
             (
-                r#""auth_type":"voucher-v1","auth_payload":"deadbeef","auth_provider":"voucher_module""#,
+                r#"{"key":"auth_type","value":"voucher-v1"}"#,
+                "needs auth_payload or auth_provider",
+            ),
+            (
+                r#"{"key":"auth_type","value":"voucher-v1"},{"key":"auth_payload","value":"deadbeef"},{"key":"auth_provider","value":"voucher_module"}"#,
                 "mutually exclusive",
             ),
-            (r#""auth_type":"voucher-v1","auth_payload":"not-hex!""#, "must be hex"),
+            (
+                r#"{"key":"auth_type","value":"voucher-v1"},{"key":"auth_payload","value":"not-hex!"}"#,
+                "must be hex",
+            ),
         ] {
             let out = reg(&mut imp, extra);
             assert!(out.contains(r#""kind":"invalid_argument""#), "{extra} got: {out}");
@@ -2661,8 +2936,7 @@ mod tests {
         let out = imp.register(
             registry.clone(),
             rln_id.clone(),
-            300,
-            r#"{"auth_type":"voucher-v1","auth_payload":"deadbeef"}"#.into(),
+            opts_arr(&[("auth_type", "voucher-v1"), ("auth_payload", "deadbeef")]),
         );
         assert!(out.contains(r#""kind":"invalid_argument""#), "got: {out}");
         assert!(out.contains("delegated registration only"), "got: {out}");

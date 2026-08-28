@@ -137,9 +137,19 @@ function mockExpr(cfg) {
           st.regSeq += 1;
           st.pendingCommit = st.regSeq === 1 ? COMMIT : COMMIT2;
           return { id_commitment: st.pendingCommit, id_secret_hash: SECRET };
-        case "register":
+        case "register": {
+          // Wire 0.6.0 arity guard: (registry_id, rln_identifier_hex, options_json)
+          // where options_json is the RegistryOptions ARRAY of {key,value}
+          // string pairs. Keep this strict so a call-site regression fails here.
+          if (args.length !== 3)
+            return { error: { kind: "invalid_argument", message: "mock: register takes 3 args (registry_id, rln_identifier_hex, options_json), got " + args.length } };
+          var opts;
+          try { opts = JSON.parse(args[2]); } catch (e) { opts = null; }
+          if (!Array.isArray(opts) || opts.some(function (o) { return !o || typeof o.key !== "string" || !o.key || typeof o.value !== "string"; }))
+            return { error: { kind: "invalid_argument", message: "mock: options_json must be a RegistryOptions array of {key,value} string pairs" } };
           st.memberships.push({ credential: { identity_commitment: st.pendingCommit }, membership_hash: "ee".repeat(32), registry_id: args[0], state: "pending", submitted_at: 1700000000, tx_result: TXRESULT });
           return { membership_hash: "ee".repeat(32), registry_id: args[0], state: "pending" };
+        }
         case "get_membership_state": {
           var m = findMem(args[1]);
           if (!m) return { registry_id: args[0], state: "unknown" };

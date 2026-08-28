@@ -41,7 +41,7 @@
 ; Events are a third channel, pushed over the lp event stream rather than
 ; returned from a call — see the events section below.
 module liblogos_rln_module {
-  version "0.5.0"
+  version "0.6.0"
   description "RLN Membership Management Module"
   category "blockchain"
   depends [liblogos_lez_rln_module]
@@ -102,8 +102,9 @@ module liblogos_rln_module {
     rate_limit: int
     remaining: int
   }
-  ; get_registry_parameters' reply. epoch_size_sec is always present (the
-  ; module's own start()-configured value); the registry-declared bounds are
+  ; get_registry_parameters' reply. epoch_size_sec is always present,
+  ; resolved for THIS registry (its start() override when one was
+  ; configured, else the module default); the registry-declared bounds are
   ; present only when the registry read returned them. price_per_unit is
   ; passed through opaquely (the sibling documents it as a decimal STRING;
   ; this contract makes no assumption about its shape).
@@ -134,16 +135,21 @@ module liblogos_rln_module {
   ; touches only the plaintext-safe metadata. {"locked":true}.
   method lock_keystore() -> tstr
 
-  ; Spec register(scope, rate_limit, options). Scope = (registry_id,
+  ; Spec register(scope, options). Scope = (registry_id,
   ; rln_identifier_hex). registry_id: CAIP-10, e.g. logos:<ref>:<config-hex>.
   ; The identity credential is GENERATED INSIDE the module and
   ; persisted encrypted — the caller supplies no credential and the secret
-  ; never crosses this wire. options_json is a FLAT string key/value map
-  ; (spec RegistryOptions: char* key/value pairs) for the logos namespace:
-  ; {"funding_holding_account_id":"<account>"} (direct, the caller pays), or
-  ; {"delegated":"true","gifter_peer_id":…,"gifter_multiaddr":…,
-  ; "auth_type"?,"auth_payload"?,"auth_provider"?,"auth_args"?} — delegated
-  ; registration via the RLN Membership Allocation Protocol: register drives
+  ; never crosses this wire. options_json is the spec's RegistryOptions
+  ; ARRAY: [{"key":"<tstr>","value":"<tstr>"}, …] — char* pairs, so every
+  ; value is a string (a non-string value or a non-array options_json is
+  ; invalid_argument; duplicate keys too). The common key "rate_limit"
+  ; (decimal string) requests the per-epoch rate; absent, the module
+  ; applies its default (the registry declares none yet — a lez-rln
+  ; follow-up). Logos-namespace keys: "funding_holding_account_id"
+  ; (direct, the caller pays), or "delegated":"true" +
+  ; "gifter_peer_id"/"gifter_multiaddr" and the optional "auth_type"/
+  ; "auth_payload"/"auth_provider"/"auth_args" — delegated registration via
+  ; the RLN Membership Allocation Protocol: register drives
   ; rln_gifter_module.request with the module-generated commitment. auth_type
   ; names the gifter auth vector verbatim (open vocabulary); its payload is
   ; auth_payload (hex) or produced by the auth_provider module (an
@@ -165,7 +171,7 @@ module liblogos_rln_module {
   ; report whether it is retryable) — "failed" is a terminal state (never
   ; blocks a fresh registration), so retrying just means calling register
   ; again for the same scope.
-  method register(registry_id: tstr, rln_identifier_hex: tstr, rate_limit: int, options_json: tstr) -> tstr
+  method register(registry_id: tstr, rln_identifier_hex: tstr, options_json: tstr) -> tstr
 
   ; Spec get_membership_state(scope). Resolves the membership BACKING the
   ; scope: records registered under this rln_identifier (or carrying none —
@@ -174,8 +180,11 @@ module liblogos_rln_module {
   ; submission reports "pending" (not "unknown"), a vanished previously-active
   ; membership reports "erased". No candidate → "unknown"; more than one
   ; → ambiguous_selection. {"registry_id":…,"state":"pending"|"failed"|
-  ; "active"|"grace_period"|"expired"|"erased"|"unknown"} plus membership_hash /
-  ; leaf_index / rate_limit when known.
+  ; "active"|"grace_period"|"expired"|"erased_awaits_withdrawal"|"slashed"|
+  ; "erased"|"unknown"} plus membership_hash / leaf_index / rate_limit when
+  ; known. (erased_awaits_withdrawal and slashed complete the spec
+  ; vocabulary; the logos registry does not expose those removal causes, so
+  ; this module never emits them today.)
   method get_membership_state(registry_id: tstr, rln_identifier_hex: tstr) -> tstr
 
   ; Spec get_memberships(): all locally managed memberships for the
@@ -216,10 +225,11 @@ module liblogos_rln_module {
   ; scope's sole usable (active|grace_period) membership, decrypts its
   ; credential IN-MODULE (requires an unlocked keystore — the secret never
   ; crosses this wire), reserves and durably persists the next message_id,
-  ; fetches the Merkle path, and proves. Returns the RateLimitProof —
-  ; {"proof":<canonical hex>,"root","external_nullifier","share_x","share_y",
-  ; "nullifier"} (all hex) — plus the spent "message_id", the "epoch" (u64
-  ; index), and the "membership_hash". Errors: no_usable_membership,
+  ; fetches the Merkle path, and proves. Returns the spec RateLimitProof —
+  ; {"proof":<128-byte compressed Groth16 hex>,"root","epoch" (32-byte LE
+  ; field hex),"external_nullifier","share_x","share_y","nullifier"} (all
+  ; hex) — plus the spent "message_id", the "epoch_index" (u64), and the
+  ; "membership_hash". Errors: no_usable_membership,
   ; ambiguous_selection (multiple; select first), locked, budget_exhausted
   ; (epoch rate limit spent), invalid_argument (bad signal/timestamp, or a
   ; timestamp whose epoch is outside now ± max_epoch_gap), permanent (the
@@ -370,10 +380,16 @@ module liblogos_rln_module {
   ; must share; it has no safe default, so until start() sets it the
   ; rate-limiting methods — generate_proof, validate_proof, get_epoch_quota —
   ; fail not_ready), "max_epoch_gap"?:N (default 1),
-  ; "registries"?:["<caip10>",…] (their root windows are warmed immediately)}.
-  ; Idempotent — safe to re-call to reconfigure. No default scope: every
-  ; other method takes its (registry_id, rln_identifier_hex) explicitly.
-  ; {"started":true,"epoch_size_sec":N,"registries":[…]}.
+  ; "registries"?:[…] (root windows are warmed immediately). A registries
+  ; entry is either a "<caip10>" string or an object
+  ; {"registry_id":"<caip10>","epoch_size_sec"?:N,"max_epoch_gap"?:N}
+  ; overriding the defaults for that registry (spec: epoch size and gap are
+  ; per-registry configuration; the rate-limiting methods resolve them per
+  ; registry). Idempotent — safe to re-call to reconfigure. No default
+  ; scope: every other method takes its (registry_id, rln_identifier_hex)
+  ; explicitly. Reply {"started":true,"epoch_size_sec":N,"max_epoch_gap":N,
+  ; "overrides"?:{"<caip10>":{"epoch_size_sec"?:N,"max_epoch_gap"?:N},…},
+  ; "registries":[…]} — overrides echoes only entries that set one.
   method start(config_json: tstr) -> result
 
   ; Spec stop(). Halt the maintenance tasks for real: sleeping workers wake

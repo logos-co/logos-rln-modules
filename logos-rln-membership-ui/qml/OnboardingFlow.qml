@@ -564,9 +564,9 @@ Item {
 
     function submitRegistration() {
         // Wallet path only — the gifter path submits via registerDelegated().
-        var options = JSON.stringify({ funding_holding_account_id: holdingHex })
+        var options = M.registryOptions(rateLimit, { funding_holding_account_id: holdingHex })
         callRetry(M.RLN_MODULE, "register",
-               [registryId, M.DEFAULT_RLN_ID, rateLimit, options], function (r) {
+               [registryId, M.DEFAULT_RLN_ID, options], function (r) {
             if (r.error) { flow.regPhase = "error"; flow.regError = M.errorText(r.error); return }
             flow.commitment = (r.credential && r.credential.identity_commitment) || ""
             flow.regState = r.state || "pending"
@@ -784,7 +784,7 @@ Item {
         regError = ""
         regState = ""
         rateLimitMismatch = false
-        var options = JSON.stringify({
+        var options = M.registryOptions(rateLimit, {
             delegated: "true",
             gifter_peer_id: gifterPeerId.trim(),
             gifter_multiaddr: gifterMultiaddr.trim(),
@@ -794,7 +794,7 @@ Item {
             auth_provider: M.CAPTURE_MODULE
         })
         callRetry(M.RLN_MODULE, "register",
-               [registryId, M.DEFAULT_RLN_ID, rateLimit, options], function (r) {
+               [registryId, M.DEFAULT_RLN_ID, options], function (r) {
             if (r.error) {
                 flow.regPhase = "error"
                 flow.regError = M.errorText(r.error)

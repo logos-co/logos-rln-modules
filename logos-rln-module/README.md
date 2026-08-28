@@ -26,7 +26,7 @@ JSON replies; `scope` = the `registry_id` + `rln_identifier_hex` arg pair):
 | Spec | Method |
 |---|---|
 | `start(config)` / `stop()` | `start(config_json)` / `stop()` |
-| `register(scope, rate_limit, options)` | `register(registry_id, rln_identifier_hex, rate_limit, options_json)` |
+| `register(scope, options)` | `register(registry_id, rln_identifier_hex, options_json)` — `options_json` is the spec `RegistryOptions` array of `{"key","value"}` string pairs (`rate_limit` rides there; default 100) |
 | `get_membership_state(scope)` | `get_membership_state(registry_id, rln_identifier_hex)` |
 | `generate_proof(scope, signal, timestamp)` | `generate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp)` |
 | `validate_proof(scope, signal, timestamp, proof)` | `validate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp, proof_json)` |
