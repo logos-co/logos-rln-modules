@@ -418,12 +418,16 @@ Item {
         autoUnlockPhase = "running"
         autoUnlockKind = ""
         callRetry(M.RLN_MODULE, "unlock_keystore_auto", [], function (r) {
-            if (r.error || r.unlocked !== true || !r.secret) {
+            // The reply carries the secret ONLY on source "created" (wire
+            // 0.7 change) — a resume needs no passphrase, wallet open is
+            // passwordless.
+            if (r.error || r.unlocked !== true
+                    || (r.source === "created" && !r.secret)) {
                 flow.autoUnlockKind = r.error ? String(r.error.kind) : "bad_reply"
                 flow.autoUnlockPhase = "fallback"
                 return
             }
-            flow.password = String(r.secret)
+            flow.password = r.secret ? String(r.secret) : ""
             flow.unlockPhase = "done"
             flow.autoUnlockPhase = "done"
         })

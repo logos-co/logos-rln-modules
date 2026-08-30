@@ -314,26 +314,44 @@ module liblogos_rln_module {
   ; provided no persistence path (same policy as the keystore).
   method provision_wallet_home(options_json: tstr) -> tstr
 
-  ; OS-keychain auto-unlock (macOS only for now — the `security` CLI
-  ; backend; elsewhere keychain_unavailable and the caller falls back to the
-  ; manual password). Fetches this instance's secret from the login keychain
-  ; (service org.logos.rln-membership.keystore, account = sha256 of the
-  ; verbatim persistence dir) and unlocks through the NORMAL verification
-  ; seam; with no item and an EMPTY keystore it generates 32 random bytes,
-  ; writes the item FIRST, then unlocks. The item carries
-  ; -T /usr/bin/security (dev trust level: any same-user process — where the
-  ; passwordless wallet already lives; production Developer-ID signing
-  ; enables a stricter app-bound ACL later). Returns the secret so a GUI can
-  ; reuse it as the wallet passphrase — the one reply that carries it; treat
-  ; it like the manual password. {"membership_count":N,"secret":…,
-  ; "source":"created"|"existing","unlocked":true}. Errors:
-  ; keychain_unavailable (non-macOS, denied/locked keychain, item missing
-  ; while the keystore HAS credentials — it never invents a secret over one,
-  ; foreign payload, write failure), bad_password (item secret fails the
-  ; keystore MAC — manual-era keystore: unlock manually once and remember),
-  ; internal (no persistence path). CAVEAT: for auto-created accounts the
-  ; user never saw the secret — deleting the keychain item orphans the
-  ; credentials (a future export surface can reveal it first).
+  ; Auto-unlock: module-owned password custody, ALL platforms. Stored
+  ; sources resolve FILE-first: rln_autounlock.secret (0600, in the
+  ; keystore dir — the module-owned marker; self-provisioned secrets
+  ; always land here), then the macOS login keychain (service
+  ; org.logos.rln-membership.keystore, account = sha256 of the verbatim
+  ; persistence dir — the UI-owned / legacy marker, and
+  ; remember_keystore_password's target; its item carries
+  ; -T /usr/bin/security, dev trust level). Unlocks through the NORMAL
+  ; verification seam; with no stored secret and a NEVER-PROVISIONED
+  ; keystore it generates 32 random bytes, durably writes the secret FILE
+  ; first, then unlocks. A stored FILE secret that fails the verifier is
+  ; moved aside (rln_autounlock.secret.bad.<unix>, kept for forensics) and
+  ; the keychain source is tried — a stale file can never permanently
+  ; shadow recovery. The module also runs this flow ITSELF at init
+  ; (full-lazy default: a fresh store self-provisions and every restart
+  ; resumes with ZERO unlock calls; set LOGOS_RLN_DISABLE_AUTO_UNLOCK=1
+  ; host-side to opt out for user-password deployments — that switch
+  ; refuses THIS method too). File-mode custody means at-rest
+  ; confidentiality reduces to filesystem ACLs (the counter ledger's
+  ; authentication is unaffected); the keychain and a manual password are
+  ; the stronger modes.
+  ; {"membership_count":N,"source":"created"|"existing","unlocked":true},
+  ; PLUS "secret":… ONLY when source is "created" — the one reply that
+  ; releases it, so a GUI can mirror the just-provisioned secret into its
+  ; wallet passphrase; treat it like the manual password. A resume
+  ; ("existing") OMITS the field entirely: the live secret is not
+  ; re-released on every call. Errors: keychain_unavailable (no stored
+  ; secret while the keystore is already PROVISIONED — a USER-owned store,
+  ; whether or not it holds credentials yet; it never invents a secret
+  ; over one, and unlocking an empty provisioned store would rekey the
+  ; user's password away — or auto-unlock is disabled by the env var),
+  ; bad_password (stored secret fails the keystore verifier — manual-era
+  ; keystore: unlock manually once and remember), internal (no persistence
+  ; path, or the secret file cannot be written — persist-before-unlock).
+  ; CAVEAT: for auto-created secrets the
+  ; user never saw the secret — deleting rln_autounlock.secret (or the
+  ; keychain item) orphans the credentials (a future export surface can
+  ; reveal it first).
   method unlock_keystore_auto() -> tstr
 
   ; Persist the CURRENT session password to the OS keychain so the next

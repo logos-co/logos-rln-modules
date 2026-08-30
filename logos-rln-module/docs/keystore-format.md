@@ -16,6 +16,7 @@ All files live in `<instance_persistence_path>/`, mode 0600.
 | `rln_allocations.json` | plaintext but authenticated: per-membership counter sections (allocations, epoch_size_sec, prune_floor) each with an HMAC, plus a root MAC over the section MACs | fsync ordering; one small rewrite per reservation, completed **before** the slot is returned |
 | `rln_cache.json` | plaintext, unauthenticated, poller-owned: registry-derived state the poller re-heals (state, leaf_index, rate_limit, failure fields, first_active_at) | rename-atomic only, no fsync — loss is always recoverable from the registry |
 | `rln_keystore.lock` | advisory OS lock sentinel; the name is shared with the ≥0.5.0 formats so those binaries and this one cannot run concurrently in one directory — never rename it | — |
+| `rln_autounlock.secret` | OPTIONAL, plaintext, 0600: the module-owned auto-unlock password (full-lazy custody default — self-provisioned on a fresh store unless `LOGOS_RLN_DISABLE_AUTO_UNLOCK=1`). Present ⇒ at-rest confidentiality reduces to filesystem ACLs; the counter ledger's authentication is unaffected. Absent ⇒ the store is user- or keychain-owned. Deleting it orphans auto-created credentials. A secret here that does not open the store is moved aside as `.bad.<unix-ts>` evidence (a stale file must never permanently shadow the keychain source) | durable write (tmp → fsync → rename), written BEFORE the store adopts the password |
 
 The durable write ordering (tmp 0600 → write → fsync(tmp) → rename →
 fsync(dir)) is power-loss-critical and untestable in CI; it degrades only
