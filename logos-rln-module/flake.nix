@@ -47,6 +47,7 @@
               echo "generating rust-lib/generated/provider_gen.rs ..."
               mkdir -p "$root/rust-lib/generated"
               logos-lidl-gen "$root/rust-lib/liblogos_rln_module.lidl" --provider \
+                --concurrency multi \
                 --dep liblogos_lez_rln_module="$root/rust-lib/deps/liblogos_lez_rln_module.lidl" \
                 -o "$root/rust-lib/generated/provider_gen.rs"
               echo "staging the SDK source at logos-rust-sdk-src/ ..."

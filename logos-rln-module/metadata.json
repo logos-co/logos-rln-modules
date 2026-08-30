@@ -6,6 +6,7 @@
   "author": "Logos Blockchain Team",
   "type": "core",
   "interface": "cdylib",
+  "concurrency": "multi",
   "category": "blockchain",
   "main": "liblogos_rln_module_plugin",
   "dependencies": [

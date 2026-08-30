@@ -147,12 +147,32 @@ static PROVIDER_OWNER: Mutex<Option<ThreadId>> = Mutex::new(None);
 /// re-call — the host may load this module before the target registers, so
 /// dispatch paths retry via `ensure_client_on_owner_thread`.
 pub(crate) fn init_client() {
+    // Stamp the owner FIRST and unconditionally: under concurrency:"multi"
+    // dispatch runs on transient worker threads, and a worker adopted as the
+    // lp owner would take its pumping loop to the grave with it. Only this
+    // (the host's context/Qt) thread may ever create clients.
+    *lock(&PROVIDER_OWNER) = Some(std::thread::current().id());
     let mut slot = lock(&PROVIDER_CLIENT);
-    if slot.is_some() {
-        return;
+    if slot.is_none() {
+        if let Some(h) = create_client(TARGET_MODULE) {
+            *slot = Some(h);
+        }
     }
-    let (Ok(target), Ok(origin)) = (CString::new(TARGET_MODULE), CString::new("core")) else {
-        return;
+    drop(slot);
+    // The gifter client is created here too (creation is lazy-dialing, so a
+    // missing gifter module still tolerates it): no dispatch worker is ever
+    // allowed to create a client, so first-use creation cannot work.
+    let mut gslot = lock(&GIFTER_CLIENT);
+    if gslot.is_none() {
+        if let Some(h) = create_client(GIFTER_MODULE) {
+            *gslot = Some(h);
+        }
+    }
+}
+
+fn create_client(module: &str) -> Option<ClientHandle> {
+    let (Ok(target), Ok(origin)) = (CString::new(module), CString::new("core")) else {
+        return None;
     };
     let raw = unsafe {
         lp::lp_client_create(
@@ -163,25 +183,28 @@ pub(crate) fn init_client() {
         )
     };
     if raw.is_null() {
-        eprintln!("membership provider: lp_client_create failed for {TARGET_MODULE}");
-        return;
+        eprintln!("membership provider: lp_client_create failed for {module}");
+        return None;
     }
-    *slot = Some(ClientHandle(raw));
-    *lock(&PROVIDER_OWNER) = Some(std::thread::current().id());
+    Some(ClientHandle(raw))
 }
 
 /// Lazy owner-thread retry for hosts that ran `on_context_ready` before the
-/// target module registered. Only the owner thread (or, before any client
-/// exists, the single-concurrency dispatch thread — the same thread) may
-/// create the client.
+/// target module registered. ONLY the stamped owner thread may create — a
+/// dispatch worker that finds no client fails the call (provider_failure)
+/// and a later owner-thread pass retries.
 fn ensure_client_on_owner_thread() {
     let has_client = lock(&PROVIDER_CLIENT).is_some();
     if has_client {
         return;
     }
-    let owner = *lock(&PROVIDER_OWNER);
-    if owner.is_none() || owner == Some(std::thread::current().id()) {
-        init_client();
+    if *lock(&PROVIDER_OWNER) == Some(std::thread::current().id()) {
+        let mut slot = lock(&PROVIDER_CLIENT);
+        if slot.is_none() {
+            if let Some(h) = create_client(TARGET_MODULE) {
+                *slot = Some(h);
+            }
+        }
     }
 }
 
@@ -405,26 +428,17 @@ const GIFTER_REQUEST_TIMEOUT_MS: c_int = 340_000;
 
 static GIFTER_CLIENT: Mutex<Option<ClientHandle>> = Mutex::new(None);
 
-/// Owner-thread-lazy client to the gifter module — created on first delegated
-/// register, never at init.
+/// Client to the gifter module — created at init on the owner thread
+/// (creation is lazy-dialing, so a missing gifter module is tolerated),
+/// with an owner-thread-only retry mirroring the provider client's.
 fn gifter_client(method: &str) -> Result<*mut lp::LpClient, ApiError> {
-    if lock(&GIFTER_CLIENT).is_none() {
-        let owner = *lock(&PROVIDER_OWNER);
-        if owner.is_none() || owner == Some(std::thread::current().id()) {
-            if let (Ok(target), Ok(origin)) = (CString::new(GIFTER_MODULE), CString::new("core")) {
-                let raw = unsafe {
-                    lp::lp_client_create(
-                        target.as_ptr(),
-                        origin.as_ptr(),
-                        std::ptr::null(),
-                        std::ptr::null(),
-                    )
-                };
-                if raw.is_null() {
-                    eprintln!("membership provider: lp_client_create failed for {GIFTER_MODULE}");
-                } else {
-                    *lock(&GIFTER_CLIENT) = Some(ClientHandle(raw));
-                }
+    if lock(&GIFTER_CLIENT).is_none()
+        && *lock(&PROVIDER_OWNER) == Some(std::thread::current().id())
+    {
+        let mut slot = lock(&GIFTER_CLIENT);
+        if slot.is_none() {
+            if let Some(h) = create_client(GIFTER_MODULE) {
+                *slot = Some(h);
             }
         }
     }
