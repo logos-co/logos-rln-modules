@@ -322,20 +322,29 @@ module liblogos_rln_module {
   ; persistence dir — the UI-owned / legacy marker, and
   ; remember_keystore_password's target; its item carries
   ; -T /usr/bin/security, dev trust level). Unlocks through the NORMAL
-  ; verification seam; with no stored secret and an EMPTY keystore it
-  ; generates 32 random bytes, durably writes the secret FILE first, then
-  ; unlocks. The module also runs this flow ITSELF at init (full-lazy
-  ; default: a fresh store self-provisions and every restart resumes with
-  ; ZERO unlock calls; set LOGOS_RLN_DISABLE_AUTO_UNLOCK=1 host-side to
-  ; opt out for user-password deployments). File-mode custody means
-  ; at-rest confidentiality reduces to filesystem ACLs (the counter
-  ; ledger's authentication is unaffected); the keychain and a manual
-  ; password are the stronger modes. Returns the secret so a GUI can
-  ; reuse it as the wallet passphrase — the one reply that carries it;
-  ; treat it like the manual password. {"membership_count":N,"secret":…,
-  ; "source":"created"|"existing","unlocked":true}. Errors:
-  ; keychain_unavailable (no stored secret while the keystore HAS
-  ; credentials — a USER-owned store; it never invents a secret over one),
+  ; verification seam; with no stored secret and a NEVER-PROVISIONED
+  ; keystore it generates 32 random bytes, durably writes the secret FILE
+  ; first, then unlocks. A stored FILE secret that fails the verifier is
+  ; moved aside (rln_autounlock.secret.bad.<unix>, kept for forensics) and
+  ; the keychain source is tried — a stale file can never permanently
+  ; shadow recovery. The module also runs this flow ITSELF at init
+  ; (full-lazy default: a fresh store self-provisions and every restart
+  ; resumes with ZERO unlock calls; set LOGOS_RLN_DISABLE_AUTO_UNLOCK=1
+  ; host-side to opt out for user-password deployments — that switch
+  ; refuses THIS method too). File-mode custody means at-rest
+  ; confidentiality reduces to filesystem ACLs (the counter ledger's
+  ; authentication is unaffected); the keychain and a manual password are
+  ; the stronger modes.
+  ; {"membership_count":N,"source":"created"|"existing","unlocked":true},
+  ; PLUS "secret":… ONLY when source is "created" — the one reply that
+  ; releases it, so a GUI can mirror the just-provisioned secret into its
+  ; wallet passphrase; treat it like the manual password. A resume
+  ; ("existing") OMITS the field entirely: the live secret is not
+  ; re-released on every call. Errors: keychain_unavailable (no stored
+  ; secret while the keystore is already PROVISIONED — a USER-owned store,
+  ; whether or not it holds credentials yet; it never invents a secret
+  ; over one, and unlocking an empty provisioned store would rekey the
+  ; user's password away — or auto-unlock is disabled by the env var),
   ; bad_password (stored secret fails the keystore verifier — manual-era
   ; keystore: unlock manually once and remember), internal (no persistence
   ; path, or the secret file cannot be written — persist-before-unlock).

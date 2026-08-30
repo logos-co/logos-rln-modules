@@ -391,6 +391,16 @@ impl Store {
         self.snapshot_arc().has_credentials
     }
 
+    /// True when the sealed header exists — some password already opens this
+    /// store, even with ZERO credentials. `unlock` RE-provisions an empty
+    /// store's header with whatever password is offered, so auto-unlock must
+    /// gate self-provisioning on this too, not only on `has_credentials`:
+    /// otherwise a user password set before the first registration is
+    /// silently rekeyed away at the next launch.
+    pub fn is_provisioned(&self) -> bool {
+        crate::lock(&self.write).sealed.is_some()
+    }
+
     pub fn base_dir(&self) -> &Path {
         &self.dir
     }

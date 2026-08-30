@@ -3,10 +3,11 @@
 //! keystore dir (the module-owned marker — self-provisioned, all
 //! platforms) and the macOS Keychain (the UI-owned / legacy marker;
 //! remember_keystore_password's target). By default the module
-//! self-provisions at init (`lazy_auto_unlock`, gated on
-//! LOGOS_RLN_DISABLE_AUTO_UNLOCK), so a fresh store needs ZERO unlock
-//! calls; a store with credentials but no stored secret is USER-owned and
-//! stays locked. The keystore itself is untouched — `Store::unlock` stays
+//! self-provisions at init (`lazy_auto_unlock`), so a fresh store needs
+//! ZERO unlock calls; LOGOS_RLN_DISABLE_AUTO_UNLOCK opts out of BOTH that
+//! and the wire op. An already provisioned store with no stored secret is
+//! USER-owned and stays locked. The keystore itself is untouched —
+//! `Store::unlock` stays
 //! the single verification seam (bad_password from the constant-time
 //! verifier, adopt-on-empty), this module only decides WHERE the password
 //! comes from.
@@ -188,6 +189,16 @@ fn keychain_err(message: &str) -> ApiError {
 /// keychain writes without an explicit user action.
 pub(crate) const AUTO_SECRET_FILE: &str = "rln_autounlock.secret";
 
+/// The host-side opt-out. It gates BOTH surfaces — module init and the
+/// wire op — so an opted-out deployment cannot be talked into
+/// self-provisioning (or into handing out a stored secret) by a wire
+/// caller.
+pub(crate) const DISABLE_ENV: &str = "LOGOS_RLN_DISABLE_AUTO_UNLOCK";
+
+pub(crate) fn auto_unlock_disabled() -> bool {
+    std::env::var_os(DISABLE_ENV).is_some()
+}
+
 fn read_file_secret(dir: &std::path::Path) -> Option<Zeroizing<String>> {
     let raw = std::fs::read_to_string(dir.join(AUTO_SECRET_FILE)).ok()?;
     let trimmed = raw.trim();
@@ -198,19 +209,27 @@ fn read_file_secret(dir: &std::path::Path) -> Option<Zeroizing<String>> {
     }
 }
 
-/// Resolve the stored auto-unlock password: the secret FILE wins (the
-/// module-owned marker), then the OS keychain (the UI-owned / legacy
-/// marker). A keychain BACKEND failure is a miss with a note, never a
-/// hard stop — the file path and manual unlock both remain; a PRESENT
-/// but undecodable keychain item stays a hard error (foreign item —
-/// generating over it would mask a real misconfiguration).
-fn read_auto_password(
-    dir: &std::path::Path,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SecretSource {
+    File,
+    Keychain,
+}
+
+/// A stored secret and which source produced it — the source decides what
+/// a failed unlock means (a bad FILE is quarantined; a bad keychain item
+/// is only reported).
+struct StoredSecret {
+    password: Zeroizing<String>,
+    source: SecretSource,
+}
+
+/// A keychain BACKEND failure is a miss with a note, never a hard stop —
+/// the file path and manual unlock both remain; a PRESENT but undecodable
+/// item stays a hard error (foreign item — generating over it would mask a
+/// real misconfiguration).
+fn read_keychain_secret(
     account: &str,
 ) -> Result<(Option<Zeroizing<String>>, Option<String>), ApiError> {
-    if let Some(secret) = read_file_secret(dir) {
-        return Ok((Some(secret), None));
-    }
     match with_backend(|k| k.read(SERVICE, account)) {
         Ok(Some(payload)) => {
             let bytes = Zeroizing::new(
@@ -228,26 +247,88 @@ fn read_auto_password(
     }
 }
 
+/// Resolve the stored auto-unlock password: the secret FILE wins (the
+/// module-owned marker), then the OS keychain (the UI-owned / legacy
+/// marker). The source travels with the secret — a file that does not open
+/// the store is quarantined rather than left to shadow the keychain.
+fn read_auto_password(
+    dir: &std::path::Path,
+    account: &str,
+) -> Result<(Option<StoredSecret>, Option<String>), ApiError> {
+    if let Some(password) = read_file_secret(dir) {
+        return Ok((Some(StoredSecret { password, source: SecretSource::File }), None));
+    }
+    let (found, note) = read_keychain_secret(account)?;
+    let stored = found.map(|password| StoredSecret { password, source: SecretSource::Keychain });
+    Ok((stored, note))
+}
+
+/// Move a rejected secret file aside, preserving it as evidence (the same
+/// pattern as `sealed_store::fs::load_json`): a stale file that keeps
+/// winning the file-first resolution would shadow the keychain source
+/// forever, and with it the documented "unlock manually once and it will
+/// be remembered" recovery.
+fn quarantine_secret_file(dir: &std::path::Path) {
+    let bad = dir.join(format!("{AUTO_SECRET_FILE}.bad.{}", crate::now_unix()));
+    eprintln!(
+        "keystore auto-unlock: {AUTO_SECRET_FILE} does not open this keystore; attempting to \
+         move it aside to {}",
+        bad.display()
+    );
+    if let Err(e) = std::fs::rename(dir.join(AUTO_SECRET_FILE), &bad) {
+        eprintln!("keystore auto-unlock: quarantine rename failed ({e}); bad file left in place");
+    }
+}
+
 /// The shared auto-unlock walk (wire and init-time lazy path alike):
-/// stored secret (file, then keychain) → unlock; no secret + credentials
-/// → refuse (USER-owned store; inventing a secret would guarantee
-/// bad_password forever); no secret + fresh store → generate, persist the
-/// FILE durably FIRST (an unlocked keystore keyed by a secret that never
-/// reached disk would be a guaranteed future lockout), then unlock.
+/// stored secret (file, then keychain) → unlock; no secret + an already
+/// provisioned store → refuse (USER-owned; inventing a secret would either
+/// guarantee bad_password forever or, on an empty store, rekey the user's
+/// password away); no secret + never-provisioned store → generate, persist
+/// the FILE durably FIRST (an unlocked keystore keyed by a secret that
+/// never reached disk would be a guaranteed future lockout), then unlock.
 fn auto_unlock_core(
     store: &std::sync::Arc<sealed::Store>,
 ) -> Result<(usize, &'static str, Zeroizing<String>), ApiError> {
     let dir = store.base_dir().to_path_buf();
     let account = account_for_dir(&dir.to_string_lossy());
-    let (found, keychain_note) = read_auto_password(&dir, &account)?;
-    if let Some(password) = found {
-        let count = store.unlock(&password)?;
-        return Ok((count, "existing", password));
+    let (found, mut keychain_note) = read_auto_password(&dir, &account)?;
+    if let Some(stored) = found {
+        match store.unlock(&stored.password) {
+            Ok(count) => return Ok((count, "existing", stored.password)),
+            Err(e) if stored.source == SecretSource::File && e.kind == ErrorKind::BadPassword => {
+                quarantine_secret_file(&dir);
+                let (fallback, note) = read_keychain_secret(&account)?;
+                keychain_note = note;
+                let Some(password) = fallback else {
+                    let note =
+                        keychain_note.map(|e| format!(" (keychain: {e})")).unwrap_or_default();
+                    return Err(ApiError::new(
+                        ErrorKind::BadPassword,
+                        &format!(
+                            "{} — the {AUTO_SECRET_FILE} that held it was moved aside; unlock \
+                             manually once and it will be remembered{note}",
+                            e.message
+                        ),
+                    ));
+                };
+                let count = store.unlock(&password)?;
+                return Ok((count, "existing", password));
+            }
+            Err(e) => return Err(e),
+        }
     }
-    if store.has_credentials() {
+    // is_provisioned, not just has_credentials: Store::unlock re-provisions a
+    // credential-less store with any password offered.
+    if store.is_provisioned() {
+        let what = if store.has_credentials() {
+            "already has credentials"
+        } else {
+            "is already provisioned with a password (no credentials yet)"
+        };
         let note = keychain_note.map(|e| format!(" (keychain: {e})")).unwrap_or_default();
         return Err(keychain_err(&format!(
-            "no stored auto-unlock secret, but the keystore already has credentials — unlock \
+            "no stored auto-unlock secret, but the keystore {what} — unlock \
              manually once (restoring the keystore files from a backup first if entries are \
              quarantined) and it will be remembered{note}",
         )));
@@ -264,23 +345,34 @@ fn auto_unlock_core(
 
 /// unlock_keystore_auto(): the wire surface over `auto_unlock_core`.
 pub(crate) fn auto_unlock_impl() -> Result<serde_json::Value, ApiError> {
+    if auto_unlock_disabled() {
+        return Err(keychain_err(&format!(
+            "module-owned auto-unlock is disabled on this deployment ({DISABLE_ENV} is set) — \
+             unlock with the user's password instead"
+        )));
+    }
     let store = sealed::current_or_uninit()?;
     let (count, source, secret) = auto_unlock_core(&store)?;
-    Ok(serde_json::json!({
+    let mut reply = serde_json::json!({
         "membership_count": count,
-        "secret": secret.as_str(),
         "source": source,
         "unlocked": true,
-    }))
+    });
+    // The secret crosses the wire exactly once, on the provision a GUI has to
+    // mirror into its wallet passphrase; a resume never re-releases it.
+    if source == "created" {
+        reply["secret"] = serde_json::Value::String(secret.as_str().to_string());
+    }
+    Ok(reply)
 }
 
 /// Full-lazy module-owned custody, run once at module init: resume the
-/// auto-owned session, or — for a store with no credentials and no stored
+/// auto-owned session, or — for a never-provisioned store with no stored
 /// secret — self-provision one, so the keystore works with ZERO unlock
-/// calls (the caller gates on LOGOS_RLN_DISABLE_AUTO_UNLOCK). A store
-/// whose credentials exist without a stored secret is USER-owned and
-/// stays locked. Failures log and leave the store locked; the wire
-/// unlock paths remain authoritative.
+/// calls (the caller gates on `auto_unlock_disabled`). An already
+/// provisioned store without a stored secret is USER-owned and stays
+/// locked. Failures log and leave the store locked; the wire unlock paths
+/// remain authoritative.
 pub(crate) fn lazy_auto_unlock() {
     let Some(store) = sealed::current() else { return };
     if store.session_password().is_some() {
@@ -369,6 +461,52 @@ mod tests {
         std::fs::read_to_string(fixture.dir.join(AUTO_SECRET_FILE)).ok()
     }
 
+    /// What the CURRENTLY published store is unlocked with — replies no
+    /// longer carry the secret on a resume, so this is how the tests check
+    /// which source actually opened the store.
+    fn session_secret() -> Option<String> {
+        sealed::current()?.session_password().map(|p| p.to_string())
+    }
+
+    fn quarantined_secrets(fixture: &Fixture) -> Vec<String> {
+        let prefix = format!("{AUTO_SECRET_FILE}.bad.");
+        let mut names: Vec<String> = std::fs::read_dir(&fixture.dir)
+            .expect("keystore dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&prefix))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The sealed header's stored verifier — it changes if and only if the
+    /// store was (re-)provisioned.
+    fn sealed_verifier(fixture: &Fixture) -> Option<String> {
+        let raw =
+            std::fs::read_to_string(fixture.dir.join(crate::sealed_store::format::SEALED_FILE))
+                .ok()?;
+        let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        parsed.get("verifier")?.as_str().map(str::to_string)
+    }
+
+    /// Env vars are process-global: an assertion failure must not leak the
+    /// opt-out into the rest of the suite (TEST_GLOBAL_LOCK ignores poison).
+    struct EnvGuard;
+
+    impl EnvGuard {
+        fn set() -> EnvGuard {
+            std::env::set_var(DISABLE_ENV, "1");
+            EnvGuard
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(DISABLE_ENV);
+        }
+    }
+
     fn teardown(fixture: &Fixture) {
         reset_backend_for_tests();
         sealed::publish(None);
@@ -441,7 +579,8 @@ mod tests {
         let _relaunched = crate::publish_test_store(fixture.dir.clone());
         let second = auto_unlock_impl().expect("relaunch auto-unlock");
         assert_eq!(second["source"], "existing");
-        assert_eq!(second["secret"].as_str(), Some(secret.as_str()));
+        assert_eq!(file_secret(&fixture).as_deref(), Some(secret.as_str()), "reused, not recreated");
+        assert_eq!(session_secret(), Some(secret.clone()), "and it is what unlocked the store");
 
         teardown(&fixture);
     }
@@ -457,7 +596,11 @@ mod tests {
 
         let out = auto_unlock_impl().expect("file-first resolution");
         assert_eq!(out["source"], "existing");
-        assert_eq!(out["secret"], "pw-file", "the file is the module-owned marker and wins");
+        assert_eq!(
+            session_secret().as_deref(),
+            Some("pw-file"),
+            "the file is the module-owned marker and wins"
+        );
 
         teardown(&fixture);
     }
@@ -505,7 +648,7 @@ mod tests {
         let out = auto_unlock_impl().expect("matching secret");
         assert_eq!(out["source"], "existing");
         assert_eq!(out["membership_count"], 1);
-        assert_eq!(out["secret"], "pw-manual");
+        assert_eq!(session_secret().as_deref(), Some("pw-manual"));
 
         teardown(&fixture);
     }
@@ -659,6 +802,154 @@ mod tests {
             );
             std::fs::set_permissions(&fixture.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
+        teardown(&fixture);
+    }
+
+    #[test]
+    fn the_opt_out_env_var_binds_the_wire_op_too() {
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let fixture = setup("opted-out");
+        let env = EnvGuard::set();
+
+        // A fresh store: a wire caller cannot make the module self-provision.
+        let err = auto_unlock_impl().unwrap_err();
+        assert!(
+            err.to_json().contains(r#""kind":"keychain_unavailable""#),
+            "got: {}",
+            err.to_json()
+        );
+        assert!(err.message.contains(DISABLE_ENV), "the refusal must name it: {}", err.message);
+        assert!(file_secret(&fixture).is_none(), "an opted-out deployment provisions no secret");
+        assert!(sealed_verifier(&fixture).is_none(), "and never touches the sealed header");
+        assert!(fixture.store.session_password().is_none());
+        teardown(&fixture);
+
+        // A store with a stored secret: it is not read out either.
+        let fixture2 = setup("opted-out-remembered");
+        store_credential("pw-file");
+        crate::sealed_store::fs::write_durable(&fixture2.dir, AUTO_SECRET_FILE, b"pw-file")
+            .expect("seed a stored secret");
+        assert!(auto_unlock_impl().is_err(), "a stored secret stays unused while opted out");
+        assert!(fixture2.store.session_password().is_none());
+
+        // Cleared: the same call resumes normally.
+        drop(env);
+        let out = auto_unlock_impl().expect("auto-unlock once the opt-out is cleared");
+        assert_eq!(out["source"], "existing");
+        assert_eq!(session_secret().as_deref(), Some("pw-file"));
+
+        teardown(&fixture2);
+    }
+
+    #[test]
+    fn a_provisioned_but_empty_store_is_never_self_provisioned_over() {
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let fixture = setup("provisioned-empty");
+        // The window between "the user set a password" and the first
+        // registration: zero credentials, but the header IS provisioned.
+        fixture.store.unlock("pw-user").expect("user provisions the empty store");
+        fixture.store.lock();
+        let verifier = sealed_verifier(&fixture).expect("header provisioned");
+
+        let err = auto_unlock_impl().unwrap_err();
+        assert!(
+            err.to_json().contains(r#""kind":"keychain_unavailable""#),
+            "got: {}",
+            err.to_json()
+        );
+        assert!(file_secret(&fixture).is_none(), "must not invent a secret over a user password");
+        assert!(fixture.store.session_password().is_none());
+        assert_eq!(
+            sealed_verifier(&fixture).as_deref(),
+            Some(verifier.as_str()),
+            "the header must not be rekeyed"
+        );
+
+        // Init-time custody must not rekey it either.
+        lazy_auto_unlock();
+        assert!(fixture.store.session_password().is_none(), "lazy must leave it locked");
+        assert_eq!(sealed_verifier(&fixture).as_deref(), Some(verifier.as_str()));
+
+        // The user's password still opens it.
+        assert_eq!(fixture.store.unlock("pw-user").expect("user password survives"), 0);
+
+        teardown(&fixture);
+    }
+
+    #[test]
+    fn a_bad_file_secret_is_quarantined_and_the_keychain_takes_over() {
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let fixture = setup("bad-file");
+        store_credential("pw-real");
+        crate::sealed_store::fs::write_durable(&fixture.dir, AUTO_SECRET_FILE, b"pw-stale")
+            .expect("seed a stale file secret");
+        seed_item(&fixture, "pw-real");
+
+        let out = auto_unlock_impl().expect("the keychain takes over once the file is aside");
+        assert_eq!(out["source"], "existing");
+        assert_eq!(out["membership_count"], 1);
+        assert_eq!(session_secret().as_deref(), Some("pw-real"));
+        assert!(file_secret(&fixture).is_none(), "the bad file must stop shadowing the keychain");
+        let quarantined = quarantined_secrets(&fixture);
+        assert_eq!(quarantined.len(), 1, "exactly one quarantined file: {quarantined:?}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.dir.join(&quarantined[0])).unwrap(),
+            "pw-stale",
+            "the evidence is preserved verbatim"
+        );
+
+        teardown(&fixture);
+    }
+
+    #[test]
+    fn a_bad_file_secret_never_bricks_the_documented_recovery() {
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let fixture = setup("bad-file-only");
+        store_credential("pw-real");
+        crate::sealed_store::fs::write_durable(&fixture.dir, AUTO_SECRET_FILE, b"pw-stale")
+            .expect("seed a stale file secret");
+
+        // No fallback source: the bad_password surfaces, but the file is aside.
+        let err = auto_unlock_impl().unwrap_err();
+        assert!(err.to_json().contains(r#""kind":"bad_password""#), "got: {}", err.to_json());
+        assert!(fixture.store.session_password().is_none());
+        assert!(file_secret(&fixture).is_none());
+        assert_eq!(quarantined_secrets(&fixture).len(), 1);
+
+        // "Unlock manually once and it will be remembered" now actually sticks.
+        fixture.store.unlock("pw-real").expect("manual unlock");
+        remember_impl().expect("remember the manual password");
+        fixture.store.lock();
+        let out = auto_unlock_impl().expect("the remembered password is no longer shadowed");
+        assert_eq!(out["source"], "existing");
+        assert_eq!(session_secret().as_deref(), Some("pw-real"));
+        assert_eq!(quarantined_secrets(&fixture).len(), 1, "the evidence survives the recovery");
+
+        teardown(&fixture);
+    }
+
+    #[test]
+    fn only_a_created_reply_carries_the_secret() {
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let fixture = setup("secret-once");
+
+        let created = auto_unlock_impl().expect("fresh provision");
+        assert_eq!(created["source"], "created");
+        let secret = created["secret"]
+            .as_str()
+            .expect("the provision reply mirrors the secret for the GUI")
+            .to_string();
+
+        fixture.store.close();
+        let _relaunched = crate::publish_test_store(fixture.dir.clone());
+        let existing = auto_unlock_impl().expect("resume");
+        assert_eq!(existing["source"], "existing");
+        assert!(
+            existing.get("secret").is_none(),
+            "a resume must not re-release the live secret: {existing}"
+        );
+        assert_eq!(session_secret(), Some(secret), "though it did unlock with the stored secret");
+
         teardown(&fixture);
     }
 }

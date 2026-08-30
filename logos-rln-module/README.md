@@ -109,8 +109,9 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   wallet module's job.
 - `rust-lib/src/keychain.rs` — `unlock_keystore_auto()` /
   `remember_keystore_password()`: macOS-Keychain-backed silent unlock via
-  the `security` CLI (stdin batch writes — the secret never hits argv;
-  a missing item over existing credentials never invents a secret).
+  the `security` CLI (stdin batch writes — the secret never hits argv; no
+  secret is ever invented over a provisioned store; the reply releases the
+  secret only on the fresh provision that created it).
   Injectable backend seam; cargo tests never touch the live keychain.
 - `rust-lib/generated/provider_gen.rs` — gitignored scaffold the nix build
   regenerates; for local `cargo check`/tests, materialise it (plus the
@@ -143,8 +144,10 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   (`rln_autounlock.secret`, 0600, in the store dir — see
   `docs/keystore-format.md`), so a headless host needs ZERO unlock calls;
   `LOGOS_RLN_DISABLE_AUTO_UNLOCK=1` opts a deployment back into
-  user-password custody, and a store that already has credentials but no
-  stored secret is never adopted (stays locked until manual unlock).
+  user-password custody — it gates module init AND refuses
+  `unlock_keystore_auto()` — and an already provisioned store with no
+  stored secret is never adopted (stays locked until manual unlock),
+  whether or not it holds credentials yet.
   File-mode custody trades at-rest confidentiality down to filesystem
   ACLs; the OS keychain (macOS) and a manual password are the stronger
   modes.
