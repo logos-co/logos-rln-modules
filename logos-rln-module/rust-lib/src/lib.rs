@@ -1669,7 +1669,7 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
         reply(keychain::remember_impl())
     }
 
-    fn register(
+    fn register_membership(
         &self,
         registry_id: String,
         rln_identifier_hex: String,
@@ -2736,10 +2736,10 @@ mod tests {
         let imp = LogosRlnModuleImpl::default();
         let rln_id = "ef".repeat(32);
 
-        let out = imp.register("not-caip10".into(), rln_id.clone(), String::new());
+        let out = imp.register_membership("not-caip10".into(), rln_id.clone(), String::new());
         assert!(out.contains(r#""kind":"invalid_argument""#), "got: {out}");
 
-        let out = imp.register(
+        let out = imp.register_membership(
             "eip155:1:0xB9cd878C90E49F797B4431fBF4fb333108CB90e6".into(),
             rln_id.clone(),
             String::new(),
@@ -2747,11 +2747,11 @@ mod tests {
         assert!(out.contains(r#""kind":"unknown_registry""#), "got: {out}");
 
         let logos = format!("logos:local:{}", "ab".repeat(32));
-        let out = imp.register(logos.clone(), rln_id, opts_arr(&[("rate_limit", "0")]));
+        let out = imp.register_membership(logos.clone(), rln_id, opts_arr(&[("rate_limit", "0")]));
         assert!(out.contains(r#""kind":"invalid_argument""#), "got: {out}");
 
         // A malformed rln_identifier is rejected before any state work.
-        let out = imp.register(logos, "xyz".into(), String::new());
+        let out = imp.register_membership(logos, "xyz".into(), String::new());
         assert!(out.contains(r#""kind":"invalid_argument""#), "got: {out}");
     }
 
@@ -2768,7 +2768,7 @@ mod tests {
         assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
         let registry = format!("logos:local:{}", "ab".repeat(32));
 
-        let out = imp.register(
+        let out = imp.register_membership(
             registry.clone(),
             "ef".repeat(32),
             opts_arr(&[("funding_holding_account_id", &"cd".repeat(32))]),
@@ -2803,7 +2803,7 @@ mod tests {
         let reg_a = format!("logos:local:{}", "ab".repeat(32));
         let funding =
             opts_arr(&[("rate_limit", "300"), ("funding_holding_account_id", &"cd".repeat(32))]);
-        let out = imp.register(reg_a.clone(), rln_id.clone(), funding);
+        let out = imp.register_membership(reg_a.clone(), rln_id.clone(), funding);
         assert!(out.contains(r#""kind":"provider_failure""#), "got: {out}");
         let listed = imp.get_memberships(reg_a);
         assert!(listed.contains("membership_hash"), "a credential was generated and persisted");
@@ -2830,7 +2830,7 @@ mod tests {
             300,
         );
 
-        let out = imp.register(reg_b.clone(), rln_id, opts_arr(&[("rate_limit", "250")]));
+        let out = imp.register_membership(reg_b.clone(), rln_id, opts_arr(&[("rate_limit", "250")]));
         assert!(!out.contains(r#""error""#), "idempotent short-circuit, no provider call: {out}");
         assert!(out.contains(r#""state":"active""#), "got: {out}");
         assert!(out.contains(r#""rate_limit":300"#), "existing registration's rate wins: {out}");
@@ -2843,7 +2843,7 @@ mod tests {
         // submit), leaving TWO records on the registry.
         let funding =
             opts_arr(&[("rate_limit", "300"), ("funding_holding_account_id", &"cd".repeat(32))]);
-        let out = imp.register(reg_b.clone(), "aa".repeat(32), funding);
+        let out = imp.register_membership(reg_b.clone(), "aa".repeat(32), funding);
         assert!(out.contains(r#""kind":"provider_failure""#), "got: {out}");
         let listed = imp.get_memberships(reg_b);
         assert_eq!(
@@ -2888,7 +2888,7 @@ mod tests {
             300,
         );
 
-        let out = imp.register(reg_expired.clone(), rln_id.clone(), funding.clone());
+        let out = imp.register_membership(reg_expired.clone(), rln_id.clone(), funding.clone());
         assert!(
             out.contains(r#""kind":"provider_failure""#),
             "no short-circuit — the fresh submit hits the dead transport: {out}"
@@ -2922,7 +2922,7 @@ mod tests {
             300,
         );
 
-        let out = imp.register(reg_erased.clone(), rln_id, funding);
+        let out = imp.register_membership(reg_erased.clone(), rln_id, funding);
         assert!(out.contains(r#""kind":"provider_failure""#), "got: {out}");
         let records = store.records_for(&reg_erased);
         assert_eq!(records.len(), 2, "the erased record is retained AND a fresh one was minted");
@@ -2947,7 +2947,7 @@ mod tests {
         let rln_id = "ef".repeat(32);
 
         let out =
-            imp.register(registry.clone(), rln_id.clone(), opts_arr(&[("delegated", "true")]));
+            imp.register_membership(registry.clone(), rln_id.clone(), opts_arr(&[("delegated", "true")]));
         assert!(out.contains(r#""kind":"invalid_argument""#), "got: {out}");
         assert_eq!(
             imp.get_memberships(registry.clone()),
@@ -2962,7 +2962,7 @@ mod tests {
             ("auth_type", "keycard-attestation"),
             ("auth_provider", "keycard_capture_module"),
         ]);
-        let out = imp.register(registry.clone(), rln_id.clone(), opts);
+        let out = imp.register_membership(registry.clone(), rln_id.clone(), opts);
         assert!(out.contains(r#""kind":"provider_failure""#), "got: {out}");
         assert!(
             imp.get_memberships(registry.clone()).contains("membership_hash"),
@@ -2979,7 +2979,7 @@ mod tests {
             ("auth_type", "voucher-v1"),
             ("auth_payload", "deadbeef"),
         ]);
-        let out = imp.register(registry.clone(), rln_id, opts);
+        let out = imp.register_membership(registry.clone(), rln_id, opts);
         assert!(out.contains(r#""kind":"provider_failure""#), "got: {out}");
 
         sealed_store::store::publish(None);
@@ -2998,7 +2998,7 @@ mod tests {
         let registry = format!("logos:local:{}", "ab".repeat(32));
         let rln_id = "ef".repeat(32);
 
-        let out = imp.register(
+        let out = imp.register_membership(
             registry.clone(),
             rln_id.clone(),
             r#"[{"key":"delegated","value":true}]"#.into(),
@@ -3007,11 +3007,11 @@ mod tests {
         assert!(out.contains("'delegated' must be a string"), "got: {out}");
 
         let out =
-            imp.register(registry.clone(), rln_id.clone(), r#"{"delegated":"true"}"#.into());
+            imp.register_membership(registry.clone(), rln_id.clone(), r#"{"delegated":"true"}"#.into());
         assert!(out.contains(r#""kind":"invalid_argument""#), "got: {out}");
         assert!(out.contains("must be a RegistryOptions array"), "got: {out}");
 
-        let out = imp.register(
+        let out = imp.register_membership(
             registry,
             rln_id,
             r#"[{"key":"rate_limit","value":"5"},{"key":"rate_limit","value":"9"}]"#.into(),
@@ -3039,7 +3039,7 @@ mod tests {
             )
         };
         let reg = |imp: &LogosRlnModuleImpl, extra: &str| {
-            imp.register(registry.clone(), rln_id.clone(), opts(extra))
+            imp.register_membership(registry.clone(), rln_id.clone(), opts(extra))
         };
 
         for (extra, expect) in [
@@ -3063,7 +3063,7 @@ mod tests {
             assert!(out.contains(expect), "{extra} got: {out}");
         }
 
-        let out = imp.register(
+        let out = imp.register_membership(
             registry.clone(),
             rln_id.clone(),
             opts_arr(&[("auth_type", "voucher-v1"), ("auth_payload", "deadbeef")]),
