@@ -41,7 +41,7 @@
 ; Events are a third channel, pushed over the lp event stream rather than
 ; returned from a call — see the events section below.
 module liblogos_rln_module {
-  version "0.6.1"
+  version "0.7.0"
   description "RLN Membership Management Module"
   category "blockchain"
   depends [liblogos_lez_rln_module]
@@ -135,7 +135,9 @@ module liblogos_rln_module {
   ; touches only the plaintext-safe metadata. {"locked":true}.
   method lock_keystore() -> tstr
 
-  ; Spec register(scope, options). Scope = (registry_id,
+  ; Spec register(scope, options) — named register_membership on this wire
+  ; ("register" is a C/C++ keyword; generated clients could not carry the
+  ; spec spelling). Scope = (registry_id,
   ; rln_identifier_hex). registry_id: CAIP-10, e.g. logos:<ref>:<config-hex>.
   ; The identity credential is GENERATED INSIDE the module and
   ; persisted encrypted — the caller supplies no credential and the secret
@@ -171,7 +173,7 @@ module liblogos_rln_module {
   ; report whether it is retryable) — "failed" is a terminal state (never
   ; blocks a fresh registration), so retrying just means calling register
   ; again for the same scope.
-  method register(registry_id: tstr, rln_identifier_hex: tstr, options_json: tstr) -> tstr
+  method register_membership(registry_id: tstr, rln_identifier_hex: tstr, options_json: tstr) -> tstr
 
   ; Spec get_membership_state(scope). Resolves the membership BACKING the
   ; scope: records registered under this rln_identifier (or carrying none —
