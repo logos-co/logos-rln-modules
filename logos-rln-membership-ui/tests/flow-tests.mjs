@@ -105,7 +105,9 @@ function mockExpr(cfg) {
           return { memberships: st.memberships };
         case "unlock_keystore_auto":
           if (cfg.autoUnlock === "error") return { error: { kind: cfg.autoUnlockKind, message: "mock: auto-unlock failed" } };
-          return { membership_count: st.memberships.length, secret: "sec-" + cfg.autoUnlock, source: cfg.autoUnlock, unlocked: true };
+          if (cfg.autoUnlock === "created")
+            return { membership_count: st.memberships.length, secret: "sec-created", source: "created", unlocked: true };
+          return { membership_count: st.memberships.length, source: cfg.autoUnlock, unlocked: true };
         case "unlock_keystore":
           if (!cfg.unlockOk) return { error: { kind: "bad_password", message: "mock: wrong password" } };
           return { membership_count: st.memberships.length, unlocked: true };
