@@ -567,19 +567,54 @@ fn delegated_submit_callback(store: Weak<Store>, hash: String) -> provider::Regi
 }
 
 /// Spec register(): generate the identity credential INSIDE the module,
+/// In-flight register claims, keyed by (canonical registry, rln id). The
+/// idempotency check is a snapshot scan and the insert lands a provider
+/// round-trip (up to ~70s) later; without this claim two concurrent
+/// register(scope) calls both pass the scan and double-mint. The second
+/// caller errors transient and retries into the short-circuit.
+static REGISTER_IN_FLIGHT: Mutex<Option<std::collections::HashSet<(String, String)>>> =
+    Mutex::new(None);
+
+struct RegisterClaim(String, String);
+
+impl RegisterClaim {
+    fn take(registry: &str, rln_id_hex: &str) -> Result<RegisterClaim, ApiError> {
+        let mut set = REGISTER_IN_FLIGHT.lock().unwrap();
+        let set = set.get_or_insert_with(std::collections::HashSet::new);
+        if !set.insert((registry.to_string(), rln_id_hex.to_string())) {
+            return Err(ApiError::new(
+                ErrorKind::ProviderFailure,
+                "a registration for this scope is already in flight — retry to observe its result",
+            ));
+        }
+        Ok(RegisterClaim(registry.to_string(), rln_id_hex.to_string()))
+    }
+}
+
+impl Drop for RegisterClaim {
+    fn drop(&mut self) {
+        if let Some(set) = REGISTER_IN_FLIGHT.lock().unwrap().as_mut() {
+            set.remove(&(self.0.clone(), self.1.clone()));
+        }
+    }
+}
+
 /// persist it encrypted, and submit its rate commitment — returning the
 /// public Pending membership immediately. Idempotent PER SCOPE: the scope's
 /// live membership short-circuits. Submission is fire-and-record (the async
 /// callback lands on the owner thread after this returns); the store lock
 /// is NEVER held across a provider call.
 fn register_impl(
-    store: Result<&Arc<Store>, ApiError>,
+    store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
     rln_identifier_hex: &str,
     options_json: &str,
 ) -> Result<serde_json::Value, ApiError> {
     let (registry, _, rln_id_hex) = parse_scope(registry_id_raw, rln_identifier_hex)?;
     let prov = provider_of(&registry)?;
+    // Claimed for the whole dispatch (RAII): the live-record scan below is
+    // only sound while no sibling register for the same scope is in flight.
+    let _claim = RegisterClaim::take(&registry.canonical, &rln_id_hex)?;
 
     // Spec register(scope, RegistryOptions): options_json is the
     // RegistryOptions ARRAY binding; the common "rate_limit" key is lifted
@@ -676,7 +711,7 @@ fn register_impl(
     // blast radius); one membership can still back many applications at
     // proof time (see scope_candidates).
     let store = store?;
-    let records = records_for_registry(store, &registry);
+    let records = records_for_registry(&store, &registry);
     if let Some(rec) = records
         .iter()
         .find(|r| !r.quarantined && r.cache.state.is_live() && scope_matches(r, &rln_id_hex))
@@ -734,13 +769,12 @@ fn register_impl(
         identity_commitment: commitment_hex.clone(),
         submitted_at: now_unix(),
     };
-    store.insert(&hash, identity, &credential)?;
-    store.update_cache(&hash, |m| m.rate_limit = Some(rate_limit))?;
+    store.insert(&hash, identity, &credential, rate_limit)?;
 
     let submit = match &delegated {
         Some(d) => provider::gifter_request_async(
             &delegated_request_args(d, &commitment_hex, rate_limit),
-            delegated_submit_callback(Arc::downgrade(store), hash.clone()),
+            delegated_submit_callback(Arc::downgrade(&store), hash.clone()),
         ),
         None => prov.register_async(
             &registry,
@@ -749,7 +783,7 @@ fn register_impl(
             &opts.to_string(),
             &commitment_hex,
             rate_limit,
-            funded_submit_callback(Arc::downgrade(store), hash.clone()),
+            funded_submit_callback(Arc::downgrade(&store), hash.clone()),
         ),
     };
     if let Err(e) = submit {
@@ -772,12 +806,15 @@ fn register_impl(
 /// candidate → UNKNOWN; more than one → AmbiguousSelection. Transitions the
 /// merged view implies are persisted.
 fn get_membership_state_impl(
-    store: Result<&Arc<Store>, ApiError>,
+    store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
     rln_identifier_hex: &str,
 ) -> Result<serde_json::Value, ApiError> {
     let (registry, _, rln_id_hex) = parse_scope(registry_id_raw, rln_identifier_hex)?;
     let prov = provider_of(&registry)?;
+    // Claimed for the whole dispatch (RAII): the live-record scan below is
+    // only sound while no sibling register for the same scope is in flight.
+    let _claim = RegisterClaim::take(&registry.canonical, &rln_id_hex)?;
 
     // A missing store (no persistence path) degrades to no local records.
     let records = store
@@ -809,8 +846,16 @@ fn get_membership_state_impl(
     if merged != record.cache.state {
         // Self-healing cache write: the merged view is recomputed from
         // (local, registry, now) on every read, so a failed persist only
-        // costs the next reader a recompute — log it and move on.
+        // costs the next reader a recompute — log it and move on. The write
+        // is a compare-and-set on the state observed under the store lock:
+        // `merged` was computed from a snapshot taken before a (potentially
+        // ~70s) provider read, and a fresher writer — the poller, a submit
+        // callback, a sibling dispatch — must not be clobbered with it.
+        let snapshot_state = record.cache.state;
         let persist = store.update_cache(hash, |m| {
+            if m.state != snapshot_state {
+                return; // lost the race to a fresher writer — keep theirs
+            }
             m.state = merged;
             if pm.registered {
                 // The pending→active re-read (spec MUST).
@@ -827,20 +872,26 @@ fn get_membership_state_impl(
                 m.failed_reason = Some("removed_from_registry".to_string());
             }
         });
-        if let Err(e) = persist {
-            eprintln!("membership state persist: {}", e.message);
-        } else if let Some((registry_id, rln_identifier, membership_hash, state, previous)) =
-            lifecycle::transition_event(hash, record, merged)
-        {
-            // Emitted after the store write returned: no store lock is held
-            // across the event emit.
-            emit_membership_state_changed(
-                &registry_id,
-                &rln_identifier,
-                &membership_hash,
-                &state,
-                &previous,
-            );
+        match persist {
+            Err(e) => eprintln!("membership state persist: {}", e.message),
+            // Emit only when THIS call actually wrote the transition (the
+            // CAS matched), with `previous` from the locked observation.
+            Ok(prior) if prior == snapshot_state => {
+                if let Some((registry_id, rln_identifier, membership_hash, state, previous)) =
+                    lifecycle::transition_event(hash, record, prior, merged)
+                {
+                    // Emitted after the store write returned: no store lock
+                    // is held across the event emit.
+                    emit_membership_state_changed(
+                        &registry_id,
+                        &rln_identifier,
+                        &membership_hash,
+                        &state,
+                        &previous,
+                    );
+                }
+            }
+            Ok(_) => {} // lost the race — the winner emitted its own event
         }
     }
 
@@ -864,7 +915,7 @@ fn get_membership_state_impl(
 /// only — the identity credential is never released. No unlocked keystore
 /// is required.
 fn select_membership_impl(
-    store: Result<&Arc<Store>, ApiError>,
+    store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
     rln_identifier_hex: &str,
     selector_json: &str,
@@ -873,7 +924,7 @@ fn select_membership_impl(
     let selector = select::parse_selector(selector_json)?;
 
     let store = store?;
-    let records = records_for_registry(store, &registry);
+    let records = records_for_registry(&store, &registry);
     let hash = select::select_hash(
         &records,
         (&registry.canonical, &rln_identifier_hex),
@@ -888,13 +939,14 @@ fn select_membership_impl(
 }
 
 fn get_memberships_impl(
-    store: Result<&Arc<Store>, ApiError>,
+    store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
 ) -> Result<serde_json::Value, ApiError> {
     let registry = parse_registry(registry_id_raw)?;
+    let store = store?;
     // No provider needed: listing LOCAL records is meaningful even for a
     // namespace this build can't reach.
-    let records = records_for_registry(store?, &registry);
+    let records = records_for_registry(&store, &registry);
     let memberships: Vec<serde_json::Value> = records
         .iter()
         .map(|r| public_membership_json(&r.hash, r, r.quarantined, false))
@@ -959,19 +1011,23 @@ fn epoch_size_for(registry_canonical: &str) -> Result<u64, ApiError> {
         })
 }
 
-/// [`epoch_gap`], per registry: the start() override when given, else the
-/// instance default.
-fn epoch_gap_for(registry_canonical: &str) -> u64 {
-    lock(&CONFIG)
-        .as_ref()
-        .map(|c| {
-            c.overrides
-                .get(registry_canonical)
-                .and_then(|o| o.max_epoch_gap)
-                .unwrap_or(c.max_epoch_gap)
-        })
-        .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_MAX_EPOCH_GAP)
+/// (epoch_size_sec, max_epoch_gap) for a registry from ONE CONFIG lock
+/// acquisition — a concurrent start() reconfigure between two separate
+/// reads could otherwise hand a handler a mixed-config pair.
+fn epoch_params_for(registry_canonical: &str) -> Result<(u64, u64), ApiError> {
+    let cfg = lock(&CONFIG);
+    let c = cfg.as_ref().ok_or_else(|| {
+        ApiError::new(
+            ErrorKind::NotReady,
+            "start() has not configured epoch_size_sec; rate limiting is not ready",
+        )
+    })?;
+    let o = c.overrides.get(registry_canonical);
+    let size = o.and_then(|o| o.epoch_size_sec).unwrap_or(c.epoch_size_sec);
+    let gap = o
+        .and_then(|o| o.max_epoch_gap)
+        .unwrap_or(c.max_epoch_gap);
+    Ok((size, if gap > 0 { gap } else { DEFAULT_MAX_EPOCH_GAP }))
 }
 
 #[cfg(test)]
@@ -987,7 +1043,13 @@ pub(crate) fn reset_config_for_test() {
 /// object {"registry_id":caip10, "epoch_size_sec"?:N, "max_epoch_gap"?:N}
 /// overriding the defaults for that registry (spec: epoch size and max gap
 /// are per-registry configuration).
+/// start/stop are idempotent but their bodies span several supervisor
+/// critical sections; interleaving two of them can strand freshly spawned
+/// workers behind a stop's generation bump. Neither is a hot path.
+static LIFECYCLE: Mutex<()> = Mutex::new(());
+
 fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
+    let _lifecycle = LIFECYCLE.lock().unwrap();
     panic_hook::install_once();
     let cfg: serde_json::Value = if config_json.trim().is_empty() {
         serde_json::json!({})
@@ -1112,6 +1174,7 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
 /// supervisor's generation counter keeps a detached straggler from ever
 /// duplicating a worker.
 fn stop_impl() -> Result<serde_json::Value, ApiError> {
+    let _lifecycle = LIFECYCLE.lock().unwrap();
     worker::stop();
     ok_json(views::StopReply::new())
 }
@@ -1154,7 +1217,7 @@ pub(crate) fn json_u8_array(v: &serde_json::Value, key: &str) -> Result<Vec<u8>,
 /// LE hex) plus the spent `message_id`, the u64 `epoch_index`, and the
 /// `membership_hash`.
 fn generate_proof_impl(
-    store: Result<&Arc<Store>, ApiError>,
+    store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
     rln_identifier_hex: &str,
     signal_hex: &str,
@@ -1165,8 +1228,7 @@ fn generate_proof_impl(
     let prov = provider_of(&registry)?;
     // Readiness gate FIRST (spec: not_ready before anything else). Size and
     // gap are the REGISTRY's (start() override or instance default).
-    let size = epoch_size_for(&registry.canonical)?;
-    let gap = epoch_gap_for(&registry.canonical);
+    let (size, gap) = epoch_params_for(&registry.canonical)?;
     // The epoch derives from the CONSUMER's timestamp — the value stamped on
     // the message — so the receiver's timestamp->epoch check lines up by
     // construction.
@@ -1189,7 +1251,7 @@ fn generate_proof_impl(
     // Pick THE usable membership backing this scope; base generate_proof
     // requires a single candidate (AmbiguousSelection otherwise).
     let store = store?;
-    let records = records_for_registry(store, &registry);
+    let records = records_for_registry(&store, &registry);
     let hash = select::select_hash(
         &scope_candidates(&records, &rln_id_hex),
         (&registry.canonical, &rln_id_hex),
@@ -1255,7 +1317,7 @@ fn generate_proof_impl(
 /// parameter (default 1); generator and verifiers must share it AND
 /// epoch_size for the binding check to line up. Also the retention floor
 /// for verification-side state keyed by epoch. Production code resolves
-/// per-registry via `epoch_gap_for`; tests use this default-path view.
+/// per-registry via `epoch_params_for`; tests use this default-path view.
 #[cfg(test)]
 fn epoch_gap() -> u64 {
     lock(&CONFIG)
@@ -1340,8 +1402,7 @@ fn validate_proof_impl(
     provider_of(&registry)?;
     // Readiness gate FIRST (spec: not_ready before anything else). Size and
     // gap are the REGISTRY's (start() override or instance default).
-    let size = epoch_size_for(&registry.canonical)?;
-    let gap = epoch_gap_for(&registry.canonical);
+    let (size, gap) = epoch_params_for(&registry.canonical)?;
     let now_epoch = rate_limit::current_epoch(now_unix(), size);
     let expected_epoch = epoch_of_timestamp(timestamp, size)?;
     let signal = registry_id::hex_to_vec(signal_hex)
@@ -1415,7 +1476,7 @@ fn validate_proof_impl(
 /// error (spec SHALL): rate_limit 0 always means "no usable membership",
 /// never an exhausted budget.
 fn get_epoch_quota_impl(
-    store: Result<&Arc<Store>, ApiError>,
+    store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
     rln_identifier_hex: &str,
     timestamp: &str,
@@ -1426,10 +1487,10 @@ fn get_epoch_quota_impl(
     // Readiness gate FIRST. The single epoch observation is fixed by the
     // caller's timestamp: taken once, it keys the remaining lookup. Size and
     // gap are the REGISTRY's (start() override or instance default).
-    let size = epoch_size_for(&registry.canonical)?;
+    let (size, gap) = epoch_params_for(&registry.canonical)?;
     let epoch_index = epoch_of_timestamp(timestamp, size)?;
     let now_epoch = rate_limit::current_epoch(now_unix(), size);
-    if !epoch_in_window(epoch_index, now_epoch, epoch_gap_for(&registry.canonical)) {
+    if !epoch_in_window(epoch_index, now_epoch, gap) {
         return Err(ApiError::new(
             ErrorKind::InvalidArgument,
             "timestamp is outside the acceptable epoch window (now ± max_epoch_gap)",
@@ -1437,7 +1498,7 @@ fn get_epoch_quota_impl(
     }
 
     let store = store?;
-    let records = records_for_registry(store, &registry);
+    let records = records_for_registry(&store, &registry);
     let usable: Vec<_> = scope_candidates(&records, &rln_id_hex)
         .into_iter()
         .filter(|r| !r.quarantined && r.cache.state.is_usable())
@@ -1496,14 +1557,17 @@ impl Default for StoreCell {
 
 #[derive(Default)]
 struct LogosRlnModuleImpl {
-    store: StoreCell,
+    // Interior-mutable: concurrency:"multi" dispatch shares the impl as
+    // Arc<Self> and every handler takes &self. Handlers clone the Arc<Store>
+    // out under a short read lock — never hold the cell lock across work.
+    store: std::sync::RwLock<StoreCell>,
 }
 
 impl LogosRlnModuleImpl {
-    /// The open store, or `internal` naming why there is none.
-    fn store(&self) -> Result<&Arc<Store>, ApiError> {
-        match &self.store {
-            StoreCell::Ready(store) => Ok(store),
+    /// The open store (cloned out), or `internal` naming why there is none.
+    fn store(&self) -> Result<Arc<Store>, ApiError> {
+        match &*self.store.read().unwrap() {
+            StoreCell::Ready(store) => Ok(store.clone()),
             StoreCell::Unready(cause) => Err(ApiError::internal(cause)),
         }
     }
@@ -1514,28 +1578,31 @@ impl LogosRlnModuleImpl {
     /// lock releases deterministically and the re-open can reacquire it —
     /// OS file locks conflict between file descriptions even within one
     /// process.
-    fn open_store(&mut self, dir: std::path::PathBuf) {
+    fn open_store(&self, dir: std::path::PathBuf) {
+        // The whole close -> open -> publish sequence runs under the write
+        // lock so a re-context cannot interleave with another.
+        let mut cell = self.store.write().unwrap();
         sealed_store::store::publish(None);
-        if let StoreCell::Ready(prev) = &self.store {
+        if let StoreCell::Ready(prev) = &*cell {
             prev.close();
         }
         match Store::open(dir) {
             Ok(store) => {
                 sealed_store::store::publish(Some(&store));
-                self.store = StoreCell::Ready(store);
+                *cell = StoreCell::Ready(store);
             }
             Err(e) => {
                 // Fail closed: leave the store unready so every keystore op
                 // errors rather than clobbering shared or existing state.
                 eprintln!("store: {e}");
-                self.store = StoreCell::Unready(e.to_string());
+                *cell = StoreCell::Unready(e.to_string());
             }
         }
     }
 }
 
 impl LiblogosRlnModule for LogosRlnModuleImpl {
-    fn on_context_ready(&mut self, ctx: &RustModuleContext) {
+    fn on_context_ready(&self, ctx: &RustModuleContext) {
         panic_hook::install_once();
         // The lp client to the sibling RLN module must be created on this
         // (the host's main Qt) thread — see provider.rs.
@@ -1546,11 +1613,12 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
             eprintln!(
                 "membership module: host provided no instance_persistence_path — keystore ops will fail"
             );
+            let mut cell = self.store.write().unwrap();
             sealed_store::store::publish(None);
-            if let StoreCell::Ready(prev) = &self.store {
+            if let StoreCell::Ready(prev) = &*cell {
                 prev.close();
             }
-            self.store = StoreCell::Unready(
+            *cell = StoreCell::Unready(
                 sealed_store::store::OpenError::NoPersistencePath(
                     "no instance persistence path from the host — keystore ops are \
                      disabled (no silent cwd fallback; see README)"
@@ -1562,7 +1630,7 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
             self.open_store(std::path::PathBuf::from(&ctx.instance_persistence_path));
             // Resume confirmation polling for records that were pending at
             // the last shutdown.
-            if let StoreCell::Ready(store) = &self.store {
+            if let StoreCell::Ready(store) = &*self.store.read().unwrap() {
                 if !store.pending_records().is_empty() {
                     poller::ensure_running();
                 }
@@ -1579,7 +1647,7 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
         }
     }
 
-    fn unlock_keystore(&mut self, mut password: String) -> String {
+    fn unlock_keystore(&self, mut password: String) -> String {
         let result = self
             .store()
             .and_then(|s| s.unlock(&password))
@@ -1588,27 +1656,27 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
         reply(result)
     }
 
-    fn lock_keystore(&mut self) -> String {
+    fn lock_keystore(&self) -> String {
         reply(self.store().map(|s| {
             s.lock();
             serde_json::json!({ "locked": true })
         }))
     }
 
-    fn provision_wallet_home(&mut self, options_json: String) -> String {
+    fn provision_wallet_home(&self, options_json: String) -> String {
         reply(wallet_home::provision_impl(&options_json))
     }
 
-    fn unlock_keystore_auto(&mut self) -> String {
+    fn unlock_keystore_auto(&self) -> String {
         reply(keychain::auto_unlock_impl())
     }
 
-    fn remember_keystore_password(&mut self) -> String {
+    fn remember_keystore_password(&self) -> String {
         reply(keychain::remember_impl())
     }
 
     fn register(
-        &mut self,
+        &self,
         registry_id: String,
         rln_identifier_hex: String,
         options_json: String,
@@ -1617,19 +1685,19 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
     }
 
     fn get_membership_state(
-        &mut self,
+        &self,
         registry_id: String,
         rln_identifier_hex: String,
     ) -> String {
         reply(get_membership_state_impl(self.store(), &registry_id, &rln_identifier_hex))
     }
 
-    fn get_memberships(&mut self, registry_id: String) -> String {
+    fn get_memberships(&self, registry_id: String) -> String {
         reply(get_memberships_impl(self.store(), &registry_id))
     }
 
     fn select_membership(
-        &mut self,
+        &self,
         registry_id: String,
         rln_identifier_hex: String,
         selector_json: String,
@@ -1642,7 +1710,7 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
         ))
     }
 
-    fn get_merkle_proof(&mut self, registry_id: String, leaf_index: i64) -> String {
+    fn get_merkle_proof(&self, registry_id: String, leaf_index: i64) -> String {
         reply((|| {
             let registry = parse_registry(&registry_id)?;
             let prov = provider_of(&registry)?;
@@ -1653,7 +1721,7 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
         })())
     }
 
-    fn get_valid_roots(&mut self, registry_id: String) -> String {
+    fn get_valid_roots(&self, registry_id: String) -> String {
         reply((|| {
             let registry = parse_registry(&registry_id)?;
             let prov = provider_of(&registry)?;
@@ -1663,7 +1731,7 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
     }
 
     fn generate_proof(
-        &mut self,
+        &self,
         registry_id: String,
         rln_identifier_hex: String,
         signal_hex: String,
@@ -1679,7 +1747,7 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
     }
 
     fn validate_proof(
-        &mut self,
+        &self,
         registry_id: String,
         rln_identifier_hex: String,
         signal_hex: String,
@@ -1696,7 +1764,7 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
     }
 
     fn get_epoch_quota(
-        &mut self,
+        &self,
         registry_id: String,
         rln_identifier_hex: String,
         timestamp: String,
@@ -1710,18 +1778,18 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
     }
 
     fn get_registry_parameters(
-        &mut self,
+        &self,
         registry_id: String,
         rln_identifier_hex: String,
     ) -> Result<serde_json::Value, String> {
         reply_result(get_registry_parameters_impl(&registry_id, &rln_identifier_hex))
     }
 
-    fn start(&mut self, config_json: String) -> Result<serde_json::Value, String> {
+    fn start(&self, config_json: String) -> Result<serde_json::Value, String> {
         reply_result(start_impl(&config_json))
     }
 
-    fn stop(&mut self) -> Result<serde_json::Value, String> {
+    fn stop(&self) -> Result<serde_json::Value, String> {
         reply_result(stop_impl())
     }
 }
@@ -1737,7 +1805,7 @@ mod tests {
 
     /// The "no store" argument for `_impl` fns whose store access must never
     /// be reached (or must surface the uninitialized internal error).
-    fn no_store<'a>() -> Result<&'a Arc<Store>, ApiError> {
+    fn no_store() -> Result<Arc<Store>, ApiError> {
         Err(ApiError::internal(sealed_store::store::UNINIT_MSG))
     }
 
@@ -1781,7 +1849,7 @@ mod tests {
             identity_trapdoor: None,
             registry_id: registry.to_string(),
         };
-        store.insert(hash, identity, &credential).expect("seed insert");
+        store.insert(hash, identity, &credential, 100).expect("seed insert");
         store
             .update_cache(hash, |m| {
                 m.state = state;
@@ -1794,7 +1862,7 @@ mod tests {
     /// A module instance wired to a fresh store in `dir` (the tests'
     /// on_context_ready stand-in), plus the store for direct seeding.
     fn imp_with_store(dir: std::path::PathBuf) -> (LogosRlnModuleImpl, Arc<Store>) {
-        let mut imp = LogosRlnModuleImpl::default();
+        let imp = LogosRlnModuleImpl::default();
         imp.open_store(dir);
         let store = imp.store().expect("test store open").clone();
         (imp, store)
@@ -1825,7 +1893,7 @@ mod tests {
         // stop() tears down the global worker supervisor; serialize with the
         // other global-state tests and reset it after.
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
-        let mut imp = LogosRlnModuleImpl::default();
+        let imp = LogosRlnModuleImpl::default();
         let err = imp
             .validate_proof("not-caip10".into(), "ef".repeat(32), "00".into(), "0".into(), "{}".into())
             .unwrap_err();
@@ -1890,10 +1958,8 @@ mod tests {
             out["overrides"].get(reg_a.as_str()).is_none(),
             "a plain string entry carries no override: {out}"
         );
-        assert_eq!(epoch_size_for(&reg_a).unwrap(), 600);
-        assert_eq!(epoch_gap_for(&reg_a), 2);
-        assert_eq!(epoch_size_for(&reg_b).unwrap(), 60);
-        assert_eq!(epoch_gap_for(&reg_b), 5);
+        assert_eq!(epoch_params_for(&reg_a).unwrap(), (600, 2));
+        assert_eq!(epoch_params_for(&reg_b).unwrap(), (60, 5));
 
         // Reconfiguring without overrides clears them (idempotent start).
         let out = start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
@@ -2362,7 +2428,7 @@ mod tests {
         // No membership yet → a zero-budget SNAPSHOT, not an error (spec
         // SHALL): rate_limit 0 is the no-usable-membership signal, so it can
         // never be confused with an exhausted budget.
-        let q = get_epoch_quota_impl(Ok(&store), &registry, &rln_id, &ts).unwrap();
+        let q = get_epoch_quota_impl(Ok(store.clone()), &registry, &rln_id, &ts).unwrap();
         assert_eq!(q["rate_limit"], 0, "got: {q}");
         assert_eq!(q["remaining"], 0, "got: {q}");
         assert!(q["epoch_index"].as_u64().is_some(), "got: {q}");
@@ -2383,7 +2449,7 @@ mod tests {
             100,
         );
 
-        let fresh = get_epoch_quota_impl(Ok(&store), &registry, &rln_id, &ts).unwrap();
+        let fresh = get_epoch_quota_impl(Ok(store.clone()), &registry, &rln_id, &ts).unwrap();
         assert_eq!(fresh["rate_limit"], serde_json::json!(100));
         assert_eq!(fresh["remaining"], serde_json::json!(100));
         let epoch_index = fresh["epoch_index"].as_u64().expect("numeric epoch index");
@@ -2393,14 +2459,14 @@ mod tests {
         // index with the decremented budget.
         store.reserve_message_id(&hash, &rln_id, epoch_index, epoch_index, 100, 600).unwrap();
         store.reserve_message_id(&hash, &rln_id, epoch_index, epoch_index, 100, 600).unwrap();
-        let spent = get_epoch_quota_impl(Ok(&store), &registry, &rln_id, &ts).unwrap();
+        let spent = get_epoch_quota_impl(Ok(store.clone()), &registry, &rln_id, &ts).unwrap();
         assert_eq!(spent["epoch_index"], serde_json::json!(epoch_index));
         assert_eq!(spent["remaining"], serde_json::json!(98));
 
         // The queried epoch is fixed by the timestamp (spec): the NEXT epoch,
         // still inside the default gap, keeps its own untouched budget.
         let next_ts = ((epoch_index + 1) * 600).to_string();
-        let next = get_epoch_quota_impl(Ok(&store), &registry, &rln_id, &next_ts).unwrap();
+        let next = get_epoch_quota_impl(Ok(store.clone()), &registry, &rln_id, &next_ts).unwrap();
         assert_eq!(next["epoch_index"], serde_json::json!(epoch_index + 1));
         assert_eq!(next["rate_limit"], serde_json::json!(100));
         assert_eq!(next["remaining"], serde_json::json!(100));
@@ -2497,7 +2563,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("rln-ms-path-cache-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (mut imp, store) = imp_with_store(dir.clone());
+        let (imp, store) = imp_with_store(dir.clone());
         assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
 
         let reg = format!("logos:local:{}", "ab".repeat(32));
@@ -2525,7 +2591,7 @@ mod tests {
         // MISS: cold cache falls back to the registry — dead transport, so
         // provider_failure proves a real read was attempted.
         let miss =
-            generate_proof_impl(Ok(&store), &reg, &rln_id_hex, signal_hex, &now_unix().to_string())
+            generate_proof_impl(Ok(store.clone()), &reg, &rln_id_hex, signal_hex, &now_unix().to_string())
                 .unwrap_err();
         assert_eq!(
             miss.kind,
@@ -2543,7 +2609,7 @@ mod tests {
             leaf_index,
         );
         let out =
-            generate_proof_impl(Ok(&store), &reg, &rln_id_hex, signal_hex, &now_unix().to_string())
+            generate_proof_impl(Ok(store.clone()), &reg, &rln_id_hex, signal_hex, &now_unix().to_string())
                 .expect("a warm cache entry needs no registry call");
         assert!(out.get("proof").and_then(|v| v.as_str()).is_some(), "got: {out}");
         assert!(out.get("root").and_then(|v| v.as_str()).is_some(), "got: {out}");
@@ -2571,7 +2637,7 @@ mod tests {
         // warm-up is a harmless one-shot and never races the cache below.
         start_impl(r#"{"epoch_size_sec": 600, "max_epoch_gap": 1}"#).unwrap();
 
-        let (mut imp, store) = imp_with_store(dir.clone());
+        let (imp, store) = imp_with_store(dir.clone());
         assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
 
         let reg = format!("logos:local:{}", "1a".repeat(32));
@@ -2602,7 +2668,7 @@ mod tests {
         let now_epoch = rate_limit::current_epoch(now_unix(), size);
         // One epoch in the past — inside now ± max_epoch_gap (=1).
         let ts = (now_unix() - size).to_string();
-        let out = generate_proof_impl(Ok(&store), &reg, &rln_id_hex, "aa", &ts)
+        let out = generate_proof_impl(Ok(store.clone()), &reg, &rln_id_hex, "aa", &ts)
             .expect("a past-but-in-window timestamp still proves");
         assert_eq!(
             out.get("epoch_index").and_then(|v| v.as_u64()),
@@ -2666,14 +2732,14 @@ mod tests {
         // With no store initialized (host provided no persistence path),
         // every keystore op fails with the internal error, never panics.
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
-        let mut imp = LogosRlnModuleImpl::default();
+        let imp = LogosRlnModuleImpl::default();
         let out = imp.lock_keystore();
         assert!(out.contains(r#""kind":"internal""#), "got: {out}");
     }
 
     #[test]
     fn register_validates_arguments_before_touching_anything() {
-        let mut imp = LogosRlnModuleImpl::default();
+        let imp = LogosRlnModuleImpl::default();
         let rln_id = "ef".repeat(32);
 
         let out = imp.register("not-caip10".into(), rln_id.clone(), String::new());
@@ -2704,7 +2770,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("rln-ms-default-rate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (mut imp, _store) = imp_with_store(dir.clone());
+        let (imp, _store) = imp_with_store(dir.clone());
         assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
         let registry = format!("logos:local:{}", "ab".repeat(32));
 
@@ -2733,7 +2799,7 @@ mod tests {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
         let dir = std::env::temp_dir().join(format!("rln-ms-lib-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (mut imp, store) = imp_with_store(dir.clone());
+        let (imp, store) = imp_with_store(dir.clone());
         assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
         let rln_id = "ef".repeat(32);
 
@@ -2805,7 +2871,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("rln-ms-terminal-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (mut imp, store) = imp_with_store(dir.clone());
+        let (imp, store) = imp_with_store(dir.clone());
         assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
         let rln_id = "ef".repeat(32);
         let funding =
@@ -2881,7 +2947,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("rln-ms-delegated-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (mut imp, _store) = imp_with_store(dir.clone());
+        let (imp, _store) = imp_with_store(dir.clone());
         assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
         let registry = format!("logos:local:{}", "ab".repeat(32));
         let rln_id = "ef".repeat(32);
@@ -2934,7 +3000,7 @@ mod tests {
     // unlock/init needed.
     #[test]
     fn register_rejects_non_string_values_and_non_array_options() {
-        let mut imp = LogosRlnModuleImpl::default();
+        let imp = LogosRlnModuleImpl::default();
         let registry = format!("logos:local:{}", "ab".repeat(32));
         let rln_id = "ef".repeat(32);
 
@@ -2967,7 +3033,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("rln-ms-auth-validate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (mut imp, _store) = imp_with_store(dir.clone());
+        let (imp, _store) = imp_with_store(dir.clone());
         assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
         let registry = format!("logos:local:{}", "ab".repeat(32));
         let rln_id = "ef".repeat(32);
@@ -2978,7 +3044,7 @@ mod tests {
                     {{"key":"gifter_multiaddr","value":"/ip4/127.0.0.1/tcp/1"}},{extra}]"#
             )
         };
-        let reg = |imp: &mut LogosRlnModuleImpl, extra: &str| {
+        let reg = |imp: &LogosRlnModuleImpl, extra: &str| {
             imp.register(registry.clone(), rln_id.clone(), opts(extra))
         };
 
@@ -2998,7 +3064,7 @@ mod tests {
                 "must be hex",
             ),
         ] {
-            let out = reg(&mut imp, extra);
+            let out = reg(&imp, extra);
             assert!(out.contains(r#""kind":"invalid_argument""#), "{extra} got: {out}");
             assert!(out.contains(expect), "{extra} got: {out}");
         }
@@ -3064,7 +3130,7 @@ mod tests {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
         let dir = std::env::temp_dir().join(format!("rln-ms-select-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (mut imp, store) = imp_with_store(dir.clone());
+        let (imp, store) = imp_with_store(dir.clone());
         // Seeding a credential still needs unlock (writes are encrypted).
         assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
 

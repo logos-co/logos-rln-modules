@@ -34,7 +34,7 @@ pub(crate) fn provision_impl(options_json: &str) -> Result<serde_json::Value, Ap
 
     let config_path = home.join("wallet_config.json");
     let storage_path = home.join("storage.json");
-    let config_existed = config_path.exists();
+    let mut config_existed = config_path.exists();
     if !config_existed {
         let config = serde_json::json!({
             // Dual-shape sequencer field, mirroring stage.sh: lez >= v0.2.1
@@ -52,12 +52,33 @@ pub(crate) fn provision_impl(options_json: &str) -> Result<serde_json::Value, Ap
             // dispatch the whole time). One sequencer, 3 probes.
             "multi_sequencer_client_config": { "distribution_limit": 1, "calibration_limit": 3 },
         });
-        // Atomic tmp+rename: the wallet module reads this file from another
-        // process.
-        let tmp = home.join("wallet_config.json.tmp");
-        std::fs::write(&tmp, config.to_string())
-            .and_then(|()| std::fs::rename(&tmp, &config_path))
-            .map_err(|e| ApiError::internal(&format!("write {}: {e}", config_path.display())))?;
+        // Atomic tmp+rename (the wallet module reads this file from another
+        // process), with a per-call tmp name and an exclusive-create claim so
+        // two concurrent first-provisions can't tear one tmp file or both
+        // report config_existed:false.
+        let claim = home.join("wallet_config.json.claim");
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&claim) {
+            Ok(_) => {
+                let tmp = home.join("wallet_config.json.tmp");
+                let write = std::fs::write(&tmp, config.to_string())
+                    .and_then(|()| std::fs::rename(&tmp, &config_path));
+                let _ = std::fs::remove_file(&claim);
+                write.map_err(|e| {
+                    ApiError::internal(&format!("write {}: {e}", config_path.display()))
+                })?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A sibling provision is writing the config right now — treat
+                // it as pre-existing rather than racing the write.
+                config_existed = true;
+            }
+            Err(e) => {
+                return Err(ApiError::internal(&format!(
+                    "claim {}: {e}",
+                    claim.display()
+                )))
+            }
+        }
     }
 
     Ok(serde_json::json!({

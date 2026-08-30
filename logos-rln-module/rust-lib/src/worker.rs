@@ -207,9 +207,13 @@ pub(crate) fn start(warm: impl FnOnce() + Send + 'static) {
             let _ = handle.join();
         }
     }
-    let gen = sup.generation;
-    sup.warm = Some(spawn_into("rln-warm", gen, warm));
-    sup.running += 1;
+    // Re-check under the lock: a stop() interleaved since this start's
+    // first section must not get a fresh warm worker spawned behind it.
+    if sup.state != WorkerState::Stopped {
+        let gen = sup.generation;
+        sup.warm = Some(spawn_into("rln-warm", gen, warm));
+        sup.running += 1;
+    }
 }
 
 /// stop(): forbid spawning, wake every sleeping worker, wait up to [`GRACE`]

@@ -423,6 +423,7 @@ impl Store {
         hash: &str,
         identity: IdentityBlock,
         credential: &StoredCredential,
+        rate_limit: u64,
     ) -> Result<(), ApiError> {
         let mut guard = crate::lock(&self.write);
         let inner = &mut *guard;
@@ -445,7 +446,11 @@ impl Store {
 
         inner.cache.insert(
             hash.to_string(),
-            CacheState { state: MembershipState::Pending, ..CacheState::default() },
+            CacheState {
+                state: MembershipState::Pending,
+                rate_limit: Some(rate_limit),
+                ..CacheState::default()
+            },
         );
         write_cache(&self.dir, inner)?;
 
@@ -569,12 +574,15 @@ impl Store {
     /// Run a cache-only mutation and persist the sidecar. Works LOCKED (the
     /// poller's path); by construction it can never touch the sealed or
     /// allocations files. Stamps the monotone `first_active_at` on the first
-    /// active-like observation.
+    /// active-like observation. Returns the row's state as observed UNDER
+    /// the write lock before the mutation ran — the authoritative "previous"
+    /// for change gating and transition events (a pre-call snapshot can be
+    /// stale under concurrent dispatch).
     pub fn update_cache(
         &self,
         hash: &str,
         f: impl FnOnce(&mut CacheState),
-    ) -> Result<(), ApiError> {
+    ) -> Result<MembershipState, ApiError> {
         let mut guard = crate::lock(&self.write);
         let inner = &mut *guard;
         ensure_open(inner)?;
@@ -582,13 +590,14 @@ impl Store {
             return Err(ApiError::new(ErrorKind::UnknownMembership, "no such membership_hash"));
         }
         let row = inner.cache.entry(hash.to_string()).or_default();
+        let prior = row.state;
         f(row);
         if row.first_active_at.is_none() && row.state.is_active_like() {
             row.first_active_at = Some(crate::now_unix());
         }
         write_cache(&self.dir, inner)?;
         self.swap_snapshot(inner);
-        Ok(())
+        Ok(prior)
     }
 
     /// Reserve the next `message_id` for `(membership, rln_identifier,
@@ -1198,7 +1207,7 @@ mod tests {
     fn insert_membership(store: &Store, registry: &str, commitment: &[u8; 32]) -> String {
         let hash = registry_id::membership_hash(registry, commitment);
         store
-            .insert(&hash, identity_for(registry, commitment), &credential_for(registry, commitment))
+            .insert(&hash, identity_for(registry, commitment), &credential_for(registry, commitment), 100)
             .unwrap();
         hash
     }
@@ -1601,6 +1610,7 @@ mod tests {
                 &hash_a,
                 identity_for(&registry, &commitment_a),
                 &credential_for(&registry, &commitment_a),
+                100,
             )
             .unwrap();
         assert_eq!(store.reserve_message_id(&hash_a, "aa", 10, 9, 5, 600).unwrap(), 1);
@@ -1663,6 +1673,7 @@ mod tests {
             &hash_b,
             identity_for(&registry, &commitment_b),
             &credential_for(&registry, &commitment_b),
+            100,
         );
         assert!(matches!(denied, Err(e) if e.kind == ErrorKind::Locked));
         let denied = store.unseal_credential(&hash_a);

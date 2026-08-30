@@ -287,9 +287,16 @@ fn quarantine_secret_file(dir: &std::path::Path) {
 /// password away); no secret + never-provisioned store → generate, persist
 /// the FILE durably FIRST (an unlocked keystore keyed by a secret that
 /// never reached disk would be a guaranteed future lockout), then unlock.
+/// Serializes the read -> maybe-generate+persist -> unlock walk: two
+/// concurrent auto-unlocks on a fresh store would otherwise both generate,
+/// race the durable secret-file write, and leave one caller's session keyed
+/// to a secret the file no longer holds.
+static AUTO_UNLOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn auto_unlock_core(
     store: &std::sync::Arc<sealed::Store>,
 ) -> Result<(usize, &'static str, Zeroizing<String>), ApiError> {
+    let _walk = AUTO_UNLOCK.lock().unwrap();
     let dir = store.base_dir().to_path_buf();
     let account = account_for_dir(&dir.to_string_lossy());
     let (found, mut keychain_note) = read_auto_password(&dir, &account)?;
@@ -545,7 +552,7 @@ mod tests {
             identity_trapdoor: None,
             registry_id: registry,
         };
-        store.insert(&"cd".repeat(32), identity, &credential).expect("fixture credential");
+        store.insert(&"cd".repeat(32), identity, &credential, 100).expect("fixture credential");
         store.lock();
     }
 
