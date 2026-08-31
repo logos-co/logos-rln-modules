@@ -32,6 +32,8 @@ pub(crate) struct CredentialView {
 pub(crate) struct MembershipView {
     credential: CredentialView,
     #[serde(skip_serializing_if = "Option::is_none")]
+    epoch_size_mismatch: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     failed_reason: Option<String>,
     leaf_index: u64,
     membership_hash: String,
@@ -52,13 +54,17 @@ pub(crate) struct MembershipView {
 impl MembershipView {
     /// `quarantined` (metadata tamper-check failed) forces `state:"failed"`
     /// and `failed_reason:"metadata_tamper"` and suppresses `retryable` — a
-    /// tamper verdict is never retriable. `rate_limit_mismatch` is emitted
-    /// only as `true`, never `false`.
+    /// tamper verdict is never retriable. `rate_limit_mismatch` and
+    /// `epoch_size_mismatch` are emitted only as `true`, never `false` —
+    /// the latter marks a live membership whose allocation ledger is bound
+    /// to a different epoch size than the module's current configuration
+    /// (its reservations will fail Permanent until re-registered).
     pub(crate) fn new(
         hash: &str,
         record: &MembershipRecord,
         quarantined: bool,
         rate_limit_mismatch: bool,
+        epoch_size_mismatch: bool,
     ) -> Self {
         let cache = &record.cache;
         let identity = &record.identity;
@@ -71,6 +77,7 @@ impl MembershipView {
             credential: CredentialView {
                 identity_commitment: identity.identity_commitment.clone(),
             },
+            epoch_size_mismatch: epoch_size_mismatch.then_some(true),
             failed_reason,
             leaf_index: cache.leaf_index.unwrap_or(0),
             membership_hash: hash.to_string(),

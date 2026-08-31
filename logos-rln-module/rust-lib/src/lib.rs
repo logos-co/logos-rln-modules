@@ -252,9 +252,16 @@ fn public_membership_json(
     record: &MembershipRecord,
     quarantined: bool,
     rate_limit_mismatch: bool,
+    epoch_size_mismatch: bool,
 ) -> serde_json::Value {
-    serde_json::to_value(views::MembershipView::new(hash, record, quarantined, rate_limit_mismatch))
-        .unwrap_or(serde_json::Value::Null)
+    serde_json::to_value(views::MembershipView::new(
+        hash,
+        record,
+        quarantined,
+        rate_limit_mismatch,
+        epoch_size_mismatch,
+    ))
+    .unwrap_or(serde_json::Value::Null)
 }
 
 fn parse_registry(raw: &str) -> Result<registry_id::CanonicalRegistryId, ApiError> {
@@ -717,7 +724,22 @@ fn register_impl(
         .find(|r| !r.quarantined && r.cache.state.is_live() && scope_matches(r, &rln_id_hex))
     {
         let mismatch = rec.cache.rate_limit != Some(rate_limit);
-        return Ok(public_membership_json(&rec.hash, rec, false, mismatch));
+        // A live membership whose allocation ledger is bound to a DIFFERENT
+        // epoch size can never reserve under the current config (the
+        // store's reservation guard fails Permanent), yet register would
+        // short-circuit to it forever with no visible cause — surface the
+        // bind here. An unconfigured module (start() not yet called) skips
+        // the check rather than failing the short-circuit.
+        let epoch_mismatch = epoch_params_for(&registry.canonical)
+            .ok()
+            .map(|(size, _)| {
+                store
+                    .epoch_size_bindings()
+                    .into_iter()
+                    .any(|(h, bound)| h == rec.hash && bound != 0 && bound != size)
+            })
+            .unwrap_or(false);
+        return Ok(public_membership_json(&rec.hash, rec, false, mismatch, epoch_mismatch));
     }
 
     // Fast-fail a rate_limit outside the registry's bounds BEFORE minting a
@@ -798,7 +820,7 @@ fn register_impl(
     let record = store
         .membership(&hash)
         .ok_or_else(|| ApiError::internal("record vanished after insert"))?;
-    Ok(public_membership_json(&hash, &record, false, false))
+    Ok(public_membership_json(&hash, &record, false, false, false))
 }
 
 /// Spec get_membership_state(scope): a live registry read overlaid on the
@@ -935,7 +957,7 @@ fn select_membership_impl(
         .find(|r| r.hash == hash)
         .cloned()
         .ok_or_else(|| ApiError::internal("selected record vanished"))?;
-    Ok(public_membership_json(&hash, &record, false, false))
+    Ok(public_membership_json(&hash, &record, false, false, false))
 }
 
 fn get_memberships_impl(
@@ -949,7 +971,7 @@ fn get_memberships_impl(
     let records = records_for_registry(&store, &registry);
     let memberships: Vec<serde_json::Value> = records
         .iter()
-        .map(|r| public_membership_json(&r.hash, r, r.quarantined, false))
+        .map(|r| public_membership_json(&r.hash, r, r.quarantined, false, false))
         .collect();
     Ok(serde_json::json!({ "memberships": memberships }))
 }
@@ -3193,7 +3215,7 @@ mod tests {
             alloc: rate_limit::AllocationState::default(),
             quarantined: false,
         };
-        let out = public_membership_json("fixture-hash", &record, false, true);
+        let out = public_membership_json("fixture-hash", &record, false, true, false);
         assert_eq!(
             out.to_string(),
             format!(
@@ -3204,12 +3226,23 @@ mod tests {
         // Quarantined forces state:"failed"/failed_reason:"metadata_tamper"
         // and SUPPRESSES retryable — never "just retry" a tamper verdict.
         // rate_limit_mismatch is only ever true or absent, never false.
-        let quarantined = public_membership_json("fixture-hash", &record, true, false);
+        let quarantined = public_membership_json("fixture-hash", &record, true, false, false);
         assert_eq!(
             quarantined.to_string(),
             format!(
                 r#"{{"credential":{{"identity_commitment":"{commitment}"}},"failed_reason":"metadata_tamper","leaf_index":7,"membership_hash":"fixture-hash","rate_limit":300,"registry_id":"{registry}","rln_identifier":"{rln_identifier}","state":"failed","submitted_at":1234567890,"tx_result":"tx-result-blob"}}"#
             )
+        );
+
+        // epoch_size_mismatch mirrors rate_limit_mismatch: only ever true or
+        // absent (the exact-shape asserts above pin the absent case). It
+        // marks a live membership whose allocation ledger is bound to a
+        // different epoch size than the module's configuration — register's
+        // short-circuit sets it so the caller learns why reservations fail.
+        let bound_elsewhere = public_membership_json("fixture-hash", &record, false, false, true);
+        assert!(
+            bound_elsewhere.to_string().contains(r#""epoch_size_mismatch":true"#),
+            "got: {bound_elsewhere}"
         );
     }
 }
