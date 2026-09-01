@@ -1,11 +1,12 @@
 {
   "name": "liblogos_lez_rln_module",
   "display_name": "LEZ RLN Module",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "RLN registry provider (LEZ chain reads + registration/funding txs)",
   "author": "Logos Blockchain Team",
   "type": "core",
   "interface": "cdylib",
+  "concurrency": "multi",
   "category": "blockchain",
   "main": "liblogos_lez_rln_module_plugin",
   "dependencies": [

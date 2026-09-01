@@ -811,20 +811,20 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
 struct LogosLezRlnModuleImpl;
 
 impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
-    fn on_context_ready(&mut self, _ctx: &RustModuleContext) {
+    fn on_context_ready(&self, _ctx: &RustModuleContext) {
         init_wallet_client();
     }
 
-    fn get_valid_roots(&mut self, rln_account_id_hex: String) -> String {
+    fn get_valid_roots(&self, rln_account_id_hex: String) -> String {
         get_valid_roots_impl(&rln_account_id_hex)
     }
 
-    fn get_merkle_proofs(&mut self, config_account_id: String, leaf_indices_json: String) -> String {
+    fn get_merkle_proofs(&self, config_account_id: String, leaf_indices_json: String) -> String {
         get_merkle_proofs_impl(&config_account_id, &leaf_indices_json)
     }
 
     fn register_member(
-        &mut self,
+        &self,
         config_account_id: String,
         user_holding_account_id: String,
         id_commitment_hex: String,
@@ -952,7 +952,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
     }
 
     fn claim_tokens(
-        &mut self,
+        &self,
         config_account_id: String,
         dest_account_id: String,
         amount: i64,
@@ -991,7 +991,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         .to_string()
     }
 
-    fn get_token_balance(&mut self, account_id: String) -> String {
+    fn get_token_balance(&self, account_id: String) -> String {
         let account_hex = resolve_account_id(&account_id);
         if account_hex.is_empty() {
             eprintln!("get_token_balance: failed to resolve account");
@@ -1023,7 +1023,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
     // the membership management module. Same conventions as the frozen
     // methods: "" = error, compact alphabetical JSON otherwise.
 
-    fn get_membership(&mut self, config_account_id: String, id_commitment_hex: String) -> String {
+    fn get_membership(&self, config_account_id: String, id_commitment_hex: String) -> String {
         let Some(id_commitment) = hex_to_bytes32(&id_commitment_hex) else {
             eprintln!("get_membership: invalid id_commitment hex");
             return String::new();
@@ -1096,7 +1096,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         .to_string()
     }
 
-    fn get_registry_bounds(&mut self, config_account_id: String) -> String {
+    fn get_registry_bounds(&self, config_account_id: String) -> String {
         let Some(ctx) = resolve_config_context(&config_account_id, "get_registry_bounds") else {
             return String::new();
         };

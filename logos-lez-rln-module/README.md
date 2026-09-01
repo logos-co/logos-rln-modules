@@ -81,10 +81,15 @@ PDA-derivation divergence, tree-encoding drift, chain-clock unit changes.
 
 ## Design constraints (read before changing)
 
-- **`concurrency` is `single`, deliberately.** Dispatch runs on the module's
-  own event loop and the blocking `lp_invoke`'s QtRO wait loop pumps that
-  same loop, so wallet round-trips do not deadlock; multi-concurrency has
-  never been validated against this module's callers.
+- **`concurrency` is `multi`** (since 2.1.0; it was `single` until a blocked
+  handler was observed wedging the whole module: single-mode dispatch runs ON
+  the subprocess event loop, so one stuck call froze QtRO replica acquisition
+  itself until SIGKILL). Under multi the Qt glue runs each call on its own
+  worker; a stuck handler leaks one worker instead of starving every caller.
+  `wallet_call` already had the off-owner-thread path (`lp_invoke_async` +
+  channel) — under multi every dispatch takes it, and the now-idle event
+  loop pumps the replies. All state lives in `Mutex` statics; the impl
+  struct has no fields.
 - **The wallet lp client is created in `on_context_ready` (main Qt thread)**
   and never lazily in handlers: the creating thread owns the client and must
   run a Qt event loop (lp owner-thread contract). `wallet_call` picks sync
