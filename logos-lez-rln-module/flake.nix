@@ -14,8 +14,8 @@
       # The builder runs logos-lidl-gen to emit the C ABI scaffold (+ the
       # typed lez_core dependency client) at rust-lib/generated/,
       # compiles the staticlib, and wraps it in the Qt cdylib glue, driven by
-      # metadata.json. Concurrency stays at the single default (see README
-      # "Design constraints").
+      # metadata.json — including concurrency:"multi" (see README "Design
+      # constraints" for why single was retired).
       #
       # RISC0_SKIP_BUILD_KERNELS comes from metadata nix.rust.env: risc0-zkvm
       # is serde-only here, no proving.
