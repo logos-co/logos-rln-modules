@@ -1374,12 +1374,9 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
                 if !store.pending_records().is_empty() {
                     poller::ensure_running();
                 }
-                // Full-lazy module-owned custody (keychain.rs): resume the
-                // auto-owned session or self-provision on a fresh store, so
-                // the keystore works with zero unlock calls. Opt out with
-                // LOGOS_RLN_DISABLE_AUTO_UNLOCK=1 (user-password
-                // deployments and the e2e manual-unlock probes) — the same
-                // switch also refuses the wire op.
+                // Full-lazy custody (keychain::lazy_auto_unlock). The opt-out
+                // is for user-password deployments and the e2e manual-unlock
+                // probes.
                 if !keychain::auto_unlock_disabled() {
                     keychain::lazy_auto_unlock();
                 }
