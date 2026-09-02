@@ -344,10 +344,13 @@ module liblogos_rln_module {
   ; secret while the keystore is already PROVISIONED — a USER-owned store,
   ; whether or not it holds credentials yet; it never invents a secret
   ; over one, and unlocking an empty provisioned store would rekey the
-  ; user's password away — or auto-unlock is disabled by the env var),
+  ; user's password away; or the secret FILE is present but unreadable,
+  ; which blocks self-provisioning rather than overwriting it, the reason
+  ; named in the message; or auto-unlock is disabled by the env var),
   ; bad_password (stored secret fails the keystore verifier — manual-era
-  ; keystore: unlock manually once and remember), internal (no persistence
-  ; path, or the secret file cannot be written — persist-before-unlock).
+  ; keystore: unlock manually once and remember, where a keychain sink
+  ; exists), internal (no persistence path, or the secret file cannot be
+  ; written — persist-before-unlock).
   ; CAVEAT: for auto-created secrets the
   ; user never saw the secret — deleting rln_autounlock.secret (or the
   ; keychain item) orphans the credentials (a future export surface can
@@ -357,6 +360,8 @@ module liblogos_rln_module {
   ; Persist the CURRENT session password to the OS keychain so the next
   ; unlock_keystore_auto succeeds silently — the manual-to-auto migration
   ; hook (the plaintext never re-crosses the wire; it is read module-side).
+  ; macOS ONLY: no other platform has a keychain sink, so elsewhere this
+  ; always answers keychain_unavailable and manual unlock stays manual.
   ; Overwrites any existing item (-U; one delete+re-add retry on ACL
   ; conflicts). {"remembered":true}; locked when nothing is unlocked,
   ; keychain_unavailable / internal as above.

@@ -188,17 +188,53 @@ pub(crate) const AUTO_SECRET_FILE: &str = "rln_autounlock.secret";
 /// caller.
 pub(crate) const DISABLE_ENV: &str = "LOGOS_RLN_DISABLE_AUTO_UNLOCK";
 
+/// The recovery advice every refusal below carries. `remember_impl`'s only
+/// sink is the OS keychain, which exists on macOS alone — off it, "it will be
+/// remembered" would send the user around an unbreakable loop.
+#[cfg(target_os = "macos")]
+const REMEMBER_HINT: &str = "unlock manually once and it will be remembered";
+#[cfg(not(target_os = "macos"))]
+const REMEMBER_HINT: &str = "unlock manually — this platform has no keychain sink, so \
+                             remember_keystore_password cannot persist the password for the \
+                             next launch";
+
 pub(crate) fn auto_unlock_disabled() -> bool {
     std::env::var_os(DISABLE_ENV).is_some()
 }
 
-fn read_file_secret(dir: &std::path::Path) -> Option<Zeroizing<String>> {
-    let raw = std::fs::read_to_string(dir.join(AUTO_SECRET_FILE)).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
+/// The stored FILE secret as `(secret, note)`. A real read failure is a MISS
+/// WITH A NOTE, exactly like a keychain backend failure — never a silent
+/// absence: an unreadable file that read as "no custody" would be denied by
+/// the refusal AND overwritten by the next self-provision.
+fn read_file_secret(dir: &std::path::Path) -> (Option<Zeroizing<String>>, Option<String>) {
+    match std::fs::read_to_string(dir.join(AUTO_SECRET_FILE)) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                (None, Some(format!("{AUTO_SECRET_FILE} is present but empty")))
+            } else {
+                (Some(Zeroizing::new(trimmed.to_string())), None)
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
+        Err(e) => (None, Some(format!("{AUTO_SECRET_FILE}: {e}"))),
+    }
+}
+
+/// Why each source came up empty, appended to every refusal — an unreadable
+/// file or a keychain outage must never look like "no custody was set up".
+fn note_suffix(file: Option<&str>, keychain: Option<&str>) -> String {
+    let mut parts = Vec::new();
+    if let Some(file) = file {
+        parts.push(file.to_string());
+    }
+    if let Some(keychain) = keychain {
+        parts.push(format!("keychain: {keychain}"));
+    }
+    if parts.is_empty() {
+        String::new()
     } else {
-        Some(Zeroizing::new(trimmed.to_string()))
+        format!(" ({})", parts.join("; "))
     }
 }
 
@@ -229,8 +265,7 @@ fn read_keychain_secret(
 /// Move a rejected secret file aside, preserving it as evidence (the same
 /// pattern as `sealed_store::fs::load_json`): a stale file that keeps
 /// winning the file-first resolution would shadow the keychain source
-/// forever, and with it the documented "unlock manually once and it will
-/// be remembered" recovery.
+/// forever, and with it the documented manual-unlock recovery.
 fn quarantine_secret_file(dir: &std::path::Path) {
     let bad = dir.join(format!("{AUTO_SECRET_FILE}.bad.{}", crate::now_unix()));
     eprintln!(
@@ -249,7 +284,9 @@ fn quarantine_secret_file(dir: &std::path::Path) {
 /// guarantee bad_password forever or, on an empty store, rekey the user's
 /// password away); no secret + never-provisioned store → generate, persist
 /// the FILE durably FIRST (an unlocked keystore keyed by a secret that
-/// never reached disk would be a guaranteed future lockout), then unlock.
+/// never reached disk would be a guaranteed future lockout), then unlock. A
+/// secret file that is PRESENT but unreadable refuses instead of generating
+/// over it, and its reason rides every refusal.
 fn auto_unlock_core(
     store: &std::sync::Arc<sealed::Store>,
 ) -> Result<(usize, &'static str, Zeroizing<String>), ApiError> {
@@ -257,8 +294,9 @@ fn auto_unlock_core(
     let account = account_for_dir(&dir.to_string_lossy());
     // FILE first (the module-owned marker); only a FILE secret is quarantined
     // on a bad password, so a stale one cannot permanently shadow the keychain.
+    let (file_secret, file_note) = read_file_secret(&dir);
     let mut rejected_file: Option<ApiError> = None;
-    if let Some(password) = read_file_secret(&dir) {
+    if let Some(password) = file_secret {
         match store.unlock(&password) {
             Ok(count) => return Ok((count, "existing", password)),
             Err(e) if e.kind == ErrorKind::BadPassword => {
@@ -273,13 +311,12 @@ fn auto_unlock_core(
         let count = store.unlock(&password)?;
         return Ok((count, "existing", password));
     }
-    let note = keychain_note.map(|e| format!(" (keychain: {e})")).unwrap_or_default();
+    let note = note_suffix(file_note.as_deref(), keychain_note.as_deref());
     if let Some(e) = rejected_file {
         return Err(ApiError::new(
             ErrorKind::BadPassword,
             &format!(
-                "{} — the {AUTO_SECRET_FILE} that held it was moved aside; unlock manually \
-                 once and it will be remembered{note}",
+                "{} — the {AUTO_SECRET_FILE} that held it was moved aside; {REMEMBER_HINT}{note}",
                 e.message
             ),
         ));
@@ -291,9 +328,17 @@ fn auto_unlock_core(
             "is already provisioned with a password (no credentials yet)"
         };
         return Err(keychain_err(&format!(
-            "no stored auto-unlock secret, but the keystore {what} — unlock \
-             manually once (restoring the keystore files from a backup first if entries are \
-             quarantined) and it will be remembered{note}",
+            "no stored auto-unlock secret, but the keystore {what} — {REMEMBER_HINT} (restoring \
+             the keystore files from a backup first if entries are quarantined){note}",
+        )));
+    }
+    // Present but unusable is still a custody marker. write_durable renames
+    // over the file, so self-provisioning here would destroy whatever it held
+    // on a store that only LOOKS fresh; refuse and name the reason instead.
+    if file_note.is_some() {
+        return Err(keychain_err(&format!(
+            "the auto-unlock secret file cannot be read, so the module will not self-provision \
+             over it — move it aside or repair it first{note}",
         )));
     }
     let mut raw = Zeroizing::new([0u8; 32]);
@@ -329,9 +374,14 @@ pub(crate) fn auto_unlock_impl() -> Result<serde_json::Value, ApiError> {
 }
 
 /// Full-lazy module-owned custody, run once at module init: `auto_unlock_core`
-/// with no reply — the caller gates on `auto_unlock_disabled`. Failures log and
-/// leave the store locked; the wire unlock paths remain authoritative.
+/// with no reply. Failures log and leave the store locked; the wire unlock
+/// paths remain authoritative.
 pub(crate) fn lazy_auto_unlock() {
+    // Fail closed at the SOURCE, as the wire op does: the opt-out binds every
+    // caller of this surface, not just the one in on_context_ready.
+    if auto_unlock_disabled() {
+        return;
+    }
     let Some(store) = sealed::current() else { return };
     if store.session_password().is_some() {
         return;
@@ -751,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn the_opt_out_env_var_binds_the_wire_op_too() {
+    fn the_opt_out_env_var_binds_both_surfaces() {
         let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         let fixture = setup("opted-out");
         let env = EnvGuard::set();
@@ -763,6 +813,12 @@ mod tests {
         assert!(file_secret(&fixture).is_none(), "an opted-out deployment provisions no secret");
         assert!(sealed_verifier(&fixture).is_none(), "and never touches the sealed header");
         assert!(fixture.store.session_password().is_none());
+
+        // The init surface is gated at the source, not by its call site.
+        lazy_auto_unlock();
+        assert!(fixture.store.session_password().is_none(), "opted out: init must not unlock");
+        assert!(file_secret(&fixture).is_none(), "opted out: init must not self-provision");
+        assert!(sealed_verifier(&fixture).is_none());
         teardown(&fixture);
 
         // A store with a stored secret: it is not read out either.
@@ -849,6 +905,7 @@ mod tests {
         // No fallback source: the bad_password surfaces, but the file is aside.
         let err = auto_unlock_impl().unwrap_err();
         assert_kind(&err, "bad_password");
+        assert!(err.message.contains(REMEMBER_HINT), "got: {}", err.message);
         assert!(fixture.store.session_password().is_none());
         assert!(file_secret(&fixture).is_none());
         assert_eq!(quarantined_secrets(&fixture).len(), 1);
@@ -861,6 +918,60 @@ mod tests {
         assert_eq!(out["source"], "existing");
         assert_eq!(session_secret().as_deref(), Some("pw-real"));
         assert_eq!(quarantined_secrets(&fixture).len(), 1, "the evidence survives the recovery");
+
+        teardown(&fixture);
+    }
+
+    #[test]
+    fn an_unreadable_secret_file_is_diagnosed_and_never_provisioned_over() {
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let fixture = setup("unreadable");
+        // A secret file the module cannot read (a directory in its place, so
+        // the case reproduces without depending on the test user's uid).
+        std::fs::create_dir_all(fixture.dir.join(AUTO_SECRET_FILE)).expect("unreadable secret");
+
+        // The store only LOOKS fresh: self-provisioning would rename over it.
+        let err = auto_unlock_impl().unwrap_err();
+        assert_kind(&err, "keychain_unavailable");
+        assert!(
+            err.message.contains(AUTO_SECRET_FILE),
+            "the refusal must name the unreadable file: {}",
+            err.message
+        );
+        assert!(fixture.store.session_password().is_none());
+        assert!(sealed_verifier(&fixture).is_none(), "the header must not be provisioned");
+        assert!(fixture.dir.join(AUTO_SECRET_FILE).is_dir(), "the file must survive untouched");
+
+        // With credentials the same diagnosis rides the USER-owned refusal,
+        // which would otherwise flatly deny that any secret file exists.
+        teardown(&fixture);
+        let fixture2 = setup("unreadable-creds");
+        store_credential("pw-manual");
+        std::fs::create_dir_all(fixture2.dir.join(AUTO_SECRET_FILE)).expect("unreadable secret");
+        let err = auto_unlock_impl().unwrap_err();
+        assert_kind(&err, "keychain_unavailable");
+        assert!(err.message.contains(AUTO_SECRET_FILE), "got: {}", err.message);
+        assert!(fixture2.store.session_password().is_none());
+
+        teardown(&fixture2);
+    }
+
+    #[test]
+    fn the_recovery_hint_is_platform_honest() {
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let fixture = setup("hint");
+        store_credential("pw-manual");
+
+        // remember_keystore_password's only sink is the OS keychain, so the
+        // "it will be remembered" promise may only be made where one exists.
+        let err = auto_unlock_impl().unwrap_err();
+        assert!(err.message.contains(REMEMBER_HINT), "got: {}", err.message);
+        assert_eq!(
+            err.message.contains("it will be remembered"),
+            cfg!(target_os = "macos"),
+            "the promise must match the platform's keychain sink: {}",
+            err.message
+        );
 
         teardown(&fixture);
     }

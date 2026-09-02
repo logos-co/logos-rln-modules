@@ -1374,12 +1374,9 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
                 if !store.pending_records().is_empty() {
                     poller::ensure_running();
                 }
-                // Full-lazy custody (keychain::lazy_auto_unlock). The opt-out
-                // is for user-password deployments and the e2e manual-unlock
-                // probes.
-                if !keychain::auto_unlock_disabled() {
-                    keychain::lazy_auto_unlock();
-                }
+                // Full-lazy custody; it self-gates on the opt-out, which is for
+                // user-password deployments and the e2e manual-unlock probes.
+                keychain::lazy_auto_unlock();
             }
         }
     }
