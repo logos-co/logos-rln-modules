@@ -711,9 +711,6 @@ mod tests {
         let root = proof.root();
         let j = proof.to_json();
 
-        // to_json now IS the decomposed spec shape — proof[128] plus the
-        // five public values; reassemble from the fields a consumer would
-        // carry in its own network message.
         let decomposed = serde_json::json!({
             "proof": j["proof"],
             "root": j["root"],

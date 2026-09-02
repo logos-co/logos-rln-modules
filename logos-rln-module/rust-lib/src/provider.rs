@@ -159,9 +159,6 @@ pub(crate) fn init_client() {
         }
     }
     drop(slot);
-    // The gifter client is created here too (creation is lazy-dialing, so a
-    // missing gifter module still tolerates it): no dispatch worker is ever
-    // allowed to create a client, so first-use creation cannot work.
     let mut gslot = lock(&GIFTER_CLIENT);
     if gslot.is_none() {
         if let Some(h) = create_client(GIFTER_MODULE) {

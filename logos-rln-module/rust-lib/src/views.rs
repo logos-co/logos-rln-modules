@@ -177,29 +177,6 @@ impl StartReply {
     }
 }
 
-/// The start reply's per-registry override map (`registry -> the keys the
-/// caller set`); None — and an omitted key — when no entry carries one.
-pub(crate) fn start_overrides_view<'a>(
-    entries: impl Iterator<Item = (&'a str, Option<u64>, Option<u64>)>,
-) -> Option<serde_json::Value> {
-    let mut map = serde_json::Map::new();
-    for (registry, size, gap) in entries {
-        let mut o = serde_json::Map::new();
-        if let Some(v) = size {
-            o.insert("epoch_size_sec".into(), v.into());
-        }
-        if let Some(v) = gap {
-            o.insert("max_epoch_gap".into(), v.into());
-        }
-        map.insert(registry.to_string(), serde_json::Value::Object(o));
-    }
-    if map.is_empty() {
-        None
-    } else {
-        Some(serde_json::Value::Object(map))
-    }
-}
-
 /// `stop`'s reply.
 #[derive(Serialize)]
 pub(crate) struct StopReply {

@@ -437,21 +437,18 @@ fn parse_registry_options(options_json: &str) -> Result<(u64, serde_json::Value)
             ));
         }
     }
-    let rate_limit = match map.remove("rate_limit") {
+    // Absent — or present but blank — takes the default; anything else must
+    // parse as a positive decimal.
+    let raw = map.remove("rate_limit");
+    let given = raw.as_ref().and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let rate_limit = match given {
         None => DEFAULT_RATE_LIMIT,
-        Some(v) => {
-            let s = v.as_str().unwrap_or_default().trim().to_string();
-            if s.is_empty() {
-                DEFAULT_RATE_LIMIT
-            } else {
-                s.parse::<u64>().ok().filter(|r| *r > 0).ok_or_else(|| {
-                    ApiError::new(
-                        ErrorKind::InvalidArgument,
-                        "rate_limit option must be a positive decimal string",
-                    )
-                })?
-            }
-        }
+        Some(s) => s.parse::<u64>().ok().filter(|r| *r > 0).ok_or_else(|| {
+            ApiError::new(
+                ErrorKind::InvalidArgument,
+                "rate_limit option must be a positive decimal string",
+            )
+        })?,
     };
     Ok((rate_limit, serde_json::Value::Object(map)))
 }
@@ -573,7 +570,6 @@ fn delegated_submit_callback(store: Weak<Store>, hash: String) -> provider::Regi
     })
 }
 
-/// Spec register(): generate the identity credential INSIDE the module,
 /// In-flight register claims, keyed by (canonical registry, rln id). The
 /// idempotency check is a snapshot scan and the insert lands a provider
 /// round-trip (up to ~70s) later; without this claim two concurrent
@@ -606,6 +602,7 @@ impl Drop for RegisterClaim {
     }
 }
 
+/// Spec register(): generate the identity credential INSIDE the module,
 /// persist it encrypted, and submit its rate commitment — returning the
 /// public Pending membership immediately. Idempotent PER SCOPE: the scope's
 /// live membership short-circuits. Submission is fire-and-record (the async
@@ -730,15 +727,9 @@ fn register_impl(
         // short-circuit to it forever with no visible cause — surface the
         // bind here. An unconfigured module (start() not yet called) skips
         // the check rather than failing the short-circuit.
+        let bound = rec.alloc.epoch_size_sec;
         let epoch_mismatch = epoch_params_for(&registry.canonical)
-            .ok()
-            .map(|(size, _)| {
-                store
-                    .epoch_size_bindings()
-                    .into_iter()
-                    .any(|(h, bound)| h == rec.hash && bound != 0 && bound != size)
-            })
-            .unwrap_or(false);
+            .is_ok_and(|(size, _)| bound != 0 && bound != size);
         return Ok(public_membership_json(&rec.hash, rec, false, mismatch, epoch_mismatch));
     }
 
@@ -978,14 +969,18 @@ fn get_memberships_impl(
 
 // ---------------------------------------------------------------- rate limiting
 
-/// Default `max_epoch_gap` (see [`epoch_gap`]) when `start()` sets none.
+/// Default `max_epoch_gap` (see [`epoch_params_for`]) when `start()` sets none.
 const DEFAULT_MAX_EPOCH_GAP: u64 = 1;
 
 /// A registry's deviation from the instance defaults (spec: the epoch size
-/// and the maximum epoch gap are per-REGISTRY configuration).
-#[derive(Clone, Copy, Default)]
+/// and the maximum epoch gap are per-REGISTRY configuration). Doubles as
+/// the start reply's per-registry override object: an unset key is OMITTED,
+/// so the reply carries only what the caller actually set.
+#[derive(Clone, Copy, Default, serde::Serialize)]
 struct RegistryOverride {
+    #[serde(skip_serializing_if = "Option::is_none")]
     epoch_size_sec: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_epoch_gap: Option<u64>,
 }
 
@@ -999,43 +994,19 @@ struct ModuleConfig {
 
 static CONFIG: Mutex<Option<ModuleConfig>> = Mutex::new(None);
 
-/// The configured epoch length — an APPLICATION parameter every proof
-/// generator and verifier must share, so there is deliberately NO default:
-/// before `start()` configures it, the epoch-dependent functions fail
-/// `not_ready` (spec: RLN_ERR_NOT_READY). Production code resolves
-/// per-registry via `epoch_size_for`; tests use this default-path view.
-#[cfg(test)]
-fn epoch_size() -> Result<u64, ApiError> {
-    lock(&CONFIG).as_ref().map(|c| c.epoch_size_sec).ok_or_else(|| {
-        ApiError::new(
-            ErrorKind::NotReady,
-            "start() has not configured epoch_size_sec; rate limiting is not ready",
-        )
-    })
-}
-
-/// The epoch length in force for one registry: its start() override when
-/// given, else the instance default (spec: per-registry configuration).
-fn epoch_size_for(registry_canonical: &str) -> Result<u64, ApiError> {
-    lock(&CONFIG)
-        .as_ref()
-        .map(|c| {
-            c.overrides
-                .get(registry_canonical)
-                .and_then(|o| o.epoch_size_sec)
-                .unwrap_or(c.epoch_size_sec)
-        })
-        .ok_or_else(|| {
-            ApiError::new(
-                ErrorKind::NotReady,
-                "start() has not configured epoch_size_sec; rate limiting is not ready",
-            )
-        })
-}
-
-/// (epoch_size_sec, max_epoch_gap) for a registry from ONE CONFIG lock
-/// acquisition — a concurrent start() reconfigure between two separate
-/// reads could otherwise hand a handler a mixed-config pair.
+/// The SOLE reader of the epoch configuration: `(epoch_size_sec,
+/// max_epoch_gap)` for one registry — each its start() override when given,
+/// else the instance default (spec: both are per-REGISTRY configuration).
+/// Taken under ONE CONFIG lock acquisition, so a concurrent start()
+/// reconfigure cannot hand a handler a mixed-config pair.
+///
+/// The size is an APPLICATION parameter every proof generator and verifier
+/// must share, so there is deliberately NO default: before `start()`
+/// configures it the epoch-dependent functions fail `not_ready` (spec:
+/// RLN_ERR_NOT_READY). The gap absorbs clock skew and propagation latency,
+/// and is also the retention floor for verification-side state keyed by
+/// epoch. `start()` filters both sources to positives, so neither component
+/// is ever 0 here.
 fn epoch_params_for(registry_canonical: &str) -> Result<(u64, u64), ApiError> {
     let cfg = lock(&CONFIG);
     let c = cfg.as_ref().ok_or_else(|| {
@@ -1046,10 +1017,15 @@ fn epoch_params_for(registry_canonical: &str) -> Result<(u64, u64), ApiError> {
     })?;
     let o = c.overrides.get(registry_canonical);
     let size = o.and_then(|o| o.epoch_size_sec).unwrap_or(c.epoch_size_sec);
-    let gap = o
-        .and_then(|o| o.max_epoch_gap)
-        .unwrap_or(c.max_epoch_gap);
-    Ok((size, if gap > 0 { gap } else { DEFAULT_MAX_EPOCH_GAP }))
+    let gap = o.and_then(|o| o.max_epoch_gap).unwrap_or(c.max_epoch_gap);
+    Ok((size, gap))
+}
+
+/// The instance-default epoch length — the un-overridden path, as a
+/// registry carrying no override sees it.
+#[cfg(test)]
+fn epoch_size() -> Result<u64, ApiError> {
+    epoch_params_for("").map(|(size, _)| size)
 }
 
 #[cfg(test)]
@@ -1139,9 +1115,13 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
         }
     }
 
-    let overrides_view = views::start_overrides_view(
-        overrides.iter().map(|(k, o)| (k.as_str(), o.epoch_size_sec, o.max_epoch_gap)),
-    );
+    let overrides_view = (!overrides.is_empty())
+        .then(|| serde_json::to_value(&overrides).unwrap_or(serde_json::Value::Null));
+    // Every epoch size a configured registry can now be bound to — read
+    // here, BEFORE `overrides` moves into CONFIG.
+    let effective: Vec<u64> = std::iter::once(epoch_size_sec)
+        .chain(overrides.values().filter_map(|o| o.epoch_size_sec))
+        .collect();
     *lock(&CONFIG) = Some(ModuleConfig { epoch_size_sec, max_epoch_gap, overrides });
     // A membership whose persisted allocations are bound to a DIFFERENT
     // epoch_size_sec can no longer generate proofs (the store fails those
@@ -1153,14 +1133,6 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
     // matches ANY configured size passes (the record's own registry is not
     // threaded through epoch_size_bindings).
     if let Some(store) = sealed_store::store::current() {
-        let effective: Vec<u64> = std::iter::once(epoch_size_sec)
-            .chain(
-                lock(&CONFIG)
-                    .as_ref()
-                    .map(|c| c.overrides.values().filter_map(|o| o.epoch_size_sec).collect::<Vec<u64>>())
-                    .unwrap_or_default(),
-            )
-            .collect();
         for (hash, bound) in store.epoch_size_bindings() {
             if bound != 0 && !effective.contains(&bound) {
                 eprintln!(
@@ -1236,8 +1208,8 @@ pub(crate) fn json_u8_array(v: &serde_json::Value, key: &str) -> Result<Vec<u8>,
 /// the caller-supplied `timestamp` (Unix seconds), NOT this module's clock,
 /// and must land within now ± `max_epoch_gap`. Returns the `RateLimitProof`
 /// (spec shape: `proof` = compressed Groth16 proof[128], `epoch` = epoch[32]
-/// LE hex) plus the spent `message_id`, the u64 `epoch_index`, and the
-/// `membership_hash`.
+/// LE hex) plus the spent `message_id`, the u64 `epoch_index`, the
+/// `membership_hash`, and `proof_canonical`.
 fn generate_proof_impl(
     store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
@@ -1248,8 +1220,7 @@ fn generate_proof_impl(
     let (registry, rln_identifier, rln_id_hex) =
         parse_scope(registry_id_raw, rln_identifier_hex)?;
     let prov = provider_of(&registry)?;
-    // Readiness gate FIRST (spec: not_ready before anything else). Size and
-    // gap are the REGISTRY's (start() override or instance default).
+    // Readiness gate FIRST (spec: not_ready before anything else).
     let (size, gap) = epoch_params_for(&registry.canonical)?;
     // The epoch derives from the CONSUMER's timestamp — the value stamped on
     // the message — so the receiver's timestamp->epoch check lines up by
@@ -1321,32 +1292,12 @@ fn generate_proof_impl(
 
     let mut out = rlp.to_json();
     if let Some(obj) = out.as_object_mut() {
-        // Extras beyond the spec struct: the spent slot, the u64 epoch index
-        // (`epoch` itself stays the spec's epoch[32] LE hex), the local
-        // handle, and the full canonical bytes for consumers that carry ONE
-        // opaque blob on their own message wire (validate_proof accepts it
-        // as `{"proof": <hex>}` alone). Tolerated/ignored by from_json.
         obj.insert("message_id".to_string(), message_id.into());
         obj.insert("epoch_index".to_string(), epoch.into());
         obj.insert("membership_hash".to_string(), hash.into());
         obj.insert("proof_canonical".to_string(), rlp.canonical_hex().into());
     }
     Ok(out)
-}
-
-/// Accepted distance, in epochs, between a proof's epoch and the verifier's
-/// current one — absorbs clock skew and propagation latency. A start()
-/// parameter (default 1); generator and verifiers must share it AND
-/// epoch_size for the binding check to line up. Also the retention floor
-/// for verification-side state keyed by epoch. Production code resolves
-/// per-registry via `epoch_params_for`; tests use this default-path view.
-#[cfg(test)]
-fn epoch_gap() -> u64 {
-    lock(&CONFIG)
-        .as_ref()
-        .map(|c| c.max_epoch_gap)
-        .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_MAX_EPOCH_GAP)
 }
 
 /// Parse a wire `timestamp` argument (Unix seconds as a decimal string — a
@@ -1369,7 +1320,7 @@ fn epoch_in_window(epoch: u64, now_epoch: u64, gap: u64) -> bool {
 
 /// Whether a proof is bound to `expected_epoch` — the epoch derived from
 /// the message's timestamp (spec: proof.epoch MUST equal it). Holds when
-/// the expected epoch is fresh (within now ± epoch_gap()), the proof's
+/// the expected epoch is fresh (within now ± max_epoch_gap), the proof's
 /// carried epoch (spec epoch[32]), when present, equals it, and the proof's
 /// external nullifier equals the one recomputed from that epoch + the
 /// scope's rln_identifier. Any failure is a verdict-`invalid` condition,
@@ -1422,8 +1373,7 @@ fn validate_proof_impl(
     let (registry, rln_identifier, _) = parse_scope(registry_id_raw, rln_identifier_hex)?;
     // Namespace support check only — no registry I/O on the verify path.
     provider_of(&registry)?;
-    // Readiness gate FIRST (spec: not_ready before anything else). Size and
-    // gap are the REGISTRY's (start() override or instance default).
+    // Readiness gate FIRST (spec: not_ready before anything else).
     let (size, gap) = epoch_params_for(&registry.canonical)?;
     let now_epoch = rate_limit::current_epoch(now_unix(), size);
     let expected_epoch = epoch_of_timestamp(timestamp, size)?;
@@ -1448,12 +1398,9 @@ fn validate_proof_impl(
     let window = roots::window(&registry.canonical).ok_or_else(|| {
         ApiError::new(ErrorKind::NotReady, "valid-root window not warm yet; retry")
     })?;
-    // A WARM window that simply doesn't carry the proof's root is the
-    // freshly-published-root race (a just-activated membership's first
-    // proofs) as often as it is a bad proof. The verdict stays "invalid"
-    // (spec: zero registry access on this path), but nudge the refresher
-    // for one out-of-band tick so the caller's retry lands against a fresh
-    // window instead of waiting out the refresh interval.
+    // A warm window lacking the proof's root is as often the freshly-
+    // published-root race as a bad proof: answer `invalid`, and let
+    // roots::nudge shorten it.
     if !window.contains(&rlp.root()) {
         roots::nudge();
         return ok_json(views::VerdictReply::verdict("invalid"));
@@ -1507,8 +1454,7 @@ fn get_epoch_quota_impl(
     // Namespace support check only — the quota is served from local state.
     provider_of(&registry)?;
     // Readiness gate FIRST. The single epoch observation is fixed by the
-    // caller's timestamp: taken once, it keys the remaining lookup. Size and
-    // gap are the REGISTRY's (start() override or instance default).
+    // caller's timestamp: taken once, it keys the remaining lookup.
     let (size, gap) = epoch_params_for(&registry.canonical)?;
     let epoch_index = epoch_of_timestamp(timestamp, size)?;
     let now_epoch = rate_limit::current_epoch(now_unix(), size);
@@ -1556,8 +1502,8 @@ fn get_registry_parameters_impl(
     let prov = provider_of(&registry)?;
 
     let bounds = prov.get_registry_bounds(&registry)?;
-    let view =
-        views::RegistryParametersView::from_bounds(epoch_size_for(&registry.canonical)?, &bounds);
+    let (epoch_size_sec, _) = epoch_params_for(&registry.canonical)?;
+    let view = views::RegistryParametersView::from_bounds(epoch_size_sec, &bounds);
     ok_json(view)
 }
 
@@ -1931,8 +1877,7 @@ mod tests {
         assert_eq!(out["started"], serde_json::json!(true));
         assert_eq!(out["epoch_size_sec"], serde_json::json!(600));
         assert_eq!(out["max_epoch_gap"], serde_json::json!(3));
-        assert_eq!(epoch_size().unwrap(), 600);
-        assert_eq!(epoch_gap(), 3);
+        assert_eq!(epoch_params_for("").unwrap(), (600, 3));
         assert!(!worker::is_stopped());
 
         let out = stop_impl().unwrap();
@@ -1968,8 +1913,13 @@ mod tests {
         })
         .to_string();
         let out = start_impl(&cfg).unwrap();
-        assert_eq!(out["overrides"][reg_b.as_str()]["epoch_size_sec"], serde_json::json!(60));
-        assert_eq!(out["overrides"][reg_b.as_str()]["max_epoch_gap"], serde_json::json!(5));
+        // Exact wire shape: sorted keys, an unset key OMITTED (never null),
+        // and a plain string entry carries no override object at all.
+        assert_eq!(
+            out["overrides"].to_string(),
+            format!(r#"{{"{reg_b}":{{"epoch_size_sec":60,"max_epoch_gap":5}}}}"#),
+            "got: {out}"
+        );
         assert!(
             out["overrides"].get(reg_a.as_str()).is_none(),
             "a plain string entry carries no override: {out}"
@@ -1980,7 +1930,7 @@ mod tests {
         // Reconfiguring without overrides clears them (idempotent start).
         let out = start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
         assert!(out.get("overrides").is_none(), "no overrides key when none are set: {out}");
-        assert_eq!(epoch_size_for(&reg_b).unwrap(), 600);
+        assert_eq!(epoch_params_for(&reg_b).unwrap(), (600, DEFAULT_MAX_EPOCH_GAP));
     }
 
     // Spec: before start() configures the epoch size, the epoch-dependent
@@ -2047,10 +1997,6 @@ mod tests {
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
     }
 
-    // A WARM window that misses the proof's root answers `invalid` AND asks
-    // the refresher for one out-of-band tick — the freshly-published-root
-    // race resolves on the caller's retry instead of a full refresh
-    // interval. The verification path itself still never reads the registry.
     #[test]
     fn root_window_miss_answers_invalid_and_nudges_the_refresher() {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
@@ -3008,12 +2954,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // RegistryOptions is the spec's char* key/value pair list: every value
-    // is a STRING; a JSON bool (or any non-string) is a type error at the
-    // array binding, never a coercion. A non-array options_json — including
-    // the retired 0.5.0 object encoding — is rejected outright, and
-    // duplicate keys are a caller bug. Fails before any store access, so no
-    // unlock/init needed.
+    // The retired 0.5.0 object encoding is rejected outright too. Fails
+    // before any store access — no unlock/init needed.
     #[test]
     fn register_rejects_non_string_values_and_non_array_options() {
         let imp = LogosRlnModuleImpl::default();
@@ -3228,11 +3170,7 @@ mod tests {
             )
         );
 
-        // epoch_size_mismatch mirrors rate_limit_mismatch: only ever true or
-        // absent (the exact-shape asserts above pin the absent case). It
-        // marks a live membership whose allocation ledger is bound to a
-        // different epoch size than the module's configuration — register's
-        // short-circuit sets it so the caller learns why reservations fail.
+        // The absent case is pinned by the exact-shape asserts above.
         let bound_elsewhere = public_membership_json("fixture-hash", &record, false, false, true);
         assert!(
             bound_elsewhere.to_string().contains(r#""epoch_size_mismatch":true"#),
