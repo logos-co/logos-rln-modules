@@ -40,13 +40,14 @@ const NUDGE_MIN_INTERVAL_SECS: u64 = 2;
 
 static LAST_NUDGE_UNIX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Ask the refresher for one immediate out-of-band tick (called on a
-/// root-window MISS in `validate_proof`). The verification path itself
-/// still performs zero registry access — this only wakes the worker, whose
-/// read lands within its own thread — and it is rate-limited by
-/// `NUDGE_MIN_INTERVAL_SECS`. Shrinks the freshly-published-root
-/// false-`invalid` window from up to one refresh interval to roughly one
-/// provider round-trip (the caller still retries the `invalid`).
+/// Ask the refresher — and ONLY the refresher — for one immediate
+/// out-of-band tick (called on a root-window MISS in `validate_proof`). The
+/// verification path itself still performs zero registry access — this only
+/// wakes the worker, whose read lands within its own thread — and it is
+/// rate-limited by `NUDGE_MIN_INTERVAL_SECS`. Shrinks the
+/// freshly-published-root false-`invalid` window from up to one refresh
+/// interval to roughly one provider round-trip (the caller still retries
+/// the `invalid`).
 pub(crate) fn nudge() {
     use std::sync::atomic::Ordering;
     let now = crate::now_unix();
@@ -112,10 +113,11 @@ pub(crate) fn ensure_refresher() {
 /// The refresher worker body, owned by the supervisor: an interruptible tick
 /// loop that exits when its run is superseded (`stop()`, or a restart's
 /// generation bump); each tick is wrapped so a transient failure never kills
-/// the worker.
+/// the worker. The ONE nudge subscriber — [`nudge`] asks for exactly this
+/// loop's work, an out-of-band root refresh.
 pub(crate) fn run_loop(my_gen: u64) {
     loop {
-        if !crate::worker::wait_tick(my_gen, REFRESH_INTERVAL) {
+        if !crate::worker::wait_tick_or_nudge(my_gen, REFRESH_INTERVAL) {
             return;
         }
         if let Err(payload) = std::panic::catch_unwind(refresh_all) {

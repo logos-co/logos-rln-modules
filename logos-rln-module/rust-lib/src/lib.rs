@@ -818,6 +818,16 @@ fn register_impl(
 /// local record of the membership backing the scope (scope_candidates). No
 /// candidate → UNKNOWN; more than one → AmbiguousSelection. Transitions the
 /// merged view implies are persisted.
+///
+/// Takes NO register claim. This is the module's most-polled READ (the UI
+/// polls it per card), it spends a full registry-read budget, and the claim
+/// is exclusive per scope: holding it here would serialize concurrent polls
+/// — and any register behind them — for up to that budget, and answer the
+/// loser "a registration is already in flight" for a registration it never
+/// issued. The claim guards register's mint; ambiguity here is already
+/// reachable without one (scope_candidates keeps terminal records), and the
+/// cache write below is a compare-and-set against the state observed under
+/// the store lock.
 fn get_membership_state_impl(
     store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
@@ -825,9 +835,6 @@ fn get_membership_state_impl(
 ) -> Result<serde_json::Value, ApiError> {
     let (registry, _, rln_id_hex) = parse_scope(registry_id_raw, rln_identifier_hex)?;
     let prov = provider_of(&registry)?;
-    // Claimed for the whole dispatch (RAII): the live-record scan below is
-    // only sound while no sibling register for the same scope is in flight.
-    let _claim = RegisterClaim::take(&registry.canonical, &rln_id_hex)?;
 
     // A missing store (no persistence path) degrades to no local records.
     let records = store
@@ -1028,6 +1035,20 @@ fn epoch_size() -> Result<u64, ApiError> {
     epoch_params_for("").map(|(size, _)| size)
 }
 
+/// start()'s stale-binding warning. Names the whole EFFECTIVE set — the
+/// instance default plus every per-registry override — because that is what
+/// the check compares against: under overrides, naming only the instance
+/// default reports a value the check never used, and reads as a
+/// contradiction to an operator whose binding matches some other configured
+/// size.
+fn epoch_binding_warning(hash: &str, bound: u64, effective: &[u64]) -> String {
+    format!(
+        "membership start: entry {hash} allocations are bound to \
+         epoch_size_sec={bound}, configured sizes are {effective:?}; \
+         generate_proof for it will fail permanent"
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn reset_config_for_test() {
     *lock(&CONFIG) = None;
@@ -1135,11 +1156,7 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
     if let Some(store) = sealed_store::store::current() {
         for (hash, bound) in store.epoch_size_bindings() {
             if bound != 0 && !effective.contains(&bound) {
-                eprintln!(
-                    "membership start: entry {hash} allocations are bound to \
-                     epoch_size_sec={bound}, config says {epoch_size_sec}; \
-                     generate_proof for it will fail permanent"
-                );
+                eprintln!("{}", epoch_binding_warning(&hash, bound, &effective));
             }
         }
     }
@@ -1933,6 +1950,22 @@ mod tests {
         assert_eq!(epoch_params_for(&reg_b).unwrap(), (600, DEFAULT_MAX_EPOCH_GAP));
     }
 
+    // The stale-binding warning names the set the check actually compared
+    // against: with an override configured, a binding that matches NO
+    // configured size must not be told "config says <instance default>" —
+    // that reports a value the check never used.
+    #[test]
+    fn epoch_binding_warning_names_every_configured_size() {
+        let msg = epoch_binding_warning("abc123", 300, &[600, 60]);
+        assert!(msg.contains("epoch_size_sec=300"), "got: {msg}");
+        assert!(msg.contains("configured sizes are [600, 60]"), "got: {msg}");
+        assert!(!msg.contains("config says"), "the single-value phrasing is gone: {msg}");
+
+        // The un-overridden instance still reads naturally.
+        let plain = epoch_binding_warning("abc123", 300, &[600]);
+        assert!(plain.contains("configured sizes are [600]"), "got: {plain}");
+    }
+
     // Spec: before start() configures the epoch size, the epoch-dependent
     // surface answers not_ready (RLN_ERR_NOT_READY).
     #[test]
@@ -2479,6 +2512,44 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::InvalidArgument, "got: {}", err.message);
         let err = validate_proof_impl(&registry, "", "00", "0", "{}").unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument, "got: {}", err.message);
+    }
+
+    // get_membership_state is a READ and takes no register claim: the UI
+    // polls it per card, so overlapping polls of one scope must all answer.
+    // The claim used to sit on this path, holding it across a full registry
+    // read — the loser was told "a registration for this scope is already in
+    // flight" about a registration it never issued, and a register queued
+    // behind a poll for as long as that read took.
+    #[test]
+    fn membership_state_reads_take_no_register_claim() {
+        let registry = format!("logos:local:{}", "1a".repeat(32));
+        let rln_id = "2b".repeat(32);
+        let (canonical, _, rln_id_hex) = parse_scope(&registry, &rln_id).unwrap();
+
+        // A register for exactly this scope is in flight, holding the claim
+        // — and it really is exclusive: a sibling REGISTER still loses it.
+        let claim = RegisterClaim::take(&canonical.canonical, &rln_id_hex).ok();
+        assert!(claim.is_some(), "the first claim must be granted");
+        match RegisterClaim::take(&canonical.canonical, &rln_id_hex) {
+            Ok(_) => panic!("the register claim must stay exclusive"),
+            Err(e) => assert!(e.message.contains("already in flight"), "got: {}", e.message),
+        }
+
+        // Reads of that same scope are unaffected, and repeat freely.
+        for _ in 0..2 {
+            let out = get_membership_state_impl(no_store(), &registry, &rln_id).unwrap();
+            assert_eq!(out["state"], serde_json::json!("unknown"), "got: {out}");
+        }
+        drop(claim);
+
+        // And with nothing in flight, the read still claims nothing — the
+        // scope is free for a register the instant the poll returns.
+        let out = get_membership_state_impl(no_store(), &registry, &rln_id).unwrap();
+        assert_eq!(out["state"], serde_json::json!("unknown"), "got: {out}");
+        assert!(
+            RegisterClaim::take(&canonical.canonical, &rln_id_hex).is_ok(),
+            "a read must leave no claim behind"
+        );
     }
 
     // The readiness gate runs before input validation, so start() first,
