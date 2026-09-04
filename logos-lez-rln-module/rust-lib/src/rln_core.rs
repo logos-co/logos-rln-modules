@@ -143,7 +143,7 @@ fn derive_pda(program_id: &[u8; 32], pda_seed: &[u8; 32]) -> [u8; 32] {
     input[32..64].copy_from_slice(program_id);
     input[64..96].copy_from_slice(pda_seed);
 
-    let hash = Sha256::digest(&input);
+    let hash = Sha256::digest(input);
     hash.into()
 }
 
@@ -235,7 +235,7 @@ pub fn build_merkle_proof(
         let is_right = (current_index % 2) as u8;
         path_indices[i] = is_right;
 
-        let sibling_index = if current_index % 2 == 0 {
+        let sibling_index = if current_index.is_multiple_of(2) {
             current_index + 1
         } else {
             current_index - 1

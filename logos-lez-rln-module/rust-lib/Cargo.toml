@@ -2,6 +2,9 @@
 name    = "lez_rln_module"
 version = "2.0.0"
 edition = "2021"
+# u64::is_multiple_of (clippy's manual_is_multiple_of fix) stabilized in 1.87;
+# the builder pins 1.94.0 (metadata.json nix.rust.toolchain).
+rust-version = "1.87"
 
 [lib]
 name = "liblogos_lez_rln_module"
