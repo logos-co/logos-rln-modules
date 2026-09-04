@@ -31,9 +31,12 @@
 //! `{"error":{"kind":…,"message":…}}` — see `ErrorKind`. The sibling RLN
 //! module's ""-on-error convention is not used here.
 //!
-//! Concurrency is SINGLE: registration is fire-and-record
-//! (lp_invoke_async), so no handler blocks on a sequencer submit; the
-//! poller thread does the slow reads off the dispatch thread.
+//! Concurrency is "multi" (metadata.json): handlers take `&self` and
+//! overlap, so one call blocked in a registry read (the register bounds
+//! pre-check, get_membership_state, get_merkle_proof, get_valid_roots — up
+//! to ~70s) no longer serializes the rest. Registration itself stays
+//! fire-and-record (lp_invoke_async); the poller thread does the periodic
+//! reads.
 
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -65,6 +68,9 @@ mod generated {
 }
 pub(crate) use generated::*;
 
+// `MembershipState` is lifecycle's enum, NOT the generated record of the same
+// name (the scaffold materializes the .lidl `type` blocks): a single-name
+// import shadows the glob import above, deliberately.
 use lifecycle::{MembershipRecord, MembershipState, StoredCredential};
 use sealed_store::store::Store;
 use zeroize::Zeroize;
