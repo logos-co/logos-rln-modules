@@ -27,8 +27,12 @@ v2.0.0 dropped the C++-era frozen wire surface: `generate_identity`,
 - `rust-lib/src/rln_core.rs` — the RLN core (tree/proof/register/funding logic),
   depending only on the shared `rln-layouts` crate.
 - `rust-lib/generated/provider_gen.rs` — checked-in scaffold for local
-  `cargo check`/tests; the nix build regenerates it. Regenerate manually with:
-  `logos-lidl-gen rust-lib/liblogos_lez_rln_module.lidl --provider \
+  `cargo check`/tests; the nix build regenerates it. Regenerate it with the
+  lidl-gen of the SDK rev the builder pins and the protocol version the
+  builder stamps (`LOGOS_PROTOCOL_VERSION_STRING` of its logos-protocol input):
+  `nix shell github:logos-co/logos-rust-sdk/<SDK_REV>#lidl-gen -c \
+   logos-lidl-gen rust-lib/liblogos_lez_rln_module.lidl --provider \
+   --concurrency multi --protocol-version <x.y.z> \
    --dep lez_core=rust-lib/deps/lez_core.lidl \
    -o rust-lib/generated/provider_gen.rs`
 

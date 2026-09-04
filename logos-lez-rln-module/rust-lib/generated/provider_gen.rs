@@ -12,6 +12,14 @@
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::sync::Mutex;
 
+/// This module's own name, from the LIDL contract.
+///
+/// The ORIGIN of every outbound call this image makes: it is what
+/// capability_module checks against its known-caller roster and the
+/// target's access policy, what the target files the minted token
+/// under, and what a callee's `current_caller()` reports.
+pub const LOGOS_MODULE_NAME: &str = "liblogos_lez_rln_module";
+
 #[derive(Debug, Clone, Default)]
 pub struct RustModuleContext {
     pub module_path: String,
@@ -50,6 +58,15 @@ pub trait LiblogosLezRlnModule: Send + Sync + 'static {
     /// LogosModuleContext::onContextReady().
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}
 
+    /// Called when the host is about to unload this module, before the
+    /// implementation is dropped. Return `Synchronous` (the default)
+    /// when teardown finished inline, or `Asynchronous` to keep the
+    /// host waiting until `logos_rust_sdk::unload_finished()` is
+    /// called. The host enforces a grace period either way.
+    fn about_to_unload(&self) -> logos_rust_sdk::Shutdown {
+        logos_rust_sdk::Shutdown::Synchronous
+    }
+
     fn get_valid_roots(&self, rln_account_id_hex: String) -> String;
     fn get_merkle_proofs(&self, config_account_id: String, leaf_indices_json: String) -> String;
     fn register_member(&self, config_account_id: String, user_holding_account_id: String, id_commitment_hex: String, rate_limit: i64) -> String;
@@ -61,9 +78,16 @@ pub trait LiblogosLezRlnModule: Send + Sync + 'static {
 
 type DispatchFn = fn(&str, &[serde_json::Value]) -> Option<serde_json::Value>;
 type EnsureFn = fn(bool);
+// Reaches the author's impl from the teardown C export, which is a free
+// function with no `T` — exactly why `dispatch` is reached this way too.
+type AboutToUnloadFn = fn() -> i32;
 struct Registered {
     dispatch: DispatchFn,
     ensure: EnsureFn,
+    // Read only by the teardown export, which is emitted for protocol >= 0.5;
+    // an older module registers the hook and never calls it.
+    #[allow(dead_code)]
+    about_to_unload: AboutToUnloadFn,
 }
 static REGISTERED: Mutex<Option<Registered>> = Mutex::new(None);
 // Shared across worker threads; the mutex guards CONSTRUCTION only.
@@ -98,6 +122,17 @@ pub fn install<T: LiblogosLezRlnModule + Default>() {
             }
         }
     }
+    fn about_to_unload_impl<T: LiblogosLezRlnModule + Default>() -> i32 {
+        // No instance means nothing was ever constructed, so there is
+        // nothing to tear down: Synchronous, and the host proceeds.
+        let inst = { INSTANCE.lock().unwrap().clone() };
+        let Some(inst) = inst else { return 0 };
+        let Ok(imp) = inst.downcast::<T>() else { return 0 };
+        match imp.about_to_unload() {
+            logos_rust_sdk::Shutdown::Asynchronous => 1,
+            logos_rust_sdk::Shutdown::Synchronous => 0,
+        }
+    }
     fn dispatch_impl<T: LiblogosLezRlnModule + Default>(method: &str, args: &[serde_json::Value]) -> Option<serde_json::Value> {
         let inst = {
             let mut guard = INSTANCE.lock().unwrap();
@@ -109,46 +144,78 @@ pub fn install<T: LiblogosLezRlnModule + Default>() {
         let imp: std::sync::Arc<T> = inst?.downcast::<T>().ok()?;
         match method {
             "get_valid_roots" => {
-                if args.len() < 1 { return None; }
-                let result = imp.get_valid_roots(args.get(0).unwrap_or(&serde_json::Value::Null).as_str().unwrap_or_default().to_string());
+                if args.len() < 1 { return Some(logos_rust_sdk::args::invalid_args("liblogos_lez_rln_module", 1, args.len())); }
+                if args.len() > 1 { return Some(logos_rust_sdk::args::invalid_args("liblogos_lez_rln_module", 1, args.len())); }
+                let __logos_a0 = match logos_rust_sdk::args::as_string(args, 0) { Ok(v) => v, Err(e) => return Some(logos_rust_sdk::args::dispatch_failed("liblogos_lez_rln_module", &e)) };
+                let result = imp.get_valid_roots(__logos_a0);
                 Some(serde_json::Value::from(result))
             }
             "get_merkle_proofs" => {
-                if args.len() < 2 { return None; }
-                let result = imp.get_merkle_proofs(args.get(0).unwrap_or(&serde_json::Value::Null).as_str().unwrap_or_default().to_string(), args.get(1).unwrap_or(&serde_json::Value::Null).as_str().unwrap_or_default().to_string());
+                if args.len() < 2 { return Some(logos_rust_sdk::args::invalid_args("liblogos_lez_rln_module", 2, args.len())); }
+                if args.len() > 2 { return Some(logos_rust_sdk::args::invalid_args("liblogos_lez_rln_module", 2, args.len())); }
+                let __logos_a0 = match logos_rust_sdk::args::as_string(args, 0) { Ok(v) => v, Err(e) => return Some(logos_rust_sdk::args::dispatch_failed("liblogos_lez_rln_module", &e)) };
+                let __logos_a1 = match logos_rust_sdk::args::as_string(args, 1) { Ok(v) => v, Err(e) => return Some(logos_rust_sdk::args::dispatch_failed("liblogos_lez_rln_module", &e)) };
+                let result = imp.get_merkle_proofs(__logos_a0, __logos_a1);
                 Some(serde_json::Value::from(result))
             }
             "register_member" => {
-                if args.len() < 4 { return None; }
-                let result = imp.register_member(args.get(0).unwrap_or(&serde_json::Value::Null).as_str().unwrap_or_default().to_string(), args.get(1).unwrap_or(&serde_json::Value::Null).as_str().unwrap_or_default().to_string(), args.get(2).unwrap_or(&serde_json::Value::Null).as_str().unwrap_or_default().to_string(), args.get(3).unwrap_or(&serde_json::Value::Null).as_i64().unwrap_or_default());
+                if args.len() < 4 { return Some(logos_rust_sdk::args::invalid_args("liblogos_lez_rln_module", 4, args.len())); }
+                if args.len() > 4 { return Some(logos_rust_sdk::args::invalid_args("liblogos_lez_rln_module", 4, args.len())); }
+                let __logos_a0 = match logos_rust_sdk::args::as_string(args, 0) { Ok(v) => v, Err(e) => return Some(logos_rust_sdk::args::dispatch_failed("liblogos_lez_rln_module", &e)) };
+                let __logos_a1 = match logos_rust_sdk::args::as_string(args, 1) { Ok(v) => v, Err(e) => return Some(logos_rust_sdk::args::dispatch_failed("liblogos_lez_rln_module", &e)) };
+                let __logos_a2 = match logos_rust_sdk::args::as_string(args, 2) { Ok(v) => v, Err(e) => return Some(logos_rust_sdk::args::dispatch_failed("liblogos_lez_rln_module", &e)) };
+                let __logos_a3 = match logos_rust_sdk::args::as_i64(args, 3) { Ok(v) => v, Err(e) => return Some(logos_rust_sdk::args::dispatch_failed("liblogos_lez_rln_module", &e)) };
+                let result = imp.register_member(__logos_a0, __logos_a1, __logos_a2, __logos_a3);
                 Some(serde_json::Value::from(result))
             }
             "get_token_balance" => {
-                if args.len() < 1 { return None; }
-                let result = imp.get_token_balance(args.get(0).unwrap_or(&serde_json::Value::Null).as_str().unwrap_or_default().to_string());
+                if args.len() < 1 { return Some(logos_rust_sdk::args::invalid_args("liblogos_lez_rln_module", 1, args.len())); }
+                if args.len() > 1 { return Some(logos_rust_sdk::args::invalid_args("liblogos_lez_rln_module", 1, args.len())); }
+                let __logos_a0 = match logos_rust_sdk::args::as_string(args, 0) { Ok(v) => v, Err(e) => return Some(logos_rust_sdk::args::dispatch_failed("liblogos_lez_rln_module", &e)) };
+                let result = imp.get_token_balance(__logos_a0);
                 Some(serde_json::Value::from(result))
             }
             "claim_tokens" => {
-                if args.len() < 3 { return None; }
-                let result = imp.claim_tokens(args.get(0).unwrap_or(&serde_json::Value::Null).as_str().unwrap_or_default().to_string(), args.get(1).unwrap_or(&serde_json::Value::Null).as_str().unwrap_or_default().to_string(), args.get(2).unwrap_or(&serde_json::Value::Null).as_i64().unwrap_or_default());
+                if args.len() < 3 { return Some(logos_rust_sdk::args::invalid_args("liblogos_lez_rln_module", 3, args.len())); }
+                if args.len() > 3 { return Some(logos_rust_sdk::args::invalid_args("liblogos_lez_rln_module", 3, args.len())); }
+                let __logos_a0 = match logos_rust_sdk::args::as_string(args, 0) { Ok(v) => v, Err(e) => return Some(logos_rust_sdk::args::dispatch_failed("liblogos_lez_rln_module", &e)) };
+                let __logos_a1 = match logos_rust_sdk::args::as_string(args, 1) { Ok(v) => v, Err(e) => return Some(logos_rust_sdk::args::dispatch_failed("liblogos_lez_rln_module", &e)) };
+                let __logos_a2 = match logos_rust_sdk::args::as_i64(args, 2) { Ok(v) => v, Err(e) => return Some(logos_rust_sdk::args::dispatch_failed("liblogos_lez_rln_module", &e)) };
+                let result = imp.claim_tokens(__logos_a0, __logos_a1, __logos_a2);
                 Some(serde_json::Value::from(result))
             }
             "get_membership" => {
-                if args.len() < 2 { return None; }
-                let result = imp.get_membership(args.get(0).unwrap_or(&serde_json::Value::Null).as_str().unwrap_or_default().to_string(), args.get(1).unwrap_or(&serde_json::Value::Null).as_str().unwrap_or_default().to_string());
+                if args.len() < 2 { return Some(logos_rust_sdk::args::invalid_args("liblogos_lez_rln_module", 2, args.len())); }
+                if args.len() > 2 { return Some(logos_rust_sdk::args::invalid_args("liblogos_lez_rln_module", 2, args.len())); }
+                let __logos_a0 = match logos_rust_sdk::args::as_string(args, 0) { Ok(v) => v, Err(e) => return Some(logos_rust_sdk::args::dispatch_failed("liblogos_lez_rln_module", &e)) };
+                let __logos_a1 = match logos_rust_sdk::args::as_string(args, 1) { Ok(v) => v, Err(e) => return Some(logos_rust_sdk::args::dispatch_failed("liblogos_lez_rln_module", &e)) };
+                let result = imp.get_membership(__logos_a0, __logos_a1);
                 Some(serde_json::Value::from(result))
             }
             "get_registry_bounds" => {
-                if args.len() < 1 { return None; }
-                let result = imp.get_registry_bounds(args.get(0).unwrap_or(&serde_json::Value::Null).as_str().unwrap_or_default().to_string());
+                if args.len() < 1 { return Some(logos_rust_sdk::args::invalid_args("liblogos_lez_rln_module", 1, args.len())); }
+                if args.len() > 1 { return Some(logos_rust_sdk::args::invalid_args("liblogos_lez_rln_module", 1, args.len())); }
+                let __logos_a0 = match logos_rust_sdk::args::as_string(args, 0) { Ok(v) => v, Err(e) => return Some(logos_rust_sdk::args::dispatch_failed("liblogos_lez_rln_module", &e)) };
+                let result = imp.get_registry_bounds(__logos_a0);
                 Some(serde_json::Value::from(result))
             }
+            "name" => {
+                                     if !args.is_empty() { return Some(logos_rust_sdk::args::invalid_args("liblogos_lez_rln_module", 0, args.len())); }
+                                     let result = "liblogos_lez_rln_module".to_string();
+                                     Some(serde_json::Value::from(result))
+                                 }
+            "version" => {
+                                     if !args.is_empty() { return Some(logos_rust_sdk::args::invalid_args("liblogos_lez_rln_module", 0, args.len())); }
+                                     let result = "2.0.0".to_string();
+                                     Some(serde_json::Value::from(result))
+                                 }
             _ => None,
         }
     }
     *REGISTERED.lock().unwrap() = Some(Registered {
         dispatch: dispatch_impl::<T>,
         ensure: ensure_impl::<T>,
+        about_to_unload: about_to_unload_impl::<T>,
     });
 }
 
@@ -157,6 +224,18 @@ pub fn install<T: LiblogosLezRlnModule + Default>() {
 /// point: set_context / set_emit_callback latch on full wiring;
 /// dispatch passes require_emit = false as the no-event-host fallback.
 fn ensure_ready(require_emit: bool) {
+    // FIRST, and before the author's install hook can construct
+    // anything: tell the SDK the name this image announces when it
+    // calls out. Every generated path that reaches author code runs
+    // through here -- install/T::default, on_context_ready, dispatch,
+    // and (transitively) about_to_unload, which answers 0 unless
+    // install already ran -- so the origin is set before the first
+    // outbound client exists. Without a name the SDK announces
+    // nothing and the capability handshake fails closed; with the
+    // wrong one ("core") it authorized as the host. The SDK also
+    // keys its client cache by origin, so even a client built before
+    // this ran cannot be reused after it. Idempotent: a OnceLock set.
+    logos_rust_sdk::set_module_origin(LOGOS_MODULE_NAME);
     if REGISTERED.lock().unwrap().is_none() {
         unsafe { __logos_install_hook::logos_module_install() };
     }
@@ -213,7 +292,7 @@ pub extern "C" fn logos_module_dispatch(method: *const c_char, args_json: *const
 
 #[no_mangle]
 pub extern "C" fn logos_module_get_methods() -> *mut c_char {
-    to_c_string("[{\"isInvokable\":true,\"name\":\"get_valid_roots\",\"parameters\":[{\"name\":\"rln_account_id_hex\",\"type\":\"QString\"}],\"returnType\":\"QString\",\"signature\":\"get_valid_roots(QString)\"},{\"isInvokable\":true,\"name\":\"get_merkle_proofs\",\"parameters\":[{\"name\":\"config_account_id\",\"type\":\"QString\"},{\"name\":\"leaf_indices_json\",\"type\":\"QString\"}],\"returnType\":\"QString\",\"signature\":\"get_merkle_proofs(QString,QString)\"},{\"isInvokable\":true,\"name\":\"register_member\",\"parameters\":[{\"name\":\"config_account_id\",\"type\":\"QString\"},{\"name\":\"user_holding_account_id\",\"type\":\"QString\"},{\"name\":\"id_commitment_hex\",\"type\":\"QString\"},{\"name\":\"rate_limit\",\"type\":\"int\"}],\"returnType\":\"QString\",\"signature\":\"register_member(QString,QString,QString,int)\"},{\"isInvokable\":true,\"name\":\"get_token_balance\",\"parameters\":[{\"name\":\"account_id\",\"type\":\"QString\"}],\"returnType\":\"QString\",\"signature\":\"get_token_balance(QString)\"},{\"isInvokable\":true,\"name\":\"claim_tokens\",\"parameters\":[{\"name\":\"config_account_id\",\"type\":\"QString\"},{\"name\":\"dest_account_id\",\"type\":\"QString\"},{\"name\":\"amount\",\"type\":\"int\"}],\"returnType\":\"QString\",\"signature\":\"claim_tokens(QString,QString,int)\"},{\"isInvokable\":true,\"name\":\"get_membership\",\"parameters\":[{\"name\":\"config_account_id\",\"type\":\"QString\"},{\"name\":\"id_commitment_hex\",\"type\":\"QString\"}],\"returnType\":\"QString\",\"signature\":\"get_membership(QString,QString)\"},{\"isInvokable\":true,\"name\":\"get_registry_bounds\",\"parameters\":[{\"name\":\"config_account_id\",\"type\":\"QString\"}],\"returnType\":\"QString\",\"signature\":\"get_registry_bounds(QString)\"}]".to_string())
+    to_c_string("[{\"isInvokable\":true,\"name\":\"get_valid_roots\",\"parameters\":[{\"name\":\"rln_account_id_hex\",\"type\":\"QString\"}],\"returnType\":\"QString\",\"signature\":\"get_valid_roots(QString)\"},{\"isInvokable\":true,\"name\":\"get_merkle_proofs\",\"parameters\":[{\"name\":\"config_account_id\",\"type\":\"QString\"},{\"name\":\"leaf_indices_json\",\"type\":\"QString\"}],\"returnType\":\"QString\",\"signature\":\"get_merkle_proofs(QString,QString)\"},{\"isInvokable\":true,\"name\":\"register_member\",\"parameters\":[{\"name\":\"config_account_id\",\"type\":\"QString\"},{\"name\":\"user_holding_account_id\",\"type\":\"QString\"},{\"name\":\"id_commitment_hex\",\"type\":\"QString\"},{\"name\":\"rate_limit\",\"type\":\"int\"}],\"returnType\":\"QString\",\"signature\":\"register_member(QString,QString,QString,int)\"},{\"isInvokable\":true,\"name\":\"get_token_balance\",\"parameters\":[{\"name\":\"account_id\",\"type\":\"QString\"}],\"returnType\":\"QString\",\"signature\":\"get_token_balance(QString)\"},{\"isInvokable\":true,\"name\":\"claim_tokens\",\"parameters\":[{\"name\":\"config_account_id\",\"type\":\"QString\"},{\"name\":\"dest_account_id\",\"type\":\"QString\"},{\"name\":\"amount\",\"type\":\"int\"}],\"returnType\":\"QString\",\"signature\":\"claim_tokens(QString,QString,int)\"},{\"isInvokable\":true,\"name\":\"get_membership\",\"parameters\":[{\"name\":\"config_account_id\",\"type\":\"QString\"},{\"name\":\"id_commitment_hex\",\"type\":\"QString\"}],\"returnType\":\"QString\",\"signature\":\"get_membership(QString,QString)\"},{\"isInvokable\":true,\"name\":\"get_registry_bounds\",\"parameters\":[{\"name\":\"config_account_id\",\"type\":\"QString\"}],\"returnType\":\"QString\",\"signature\":\"get_registry_bounds(QString)\"},{\"isInvokable\":true,\"name\":\"name\",\"returnType\":\"QString\",\"signature\":\"name()\"},{\"isInvokable\":true,\"name\":\"version\",\"returnType\":\"QString\",\"signature\":\"version()\"}]".to_string())
 }
 
 #[no_mangle]
@@ -246,9 +325,15 @@ pub extern "C" fn logos_module_accept_token(module_name: *const c_char, token: *
     if module_name.is_null() || token.is_null() { return -1; }
     let name = unsafe { CStr::from_ptr(module_name) }.to_string_lossy().into_owned();
     let tok = unsafe { CStr::from_ptr(token) }.to_string_lossy().into_owned();
-    // The runtime handshake: hand the host-issued token to the SDK's
+    // THE OUTBOUND DOOR. Hand the host-issued token to the SDK's
     // protocol stack so this module's *outbound* calls authenticate —
     // the same stack the typed client wrappers invoke through.
+    //
+    // ONE MEANING ONLY, as of protocol 0.8: the module's OWN anchor,
+    // seeded by the Qt glue's onInit. A CALLER's token goes through
+    // logos_module_accept_inbound_token instead. Do not merge them —
+    // one value written through the wrong door made every capability
+    // grant silently bidirectional.
     logos_rust_sdk::save_token(&name, &tok);
     TOKENS.lock().unwrap().push((name, tok));
     0
@@ -258,7 +343,7 @@ pub extern "C" fn logos_module_accept_token(module_name: *const c_char, token: *
 /// (stamped at generation time by the build; never minted here).
 #[no_mangle]
 pub extern "C" fn logos_module_get_protocol_version() -> *const c_char {
-    static VERSION: &str = "0.1.0\0";
+    static VERSION: &str = "0.9.0\0";
     VERSION.as_ptr() as *const c_char
 }
 
@@ -269,6 +354,52 @@ pub extern "C" fn logos_module_string_free(s: *mut c_char) {
     }
 }
 
+#[no_mangle]
+pub extern "C" fn logos_module_grant_host_services(services_json: *const c_char) -> c_int {
+    if services_json.is_null() { return -1; }
+    unsafe { logos_rust_sdk::grant_host_services(services_json) }
+}
+
+#[no_mangle]
+pub extern "C" fn logos_module_set_unload_done_callback(
+    cb: Option<logos_rust_sdk::UnloadDoneCb>,
+    user_data: *mut std::os::raw::c_void,
+) {
+    logos_rust_sdk::set_unload_done_callback(cb, user_data);
+}
+
+/// Ask the impl whether it is ready to be unloaded: 0 = Synchronous
+/// (proceed), 1 = Asynchronous (wait for unload_finished()).
+///
+/// A module that was never installed answers 0: there is no instance, so
+/// there is nothing to tear down and nothing for the host to wait on.
+#[no_mangle]
+pub extern "C" fn logos_module_about_to_unload() -> c_int {
+    let hook = REGISTERED.lock().unwrap().as_ref().map(|r| r.about_to_unload);
+    match hook {
+        Some(f) => f(),
+        None => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn logos_module_set_call_caller(caller_json: *const c_char) {
+    unsafe { logos_rust_sdk::set_call_caller(caller_json) }
+}
+
+extern "C" {
+    fn lp_token_save_inbound(caller: *const c_char, token: *const c_char) -> c_int;
+}
+
+#[no_mangle]
+pub extern "C" fn logos_module_accept_inbound_token(caller: *const c_char, token: *const c_char) -> c_int {
+    if caller.is_null() || token.is_null() { return -1; }
+    // INBOUND: `caller` is the module that will CALL US. This is not a
+    // credential this module may present to anyone, and it must not
+    // reach lp_token_save().
+    unsafe { lp_token_save_inbound(caller, token) }
+}
+
 // Typed dependency clients + the Modules aggregate — generated by
 // logos-lidl-gen from the dependencies' LIDL contracts. Do not edit.
 
@@ -277,7 +408,7 @@ pub mod lez_core {
     //
     // Typed caller + event subscribers over logos_rust_sdk's lp_* consumer.
 
-    use logos_rust_sdk::{EventData, EventSubscription, LogosError, LogosModuleSDK, PluginProxy};
+    use logos_rust_sdk::{EventData, EventSubscription, LogosError, LogosModuleSDK, PluginProxy, RestartPolicy, SubStatus};
 
     pub struct LezCoreClient {
         proxy: PluginProxy,
@@ -304,6 +435,26 @@ pub mod lez_core {
             Ok(value.as_str().unwrap_or_default().to_string())
         }
 
+        /// [`Self::account_id_from_base58`] with a per-call timeout: THIS call gives up after
+        /// `timeout` instead of waiting for the protocol default (20s).
+        /// The bound is threaded down to the call and stored nowhere, so
+        /// the next call through the same client — with a different
+        /// timeout, or with none — is unaffected.
+        ///
+        /// Fails with `LogosError::InvalidTimeout` if the duration cannot be
+        /// expressed on the protocol ABI (sub-millisecond, or longer than
+        /// ~24.8 days). It is refused, never clamped.
+        ///
+        /// A parallel entry point rather than a parameter on [`Self::account_id_from_base58`]:
+        /// Rust has neither overloading nor default arguments, so the
+        /// parameter would break every existing call site. STOPGAP — a later
+        /// breaking release folds this back into the single entry point.
+        pub fn account_id_from_base58_with_timeout(&self, base58_str: &str, timeout: std::time::Duration) -> Result<String, LogosError> {
+            let args = serde_json::Value::Array(vec![serde_json::Value::from(base58_str)]);
+            let value = self.proxy.call_json_with_timeout("account_id_from_base58", &args, timeout)?;
+            Ok(value.as_str().unwrap_or_default().to_string())
+        }
+
         /// Async twin of [`Self::account_id_from_base58`]: fire the call and receive the typed
         /// result in `callback` once it lands — the Rust analog of the C++
         /// client's `account_id_from_base58Async`. The callback runs from the protocol
@@ -319,10 +470,52 @@ pub mod lez_core {
             });
         }
 
+        /// [`Self::account_id_from_base58_async`] with a per-call timeout — the async half of
+        /// [`Self::account_id_from_base58_with_timeout`]. The bound applies to THIS call only;
+        /// nothing is stored on the client.
+        ///
+        /// A duration the protocol ABI cannot express (sub-millisecond, or
+        /// longer than ~24.8 days) is delivered to `callback` as
+        /// `LogosError::InvalidTimeout`, synchronously and with nothing sent,
+        /// which is how every other undispatchable async call is reported.
+        ///
+        /// STOPGAP, like its sync twin: Rust cannot overload
+        /// [`Self::account_id_from_base58_async`], so the bounded form needs its own name until a
+        /// breaking release makes `timeout` a parameter of the one entry point.
+        pub fn account_id_from_base58_async_with_timeout<F>(&self, base58_str: &str, timeout: std::time::Duration, callback: F)
+        where
+            F: FnOnce(Result<String, LogosError>) + Send + 'static,
+        {
+            let args = serde_json::Value::Array(vec![serde_json::Value::from(base58_str)]);
+            self.proxy.call_json_async_with_timeout("account_id_from_base58", &args, timeout, move |result| {
+                callback(result.and_then(|value| Ok(value.as_str().unwrap_or_default().to_string())));
+            });
+        }
+
         /// Fetch public account state as JSON {program_owner, balance, nonce, data} (all hex); empty string on failure.
         pub fn get_account_public(&self, account_id_hex: &str) -> Result<String, LogosError> {
             let args = serde_json::Value::Array(vec![serde_json::Value::from(account_id_hex)]);
             let value = self.proxy.call_json("get_account_public", &args)?;
+            Ok(value.as_str().unwrap_or_default().to_string())
+        }
+
+        /// [`Self::get_account_public`] with a per-call timeout: THIS call gives up after
+        /// `timeout` instead of waiting for the protocol default (20s).
+        /// The bound is threaded down to the call and stored nowhere, so
+        /// the next call through the same client — with a different
+        /// timeout, or with none — is unaffected.
+        ///
+        /// Fails with `LogosError::InvalidTimeout` if the duration cannot be
+        /// expressed on the protocol ABI (sub-millisecond, or longer than
+        /// ~24.8 days). It is refused, never clamped.
+        ///
+        /// A parallel entry point rather than a parameter on [`Self::get_account_public`]:
+        /// Rust has neither overloading nor default arguments, so the
+        /// parameter would break every existing call site. STOPGAP — a later
+        /// breaking release folds this back into the single entry point.
+        pub fn get_account_public_with_timeout(&self, account_id_hex: &str, timeout: std::time::Duration) -> Result<String, LogosError> {
+            let args = serde_json::Value::Array(vec![serde_json::Value::from(account_id_hex)]);
+            let value = self.proxy.call_json_with_timeout("get_account_public", &args, timeout)?;
             Ok(value.as_str().unwrap_or_default().to_string())
         }
 
@@ -341,10 +534,52 @@ pub mod lez_core {
             });
         }
 
+        /// [`Self::get_account_public_async`] with a per-call timeout — the async half of
+        /// [`Self::get_account_public_with_timeout`]. The bound applies to THIS call only;
+        /// nothing is stored on the client.
+        ///
+        /// A duration the protocol ABI cannot express (sub-millisecond, or
+        /// longer than ~24.8 days) is delivered to `callback` as
+        /// `LogosError::InvalidTimeout`, synchronously and with nothing sent,
+        /// which is how every other undispatchable async call is reported.
+        ///
+        /// STOPGAP, like its sync twin: Rust cannot overload
+        /// [`Self::get_account_public_async`], so the bounded form needs its own name until a
+        /// breaking release makes `timeout` a parameter of the one entry point.
+        pub fn get_account_public_async_with_timeout<F>(&self, account_id_hex: &str, timeout: std::time::Duration, callback: F)
+        where
+            F: FnOnce(Result<String, LogosError>) + Send + 'static,
+        {
+            let args = serde_json::Value::Array(vec![serde_json::Value::from(account_id_hex)]);
+            self.proxy.call_json_async_with_timeout("get_account_public", &args, timeout, move |result| {
+                callback(result.and_then(|value| Ok(value.as_str().unwrap_or_default().to_string())));
+            });
+        }
+
         /// Submit a generic public transaction: parallel account_ids/signing_requirements arrays, u32-word instruction stream, 32-byte program id hex. Returns JSON {success, tx_hash, secrets, error} (no secrets key on failure).
         pub fn send_generic_public_transaction(&self, account_ids: &serde_json::Value, signing_requirements: &serde_json::Value, instruction: &serde_json::Value, program_id_hex: &str) -> Result<String, LogosError> {
             let args = serde_json::Value::Array(vec![account_ids.clone(), signing_requirements.clone(), instruction.clone(), serde_json::Value::from(program_id_hex)]);
             let value = self.proxy.call_json("send_generic_public_transaction", &args)?;
+            Ok(value.as_str().unwrap_or_default().to_string())
+        }
+
+        /// [`Self::send_generic_public_transaction`] with a per-call timeout: THIS call gives up after
+        /// `timeout` instead of waiting for the protocol default (20s).
+        /// The bound is threaded down to the call and stored nowhere, so
+        /// the next call through the same client — with a different
+        /// timeout, or with none — is unaffected.
+        ///
+        /// Fails with `LogosError::InvalidTimeout` if the duration cannot be
+        /// expressed on the protocol ABI (sub-millisecond, or longer than
+        /// ~24.8 days). It is refused, never clamped.
+        ///
+        /// A parallel entry point rather than a parameter on [`Self::send_generic_public_transaction`]:
+        /// Rust has neither overloading nor default arguments, so the
+        /// parameter would break every existing call site. STOPGAP — a later
+        /// breaking release folds this back into the single entry point.
+        pub fn send_generic_public_transaction_with_timeout(&self, account_ids: &serde_json::Value, signing_requirements: &serde_json::Value, instruction: &serde_json::Value, program_id_hex: &str, timeout: std::time::Duration) -> Result<String, LogosError> {
+            let args = serde_json::Value::Array(vec![account_ids.clone(), signing_requirements.clone(), instruction.clone(), serde_json::Value::from(program_id_hex)]);
+            let value = self.proxy.call_json_with_timeout("send_generic_public_transaction", &args, timeout)?;
             Ok(value.as_str().unwrap_or_default().to_string())
         }
 
@@ -359,6 +594,156 @@ pub mod lez_core {
         {
             let args = serde_json::Value::Array(vec![account_ids.clone(), signing_requirements.clone(), instruction.clone(), serde_json::Value::from(program_id_hex)]);
             self.proxy.call_json_async("send_generic_public_transaction", &args, move |result| {
+                callback(result.and_then(|value| Ok(value.as_str().unwrap_or_default().to_string())));
+            });
+        }
+
+        /// [`Self::send_generic_public_transaction_async`] with a per-call timeout — the async half of
+        /// [`Self::send_generic_public_transaction_with_timeout`]. The bound applies to THIS call only;
+        /// nothing is stored on the client.
+        ///
+        /// A duration the protocol ABI cannot express (sub-millisecond, or
+        /// longer than ~24.8 days) is delivered to `callback` as
+        /// `LogosError::InvalidTimeout`, synchronously and with nothing sent,
+        /// which is how every other undispatchable async call is reported.
+        ///
+        /// STOPGAP, like its sync twin: Rust cannot overload
+        /// [`Self::send_generic_public_transaction_async`], so the bounded form needs its own name until a
+        /// breaking release makes `timeout` a parameter of the one entry point.
+        pub fn send_generic_public_transaction_async_with_timeout<F>(&self, account_ids: &serde_json::Value, signing_requirements: &serde_json::Value, instruction: &serde_json::Value, program_id_hex: &str, timeout: std::time::Duration, callback: F)
+        where
+            F: FnOnce(Result<String, LogosError>) + Send + 'static,
+        {
+            let args = serde_json::Value::Array(vec![account_ids.clone(), signing_requirements.clone(), instruction.clone(), serde_json::Value::from(program_id_hex)]);
+            self.proxy.call_json_async_with_timeout("send_generic_public_transaction", &args, timeout, move |result| {
+                callback(result.and_then(|value| Ok(value.as_str().unwrap_or_default().to_string())));
+            });
+        }
+
+        /// The module's name, as declared in its metadata.
+        pub fn name(&self) -> Result<String, LogosError> {
+            let args = serde_json::Value::Array(vec![]);
+            let value = self.proxy.call_json("name", &args)?;
+            Ok(value.as_str().unwrap_or_default().to_string())
+        }
+
+        /// [`Self::name`] with a per-call timeout: THIS call gives up after
+        /// `timeout` instead of waiting for the protocol default (20s).
+        /// The bound is threaded down to the call and stored nowhere, so
+        /// the next call through the same client — with a different
+        /// timeout, or with none — is unaffected.
+        ///
+        /// Fails with `LogosError::InvalidTimeout` if the duration cannot be
+        /// expressed on the protocol ABI (sub-millisecond, or longer than
+        /// ~24.8 days). It is refused, never clamped.
+        ///
+        /// A parallel entry point rather than a parameter on [`Self::name`]:
+        /// Rust has neither overloading nor default arguments, so the
+        /// parameter would break every existing call site. STOPGAP — a later
+        /// breaking release folds this back into the single entry point.
+        pub fn name_with_timeout(&self, timeout: std::time::Duration) -> Result<String, LogosError> {
+            let args = serde_json::Value::Array(vec![]);
+            let value = self.proxy.call_json_with_timeout("name", &args, timeout)?;
+            Ok(value.as_str().unwrap_or_default().to_string())
+        }
+
+        /// Async twin of [`Self::name`]: fire the call and receive the typed
+        /// result in `callback` once it lands — the Rust analog of the C++
+        /// client's `nameAsync`. The callback runs from the protocol
+        /// completion path (the module's Qt event loop), so it fires after
+        /// the current method returns, never inline.
+        pub fn name_async<F>(&self, callback: F)
+        where
+            F: FnOnce(Result<String, LogosError>) + Send + 'static,
+        {
+            let args = serde_json::Value::Array(vec![]);
+            self.proxy.call_json_async("name", &args, move |result| {
+                callback(result.and_then(|value| Ok(value.as_str().unwrap_or_default().to_string())));
+            });
+        }
+
+        /// [`Self::name_async`] with a per-call timeout — the async half of
+        /// [`Self::name_with_timeout`]. The bound applies to THIS call only;
+        /// nothing is stored on the client.
+        ///
+        /// A duration the protocol ABI cannot express (sub-millisecond, or
+        /// longer than ~24.8 days) is delivered to `callback` as
+        /// `LogosError::InvalidTimeout`, synchronously and with nothing sent,
+        /// which is how every other undispatchable async call is reported.
+        ///
+        /// STOPGAP, like its sync twin: Rust cannot overload
+        /// [`Self::name_async`], so the bounded form needs its own name until a
+        /// breaking release makes `timeout` a parameter of the one entry point.
+        pub fn name_async_with_timeout<F>(&self, timeout: std::time::Duration, callback: F)
+        where
+            F: FnOnce(Result<String, LogosError>) + Send + 'static,
+        {
+            let args = serde_json::Value::Array(vec![]);
+            self.proxy.call_json_async_with_timeout("name", &args, timeout, move |result| {
+                callback(result.and_then(|value| Ok(value.as_str().unwrap_or_default().to_string())));
+            });
+        }
+
+        /// The module's version, as declared in its metadata.
+        pub fn version(&self) -> Result<String, LogosError> {
+            let args = serde_json::Value::Array(vec![]);
+            let value = self.proxy.call_json("version", &args)?;
+            Ok(value.as_str().unwrap_or_default().to_string())
+        }
+
+        /// [`Self::version`] with a per-call timeout: THIS call gives up after
+        /// `timeout` instead of waiting for the protocol default (20s).
+        /// The bound is threaded down to the call and stored nowhere, so
+        /// the next call through the same client — with a different
+        /// timeout, or with none — is unaffected.
+        ///
+        /// Fails with `LogosError::InvalidTimeout` if the duration cannot be
+        /// expressed on the protocol ABI (sub-millisecond, or longer than
+        /// ~24.8 days). It is refused, never clamped.
+        ///
+        /// A parallel entry point rather than a parameter on [`Self::version`]:
+        /// Rust has neither overloading nor default arguments, so the
+        /// parameter would break every existing call site. STOPGAP — a later
+        /// breaking release folds this back into the single entry point.
+        pub fn version_with_timeout(&self, timeout: std::time::Duration) -> Result<String, LogosError> {
+            let args = serde_json::Value::Array(vec![]);
+            let value = self.proxy.call_json_with_timeout("version", &args, timeout)?;
+            Ok(value.as_str().unwrap_or_default().to_string())
+        }
+
+        /// Async twin of [`Self::version`]: fire the call and receive the typed
+        /// result in `callback` once it lands — the Rust analog of the C++
+        /// client's `versionAsync`. The callback runs from the protocol
+        /// completion path (the module's Qt event loop), so it fires after
+        /// the current method returns, never inline.
+        pub fn version_async<F>(&self, callback: F)
+        where
+            F: FnOnce(Result<String, LogosError>) + Send + 'static,
+        {
+            let args = serde_json::Value::Array(vec![]);
+            self.proxy.call_json_async("version", &args, move |result| {
+                callback(result.and_then(|value| Ok(value.as_str().unwrap_or_default().to_string())));
+            });
+        }
+
+        /// [`Self::version_async`] with a per-call timeout — the async half of
+        /// [`Self::version_with_timeout`]. The bound applies to THIS call only;
+        /// nothing is stored on the client.
+        ///
+        /// A duration the protocol ABI cannot express (sub-millisecond, or
+        /// longer than ~24.8 days) is delivered to `callback` as
+        /// `LogosError::InvalidTimeout`, synchronously and with nothing sent,
+        /// which is how every other undispatchable async call is reported.
+        ///
+        /// STOPGAP, like its sync twin: Rust cannot overload
+        /// [`Self::version_async`], so the bounded form needs its own name until a
+        /// breaking release makes `timeout` a parameter of the one entry point.
+        pub fn version_async_with_timeout<F>(&self, timeout: std::time::Duration, callback: F)
+        where
+            F: FnOnce(Result<String, LogosError>) + Send + 'static,
+        {
+            let args = serde_json::Value::Array(vec![]);
+            self.proxy.call_json_async_with_timeout("version", &args, timeout, move |result| {
                 callback(result.and_then(|value| Ok(value.as_str().unwrap_or_default().to_string())));
             });
         }
