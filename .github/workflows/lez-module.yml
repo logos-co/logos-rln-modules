@@ -1,0 +1,60 @@
+name: lez-rln-module
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "logos-lez-rln-module/**"
+      - ".github/workflows/lez-module.yml"
+  pull_request:
+    paths:
+      - "logos-lez-rln-module/**"
+      - ".github/workflows/lez-module.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo:
+    name: cargo (clippy, test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        run: rustup update stable && rustup default stable && rustup component add clippy
+
+      # The SDK source the crate path-deps as ../logos-rust-sdk-src is
+      # gitignored; stage it at the rev flake.lock pins. The provider scaffold
+      # (rust-lib/generated/provider_gen.rs) is checked in for this module.
+      - name: Stage the SDK source
+        run: bash logos-lez-rln-module/stage-sources.sh
+
+      # stage-sources.sh keeps its own SDK_REV; fail loudly if it drifted from
+      # the rev the builder locks (the coupling nothing else enforces).
+      - name: Check SDK_REV against flake.lock
+        run: |
+          locked=$(jq -r '.nodes.root.inputs["logos-module-builder"] as $k
+                          | .nodes[.nodes[$k].inputs["logos-rust-sdk"]].locked.rev' \
+                   logos-lez-rln-module/flake.lock)
+          staged=$(sed -n 's/^SDK_REV=//p' logos-lez-rln-module/stage-sources.sh)
+          echo "locked=$locked staged=$staged"
+          test "$locked" = "$staged"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: logos-lez-rln-module/rust-lib
+
+      - name: cargo clippy
+        working-directory: logos-lez-rln-module/rust-lib
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # The testnet tests are env-gated (LEZ_RLN_TESTNET_TESTS) and stay off in CI.
+      - name: cargo test
+        working-directory: logos-lez-rln-module/rust-lib
+        run: cargo test --locked
