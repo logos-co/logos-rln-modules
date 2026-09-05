@@ -86,9 +86,10 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   confirmation window, erased inference), change-gated transition events,
   submit-error recording policy.
 - `rust-lib/src/provider.rs` — the spec's Registry Provider Interface as a
-  trait + namespace routing; the lez-rln provider is a raw `lp_*` wire
-  client of the sibling module (owner-thread-bound, explicit per-call
-  timeouts; fire-and-record async submission), plus the lazy gifter client
+  trait + namespace routing; the lez-rln provider drives the sibling through
+  the SDK's generated typed client (`modules().liblogos_lez_rln_module`,
+  `*_async_with_timeout` twins with explicit per-call timeouts; fire-and-record
+  async submission), plus the `PluginProxy` gifter client
   for delegated registration (`rln_gifter_module.request` driven with the
   module-generated commitment and the caller's auth-vector selection; the
   vector's producer module binds the auth payload to that commitment).

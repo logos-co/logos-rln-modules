@@ -104,8 +104,8 @@ pub(crate) fn window(canonical: &str) -> Option<Vec<[u8; 32]>> {
 }
 
 /// Idempotently spawn the background refresher; spawn permission lives in
-/// the supervisor, so nothing spawns after `stop()`. The worker runs off the
-/// owner thread, so its provider calls take the async lp path.
+/// the supervisor, so nothing spawns after `stop()`. The worker's provider
+/// calls are the async twins plus a channel wait, like every other caller's.
 pub(crate) fn ensure_refresher() {
     crate::worker::ensure_refresher();
 }
