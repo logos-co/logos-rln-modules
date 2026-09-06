@@ -1,6 +1,13 @@
 {
   description = "Logos RLN Modules";
 
+  nixConfig = {
+    extra-substituters = [ "https://cache.nix.logos.co/public" ];
+    extra-trusted-public-keys = [
+      "public:l4HrXgL4nw246+LBh2SOJyhz64BoGegOYLheT/iIAPU="
+    ];
+  };
+
   inputs = {
     nixpkgs.follows = "logos-core/nixpkgs";
 
