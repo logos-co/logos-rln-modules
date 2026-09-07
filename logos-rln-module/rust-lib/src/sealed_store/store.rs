@@ -391,6 +391,10 @@ impl Store {
         self.snapshot_arc().has_credentials
     }
 
+    pub fn is_provisioned(&self) -> bool {
+        crate::lock(&self.write).sealed.is_some()
+    }
+
     pub fn base_dir(&self) -> &Path {
         &self.dir
     }
