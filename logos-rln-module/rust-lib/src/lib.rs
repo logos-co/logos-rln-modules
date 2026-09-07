@@ -13,9 +13,9 @@
 //!   on-disk format, durable files, runtime Store with persist-before-issue
 //!   message_id reservation) and `lifecycle.rs` (the state machine, merged
 //!   view)
-//! - registry provider → `provider.rs` (trait + the lez-rln provider, a raw
-//!   lp_* wire client of the sibling liblogos_lez_rln_module; also the lazy
-//!   gifter client for delegated registration)
+//! - registry provider → `provider.rs` (trait + the lez-rln provider over
+//!   the SDK's generated client of the sibling liblogos_lez_rln_module; also
+//!   the gifter client for delegated registration)
 //! - Pending confirmation window + involuntary-removal detection →
 //!   `poller.rs` (a `worker.rs`-supervised worker)
 //! - selection (per-scope RoundRobin etc.; public view only) → `select.rs`
@@ -35,8 +35,14 @@
 //! overlap, so one call blocked in a registry read (the register bounds
 //! pre-check, get_membership_state, get_merkle_proof, get_valid_roots — up
 //! to ~70s) no longer serializes the rest. Registration itself stays
-//! fire-and-record (lp_invoke_async); the poller thread does the periodic
-//! reads.
+//! fire-and-record (the SDK's async twin); the poller thread does the
+//! periodic reads.
+
+// Author code is unsafe-free: every outbound call goes through the SDK's
+// safe surface (`modules()`, `PluginProxy`). The only `unsafe` in this crate
+// is the generated module-impl scaffold, which owns the C ABI and is exempted
+// where it is included.
+#![deny(unsafe_code)]
 
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -61,6 +67,7 @@ mod worker;
 mod generated {
     #![allow(warnings)]
     #![allow(clippy::all)]
+    #![allow(unsafe_code)]
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/generated/provider_gen.rs"
@@ -493,7 +500,7 @@ fn is_retryable_submit_error(e: &ApiError) -> bool {
 }
 
 /// Fire-and-record tail of a funded submit: record the register_member reply,
-/// or mark the record failed. Runs on the owner thread after register
+/// or mark the record failed. Runs on the module's event loop after register
 /// returns; `store` is a Weak capture of the store the record was inserted
 /// into — gone (re-context replaced it) means there is nothing to record on.
 fn funded_submit_callback(store: Weak<Store>, hash: String) -> provider::RegisterCallback {
@@ -612,8 +619,8 @@ impl Drop for RegisterClaim {
 /// persist it encrypted, and submit its rate commitment — returning the
 /// public Pending membership immediately. Idempotent PER SCOPE: the scope's
 /// live membership short-circuits. Submission is fire-and-record (the async
-/// callback lands on the owner thread after this returns); the store lock
-/// is NEVER held across a provider call.
+/// callback lands on the module's event loop after this returns); the store
+/// lock is NEVER held across a provider call.
 fn register_impl(
     store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
@@ -777,7 +784,7 @@ fn register_impl(
 
     // Pending record FIRST (an interrupted submit still leaves an auditable
     // record the poller will resolve), then the async submit, whose callback
-    // lands on the owner thread after this handler has returned. `insert`
+    // lands on the module's event loop after this handler has returned. `insert`
     // owns the Pending cache row and the empty allocation ledger
     // (allocations, the epoch-size binding, and the floor start unset; the
     // binding and floor are adopted at the first successful reservation —
@@ -1777,6 +1784,9 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
     }
 }
 
+// The one `no_mangle` the scaffold contract requires of author code: the
+// generated `__logos_install_hook` resolves this symbol by linkage.
+#[allow(unsafe_code)]
 #[no_mangle]
 pub extern "Rust" fn logos_module_install() {
     install::<LogosRlnModuleImpl>();

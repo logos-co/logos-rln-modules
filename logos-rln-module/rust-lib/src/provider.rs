@@ -1,460 +1,206 @@
 //! Registry provider layer: the spec's provider interface as a Rust trait,
-//! namespace → provider routing, and the lez-rln provider — a raw `lp_*`
-//! wire client of the sibling `liblogos_lez_rln_module`.
+//! namespace → provider routing, and the lez-rln provider — a client of the
+//! sibling `liblogos_lez_rln_module` through the SDK's generated typed
+//! client (`modules().liblogos_lez_rln_module`), plus a `PluginProxy` to the
+//! gifter module.
 //!
-//! Binds the raw consumer C ABI rather than the SDK's generated typed
-//! client. Historical reason: the SDK's `PluginProxy` hardcoded
-//! `timeout_ms = 0` (the ~20s protocol default) with no per-call override,
-//! and calls here need per-call timeouts ([`READ_TIMEOUT_MS`],
-//! [`GIFTER_REQUEST_TIMEOUT_MS`]). Since logos-rust-sdk 80d028ab the proxy
-//! has `call_*_with_timeout` twins; moving onto them (and retiring this
-//! `unsafe` layer) is a tracked follow-up, kept out of the toolchain bump.
+//! Every outbound call carries its own timeout (`READ_TIMEOUT`,
+//! `REGISTER_TIMEOUT`, `GIFTER_REQUEST_TIMEOUT`) through the SDK's
+//! `*_with_timeout` entry points; the raw `lp_*` C ABI this file used to bind
+//! for that purpose is gone with logos-rust-sdk 80d028ab.
 //!
-//! Threading contract: the lp client is created once
-//! on the host's main Qt thread (`init_client` from `on_context_ready`) and
-//! is owner-thread-bound. On the owner thread `provider_call` uses the
-//! synchronous `lp_invoke` (its QtRO wait loop pumps the owner loop); off
-//! it (the poller thread) `lp_invoke_async` + a channel wait, replies
-//! delivered from the owner thread whenever it pumps. `register_async` is
-//! fire-and-record: the boxed callback runs on the owner thread when the
-//! loop pumps — i.e. after the dispatching handler has returned — so it may
-//! freely take the store lock.
+//! Threading contract. Handlers run on `concurrency:"multi"` worker threads
+//! and reach the sibling through the ASYNC twins plus a channel wait
+//! (`await_reply`): the SDK delivers the callback from the module's Qt event
+//! loop once the reply lands, so the worker only ever blocks on its channel
+//! and the loop stays free for every other call. Never use the synchronous
+//! twins from a worker — they marshal onto the main thread and serialize
+//! every in-flight call behind one nested wait. `register_async` and the
+//! gifter request are fire-and-record: their callback runs on the loop after
+//! the dispatching handler has returned, so it may freely take the store
+//! lock.
+//!
+//! Client lifetime. One shared client per target lives in a static for the
+//! process lifetime (the SDK's cache holds only weak references, so a
+//! transient `modules()` would create and destroy a client per call).
+//! `init_client` warms both on the host's main thread at load; at protocol
+//! 0.9 that is a courtesy, not a requirement — `lp_client_create` constructs
+//! a Qt-affine client on the Qt main thread whoever calls it, so a worker
+//! that finds no client may create one lazily.
 
-use std::ffi::{c_char, c_int, CStr, CString};
-use std::sync::Mutex;
-use std::thread::ThreadId;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use crate::registry_id::CanonicalRegistryId;
+use logos_rust_sdk::{LogosError, LogosModuleSDK, PluginProxy};
+
+use crate::liblogos_lez_rln_module::LiblogosLezRlnModuleClient;
 use crate::lifecycle::MembershipState;
+use crate::registry_id::CanonicalRegistryId;
 use crate::{lock, ApiError, ErrorKind};
 
 const TARGET_MODULE: &str = "liblogos_lez_rln_module";
 /// The sibling's reads run up to 60s against the wallet; add hop margin.
-const READ_TIMEOUT_MS: c_int = 70_000;
+const READ_TIMEOUT: Duration = Duration::from_secs(70);
 /// The sibling's register_member submits with a 180s tx timeout.
-const REGISTER_TIMEOUT_MS: c_int = 190_000;
+const REGISTER_TIMEOUT: Duration = Duration::from_secs(190);
+/// The protocol owns timeout enforcement; this margin only guards the channel
+/// wait against a callback that never fires.
+const REPLY_MARGIN: Duration = Duration::from_secs(10);
 
-// ---------------------------------------------------------------- lp raw ABI
-//
-// Same consumer C ABI the sibling binds (symbols resolve against the
-// logos-protocol archive linked into this plugin).
-#[cfg(not(test))]
-mod lp {
-    use std::ffi::{c_char, c_int};
+// ------------------------------------------------------------ shared clients
 
-    #[repr(C)]
-    pub struct LpClient {
-        _private: [u8; 0],
-    }
+static LEZ_CLIENT: Mutex<Option<Arc<LiblogosLezRlnModuleClient>>> = Mutex::new(None);
+static GIFTER_CLIENT: Mutex<Option<Arc<PluginProxy>>> = Mutex::new(None);
 
-    /// Result callback for `lp_invoke_async`: `ok != 0` → `json` is the
-    /// result value; `ok == 0` → canonical error object. `json` is only
-    /// valid for the duration of the callback.
-    pub type LpResultCb =
-        extern "C" fn(ok: c_int, json: *const c_char, user_data: *mut std::ffi::c_void);
-
-    extern "C" {
-        pub fn lp_client_create(
-            target_module: *const c_char,
-            origin_module: *const c_char,
-            target_transport_json: *const c_char,
-            capability_transport_json: *const c_char,
-        ) -> *mut LpClient;
-        pub fn lp_invoke(
-            client: *mut LpClient,
-            method: *const c_char,
-            args_json: *const c_char,
-            timeout_ms: c_int,
-            out_result_json: *mut *mut c_char,
-            out_error_json: *mut *mut c_char,
-        ) -> c_int;
-        pub fn lp_invoke_async(
-            client: *mut LpClient,
-            method: *const c_char,
-            args_json: *const c_char,
-            timeout_ms: c_int,
-            cb: LpResultCb,
-            user_data: *mut std::ffi::c_void,
-        ) -> c_int;
-        pub fn lp_string_free(s: *mut c_char);
-    }
-
-    pub const LP_OK: c_int = 0;
-}
-
-// The unit-test binary has no protocol archive to resolve lp_* against;
-// stub them as "no client". `unsafe` mirrors the extern ABI's signatures so
-// call sites compile identically.
-#[cfg(test)]
-#[allow(clippy::missing_safety_doc)]
-mod lp {
-    use std::ffi::{c_char, c_int};
-
-    #[repr(C)]
-    pub struct LpClient {
-        _private: [u8; 0],
-    }
-
-    pub type LpResultCb =
-        extern "C" fn(ok: c_int, json: *const c_char, user_data: *mut std::ffi::c_void);
-
-    pub unsafe fn lp_client_create(
-        _target_module: *const c_char,
-        _origin_module: *const c_char,
-        _target_transport_json: *const c_char,
-        _capability_transport_json: *const c_char,
-    ) -> *mut LpClient {
-        std::ptr::null_mut()
-    }
-
-    pub unsafe fn lp_invoke(
-        _client: *mut LpClient,
-        _method: *const c_char,
-        _args_json: *const c_char,
-        _timeout_ms: c_int,
-        _out_result_json: *mut *mut c_char,
-        _out_error_json: *mut *mut c_char,
-    ) -> c_int {
-        -3
-    }
-
-    pub unsafe fn lp_invoke_async(
-        _client: *mut LpClient,
-        _method: *const c_char,
-        _args_json: *const c_char,
-        _timeout_ms: c_int,
-        _cb: LpResultCb,
-        _user_data: *mut std::ffi::c_void,
-    ) -> c_int {
-        -3
-    }
-
-    pub unsafe fn lp_string_free(_s: *mut c_char) {}
-
-    pub const LP_OK: c_int = 0;
-}
-
-struct ClientHandle(*mut lp::LpClient);
-// The lp client is only ever USED per its owner-thread contract; the handle
-// itself may be read from any thread.
-unsafe impl Send for ClientHandle {}
-
-static PROVIDER_CLIENT: Mutex<Option<ClientHandle>> = Mutex::new(None);
-static PROVIDER_OWNER: Mutex<Option<ThreadId>> = Mutex::new(None);
-
-/// Create the process-lifetime lp client to the sibling RLN module. MUST
-/// run on the host's main Qt thread (async replies are delivered FROM the
-/// owner thread's pumping loop). Called from `on_context_ready`; safe to
-/// re-call — the host may load this module before the target registers, so
-/// dispatch paths retry via `ensure_client_on_owner_thread`.
+/// Warm the process-lifetime clients. Called from `on_context_ready` on the
+/// host's main Qt thread so the one-time construction happens at load rather
+/// than inside the first dispatch; safe to re-call.
 pub(crate) fn init_client() {
-    // Stamp the owner FIRST and unconditionally: under concurrency:"multi"
-    // dispatch runs on transient worker threads, and a worker adopted as the
-    // lp owner would take its pumping loop to the grave with it. Only this
-    // (the host's context/Qt) thread may ever create clients.
-    *lock(&PROVIDER_OWNER) = Some(std::thread::current().id());
-    let mut slot = lock(&PROVIDER_CLIENT);
-    if slot.is_none() {
-        if let Some(h) = create_client(TARGET_MODULE) {
-            *slot = Some(h);
-        }
-    }
-    drop(slot);
-    let mut gslot = lock(&GIFTER_CLIENT);
-    if gslot.is_none() {
-        if let Some(h) = create_client(GIFTER_MODULE) {
-            *gslot = Some(h);
-        }
-    }
+    let _ = lez_client();
+    let _ = gifter_client();
 }
 
-fn create_client(module: &str) -> Option<ClientHandle> {
-    // The origin is THIS module's name, never "core": "core" is the token
-    // manager's host-anchor role label, so announcing it masked our identity
-    // (from protocol 0.6 on the callee reads the caller as Unknown) and the
-    // callee's `lp_token_save("core", …)` overwrote its own host anchor.
-    // Mirrors what the SDK's PluginProxy does since rust-sdk 7d2192c.
-    let (Ok(target), Ok(origin)) =
-        (CString::new(module), CString::new(crate::LOGOS_MODULE_NAME))
-    else {
-        return None;
-    };
-    let raw = unsafe {
-        lp::lp_client_create(
-            target.as_ptr(),
-            origin.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    if raw.is_null() {
-        eprintln!("membership provider: lp_client_create failed for {module}");
-        return None;
-    }
-    Some(ClientHandle(raw))
+/// The shared typed client to the sibling, created on first use. The lock is
+/// released before the caller makes any SDK call.
+fn lez_client() -> Arc<LiblogosLezRlnModuleClient> {
+    let mut slot = lock(&LEZ_CLIENT);
+    Arc::clone(slot.get_or_insert_with(|| Arc::new(LiblogosLezRlnModuleClient::new())))
 }
 
-/// Lazy owner-thread retry for hosts that ran `on_context_ready` before the
-/// target module registered. ONLY the stamped owner thread may create — a
-/// dispatch worker that finds no client fails the call (provider_failure)
-/// and a later owner-thread pass retries.
-fn ensure_client_on_owner_thread() {
-    let has_client = lock(&PROVIDER_CLIENT).is_some();
-    if has_client {
-        return;
-    }
-    if *lock(&PROVIDER_OWNER) == Some(std::thread::current().id()) {
-        let mut slot = lock(&PROVIDER_CLIENT);
-        if slot.is_none() {
-            if let Some(h) = create_client(TARGET_MODULE) {
-                *slot = Some(h);
+/// A client whose construction failed (the SDK answers every call with
+/// "Failed to create protocol client") is dropped so the next call retries.
+fn forget_lez_client() {
+    *lock(&LEZ_CLIENT) = None;
+}
+
+/// Run one bounded async call from a worker and wait for its reply. `start`
+/// receives the completion callback to hand to the SDK's `*_async_with_timeout`
+/// twin. A transport failure, a dispatch refusal, or a silent callback all
+/// collapse to the sibling's provider_failure (logged), so callers just `?`.
+fn await_reply<T: Send + 'static>(
+    method: &str,
+    timeout: Duration,
+    start: impl FnOnce(Box<dyn FnOnce(Result<T, LogosError>) + Send + 'static>),
+) -> Result<T, ApiError> {
+    let (tx, rx) = mpsc::channel::<Result<T, LogosError>>();
+    start(Box::new(move |result| {
+        let _ = tx.send(result);
+    }));
+    match rx.recv_timeout(timeout + REPLY_MARGIN) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => {
+            if is_no_client(&e) {
+                forget_lez_client();
             }
+            eprintln!("membership provider: {method}: {e}");
+            Err(provider_failure(method))
         }
-    }
-}
-
-/// Acquire the owner-thread-bound lp client, lazily retrying creation for
-/// hosts that ran `on_context_ready` before the target registered. A missing
-/// client is the sibling's provider_failure (logged once per call).
-fn owner_client(method: &str) -> Result<*mut lp::LpClient, ApiError> {
-    ensure_client_on_owner_thread();
-    let slot = lock(&PROVIDER_CLIENT);
-    match slot.as_ref() {
-        Some(h) => Ok(h.0),
-        None => {
-            eprintln!("membership provider: {method}: no lp client for {TARGET_MODULE}");
+        Err(_) => {
+            eprintln!("membership provider: {method}: reply channel timed out");
             Err(provider_failure(method))
         }
     }
 }
 
-struct AsyncReply {
-    tx: std::sync::mpsc::Sender<(bool, String)>,
+fn is_no_client(e: &LogosError) -> bool {
+    matches!(e, LogosError::Other(msg) if msg.starts_with("Failed to create protocol client"))
 }
 
-extern "C" fn reply_trampoline(ok: c_int, json: *const c_char, user_data: *mut std::ffi::c_void) {
-    if user_data.is_null() {
-        return;
-    }
-    let reply = unsafe { Box::from_raw(user_data as *mut AsyncReply) };
-    let raw = if json.is_null() {
-        String::new()
-    } else {
-        unsafe { CStr::from_ptr(json) }.to_string_lossy().into_owned()
-    };
-    let _ = reply.tx.send((ok != 0, raw));
-}
-
-/// Interpret a raw lp result as the target's QString reply, "" otherwise —
-/// the sibling module's own error value.
-fn lp_result_to_string(raw: &str) -> String {
-    match serde_json::from_str::<serde_json::Value>(raw) {
-        Ok(serde_json::Value::String(s)) => s,
-        _ => String::new(),
-    }
-}
-
-/// One call to the sibling module: JSON-array args in, its QString reply out.
-/// An empty reply, a missing client, or any transport error all collapse to
-/// the sibling's provider_failure (its own ""-means-error convention), so
-/// callers just `?` and never re-check for emptiness.
-fn provider_call(
-    method: &str,
-    args: &serde_json::Value,
-    timeout_ms: c_int,
-) -> Result<String, ApiError> {
-    let client = owner_client(method)?;
-    let (Ok(method_c), Ok(args_c)) = (CString::new(method), CString::new(args.to_string()))
-    else {
-        eprintln!("membership provider: {method}: args not CString-safe");
-        return Err(provider_failure(method));
-    };
-
-    let on_owner_thread = lock(&PROVIDER_OWNER)
-        .map(|id| id == std::thread::current().id())
-        .unwrap_or(false);
-    let raw = if on_owner_thread {
-        let mut result_json: *mut c_char = std::ptr::null_mut();
-        let mut error_json: *mut c_char = std::ptr::null_mut();
-        let rc = unsafe {
-            lp::lp_invoke(
-                client,
-                method_c.as_ptr(),
-                args_c.as_ptr(),
-                timeout_ms,
-                &mut result_json,
-                &mut error_json,
-            )
-        };
-        if rc != lp::LP_OK {
-            if !error_json.is_null() {
-                let message = unsafe { CStr::from_ptr(error_json) }.to_string_lossy();
-                eprintln!("membership provider: {method}: lp error {rc}: {message}");
-                unsafe { lp::lp_string_free(error_json) };
-            } else {
-                eprintln!("membership provider: {method}: lp error {rc}");
-            }
-            return Err(provider_failure(method));
-        }
-        if result_json.is_null() {
-            String::new()
-        } else {
-            let s = unsafe { CStr::from_ptr(result_json) }
-                .to_string_lossy()
-                .into_owned();
-            unsafe { lp::lp_string_free(result_json) };
-            s
-        }
-    } else {
-        let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
-        let user_data = Box::into_raw(Box::new(AsyncReply { tx })) as *mut std::ffi::c_void;
-        let rc = unsafe {
-            lp::lp_invoke_async(
-                client,
-                method_c.as_ptr(),
-                args_c.as_ptr(),
-                timeout_ms,
-                reply_trampoline,
-                user_data,
-            )
-        };
-        if rc != lp::LP_OK {
-            // The callback will never fire; reclaim the box.
-            drop(unsafe { Box::from_raw(user_data as *mut AsyncReply) });
-            eprintln!("membership provider: {method}: lp_invoke_async dispatch failed rc={rc}");
-            return Err(provider_failure(method));
-        }
-
-        // The protocol owns timeout enforcement; the margin only guards against
-        // a callback that never fires.
-        let wait = Duration::from_millis(timeout_ms as u64 + 10_000);
-        let (ok, raw) = match rx.recv_timeout(wait) {
-            Ok(reply) => reply,
-            Err(_) => {
-                eprintln!("membership provider: {method}: reply channel timed out");
-                return Err(provider_failure(method));
-            }
-        };
-        if !ok {
-            let message = serde_json::from_str::<serde_json::Value>(&raw)
-                .ok()
-                .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
-                .unwrap_or(raw);
-            eprintln!("membership provider: {method}: lp error: {message}");
-            return Err(provider_failure(method));
-        }
-        raw
-    };
-    let value = lp_result_to_string(&raw);
+/// One read of the sibling: its QString reply, where an empty reply is the
+/// sibling's own ""-means-error convention and so a provider_failure.
+fn read_reply(method: &str, reply: Result<String, ApiError>) -> Result<String, ApiError> {
+    let value = reply?;
     if value.is_empty() {
         return Err(provider_failure(method));
     }
     Ok(value)
 }
 
-// ------------------------------------------------- fire-and-record submission
-
-/// Boxed-callback plumbing shared by the fire-and-record submit paths (the
-/// funded register_member, the delegated gifter request). The reply lands on
-/// the owner thread after the dispatching handler has returned, so the
-/// callback may freely take the store lock.
-struct SubmitReply {
-    method: &'static str,
-    on_done: Option<RegisterCallback>,
-}
-
-extern "C" fn submit_trampoline(ok: c_int, json: *const c_char, user_data: *mut std::ffi::c_void) {
-    if user_data.is_null() {
-        return;
-    }
-    let mut reply = unsafe { Box::from_raw(user_data as *mut SubmitReply) };
-    let raw = if json.is_null() {
-        String::new()
-    } else {
-        unsafe { CStr::from_ptr(json) }.to_string_lossy().into_owned()
-    };
-    let value = if ok != 0 { lp_result_to_string(&raw) } else { String::new() };
-    if let Some(cb) = reply.on_done.take() {
-        if value.is_empty() {
-            cb(Err(provider_failure(reply.method)));
-        } else {
-            cb(Ok(value));
+/// The SDK's completion as the `RegisterCallback`'s `Result`, with the
+/// target's "" folded to provider_failure like every other reply.
+fn fold_reply(method: &str, result: Result<String, LogosError>) -> Result<String, ApiError> {
+    match result {
+        Ok(value) if !value.is_empty() => Ok(value),
+        Ok(_) => Err(provider_failure(method)),
+        Err(e) => {
+            eprintln!("membership provider: {method}: {e}");
+            Err(provider_failure(method))
         }
     }
 }
 
-/// Dispatch one fire-and-record call: `on_done` receives the target's QString
-/// reply (or the transport error) once it lands.
-fn invoke_async_recorded(
-    client: *mut lp::LpClient,
+/// Fire-and-record dispatch, keeping the contract the raw ABI had: a
+/// submission the SDK cannot even dispatch (no client, unencodable
+/// arguments) is a SYNCHRONOUS `Err` here — the SDK reports that case from
+/// the callback before `*_async_with_timeout` returns — so the record's owner
+/// marks it failed once and surfaces the error; a reply that lands later
+/// reaches `on_done` from the module's event loop after the dispatching
+/// handler has returned. One mutex orders the two, so a completion racing the
+/// return is delivered exactly once either way.
+fn dispatch_recorded(
     method: &'static str,
-    args: &serde_json::Value,
-    timeout_ms: c_int,
     on_done: RegisterCallback,
+    start: impl FnOnce(Box<dyn FnOnce(Result<String, LogosError>) + Send + 'static>),
 ) -> Result<(), ApiError> {
-    let (Ok(method_c), Ok(args_c)) = (CString::new(method), CString::new(args.to_string())) else {
-        return Err(ApiError::internal("submit args not CString-safe"));
-    };
-    let user_data = Box::into_raw(Box::new(SubmitReply {
-        method,
-        on_done: Some(on_done),
-    })) as *mut std::ffi::c_void;
-    let rc = unsafe {
-        lp::lp_invoke_async(
-            client,
-            method_c.as_ptr(),
-            args_c.as_ptr(),
-            timeout_ms,
-            submit_trampoline,
-            user_data,
-        )
-    };
-    if rc != lp::LP_OK {
-        drop(unsafe { Box::from_raw(user_data as *mut SubmitReply) });
-        return Err(ApiError::new(
-            ErrorKind::ProviderFailure,
-            &format!("{method} dispatch failed rc={rc}"),
-        ));
+    struct Pending {
+        dispatched: bool,
+        on_done: Option<RegisterCallback>,
+        sync_result: Option<Result<String, ApiError>>,
     }
-    Ok(())
+    let state = Arc::new(Mutex::new(Pending {
+        dispatched: false,
+        on_done: Some(on_done),
+        sync_result: None,
+    }));
+    let cb_state = Arc::clone(&state);
+    start(Box::new(move |result| {
+        let outcome = fold_reply(method, result);
+        let mut st = lock(&cb_state);
+        if !st.dispatched {
+            st.sync_result = Some(outcome);
+            return;
+        }
+        let cb = st.on_done.take();
+        drop(st);
+        if let Some(cb) = cb {
+            cb(outcome);
+        }
+    }));
+    let mut st = lock(&state);
+    st.dispatched = true;
+    match st.sync_result.take() {
+        Some(Err(e)) => {
+            st.on_done = None;
+            Err(e)
+        }
+        Some(Ok(value)) => {
+            let cb = st.on_done.take();
+            drop(st);
+            if let Some(cb) = cb {
+                cb(Ok(value));
+            }
+            Ok(())
+        }
+        None => Ok(()),
+    }
 }
 
 // ------------------------------------------------------------ gifter delegate
 
 /// The delegated-registration executor (RLN Membership Allocation Protocol):
 /// the co-located gifter client module. NOT declared in metadata.json
-/// dependencies — deployments without a gifter module must still load.
+/// dependencies — deployments without a gifter module must still load, so it
+/// is reached through an untyped `PluginProxy` rather than a generated client.
 const GIFTER_MODULE: &str = "rln_gifter_module";
 /// The gifter request budget: client-side payload production by the vector's
 /// provider module (≤120s — keycard capture with a slow tap sets the bar)
 /// plus the dial and the server-side on-chain register (≤205s), with
 /// dispatch margin.
-const GIFTER_REQUEST_TIMEOUT_MS: c_int = 340_000;
+const GIFTER_REQUEST_TIMEOUT: Duration = Duration::from_secs(340);
 
-static GIFTER_CLIENT: Mutex<Option<ClientHandle>> = Mutex::new(None);
-
-/// Client to the gifter module — created at init on the owner thread
-/// (creation is lazy-dialing, so a missing gifter module is tolerated),
-/// with an owner-thread-only retry mirroring the provider client's.
-fn gifter_client(method: &str) -> Result<*mut lp::LpClient, ApiError> {
-    if lock(&GIFTER_CLIENT).is_none()
-        && *lock(&PROVIDER_OWNER) == Some(std::thread::current().id())
-    {
-        let mut slot = lock(&GIFTER_CLIENT);
-        if slot.is_none() {
-            if let Some(h) = create_client(GIFTER_MODULE) {
-                *slot = Some(h);
-            }
-        }
-    }
-    match lock(&GIFTER_CLIENT).as_ref() {
-        Some(h) => Ok(h.0),
-        None => Err(ApiError::new(
-            ErrorKind::ProviderFailure,
-            &format!("{GIFTER_MODULE}.{method}: no lp client (is the gifter module loaded?)"),
-        )),
-    }
+fn gifter_client() -> Arc<PluginProxy> {
+    let mut slot = lock(&GIFTER_CLIENT);
+    Arc::clone(slot.get_or_insert_with(|| Arc::new(LogosModuleSDK::new().plugin(GIFTER_MODULE))))
 }
 
 /// Fire the gifter module's `request` with the module-generated commitment and
@@ -466,14 +212,18 @@ pub(crate) fn gifter_request_async(
     args_json: &str,
     on_done: RegisterCallback,
 ) -> Result<(), ApiError> {
-    let client = gifter_client("request")?;
-    invoke_async_recorded(
-        client,
-        "request",
-        &serde_json::json!([args_json]),
-        GIFTER_REQUEST_TIMEOUT_MS,
-        on_done,
-    )
+    let client = gifter_client();
+    let args = serde_json::json!([args_json]);
+    dispatch_recorded("request", on_done, |done| {
+        client.call_json_async_with_timeout("request", &args, GIFTER_REQUEST_TIMEOUT, move |result| {
+            // The gifter answers a QString like the sibling does; anything
+            // else is its failure value.
+            done(result.map(|v| match v {
+                serde_json::Value::String(s) => s,
+                _ => String::new(),
+            }))
+        })
+    })
 }
 
 // ----------------------------------------------------------- provider trait
@@ -503,8 +253,8 @@ pub(crate) trait RegistryProvider: Send + Sync {
 
     /// Submit a registration without blocking: `on_done` receives the
     /// submission reply (acceptance, NOT application — confirmation is the
-    /// poller's read-back) or the submission error. Runs on the owner
-    /// thread after the current dispatch returns.
+    /// poller's read-back) or the submission error. Runs on the module's
+    /// event loop after the current dispatch returns.
     fn register_async(
         &self,
         registry: &CanonicalRegistryId,
@@ -561,10 +311,17 @@ impl RegistryProvider for LezRlnProvider {
         registry: &CanonicalRegistryId,
         id_commitment_hex: &str,
     ) -> Result<ProviderMembership, ApiError> {
-        let raw = provider_call(
+        let client = lez_client();
+        let raw = read_reply(
             "get_membership",
-            &serde_json::json!([registry.account, id_commitment_hex]),
-            READ_TIMEOUT_MS,
+            await_reply("get_membership", READ_TIMEOUT, |done| {
+                client.get_membership_async_with_timeout(
+                    &registry.account,
+                    id_commitment_hex,
+                    READ_TIMEOUT,
+                    done,
+                )
+            }),
         )?;
         let v: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| ApiError::new(ErrorKind::ProviderFailure, &format!("get_membership reply parse: {e}")))?;
@@ -632,10 +389,23 @@ impl RegistryProvider for LezRlnProvider {
                 "logos registries require options_json.funding_holding_account_id",
             ));
         };
+        // The wire carries `int`; a rate the sibling could not even receive
+        // is the caller's error, not a submission to be recorded.
+        let rate_limit = i64::try_from(rate_limit).map_err(|_| {
+            ApiError::new(ErrorKind::InvalidArgument, "rate_limit exceeds the wire's i64")
+        })?;
 
-        let client = owner_client("register_member")?;
-        let args = serde_json::json!([registry.account, funding, id_commitment_hex, rate_limit]);
-        invoke_async_recorded(client, "register_member", &args, REGISTER_TIMEOUT_MS, on_done)
+        let client = lez_client();
+        dispatch_recorded("register_member", on_done, |done| {
+            client.register_member_async_with_timeout(
+                &registry.account,
+                funding,
+                id_commitment_hex,
+                rate_limit,
+                REGISTER_TIMEOUT,
+                done,
+            )
+        })
     }
 
     fn get_merkle_proof(
@@ -643,10 +413,18 @@ impl RegistryProvider for LezRlnProvider {
         registry: &CanonicalRegistryId,
         leaf_index: u64,
     ) -> Result<serde_json::Value, ApiError> {
-        let raw = provider_call(
+        let client = lez_client();
+        let indices = format!("[{leaf_index}]");
+        let raw = read_reply(
             "get_merkle_proofs",
-            &serde_json::json!([registry.account, format!("[{leaf_index}]")]),
-            READ_TIMEOUT_MS,
+            await_reply("get_merkle_proofs", READ_TIMEOUT, |done| {
+                client.get_merkle_proofs_async_with_timeout(
+                    &registry.account,
+                    &indices,
+                    READ_TIMEOUT,
+                    done,
+                )
+            }),
         )?;
         let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
             ApiError::new(ErrorKind::ProviderFailure, &format!("proofs reply parse: {e}"))
@@ -666,10 +444,12 @@ impl RegistryProvider for LezRlnProvider {
         &self,
         registry: &CanonicalRegistryId,
     ) -> Result<Vec<String>, ApiError> {
-        let raw = provider_call(
+        let client = lez_client();
+        let raw = read_reply(
             "get_valid_roots",
-            &serde_json::json!([registry.account]),
-            READ_TIMEOUT_MS,
+            await_reply("get_valid_roots", READ_TIMEOUT, |done| {
+                client.get_valid_roots_async_with_timeout(&registry.account, READ_TIMEOUT, done)
+            }),
         )?;
         serde_json::from_str::<Vec<String>>(&raw).map_err(|e| {
             ApiError::new(ErrorKind::ProviderFailure, &format!("roots reply parse: {e}"))
@@ -680,10 +460,12 @@ impl RegistryProvider for LezRlnProvider {
         &self,
         registry: &CanonicalRegistryId,
     ) -> Result<serde_json::Value, ApiError> {
-        let raw = provider_call(
+        let client = lez_client();
+        let raw = read_reply(
             "get_registry_bounds",
-            &serde_json::json!([registry.account]),
-            READ_TIMEOUT_MS,
+            await_reply("get_registry_bounds", READ_TIMEOUT, |done| {
+                client.get_registry_bounds_async_with_timeout(&registry.account, READ_TIMEOUT, done)
+            }),
         )?;
         serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
             ApiError::new(ErrorKind::ProviderFailure, &format!("bounds reply parse: {e}"))
@@ -691,13 +473,70 @@ impl RegistryProvider for LezRlnProvider {
     }
 }
 
+// ------------------------------------------------------- test-time transport
+
+/// The unit-test binary links no logos-protocol archive, yet the SDK's client
+/// path references the `lp_*` symbols by name. Define the ones that path can
+/// reach as a "no client" transport — `lp_client_create` answers NULL, so
+/// every call fails cleanly with the SDK's own error and nothing below the
+/// ABI is ever exercised. The real symbols come from the protocol archive at
+/// the final plugin link.
+#[cfg(test)]
+mod lp_test_transport {
+    // `#[no_mangle]` definitions are what the crate-wide `deny(unsafe_code)`
+    // exists to flag; these five exist only to give the test binary a link
+    // target, and never run past returning "no client".
+    #![allow(unsafe_code)]
+    use std::ffi::{c_char, c_int, c_void};
+
+    #[no_mangle]
+    pub extern "C" fn lp_client_create(
+        _target_module: *const c_char,
+        _origin_module: *const c_char,
+        _target_transport_json: *const c_char,
+        _capability_transport_json: *const c_char,
+    ) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    #[no_mangle]
+    pub extern "C" fn lp_client_destroy(_client: *mut c_void) {}
+
+    #[no_mangle]
+    pub extern "C" fn lp_invoke(
+        _client: *mut c_void,
+        _method: *const c_char,
+        _args_json: *const c_char,
+        _timeout_ms: c_int,
+        _out_result_json: *mut *mut c_char,
+        _out_error_json: *mut *mut c_char,
+    ) -> c_int {
+        -3
+    }
+
+    #[no_mangle]
+    pub extern "C" fn lp_invoke_async(
+        _client: *mut c_void,
+        _method: *const c_char,
+        _args_json: *const c_char,
+        _timeout_ms: c_int,
+        _cb: Option<extern "C" fn(c_int, *const c_char, *mut c_void)>,
+        _user_data: *mut c_void,
+    ) -> c_int {
+        -3
+    }
+
+    #[no_mangle]
+    pub extern "C" fn lp_string_free(_s: *mut c_char) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::registry_id;
 
-    // With the test lp stub (rc = -3, no client), every provider path must
-    // degrade to provider_failure — never panic, never wedge.
+    // With the test transport (no client), every provider path must degrade
+    // to provider_failure — never panic, never wedge.
     #[test]
     fn stubbed_transport_degrades_to_provider_failure() {
         let registry = registry_id::parse(&format!("logos:local:{}", "ab".repeat(32))).unwrap();
@@ -705,16 +544,24 @@ mod tests {
         assert!(provider.get_membership(&registry, &"11".repeat(32)).is_err());
         assert!(provider.get_merkle_proof(&registry, 0).is_err());
         assert!(provider.get_valid_roots(&registry).is_err());
+        // Fire-and-record: a submission the SDK cannot dispatch (no client)
+        // is a synchronous provider_failure, and the callback is NOT also
+        // invoked — the record's owner handles the failure exactly once.
+        let fired = Arc::new(Mutex::new(false));
+        let seen = Arc::clone(&fired);
         let err = provider
             .register_async(
                 &registry,
                 &format!(r#"{{"funding_holding_account_id":"{}"}}"#, "cd".repeat(32)),
                 &"11".repeat(32),
                 300,
-                Box::new(|_| {}),
+                Box::new(move |_| {
+                    *lock(&seen) = true;
+                }),
             )
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ProviderFailure);
+        assert!(!*lock(&fired), "a synchronous failure must not also reach on_done");
     }
 
     #[test]
