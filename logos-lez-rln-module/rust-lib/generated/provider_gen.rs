@@ -43,20 +43,20 @@ fn emit_event(name: &str, payload: &serde_json::Value) {
     }
 }
 
-pub trait LiblogosLezRlnModule: 'static {
+pub trait LiblogosLezRlnModule: Send + Sync + 'static {
     /// One-time setup hook: fires after the host has stamped the module
     /// context (path / instance id / persistence path) and before the
     /// first method dispatch — the Rust analog of C++'s
     /// LogosModuleContext::onContextReady().
-    fn on_context_ready(&mut self, _ctx: &RustModuleContext) {}
+    fn on_context_ready(&self, _ctx: &RustModuleContext) {}
 
-    fn get_valid_roots(&mut self, rln_account_id_hex: String) -> String;
-    fn get_merkle_proofs(&mut self, config_account_id: String, leaf_indices_json: String) -> String;
-    fn register_member(&mut self, config_account_id: String, user_holding_account_id: String, id_commitment_hex: String, rate_limit: i64) -> String;
-    fn get_token_balance(&mut self, account_id: String) -> String;
-    fn claim_tokens(&mut self, config_account_id: String, dest_account_id: String, amount: i64) -> String;
-    fn get_membership(&mut self, config_account_id: String, id_commitment_hex: String) -> String;
-    fn get_registry_bounds(&mut self, config_account_id: String) -> String;
+    fn get_valid_roots(&self, rln_account_id_hex: String) -> String;
+    fn get_merkle_proofs(&self, config_account_id: String, leaf_indices_json: String) -> String;
+    fn register_member(&self, config_account_id: String, user_holding_account_id: String, id_commitment_hex: String, rate_limit: i64) -> String;
+    fn get_token_balance(&self, account_id: String) -> String;
+    fn claim_tokens(&self, config_account_id: String, dest_account_id: String, amount: i64) -> String;
+    fn get_membership(&self, config_account_id: String, id_commitment_hex: String) -> String;
+    fn get_registry_bounds(&self, config_account_id: String) -> String;
 }
 
 type DispatchFn = fn(&str, &[serde_json::Value]) -> Option<serde_json::Value>;
@@ -66,32 +66,24 @@ struct Registered {
     ensure: EnsureFn,
 }
 static REGISTERED: Mutex<Option<Registered>> = Mutex::new(None);
-// A concurrency:"single" module runs entirely on one thread (its
-// subprocess event loop): install / on_context_ready / dispatch all touch
-// INSTANCE from that thread, so the impl never crosses threads and need
-// not be Send. This single-threaded Sync wrapper lets a non-Send impl
-// live in a static (cf. the EmitState unsafe impl above).
-struct SingleInstance(Mutex<Option<Box<dyn std::any::Any>>>);
-unsafe impl Sync for SingleInstance {}
-static INSTANCE: SingleInstance = SingleInstance(Mutex::new(None));
+// Shared across worker threads; the mutex guards CONSTRUCTION only.
+static INSTANCE: Mutex<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>> = Mutex::new(None);
 static HOOK_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Install `T` as the module implementation (Default-constructed once).
 ///
-/// `on_context_ready` fires AT MODULE LOAD — as soon as the host has
-/// delivered both the context (set_context) and the event plumbing
-/// (set_emit_callback), which the glue does during registration,
-/// before the module is published for inbound calls. This matches
-/// C++'s onContextReady-in-onInit semantics: subscriptions, outbound
-/// calls and typed emission all work from the hook without waiting
-/// for a first inbound dispatch. (For hosts that never wire an emit
-/// callback, the hook still fires before the first dispatch.)
+/// `on_context_ready` fires AT MODULE LOAD, before the module is published for
+/// inbound calls — single-threaded at that point, so it matches the single-mode
+/// scaffold's "fires once before the first dispatch" contract.
 pub fn install<T: LiblogosLezRlnModule + Default>() {
     fn ensure_impl<T: LiblogosLezRlnModule + Default>(require_emit: bool) {
-        let mut guard = INSTANCE.0.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(Box::new(T::default()));
-        }
+        let inst = {
+            let mut guard = INSTANCE.lock().unwrap();
+            if guard.is_none() {
+                *guard = Some(std::sync::Arc::new(T::default()));
+            }
+            guard.clone()
+        };
         if HOOK_FIRED.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
@@ -99,17 +91,22 @@ pub fn install<T: LiblogosLezRlnModule + Default>() {
         if require_emit && EMIT.lock().unwrap().cb.is_none() {
             return;
         }
-        if let Some(imp) = guard.as_mut().unwrap().downcast_mut::<T>() {
-            HOOK_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
-            imp.on_context_ready(&ctx);
+        if let Some(inst) = inst {
+            if let Ok(imp) = inst.downcast::<T>() {
+                HOOK_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
+                imp.on_context_ready(&ctx);
+            }
         }
     }
     fn dispatch_impl<T: LiblogosLezRlnModule + Default>(method: &str, args: &[serde_json::Value]) -> Option<serde_json::Value> {
-        let mut guard = INSTANCE.0.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(Box::new(T::default()));
-        }
-        let imp: &mut T = guard.as_mut().unwrap().downcast_mut::<T>()?;
+        let inst = {
+            let mut guard = INSTANCE.lock().unwrap();
+            if guard.is_none() {
+                *guard = Some(std::sync::Arc::new(T::default()));
+            }
+            guard.clone()
+        };
+        let imp: std::sync::Arc<T> = inst?.downcast::<T>().ok()?;
         match method {
             "get_valid_roots" => {
                 if args.len() < 1 { return None; }
@@ -202,10 +199,11 @@ pub extern "C" fn logos_module_dispatch(method: *const c_char, args_json: *const
     // Copy the dispatch fn pointer out and RELEASE the REGISTERED
     // lock BEFORE running the handler. A concurrency:"multi" module's
     // glue calls this from worker threads; holding the mutex across
-    // the handler would serialize every call (peak overlap 1). The
-    // INSTANCE arc is already cloned + unlocked inside dispatch_impl,
-    // so concurrent handlers are safe. Same release-before-call shape
-    // as ensure_ready.
+    // the handler would serialize every call (peak overlap 1).
+    // dispatch_impl resolves the instance internally (a cloned Arc in
+    // multi mode, the boxed instance behind the SingleInstance mutex in
+    // single mode) without holding REGISTERED, so dropping the lock here
+    // first is safe. Same release-before-call shape as ensure_ready.
     let dispatch = match REGISTERED.lock().unwrap().as_ref() { Some(r) => r.dispatch, None => return std::ptr::null_mut() };
     match dispatch(&method, &args) {
         Some(value) => to_c_string(value.to_string()),
