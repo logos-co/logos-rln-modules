@@ -74,13 +74,13 @@ LogosScrollView {
         // The credential is generated inside the module; the caller supplies
         // only the scope (registry_id + rln_identifier) and, for the logos
         // namespace, the paying account.
-        var options = JSON.stringify({
+        var options = M.registryOptions(rateSpin.value, {
             funding_holding_account_id: fundingField.text.trim()
         })
         busy = true
         liveState = ""
         M.call(bridge, M.RLN_MODULE, "register",
-               [registryId, M.DEFAULT_RLN_ID, rateSpin.value, options], function (r) {
+               [registryId, M.DEFAULT_RLN_ID, options], function (r) {
             view.busy = false
             if (r.error) { view.report(M.errorText(r.error), true); return }
             // register returns the public Membership view; the commitment is the
