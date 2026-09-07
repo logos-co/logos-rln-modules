@@ -89,14 +89,17 @@ PDA-derivation divergence, tree-encoding drift, chain-clock unit changes.
   the subprocess event loop, so one stuck call froze QtRO replica acquisition
   itself until SIGKILL). Under multi the Qt glue runs each call on its own
   worker; a stuck handler leaks one worker instead of starving every caller.
-  `wallet_call` already had the off-owner-thread path (`lp_invoke_async` +
-  channel) — under multi every dispatch takes it, and the now-idle event
-  loop pumps the replies. All state lives in `Mutex` statics; the impl
+  `wallet_call` is the SDK's `call_json_async_with_timeout` plus a channel
+  wait — every dispatch worker blocks only on its channel while the event
+  loop delivers the replies. All state lives in `Mutex` statics; the impl
   struct has no fields.
-- **The wallet lp client is created in `on_context_ready` (main Qt thread)**
-  and never lazily in handlers: the creating thread owns the client and must
-  run a Qt event loop (lp owner-thread contract). `wallet_call` picks sync
-  `lp_invoke` on the owner thread and `lp_invoke_async` + channel off it.
+- **The wallet client is the SDK's `PluginProxy`, held for the process
+  lifetime** in a static (the SDK's cache is weak — a transient proxy would
+  create and destroy a client per call) and warmed in `on_context_ready`. At
+  protocol 0.9 `lp_client_create` constructs the client on the Qt main thread
+  whoever calls it, so lazy creation from a worker is safe; the synchronous
+  call twin is never used from a worker (it would serialize every call on
+  the main thread). The crate carries `#![deny(unsafe_code)]`: no raw `lp_*`.
 - **`REG_IN_FLIGHT` dedup in `register_member`**: callers can fire
   register_member twice within seconds for the same membership. An on-chain
   idempotency pre-check cannot see a tx that is still confirming (60-90s on
