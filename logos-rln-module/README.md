@@ -109,8 +109,9 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   wallet module's job.
 - `rust-lib/src/keychain.rs` — `unlock_keystore_auto()` /
   `remember_keystore_password()`: macOS-Keychain-backed silent unlock via
-  the `security` CLI (stdin batch writes — the secret never hits argv;
-  a missing item over existing credentials never invents a secret).
+  the `security` CLI (stdin batch writes — the secret never hits argv; no
+  secret is ever invented over a provisioned store; the reply releases the
+  secret only on the fresh provision that created it).
   Injectable backend seam; cargo tests never touch the live keychain.
 - `rust-lib/generated/provider_gen.rs` — gitignored scaffold the nix build
   regenerates; for local `cargo check`/tests, materialise it (plus the
@@ -131,12 +132,25 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
 - **Unlock model.** Reads, lifecycle polling, selection, `get_epoch_quota`,
   and `validate_proof` never need the password (identity/cache/counter
   plaintext is locked-readable; verification uses no credential at all).
-  `unlock_keystore` is required to `register` (seals the freshly generated
-  credential) and to `generate_proof` (unseals it in-module for the
-  witness). With zero stored credentials any password unlocks and becomes
-  the store password — re-provisioning the header — until the first insert
-  freezes the stored verifier; from then on unlock is exactly one Argon2id
-  run checked in constant time, independent of entry count.
+  An unlocked keystore is required to `register` a fresh scope (seals the
+  freshly generated credential) and to `generate_proof` (unseals it
+  in-module for the witness); a live-scope re-register short-circuits and
+  works locked. With zero stored credentials any password unlocks and
+  becomes the store password — re-provisioning the header — until the
+  first insert freezes the stored verifier; from then on unlock is exactly
+  one Argon2id run checked in constant time, independent of entry count.
+  **Custody default is module-owned (full-lazy)**: at init the module
+  resumes or self-provisions its own random password
+  (`rln_autounlock.secret`, 0600, in the store dir — see
+  `docs/keystore-format.md`), so a headless host needs ZERO unlock calls;
+  `LOGOS_RLN_DISABLE_AUTO_UNLOCK=1` opts a deployment back into
+  user-password custody — it gates module init AND refuses
+  `unlock_keystore_auto()` — and an already provisioned store with no
+  stored secret is never adopted (stays locked until manual unlock),
+  whether or not it holds credentials yet.
+  File-mode custody trades at-rest confidentiality down to filesystem
+  ACLs; the OS keychain (macOS) and a manual password are the stronger
+  modes.
 - **Slot allocation is persist-before-issue, and the allocator is
   monotonic.** `generate_proof` durably records the `(rln_identifier, epoch,
   message_id)` allocation before the proof leaves the module (fsync'd write —

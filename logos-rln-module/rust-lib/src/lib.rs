@@ -1374,6 +1374,7 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
                 if !store.pending_records().is_empty() {
                     poller::ensure_running();
                 }
+                keychain::lazy_auto_unlock();
             }
         }
     }
