@@ -97,6 +97,10 @@ pub(crate) struct RateLimitProof {
     epoch: Option<u64>,
 }
 
+/// The compressed Groth16 proof's byte length — the spec's `proof[128]`,
+/// and the canonical zerokit serialization's leading segment.
+const GROTH16_LEN: usize = 128;
+
 impl RateLimitProof {
     /// Bundle the Groth16 proof with its public values and capture both the
     /// canonical bytes and the decoded field view. `epoch` is `None` here —
@@ -132,13 +136,24 @@ impl RateLimitProof {
         self.root
     }
 
-    /// The spec `RateLimitProof` as a JSON object: `proof` is the canonical
-    /// hex the consumer round-trips unchanged, the rest a decoded view.
-    /// `epoch` (the spec's `epoch[32]`, 32-byte LE hex) is present only when
-    /// this proof carries one.
+    /// The full canonical zerokit serialization as hex — generate_proof's
+    /// `proof_canonical` reply extra. A consumer that carries ONE opaque
+    /// blob on its own message wire can validate with `{"proof": <hex>}`
+    /// alone: [`Self::from_json`]'s canonical path recovers every public
+    /// value from the bytes.
+    pub(crate) fn canonical_hex(&self) -> String {
+        bytes_to_hex(&self.canonical)
+    }
+
+    /// The spec `RateLimitProof` as a JSON object — the DECOMPOSED shape:
+    /// `proof` is the bare compressed Groth16 proof (spec `proof[128]`),
+    /// and `root`/`external_nullifier`/`share_x`/`share_y`/`nullifier` carry
+    /// the public values. `epoch` (the spec's `epoch[32]`, 32-byte LE hex)
+    /// is present only when this proof carries one. [`Self::from_json`]
+    /// accepts this shape and the pre-0.6.0 canonical-blob form alike.
     pub(crate) fn to_json(&self) -> serde_json::Value {
         let mut out = serde_json::json!({
-            "proof": bytes_to_hex(&self.canonical),
+            "proof": bytes_to_hex(&self.canonical[..GROTH16_LEN.min(self.canonical.len())]),
             "root": bytes_to_hex(&self.root),
             "external_nullifier": bytes_to_hex(&self.external_nullifier),
             "share_x": bytes_to_hex(&self.share_x),
@@ -176,7 +191,6 @@ impl RateLimitProof {
         let bytes = hex_to_vec(proof_hex)
             .ok_or_else(|| ProofError::BadInput("proof: not valid hex".into()))?;
 
-        const GROTH16_LEN: usize = 128;
         let canonical: Vec<u8> = if bytes.len() == GROTH16_LEN {
             // Spec-struct shape: rebuild the zerokit proof around the bare
             // Groth16 proof and re-serialize it into the canonical form.
@@ -634,12 +648,11 @@ mod tests {
             "cbf8daa2f4d16e31165c6789a738681b0871a5cc775206af276ad4295e185e1e"
         );
 
-        // Canonical serialization layout (zerokit's `RLNProof` LE format):
-        // the 128-byte compressed Groth16 proof, the Single-mode tag byte,
-        // then the 160-byte LE public values — 289 bytes total.
-        let canonical = hex_to_vec(j["proof"].as_str().unwrap()).unwrap();
-        assert_eq!(canonical.len(), 289);
-        assert_eq!(canonical[128], 0x00);
+        // The spec's proof[128]: to_json emits the bare compressed Groth16
+        // proof (the canonical zerokit blob's leading segment); the public
+        // values travel as the decomposed fields asserted above.
+        let bare = hex_to_vec(j["proof"].as_str().unwrap()).unwrap();
+        assert_eq!(bare.len(), 128);
     }
 
     #[test]
@@ -698,12 +711,8 @@ mod tests {
         let root = proof.root();
         let j = proof.to_json();
 
-        // Slice the bare Groth16 proof out of the canonical bytes — exactly
-        // what the spec's proof[128] carries.
-        let canonical = hex_to_vec(j["proof"].as_str().unwrap()).unwrap();
-        let bare = bytes_to_hex(&canonical[..128]);
         let decomposed = serde_json::json!({
-            "proof": bare,
+            "proof": j["proof"],
             "root": j["root"],
             "external_nullifier": j["external_nullifier"],
             "share_x": j["share_x"],
@@ -728,6 +737,27 @@ mod tests {
             Err(_) => {}
             Ok(p) => assert!(!verify(&p, b"net msg", &[root]).expect("verify tampered")),
         }
+    }
+
+    // The message-wire transport shortcut: generate's `proof_canonical`
+    // bytes, fed back as the ONLY proof field, must land in the identical
+    // verified representation — no decomposed fields needed.
+    #[test]
+    fn canonical_blob_alone_round_trips() {
+        let material = material_from_seed(&[5u8; 32], 100, 2);
+        let rln_id = [6u8; 32];
+        let proof = generate(&material, b"net msg", 77, &rln_id).expect("generate");
+        let hex = proof.canonical_hex();
+        assert_eq!(hex.len(), 289 * 2, "Single-mode canonical blob is 289 bytes");
+        assert!(
+            hex.starts_with(proof.to_json()["proof"].as_str().unwrap()),
+            "the blob's leading segment is the bare proof[128]"
+        );
+
+        let restored = RateLimitProof::from_json(&serde_json::json!({ "proof": hex }))
+            .expect("blob-only from_json");
+        assert_eq!(restored.root(), proof.root());
+        assert!(verify(&restored, b"net msg", &[proof.root()]).expect("verify"));
     }
 
     #[test]

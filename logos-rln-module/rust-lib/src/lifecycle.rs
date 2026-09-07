@@ -21,7 +21,18 @@ pub(crate) enum MembershipState {
     Active,
     GracePeriod,
     Expired,
+    /// Spec MEMBERSHIP_ERASED_AWAITS_WITHDRAWAL: removed, deposit still
+    /// recoverable. In the vocabulary for spec completeness — the logos
+    /// registry exposes no recoverable-deposit state, so the provider never
+    /// reports it today.
+    ErasedAwaitsWithdrawal,
     Erased,
+    /// Spec MEMBERSHIP_SLASHED: removed by slashing, identity secret
+    /// publicly revealed. In the vocabulary for spec completeness — the
+    /// logos registry does not expose slashing as a removal cause, so
+    /// removals surface as `Erased` (spec-sanctioned) and the provider
+    /// never reports this today.
+    Slashed,
 }
 
 impl MembershipState {
@@ -38,9 +49,19 @@ impl MembershipState {
     }
 
     /// Ever observed on the registry — the "was Active, now gone → erased"
-    /// inference's building block (see `merge_state`).
+    /// inference's building block (see `merge_state`). The removal states
+    /// (`ErasedAwaitsWithdrawal`, `Erased`, `Slashed`) all imply a prior
+    /// registry sighting.
     pub(crate) fn is_active_like(self) -> bool {
-        matches!(self, Self::Active | Self::GracePeriod | Self::Expired | Self::Erased)
+        matches!(
+            self,
+            Self::Active
+                | Self::GracePeriod
+                | Self::Expired
+                | Self::ErasedAwaitsWithdrawal
+                | Self::Erased
+                | Self::Slashed
+        )
     }
 }
 
@@ -179,9 +200,10 @@ pub fn merge_state(
 pub fn transition_event(
     hash: &str,
     record: &MembershipRecord,
+    prior: MembershipState,
     new_state: MembershipState,
 ) -> Option<(String, String, String, String, String)> {
-    if new_state == record.cache.state {
+    if new_state == prior {
         return None;
     }
     // Serde's `rename_all` on MembershipState is the single source of truth
@@ -197,7 +219,7 @@ pub fn transition_event(
         record.identity.rln_identifier.clone(),
         hash.to_string(),
         wire(new_state),
-        wire(record.cache.state),
+        wire(prior),
     ))
 }
 
@@ -280,11 +302,11 @@ mod tests {
     fn transition_event_gates_on_actual_state_change() {
         use MembershipState::*;
         let active = rec(Active, 0);
-        assert!(transition_event("h", &active, Active).is_none());
+        assert!(transition_event("h", &active, active.cache.state, Active).is_none());
 
         let pending = rec(Pending, 0);
         let (registry_id, rln_identifier, hash, state, previous) =
-            transition_event("h1", &pending, Active).expect("real transition");
+            transition_event("h1", &pending, pending.cache.state, Active).expect("real transition");
         assert_eq!(registry_id, pending.identity.registry_id);
         assert_eq!(rln_identifier, "");
         assert_eq!(hash, "h1");
@@ -294,7 +316,7 @@ mod tests {
         let mut scoped = rec(Pending, 0);
         scoped.identity.rln_identifier = "ab".repeat(32);
         let (_, rln_identifier, ..) =
-            transition_event("h2", &scoped, Failed).expect("real transition");
+            transition_event("h2", &scoped, scoped.cache.state, Failed).expect("real transition");
         assert_eq!(rln_identifier, scoped.identity.rln_identifier);
     }
 
