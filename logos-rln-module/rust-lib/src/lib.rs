@@ -386,21 +386,16 @@ fn flat_str_option(options: &serde_json::Value, key: &str) -> Result<Option<Stri
     }
 }
 
-/// The logos-namespace default when the common "rate_limit" option key is
-/// absent (spec register(): "absent, the registry … applies its default").
-/// The lez registry declares no default today, so the module supplies one.
-/// TODO: investigate a registry-declared default in logos-lez-rln (surfaced
-/// via get_registry_parameters, e.g. default_rate_limit) and prefer it over
-/// this constant when present.
+/// Applied when the common "rate_limit" option key is absent (spec: "absent,
+/// the registry … applies its default"); the lez registry declares no default
+/// yet, so the module supplies one. TODO: prefer a registry-declared default
+/// (via get_registry_parameters) once logos-lez-rln surfaces one.
 const DEFAULT_RATE_LIMIT: u64 = 100;
 
-/// Parse the wire's options_json — the JSON binding of the spec's
-/// RegistryOptions: an ARRAY of {"key","value"} pairs, both strings (char*
-/// pairs in the C type, so a non-string value is a type error, never a
-/// coercion). Empty input means "no options". Duplicate keys are a caller
-/// bug and rejected. Returns the requested rate_limit (the common key,
-/// defaulted when absent/empty) and the remaining options as a flat object
-/// — the shape the option validators and the provider consume.
+/// The wire's options_json: the spec RegistryOptions ARRAY of {"key","value"}
+/// string pairs (char* pairs, so a non-string value is a type error, never a
+/// coercion; duplicate keys are rejected). Returns the rate_limit (defaulted
+/// when absent) and the remaining pairs as a flat object.
 fn parse_registry_options(options_json: &str) -> Result<(u64, serde_json::Value), ApiError> {
     let trimmed = options_json.trim();
     let entries = if trimmed.is_empty() {
@@ -450,8 +445,7 @@ fn parse_registry_options(options_json: &str) -> Result<(u64, serde_json::Value)
             ));
         }
     }
-    // Absent — or present but blank — takes the default; anything else must
-    // parse as a positive decimal.
+    // A present-but-blank value falls back to the default, like absent.
     let raw = map.remove("rate_limit");
     let given = raw.as_ref().and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
     let rate_limit = match given {
@@ -583,11 +577,10 @@ fn delegated_submit_callback(store: Weak<Store>, hash: String) -> provider::Regi
     })
 }
 
-/// In-flight register claims, keyed by (canonical registry, rln id). The
-/// idempotency check is a snapshot scan and the insert lands a provider
-/// round-trip (up to ~70s) later; without this claim two concurrent
-/// register(scope) calls both pass the scan and double-mint. The second
-/// caller errors transient and retries into the short-circuit.
+/// In-flight register claims by (canonical registry, rln id): the idempotency
+/// scan and the insert are separated by a provider round-trip (up to ~70s), so
+/// without a claim two concurrent register(scope) calls double-mint. The loser
+/// errors transient and retries into the short-circuit.
 static REGISTER_IN_FLIGHT: Mutex<Option<std::collections::HashSet<(String, String)>>> =
     Mutex::new(None);
 
@@ -633,16 +626,9 @@ fn register_impl(
     // only sound while no sibling register for the same scope is in flight.
     let _claim = RegisterClaim::take(&registry.canonical, &rln_id_hex)?;
 
-    // Spec register(scope, RegistryOptions): options_json is the
-    // RegistryOptions ARRAY binding; the common "rate_limit" key is lifted
-    // out here (defaulted when absent) and the remaining pairs become the
-    // flat option map. Delegated registration (selecting the RLN Membership
-    // Allocation Protocol) is the "delegated":"true" pair plus
-    // "gifter_peer_id"/"gifter_multiaddr" and the optional "auth_type"/
-    // "auth_payload"/"auth_provider"/"auth_args" vector selection (OPEN
-    // vocabulary; payload from auth_payload hex or an auth_provider module,
-    // auth_args forwarded verbatim). No auth_type is an unauthenticated
-    // request. Validated up front so a malformed request never mints a
+    // "delegated":"true" selects delegated registration via the RLN
+    // Membership Allocation Protocol (the .lidl documents the option
+    // vocabulary). Validated up front so a malformed request never mints a
     // credential.
     let (rate_limit, opts) = parse_registry_options(options_json)?;
     let delegated = if flat_bool_option(&opts, "delegated")? {
@@ -734,12 +720,9 @@ fn register_impl(
         .find(|r| !r.quarantined && r.cache.state.is_live() && scope_matches(r, &rln_id_hex))
     {
         let mismatch = rec.cache.rate_limit != Some(rate_limit);
-        // A live membership whose allocation ledger is bound to a DIFFERENT
-        // epoch size can never reserve under the current config (the
-        // store's reservation guard fails Permanent), yet register would
-        // short-circuit to it forever with no visible cause — surface the
-        // bind here. An unconfigured module (start() not yet called) skips
-        // the check rather than failing the short-circuit.
+        // A live membership bound to a DIFFERENT epoch size can never reserve
+        // under the current config (Permanent), yet register short-circuits
+        // to it forever — surface the bind. Skipped before start() configures.
         let bound = rec.alloc.epoch_size_sec;
         let epoch_mismatch = epoch_params_for(&registry.canonical)
             .is_ok_and(|(size, _)| bound != 0 && bound != size);
@@ -804,8 +787,7 @@ fn register_impl(
         ),
         None => prov.register_async(
             &registry,
-            // The provider consumes the flat option OBJECT (its wire is
-            // unchanged); the RegistryOptions array was flattened above.
+            // The provider's wire takes the flat option object, not the array.
             &opts.to_string(),
             &commitment_hex,
             rate_limit,
@@ -832,15 +814,11 @@ fn register_impl(
 /// candidate → UNKNOWN; more than one → AmbiguousSelection. Transitions the
 /// merged view implies are persisted.
 ///
-/// Takes NO register claim. This is the module's most-polled READ (the UI
-/// polls it per card), it spends a full registry-read budget, and the claim
-/// is exclusive per scope: holding it here would serialize concurrent polls
-/// — and any register behind them — for up to that budget, and answer the
-/// loser "a registration is already in flight" for a registration it never
-/// issued. The claim guards register's mint; ambiguity here is already
-/// reachable without one (scope_candidates keeps terminal records), and the
-/// cache write below is a compare-and-set against the state observed under
-/// the store lock.
+/// Takes NO register claim: this is the module's most-polled read and the
+/// claim is exclusive per scope — holding it here would serialize polls (and
+/// any register behind them) for a full registry-read budget and tell the
+/// loser a registration is in flight that it never issued. The cache write
+/// below is a compare-and-set instead.
 fn get_membership_state_impl(
     store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
@@ -877,13 +855,11 @@ fn get_membership_state_impl(
     let merged = lifecycle::merge_state(Some(record), registry_state, now_unix());
 
     if merged != record.cache.state {
-        // Self-healing cache write: the merged view is recomputed from
-        // (local, registry, now) on every read, so a failed persist only
-        // costs the next reader a recompute — log it and move on. The write
-        // is a compare-and-set on the state observed under the store lock:
-        // `merged` was computed from a snapshot taken before a (potentially
-        // ~70s) provider read, and a fresher writer — the poller, a submit
-        // callback, a sibling dispatch — must not be clobbered with it.
+        // Self-healing cache write: the merged view is recomputed on every
+        // read, so a failed persist only costs the next reader a recompute.
+        // Compare-and-set on the state observed under the store lock —
+        // `merged` comes from a snapshot taken before a (potentially ~70s)
+        // provider read and must not clobber a fresher writer.
         let snapshot_state = record.cache.state;
         let persist = store.update_cache(hash, |m| {
             if m.state != snapshot_state {
@@ -907,8 +883,7 @@ fn get_membership_state_impl(
         });
         match persist {
             Err(e) => eprintln!("membership state persist: {}", e.message),
-            // Emit only when THIS call actually wrote the transition (the
-            // CAS matched), with `previous` from the locked observation.
+            // Emit only when this call's CAS actually wrote the transition.
             Ok(prior) if prior == snapshot_state => {
                 if let Some((registry_id, rln_identifier, membership_hash, state, previous)) =
                     lifecycle::transition_event(hash, record, prior, merged)
@@ -992,10 +967,9 @@ fn get_memberships_impl(
 /// Default `max_epoch_gap` (see [`epoch_params_for`]) when `start()` sets none.
 const DEFAULT_MAX_EPOCH_GAP: u64 = 1;
 
-/// A registry's deviation from the instance defaults (spec: the epoch size
-/// and the maximum epoch gap are per-REGISTRY configuration). Doubles as
-/// the start reply's per-registry override object: an unset key is OMITTED,
-/// so the reply carries only what the caller actually set.
+/// A registry's deviation from the instance defaults (spec: epoch size and
+/// max gap are per-REGISTRY configuration). Doubles as the start reply's
+/// override object — an unset key is omitted, never null.
 #[derive(Clone, Copy, Default, serde::Serialize)]
 struct RegistryOverride {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1014,19 +988,13 @@ struct ModuleConfig {
 
 static CONFIG: Mutex<Option<ModuleConfig>> = Mutex::new(None);
 
-/// The SOLE reader of the epoch configuration: `(epoch_size_sec,
-/// max_epoch_gap)` for one registry — each its start() override when given,
-/// else the instance default (spec: both are per-REGISTRY configuration).
-/// Taken under ONE CONFIG lock acquisition, so a concurrent start()
-/// reconfigure cannot hand a handler a mixed-config pair.
-///
-/// The size is an APPLICATION parameter every proof generator and verifier
-/// must share, so there is deliberately NO default: before `start()`
-/// configures it the epoch-dependent functions fail `not_ready` (spec:
-/// RLN_ERR_NOT_READY). The gap absorbs clock skew and propagation latency,
-/// and is also the retention floor for verification-side state keyed by
-/// epoch. `start()` filters both sources to positives, so neither component
-/// is ever 0 here.
+/// The sole reader of the epoch configuration: `(epoch_size_sec,
+/// max_epoch_gap)` for one registry — its start() override, else the instance
+/// default — under ONE lock acquisition, so a concurrent reconfigure cannot
+/// hand a handler a mixed pair. No default on purpose: the size is an
+/// application parameter every prover and verifier must share, so before
+/// start() the epoch-dependent methods fail `not_ready`. start() filters both
+/// values to positives, so neither component is ever 0 here.
 fn epoch_params_for(registry_canonical: &str) -> Result<(u64, u64), ApiError> {
     let cfg = lock(&CONFIG);
     let c = cfg.as_ref().ok_or_else(|| {
@@ -1041,19 +1009,14 @@ fn epoch_params_for(registry_canonical: &str) -> Result<(u64, u64), ApiError> {
     Ok((size, gap))
 }
 
-/// The instance-default epoch length — the un-overridden path, as a
-/// registry carrying no override sees it.
 #[cfg(test)]
 fn epoch_size() -> Result<u64, ApiError> {
     epoch_params_for("").map(|(size, _)| size)
 }
 
-/// start()'s stale-binding warning. Names the whole EFFECTIVE set — the
-/// instance default plus every per-registry override — because that is what
-/// the check compares against: under overrides, naming only the instance
-/// default reports a value the check never used, and reads as a
-/// contradiction to an operator whose binding matches some other configured
-/// size.
+/// start()'s stale-binding warning. Names the whole effective set (instance
+/// default + overrides) because that is what the check compares against —
+/// naming only the default would report a value the check never used.
 fn epoch_binding_warning(hash: &str, bound: u64, effective: &[u64]) -> String {
     format!(
         "membership start: entry {hash} allocations are bound to \
@@ -1067,19 +1030,18 @@ pub(crate) fn reset_config_for_test() {
     *lock(&CONFIG) = None;
 }
 
+/// start/stop bodies span several supervisor critical sections; interleaving
+/// two of them can strand freshly spawned workers behind a stop's generation
+/// bump. Neither is a hot path.
+static LIFECYCLE: Mutex<()> = Mutex::new(());
+
 /// Spec start(): apply configuration, warm the configured registries' root
 /// windows, begin maintenance, and clear any prior stop(). Idempotent —
 /// safe to call again to reconfigure. config_json:
 /// {"epoch_size_sec":N (required — the instance default), "max_epoch_gap"?:N,
 /// "registries"?:[<entry>,…]} where an entry is a CAIP-10 string, or an
 /// object {"registry_id":caip10, "epoch_size_sec"?:N, "max_epoch_gap"?:N}
-/// overriding the defaults for that registry (spec: epoch size and max gap
-/// are per-registry configuration).
-/// start/stop are idempotent but their bodies span several supervisor
-/// critical sections; interleaving two of them can strand freshly spawned
-/// workers behind a stop's generation bump. Neither is a hot path.
-static LIFECYCLE: Mutex<()> = Mutex::new(());
-
+/// overriding the defaults for that registry.
 fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
     let _lifecycle = LIFECYCLE.lock().unwrap();
     panic_hook::install_once();
@@ -1107,9 +1069,8 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_MAX_EPOCH_GAP);
 
-    // Warm the root window for every configured registry; an object entry
-    // additionally carries that registry's overrides. Unparseable entries
-    // are skipped, as ever.
+    // Warm each configured registry's root window; unparseable entries are
+    // skipped.
     let mut tracked: Vec<String> = Vec::new();
     let mut overrides: std::collections::BTreeMap<String, RegistryOverride> =
         std::collections::BTreeMap::new();
@@ -1151,25 +1112,19 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
 
     let overrides_view = (!overrides.is_empty())
         .then(|| serde_json::to_value(&overrides).unwrap_or(serde_json::Value::Null));
-    // Every epoch size a configured registry can now be bound to — read
-    // here, BEFORE `overrides` moves into CONFIG.
-    let effective: Vec<u64> = std::iter::once(epoch_size_sec)
+    let effective_sizes: Vec<u64> = std::iter::once(epoch_size_sec)
         .chain(overrides.values().filter_map(|o| o.epoch_size_sec))
         .collect();
     *lock(&CONFIG) = Some(ModuleConfig { epoch_size_sec, max_epoch_gap, overrides });
-    // A membership whose persisted allocations are bound to a DIFFERENT
-    // epoch_size_sec can no longer generate proofs (the store fails those
-    // reservations `permanent`); surface that at configure time. Warn-only:
-    // rejecting start() would DoS validate_proof for every scope over one
-    // stale local membership. Ignore an uninitialized store (pre-context) —
-    // read the published slot, exactly like the worker loops.
-    // Effective-size check is approximate under overrides: a binding that
-    // matches ANY configured size passes (the record's own registry is not
-    // threaded through epoch_size_bindings).
+    // A membership bound to a DIFFERENT epoch size can no longer generate
+    // proofs; surface that at configure time. Warn-only — rejecting start()
+    // would DoS validate_proof for every scope over one stale local
+    // membership. Approximate under overrides: a binding matching ANY
+    // configured size passes (epoch_size_bindings carries no registry).
     if let Some(store) = sealed_store::store::current() {
         for (hash, bound) in store.epoch_size_bindings() {
-            if bound != 0 && !effective.contains(&bound) {
-                eprintln!("{}", epoch_binding_warning(&hash, bound, &effective));
+            if bound != 0 && !effective_sizes.contains(&bound) {
+                eprintln!("{}", epoch_binding_warning(&hash, bound, &effective_sizes));
             }
         }
     }
@@ -1802,8 +1757,7 @@ mod tests {
         Err(ApiError::internal(sealed_store::store::UNINIT_MSG))
     }
 
-    /// The wire's RegistryOptions array from (key, value) pairs — the LIP
-    /// binding every register call site speaks.
+    /// The wire's RegistryOptions array from (key, value) pairs.
     fn opts_arr(pairs: &[(&str, &str)]) -> String {
         serde_json::Value::Array(
             pairs
@@ -1925,10 +1879,8 @@ mod tests {
         assert!(err.message.contains("epoch_size_sec"), "got: {}", err.message);
     }
 
-    // Spec: epoch size and max gap are per-REGISTRY configuration. A
-    // registries entry may be an object carrying overrides; a plain string
-    // entry inherits the instance defaults. The reply surfaces only the
-    // overrides actually set.
+    // Spec: epoch size and max gap are per-REGISTRY configuration — an
+    // object registries entry carries overrides, a plain string inherits.
     #[test]
     fn start_per_registry_overrides_select_epoch_config() {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
@@ -1944,8 +1896,7 @@ mod tests {
         })
         .to_string();
         let out = start_impl(&cfg).unwrap();
-        // Exact wire shape: sorted keys, an unset key OMITTED (never null),
-        // and a plain string entry carries no override object at all.
+        // Exact wire shape: sorted keys, unset keys omitted (never null).
         assert_eq!(
             out["overrides"].to_string(),
             format!(r#"{{"{reg_b}":{{"epoch_size_sec":60,"max_epoch_gap":5}}}}"#),
@@ -1964,10 +1915,8 @@ mod tests {
         assert_eq!(epoch_params_for(&reg_b).unwrap(), (600, DEFAULT_MAX_EPOCH_GAP));
     }
 
-    // The stale-binding warning names the set the check actually compared
-    // against: with an override configured, a binding that matches NO
-    // configured size must not be told "config says <instance default>" —
-    // that reports a value the check never used.
+    // With an override configured, the warning must not name only the
+    // instance default — a value the check never used.
     #[test]
     fn epoch_binding_warning_names_every_configured_size() {
         let msg = epoch_binding_warning("abc123", 300, &[600, 60]);
@@ -2530,18 +2479,13 @@ mod tests {
 
     // get_membership_state is a READ and takes no register claim: the UI
     // polls it per card, so overlapping polls of one scope must all answer.
-    // The claim used to sit on this path, holding it across a full registry
-    // read — the loser was told "a registration for this scope is already in
-    // flight" about a registration it never issued, and a register queued
-    // behind a poll for as long as that read took.
     #[test]
     fn membership_state_reads_take_no_register_claim() {
         let registry = format!("logos:local:{}", "1a".repeat(32));
         let rln_id = "2b".repeat(32);
         let (canonical, _, rln_id_hex) = parse_scope(&registry, &rln_id).unwrap();
 
-        // A register for exactly this scope is in flight, holding the claim
-        // — and it really is exclusive: a sibling REGISTER still loses it.
+        // A register for exactly this scope is in flight, holding the claim.
         let claim = RegisterClaim::take(&canonical.canonical, &rln_id_hex).ok();
         assert!(claim.is_some(), "the first claim must be granted");
         match RegisterClaim::take(&canonical.canonical, &rln_id_hex) {
@@ -2556,8 +2500,6 @@ mod tests {
         }
         drop(claim);
 
-        // And with nothing in flight, the read still claims nothing — the
-        // scope is free for a register the instant the poll returns.
         let out = get_membership_state_impl(no_store(), &registry, &rln_id).unwrap();
         assert_eq!(out["state"], serde_json::json!("unknown"), "got: {out}");
         assert!(
@@ -2722,8 +2664,7 @@ mod tests {
             Some(now_epoch - 1),
             "epoch must derive from the supplied timestamp, not the module clock: {out}"
         );
-        // The reply's message-wire extra: the full canonical blob, whose
-        // leading segment is the bare proof[128].
+        // The full canonical blob; its leading segment is the bare proof[128].
         let canonical = out
             .get("proof_canonical")
             .and_then(|v| v.as_str())
@@ -2809,8 +2750,7 @@ mod tests {
     }
 
     // The common rate_limit key is optional: absent, the module applies
-    // DEFAULT_RATE_LIMIT (the registry declares no default today — see the
-    // constant's TODO). The defaulted value lands on the Pending record.
+    // DEFAULT_RATE_LIMIT (see the constant's TODO).
     #[test]
     fn register_defaults_rate_limit_when_option_absent() {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);

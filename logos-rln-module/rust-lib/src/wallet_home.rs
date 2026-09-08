@@ -53,9 +53,8 @@ pub(crate) fn provision_impl(options_json: &str) -> Result<serde_json::Value, Ap
             "multi_sequencer_client_config": { "distribution_limit": 1, "calibration_limit": 3 },
         });
         // Atomic tmp+rename (the wallet module reads this file from another
-        // process), behind an exclusive-create claim so two concurrent
-        // first-provisions can't tear the tmp file or both report
-        // config_existed:false.
+        // process), behind an exclusive-create claim so two concurrent first
+        // provisions can't tear the tmp file.
         let claim = home.join("wallet_config.json.claim");
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&claim) {
             Ok(_) => {

@@ -138,9 +138,7 @@ function mockExpr(cfg) {
           st.pendingCommit = st.regSeq === 1 ? COMMIT : COMMIT2;
           return { id_commitment: st.pendingCommit, id_secret_hash: SECRET };
         case "register": {
-          // Wire 0.6.0 arity guard: (registry_id, rln_identifier_hex, options_json)
-          // where options_json is the RegistryOptions ARRAY of {key,value}
-          // string pairs. Keep this strict so a call-site regression fails here.
+          // Deliberately strict so a call-site regression fails here.
           if (args.length !== 3)
             return { error: { kind: "invalid_argument", message: "mock: register takes 3 args (registry_id, rln_identifier_hex, options_json), got " + args.length } };
           var opts;

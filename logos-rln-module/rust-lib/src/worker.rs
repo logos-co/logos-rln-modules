@@ -53,12 +53,10 @@ struct Supervisor {
     /// captured generation no longer matches is from a superseded run and
     /// exits at its next check — the mechanism that makes detaching safe.
     generation: u64,
-    /// Bumped by nudge(): asks the SUBSCRIBED tick loops (those waiting in
-    /// `wait_tick_or_nudge`) for one immediate out-of-band tick — a
-    /// root-window miss on the verification path wants the refresher NOW,
-    /// not in up to one refresh interval. Loops that do not subscribe keep
-    /// their own cadence: a remote peer's proofs must not be able to drive
-    /// this module's other registry reads.
+    /// Bumped by nudge(): asks the tick loops waiting in `wait_tick_or_nudge`
+    /// for one immediate out-of-band tick. Non-subscribers keep their own
+    /// cadence — a remote peer's proofs must not be able to drive this
+    /// module's other registry reads.
     nudges: u64,
     /// Live (spawned, not yet returned) workers — stop()'s join condition
     /// and the tests' observability seam.
@@ -92,11 +90,9 @@ pub(crate) fn wait_tick(my_gen: u64, dur: Duration) -> bool {
     wait(my_gen, dur, false)
 }
 
-/// [`wait_tick`] for a loop that SUBSCRIBES to nudges: a [`nudge`] counts as
-/// this loop's due tick. Only a loop whose out-of-band work is what the
-/// nudger is asking for may take it — a nudge is not a general "everybody
-/// tick now", or one subsystem's miss would accelerate every other loop's
-/// unrelated registry reads.
+/// [`wait_tick`] for a loop that subscribes to nudges: a [`nudge`] counts as
+/// this loop's due tick. Subscribe only a loop whose work is what the nudger
+/// asks for (see the `nudges` field).
 pub(crate) fn wait_tick_or_nudge(my_gen: u64, dur: Duration) -> bool {
     wait(my_gen, dur, true)
 }
@@ -118,9 +114,8 @@ fn wait(my_gen: u64, dur: Duration, honor_nudge: bool) -> bool {
         && sup.state != WorkerState::Stopped
 }
 
-/// Wake the subscribed tick loops ([`wait_tick_or_nudge`]) for one immediate
-/// tick. Callers rate-limit themselves (see roots::nudge) — this is the raw
-/// wake.
+/// The raw wake for the subscribed tick loops ([`wait_tick_or_nudge`]);
+/// callers rate-limit themselves (see roots::nudge).
 pub(crate) fn nudge() {
     crate::lock(&SUP).nudges += 1;
     CVAR.notify_all();
@@ -327,17 +322,13 @@ mod tests {
     // The supervisor is process-global; every test here serializes on the
     // crate's designated global-state lock and starts from a clean reset.
 
-    // A nudge is a targeted wake, not a broadcast tick: it is the due tick
-    // of a SUBSCRIBED loop (roots) and no event at all for one that is not
-    // (the poller), whose own registry reads must keep their own cadence.
     #[test]
     fn nudge_wakes_only_the_subscribed_loop() {
         let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
         let gen = generation_for_test();
 
-        // Both waits are far longer than the assertion bounds: only a nudge
-        // (not the timeout) can return either within the test's lifetime.
+        // Both waits far outlast the test: only a nudge can return either.
         let woke = Arc::new(AtomicBool::new(false));
         let woke2 = woke.clone();
         let subscriber = std::thread::spawn(move || {
@@ -358,16 +349,13 @@ mod tests {
         assert!(woke.load(Ordering::SeqCst), "a nudge must count as a DUE tick, not a spurious wake");
         assert!(began.elapsed() < Duration::from_secs(5), "nudge wake took {:?}", began.elapsed());
 
-        // The bystander was woken by the same broadcast; it must have found
-        // the nudge irrelevant and gone back to sleeping out its own tick.
         std::thread::sleep(Duration::from_millis(200));
         assert!(
             !returned.load(Ordering::SeqCst),
             "a nudge must not accelerate a loop that does not subscribe to it"
         );
 
-        // Release it without waiting out the minute: the generation bump is
-        // its exit signal, so it returns "not a due tick".
+        // The generation bump is the bystander's exit signal — no minute wait.
         reset_for_test();
         assert!(!bystander.join().unwrap(), "a superseded waiter must not report a due tick");
     }

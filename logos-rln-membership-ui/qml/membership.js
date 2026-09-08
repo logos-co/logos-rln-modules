@@ -22,11 +22,9 @@ var RATE_LIMIT_MIN = 100;
 var RATE_LIMIT_MAX = 600;
 var RATE_LIMIT_DEFAULT = 300;
 
-// register()'s options_json (module wire 0.6.0): the spec RegistryOptions
-// ARRAY of {"key","value"} STRING pairs — rate_limit rides in the array,
-// not as a positional arg. `extras` is a flat object of additional string
-// options; every value is stringified (the module rejects non-string
-// values). ALL register call sites must build options through this helper.
+// register()'s options_json: the spec RegistryOptions ARRAY of {"key","value"}
+// string pairs — rate_limit rides in the array, not as a positional arg, and
+// every value is stringified (the module rejects non-string values).
 function registryOptions(rateLimit, extras) {
     var arr = [{ key: "rate_limit", value: String(rateLimit) }];
     for (var k in extras) {

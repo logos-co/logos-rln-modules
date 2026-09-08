@@ -568,10 +568,10 @@ impl Store {
     /// Run a cache-only mutation and persist the sidecar. Works LOCKED (the
     /// poller's path); by construction it can never touch the sealed or
     /// allocations files. Stamps the monotone `first_active_at` on the first
-    /// active-like observation. Returns the row's state as observed UNDER
-    /// the write lock before the mutation ran — the authoritative "previous"
-    /// for change gating and transition events (a pre-call snapshot can be
-    /// stale under concurrent dispatch).
+    /// active-like observation. Returns the row's pre-mutation state as
+    /// observed under the write lock — the authoritative "previous" for
+    /// transition events (a pre-call snapshot can be stale under concurrent
+    /// dispatch).
     pub fn update_cache(
         &self,
         hash: &str,
