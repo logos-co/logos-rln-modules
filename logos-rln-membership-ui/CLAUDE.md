@@ -7,3 +7,7 @@
   None on a float) turns the argument into a silent 0 — a zero-token claim,
   a zero rate_limit. The full mechanism is documented at the coercion site
   in membership.js.
+- Every `register` call site must build its options_json through
+  `registryOptions()` in `qml/membership.js` — the module wire takes the
+  RegistryOptions array of `{key,value}` string pairs, and a hand-built
+  flat object (the pre-0.6.0 shape) is rejected as invalid_argument.

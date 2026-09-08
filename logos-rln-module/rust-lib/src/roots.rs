@@ -32,22 +32,18 @@ struct Window {
 static WINDOWS: Mutex<Option<HashMap<String, Window>>> = Mutex::new(None);
 static TRACKED: Mutex<Option<HashMap<String, CanonicalRegistryId>>> = Mutex::new(None);
 
-/// On-demand refresh floor: a root-window miss on the verification path may
-/// ask for one out-of-band refresher tick, at most this often — a stream of
-/// invalid proofs must never become registry-read spam. Matches the sibling
-/// stacks' minimum root-refresh interval.
+/// On-demand refresh floor: a stream of invalid proofs must never become
+/// registry-read spam. Matches the sibling stacks' minimum refresh interval.
 const NUDGE_MIN_INTERVAL_SECS: u64 = 2;
 
 static LAST_NUDGE_UNIX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Ask the refresher — and ONLY the refresher — for one immediate
-/// out-of-band tick (called on a root-window MISS in `validate_proof`). The
-/// verification path itself still performs zero registry access — this only
-/// wakes the worker, whose read lands within its own thread — and it is
-/// rate-limited by `NUDGE_MIN_INTERVAL_SECS`. Shrinks the
+/// Ask the refresher for one immediate out-of-band tick, on a root-window
+/// miss in `validate_proof`. The verification path still performs zero
+/// registry access — this only wakes the worker — and the rate limit keeps a
+/// stream of misses from becoming registry reads. Shrinks the
 /// freshly-published-root false-`invalid` window from up to one refresh
-/// interval to roughly one provider round-trip (the caller still retries
-/// the `invalid`).
+/// interval to roughly one provider round-trip.
 pub(crate) fn nudge() {
     use std::sync::atomic::Ordering;
     let now = crate::now_unix();
@@ -63,11 +59,10 @@ pub(crate) fn nudge() {
     }
 }
 
-/// Adopt a provider-fetched root set into the window. NON-verification
-/// paths only (the poller's path refresh and `generate_proof`'s Merkle
-/// fetch both receive `valid_roots` from the SAME provider snapshot) —
-/// same trust as the refresher's own read, so a node that just generated
-/// a proof can validate it without waiting for the next tick.
+/// Adopt a provider-fetched root set into the window — non-verification
+/// paths only, whose Merkle fetches carry `valid_roots` from the same
+/// provider snapshot (same trust as the refresher's own read). A node that
+/// just generated a proof can then validate it without waiting for a tick.
 pub(crate) fn adopt(canonical: &str, roots: Vec<[u8; 32]>) {
     if roots.is_empty() {
         return;
@@ -113,8 +108,8 @@ pub(crate) fn ensure_refresher() {
 /// The refresher worker body, owned by the supervisor: an interruptible tick
 /// loop that exits when its run is superseded (`stop()`, or a restart's
 /// generation bump); each tick is wrapped so a transient failure never kills
-/// the worker. The ONE nudge subscriber — [`nudge`] asks for exactly this
-/// loop's work, an out-of-band root refresh.
+/// the worker. The one nudge subscriber ([`nudge`] asks for exactly this
+/// loop's work).
 pub(crate) fn run_loop(my_gen: u64) {
     loop {
         if !crate::worker::wait_tick_or_nudge(my_gen, REFRESH_INTERVAL) {

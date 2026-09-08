@@ -22,7 +22,7 @@
       # typed lez_core dependency client) at rust-lib/generated/,
       # compiles the staticlib, and wraps it in the Qt cdylib glue, driven by
       # metadata.json — including concurrency:"multi" (see README "Design
-      # constraints" for why single was retired).
+      # constraints").
       #
       # RISC0_SKIP_BUILD_KERNELS comes from metadata nix.rust.env: risc0-zkvm
       # is serde-only here, no proving.

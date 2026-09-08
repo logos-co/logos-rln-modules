@@ -137,20 +137,17 @@ impl RateLimitProof {
     }
 
     /// The full canonical zerokit serialization as hex — generate_proof's
-    /// `proof_canonical` reply extra. A consumer that carries ONE opaque
-    /// blob on its own message wire can validate with `{"proof": <hex>}`
-    /// alone: [`Self::from_json`]'s canonical path recovers every public
-    /// value from the bytes.
+    /// `proof_canonical` reply extra. Fed back alone as `{"proof": <hex>}`,
+    /// [`Self::from_json`] recovers every public value from the bytes.
     pub(crate) fn canonical_hex(&self) -> String {
         bytes_to_hex(&self.canonical)
     }
 
-    /// The spec `RateLimitProof` as a JSON object — the DECOMPOSED shape:
-    /// `proof` is the bare compressed Groth16 proof (spec `proof[128]`),
-    /// and `root`/`external_nullifier`/`share_x`/`share_y`/`nullifier` carry
-    /// the public values. `epoch` (the spec's `epoch[32]`, 32-byte LE hex)
-    /// is present only when this proof carries one. [`Self::from_json`]
-    /// accepts this shape and the pre-0.6.0 canonical-blob form alike.
+    /// The spec `RateLimitProof` as a JSON object — the decomposed shape:
+    /// `proof` is the bare Groth16 proof (spec `proof[128]`), the rest the
+    /// public values; `epoch` (spec `epoch[32]`, 32-byte LE hex) is present
+    /// only when this proof carries one. [`Self::from_json`] accepts this
+    /// shape and the canonical-blob form alike.
     pub(crate) fn to_json(&self) -> serde_json::Value {
         let mut out = serde_json::json!({
             "proof": bytes_to_hex(&self.canonical[..GROTH16_LEN.min(self.canonical.len())]),
@@ -648,11 +645,8 @@ mod tests {
             "cbf8daa2f4d16e31165c6789a738681b0871a5cc775206af276ad4295e185e1e"
         );
 
-        // The spec's proof[128]: to_json emits the bare compressed Groth16
-        // proof (the canonical zerokit blob's leading segment); the public
-        // values travel as the decomposed fields asserted above.
         let bare = hex_to_vec(j["proof"].as_str().unwrap()).unwrap();
-        assert_eq!(bare.len(), 128);
+        assert_eq!(bare.len(), 128, "to_json emits the bare spec proof[128]");
     }
 
     #[test]
@@ -739,9 +733,6 @@ mod tests {
         }
     }
 
-    // The message-wire transport shortcut: generate's `proof_canonical`
-    // bytes, fed back as the ONLY proof field, must land in the identical
-    // verified representation — no decomposed fields needed.
     #[test]
     fn canonical_blob_alone_round_trips() {
         let material = material_from_seed(&[5u8; 32], 100, 2);
