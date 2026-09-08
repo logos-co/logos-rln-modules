@@ -5,17 +5,22 @@
 //! tx, and the faucet funding flow (claim_tokens / get_token_balance). The
 //! chain logic lives in-crate (`mod rln_core`, plain Rust — no C ABI), and
 //! wallet access is over raw `lp_*` protocol calls to the wallet module
-//! (`lez_core`) with per-call timeouts (60s reads, 180s
-//! registration tx) — the SDK's generated typed client has no per-call
-//! timeout and would cap every call at the 20s protocol default.
+//! (`lez_core`) with per-call timeouts (60s reads, 180s registration tx).
+//! Historical reason for the raw ABI: the SDK's generated typed client had
+//! no per-call timeout and capped every call at the 20s protocol default;
+//! since logos-rust-sdk 80d028ab it has `_with_timeout` twins, and moving
+//! onto them is a tracked follow-up.
 //!
 //! Identity and credential generation live in the membership
 //! module (secrets never cross the module wire); this module only ever sees
 //! the public id_commitment.
 //!
-//! Concurrency is SINGLE: dispatch runs on the module's own event loop, and
-//! the blocking lp_invoke's QtRO wait loop pumps that same loop, so wallet
-//! round-trips do not deadlock the process.
+//! Concurrency is "multi" (metadata.json, since 2.1.0): handlers run on Qt
+//! worker threads and overlap, so one wallet round-trip stuck in a slow
+//! sequencer read no longer wedges every other call. The wallet lp client
+//! is owned by the main Qt thread (`init_wallet_client`), so handlers take
+//! the `lp_invoke_async` + channel path; the blocking `lp_invoke` branch
+//! survives only for a caller that is itself on the owner thread.
 
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::sync::Mutex;
@@ -49,9 +54,10 @@ const TX_TIMEOUT_MS: c_int = 180_000;
 // ---------------------------------------------------------------- lp raw ABI
 //
 // The lp_* consumer C ABI (the symbols resolve against the protocol archive
-// linked into this plugin), declared here because the SDK's PluginProxy
-// hardcodes timeout_ms = 0 (the 20s protocol default) with no public escape
-// hatch. One shared client for the wallet target.
+// linked into this plugin), declared here because, at the SDK rev this was
+// written against, PluginProxy hardcoded timeout_ms = 0 (the 20s protocol
+// default) with no public escape hatch. The SDK now has `_with_timeout`
+// twins; adopting them is a follow-up. One shared client for the wallet target.
 #[cfg(not(test))]
 mod lp {
     use std::ffi::{c_char, c_int};
@@ -194,7 +200,13 @@ fn init_wallet_client() {
     if slot.is_some() {
         return;
     }
-    let (Ok(target), Ok(origin)) = (CString::new(WALLET_MODULE), CString::new("core")) else {
+    // Origin = THIS module's name, never "core" (the token manager's
+    // host-anchor role label): announcing "core" masked our identity from
+    // protocol 0.6 on and overwrote the callee's host anchor on token save.
+    // Mirrors the SDK's own PluginProxy since rust-sdk 7d2192c.
+    let (Ok(target), Ok(origin)) =
+        (CString::new(WALLET_MODULE), CString::new(LOGOS_MODULE_NAME))
+    else {
         return;
     };
     let raw = unsafe {
@@ -249,12 +261,12 @@ fn lp_result_to_string(raw: &str) -> String {
 ///
 /// Two paths by thread, per the lp_client owner-thread contract
 /// (logos_protocol.h):
-/// - On the owner thread (single-concurrency dispatch runs there): the
+/// - On the owner thread (a caller that is itself on the main Qt thread): the
 ///   synchronous lp_invoke — its internal QtRO wait loop keeps pumping the
 ///   owner loop, so wallet round-trips do not deadlock dispatch.
-/// - Off the owner thread: lp_invoke_async ("safe to call from any thread")
-///   + a channel wait; the reply is delivered from the owner thread
-///   whenever it pumps.
+/// - Off the owner thread (every concurrency:"multi" dispatch worker):
+///   lp_invoke_async ("safe to call from any thread") plus a channel wait;
+///   the reply is delivered from the owner thread whenever it pumps.
 fn wallet_call(method: &str, args: &serde_json::Value, timeout_ms: c_int) -> String {
     let client = {
         let slot = lock(&WALLET_CLIENT);
@@ -367,7 +379,7 @@ fn strip_hex_prefix(s: &str) -> &str {
 /// length.
 fn hex_to_bytes(hex: &str, expected_len: Option<usize>) -> Option<Vec<u8>> {
     let digits = strip_hex_prefix(hex);
-    if digits.len() % 2 != 0 {
+    if !digits.len().is_multiple_of(2) {
         return None;
     }
     let bytes = digits.as_bytes();

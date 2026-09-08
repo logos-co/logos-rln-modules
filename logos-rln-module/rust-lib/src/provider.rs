@@ -3,10 +3,12 @@
 //! wire client of the sibling `liblogos_lez_rln_module`.
 //!
 //! Binds the raw consumer C ABI rather than the SDK's generated typed
-//! client: the generated `PluginProxy` hardcodes `timeout_ms = 0` (the ~20s
-//! protocol default) at every call site with no per-call override, and calls
-//! here need per-call timeouts ([`READ_TIMEOUT_MS`],
-//! [`GIFTER_REQUEST_TIMEOUT_MS`]).
+//! client. Historical reason: the SDK's `PluginProxy` hardcoded
+//! `timeout_ms = 0` (the ~20s protocol default) with no per-call override,
+//! and calls here need per-call timeouts ([`READ_TIMEOUT_MS`],
+//! [`GIFTER_REQUEST_TIMEOUT_MS`]). Since logos-rust-sdk 80d028ab the proxy
+//! has `call_*_with_timeout` twins; moving onto them (and retiring this
+//! `unsafe` layer) is a tracked follow-up, kept out of the toolchain bump.
 //!
 //! Threading contract: the lp client is created once
 //! on the host's main Qt thread (`init_client` from `on_context_ready`) and
@@ -168,7 +170,14 @@ pub(crate) fn init_client() {
 }
 
 fn create_client(module: &str) -> Option<ClientHandle> {
-    let (Ok(target), Ok(origin)) = (CString::new(module), CString::new("core")) else {
+    // The origin is THIS module's name, never "core": "core" is the token
+    // manager's host-anchor role label, so announcing it masked our identity
+    // (from protocol 0.6 on the callee reads the caller as Unknown) and the
+    // callee's `lp_token_save("core", …)` overwrote its own host anchor.
+    // Mirrors what the SDK's PluginProxy does since rust-sdk 7d2192c.
+    let (Ok(target), Ok(origin)) =
+        (CString::new(module), CString::new(crate::LOGOS_MODULE_NAME))
+    else {
         return None;
     };
     let raw = unsafe {
