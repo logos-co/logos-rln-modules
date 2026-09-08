@@ -6,10 +6,13 @@
 #   logos-rust-sdk-src/  <- logos-co/logos-rust-sdk @ SDK_REV
 set -euo pipefail
 
-# MUST equal the logos-rust-sdk rev locked in the root flake.lock
+# MUST equal the logos-rust-sdk rev locked in this module's flake.lock
 # (logos-module-builder → logos-rust-sdk) — nothing enforces the coupling.
-# Bump together with flake.lock and re-run the sim acceptance gate.
-SDK_REV=270e4cf687896d501ed73c1409ea4157cc8a5b54
+# Bump together with flake.lock and re-run the e2e acceptance ladder.
+# Read it with:
+#   jq -r '.nodes.root.inputs["logos-module-builder"] as $k
+#          | .nodes[.nodes[$k].inputs["logos-rust-sdk"]].locked.rev' flake.lock
+SDK_REV=102f86779b010f5bc2e845cf91bb3583e87dcc0c
 SDK_REPO=https://github.com/logos-co/logos-rust-sdk
 # Excluded dirs are not needed by mkLogosModule.
 SDK_EXCLUDES=(--exclude .git --exclude target --exclude doctests --exclude result --exclude tests)
