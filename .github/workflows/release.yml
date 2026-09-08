@@ -141,6 +141,7 @@ jobs:
   # whatever variants succeeded.
   build:
     needs: plan
+    environment: ${{ github.ref == 'refs/heads/main' && 'public-cache' || '' }}
     if: needs.plan.outputs.to_build != ''
     strategy:
       fail-fast: false
@@ -256,6 +257,7 @@ jobs:
   # regenerate the catalog, and (re)upload it to the rolling index release.
   publish:
     needs: [plan, build]
+    environment: ${{ github.ref == 'refs/heads/main' && 'public-cache' || '' }}
     # Run even when some variants failed (partial multi-platform is fine) or the
     # build job was skipped entirely (everything already published -> refresh).
     if: always() && needs.plan.result == 'success'
