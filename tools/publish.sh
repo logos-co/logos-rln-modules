@@ -47,13 +47,11 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/lgx"
 
-# The two Rust modules build from gitignored staged sources; stage them on
-# demand so this works from a fresh clone. logos-lez-rln-module stages via
-# stage-sources.sh; logos-rln-module codegens + stages via `nix run .#generate`.
-if [ ! -d "${REPO_ROOT}/logos-lez-rln-module/logos-rust-sdk-src" ]; then
-  echo "== Staging sources for logos-lez-rln-module =="
-  bash "${REPO_ROOT}/logos-lez-rln-module/stage-sources.sh"
-fi
+# The two Rust modules build from gitignored staged sources (the SDK copy and
+# the provider scaffold); each module's `nix run .#generate` materialises them
+# from its locked builder, so this works from a fresh clone.
+echo "== Staging sources for logos-lez-rln-module (codegen) =="
+nix run "path:${REPO_ROOT}/logos-lez-rln-module#generate" -L
 echo "== Staging sources for logos-rln-module (codegen) =="
 nix run "path:${REPO_ROOT}/logos-rln-module#generate" -L
 

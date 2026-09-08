@@ -51,7 +51,7 @@ nix run .#inspect-rln-module      # or .#inspect-lez-rln-module
 ```
 
 The Rust modules build from gitignored staged sources — refresh with
-`logos-lez-rln-module/stage-sources.sh` and
+`nix run ./logos-lez-rln-module#generate` and
 `nix run ./logos-rln-module#generate` (both clone-and-go; see each
 module's README). Release bundles + package catalog: `tools/publish.sh`.
 

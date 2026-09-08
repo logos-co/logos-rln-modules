@@ -26,30 +26,30 @@ v2.0.0 dropped the C++-era frozen wire surface: `generate_identity`,
   7 handlers).
 - `rust-lib/src/rln_core.rs` — the RLN core (tree/proof/register/funding logic),
   depending only on the shared `rln-layouts` crate.
-- `rust-lib/generated/provider_gen.rs` — checked-in scaffold for local
-  `cargo check`/tests; the nix build regenerates it. Regenerate it with the
-  lidl-gen of the SDK rev the builder pins and the protocol version the
-  builder stamps (`LOGOS_PROTOCOL_VERSION_STRING` of its logos-protocol input):
-  `nix shell github:logos-co/logos-rust-sdk/<SDK_REV>#lidl-gen -c \
-   logos-lidl-gen rust-lib/liblogos_lez_rln_module.lidl --provider \
-   --concurrency multi --protocol-version <x.y.z> \
-   --dep lez_core=rust-lib/deps/lez_core.lidl \
-   -o rust-lib/generated/provider_gen.rs`
+- `rust-lib/generated/provider_gen.rs` — gitignored scaffold the nix build
+  regenerates in-derivation; `nix run .#generate` materialises it for local
+  `cargo check`/tests (see "Staged sources").
 
 ## Staged sources (not committed)
 
 mkLogosModule's `rustCrateSrc` stages only the crate dir (plus
 `logos-rust-sdk-src`) into the nix sandbox, so path-deps must live inside the
-module tree. One staged copy is required and is NOT in git:
+module tree. Two inputs the crate references are NOT in git:
 
-- `logos-rust-sdk-src/` — logos-co/logos-rust-sdk at the rev pinned in
-  `stage-sources.sh` (the rev the builder's codegen comes from).
+- `logos-rust-sdk-src/` — logos-co/logos-rust-sdk at the rev the locked
+  builder pins (the rev its codegen comes from).
+- `rust-lib/generated/provider_gen.rs` — the provider scaffold + typed
+  `lez_core` client, emitted by that builder's lidl-gen at the protocol
+  version it stamps (`LOGOS_PROTOCOL_VERSION_STRING` of its logos-protocol
+  input).
 
-Refresh it — rsync plus a diff verification that fails on drift — with:
+Materialise both — they cannot drift from what the nix build compiles — with:
 
 ```sh
-./stage-sources.sh
+nix run .#generate        # ./stage-sources.sh is a wrapper kept for callers
 ```
+
+Re-run it after any flake.lock or `.lidl` change.
 
 `rln-layouts` (the shared borsh wire crate) is a normal cargo git dependency
 on logos-co/logos-lez-rln, pinned by rev in `rust-lib/Cargo.toml`; bump the
