@@ -58,7 +58,7 @@ Item {
         flow.callRetry(M.RLN_MODULE, "get_memberships", [registryId], function (r) {
             if (r.error) {
                 // Transient hiccup: keep the card as-is, retry next tick.
-                if (!M.isTransientError(r.error.kind)) card.error = M.errorText(r.error)
+                if (!M.isTransientError(r.error)) card.error = M.errorText(r.error)
                 card.refreshing = false
                 return
             }

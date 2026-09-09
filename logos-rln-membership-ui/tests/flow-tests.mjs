@@ -2,8 +2,12 @@
 // scripted mock bridge injected through the inspector's `evaluate` command
 // (framework.mjs doesn't wrap it; the server supports it). No daemon, no
 // faucet: the mock replies with the same parseReply-visible shapes as the
-// real wire (the module .lidl files plus the wallet module's int64 and
-// raw-string returns).
+// real wire (liblogos_rln_module.lidl at wire 0.7.0 — register_membership,
+// the LIP MembershipStatus vocabulary, {class,kind,message} error envelopes —
+// liblogos_lez_rln_module.lidl 2.0.0, plus the wallet module's int64 and
+// raw-string returns). One deliberate simplification: register_membership
+// here always mints a NEW membership, where the real module short-circuits
+// to the scope's live one — the multi-pill list scenarios need the former.
 //
 // The seam: Main.qml `bridgeOverride` re-threads the whole tree to the mock;
 // OnboardingView `flowController` exposes the flow's phase properties and
@@ -69,23 +73,34 @@ function mockExpr(cfg) {
   });
   return `(function () {
     var cfg = ${c};
-    var st = { synced: 0, acctSeq: 0, claimedAccount: "", failMemberships: false, memberships: cfg.memberships.slice(), transientLeft: {}, force: {}, regSeq: 0, pendingCommit: "" };
+    var st = { synced: 0, acctSeq: 0, claimedAccount: "", failMemberships: false, memberships: cfg.memberships.slice(), transientLeft: {}, force: {}, regSeq: 0 };
     for (var k in cfg.transientOnce) st.transientLeft[k] = cfg.transientOnce[k].times;
     var log = [];
     // First registration keeps the golden "aa" commitment; a second run (the
     // ghost / New-membership path) gets a distinct one so the list holds two
     // separate pills.
-    var COMMIT = "aa".repeat(32), COMMIT2 = "dd".repeat(32), SECRET = "bb".repeat(32);
+    var COMMIT = "aa".repeat(32), COMMIT2 = "dd".repeat(32);
     // The raw register_member wire reply the module records as MembershipMeta
     // .tx_result and get_memberships echoes back — double-encoded exactly as
     // live (inner tx_result is itself a JSON string). qml/membership.js
     // parseTxResult / MembershipCard's Registration section consume this.
     var TXHASH = "12".repeat(32);
     var TXRESULT = JSON.stringify({ leaf_index: 5, payment_definition: "dd".repeat(32), tx_result: JSON.stringify({ error: "", secrets: [], success: true, tx_hash: TXHASH }) });
-    function findMem(commit) {
-      for (var i = 0; i < st.memberships.length; i++) {
-        var c = st.memberships[i].credential ? st.memberships[i].credential.identity_commitment : "";
-        if (c === commit) return st.memberships[i];
+    // The wire's error envelope: class is the coarse RlnErrorKind the UI
+    // switches on, kind refines it (docs/wire-binding.md "Error envelope").
+    var CLASS_OF = { bridge_failure: "transient", empty_reply: "transient", bad_reply: "transient", timeout: "transient", provider_failure: "transient", not_ready: "not_ready", locked: "not_ready", budget_exhausted: "budget_exhausted" };
+    function err(kind, message) {
+      return { error: { "class": CLASS_OF[kind] || "permanent", kind: kind, message: message } };
+    }
+    // Scope resolution the way the module does it (lidl get_membership_state):
+    // records registered under this rln_identifier, or legacy rows carrying
+    // none, back the scope; the newest such record wins here (the module
+    // would answer ambiguous_selection for several — see the header note).
+    function findScoped(registryId, rlnId) {
+      for (var i = st.memberships.length - 1; i >= 0; i--) {
+        var m = st.memberships[i];
+        if (m.registry_id !== undefined && m.registry_id !== registryId) continue;
+        if (m.rln_identifier === undefined || m.rln_identifier === rlnId) return m;
       }
       return null;
     }
@@ -94,22 +109,22 @@ function mockExpr(cfg) {
       // Runtime-settable: force a method to always return a transient error
       // (set root.bridgeOverride.state.force.<method> = "<kind>").
       if (st.force[method])
-        return { error: { kind: st.force[method], message: "mock: forced " + method } };
+        return err(st.force[method], "mock: forced " + method);
       if (st.transientLeft[method] > 0) {
         st.transientLeft[method] -= 1;
-        return { error: { kind: cfg.transientOnce[method].kind, message: "mock: transient " + method } };
+        return err(cfg.transientOnce[method].kind, "mock: transient " + method);
       }
       switch (method) {
         case "get_memberships":
-          if (st.failMemberships) return { error: { kind: "provider_failure", message: "mock: memberships unavailable" } };
+          if (st.failMemberships) return err("provider_failure", "mock: memberships unavailable");
           return { memberships: st.memberships };
         case "unlock_keystore_auto":
-          if (cfg.autoUnlock === "error") return { error: { kind: cfg.autoUnlockKind, message: "mock: auto-unlock failed" } };
+          if (cfg.autoUnlock === "error") return err(cfg.autoUnlockKind, "mock: auto-unlock failed");
           if (cfg.autoUnlock === "created")
             return { membership_count: st.memberships.length, secret: "sec-created", source: "created", unlocked: true };
           return { membership_count: st.memberships.length, source: cfg.autoUnlock, unlocked: true };
         case "unlock_keystore":
-          if (!cfg.unlockOk) return { error: { kind: "bad_password", message: "mock: wrong password" } };
+          if (!cfg.unlockOk) return err("bad_password", "mock: wrong password");
           return { membership_count: st.memberships.length, unlocked: true };
         case "remember_keystore_password": return { remembered: true };
         case "provision_wallet_home":
@@ -118,7 +133,7 @@ function mockExpr(cfg) {
         case "open": return 0;
         case "save": return 0;
         case "get_current_block_height":
-          if (cfg.syncFail) return { error: { kind: "empty_reply", message: "mock: no head" } };
+          if (cfg.syncFail) return err("empty_reply", "mock: no head");
           return cfg.syncHead;
         case "get_last_synced_block": return st.synced;
         case "sync_to_block": st.synced = Math.min(args[0], cfg.syncHead); return 0;
@@ -133,31 +148,51 @@ function mockExpr(cfg) {
             return { exists: true, balance: "6000000", definition: "dd".repeat(32) };
           return { exists: false, balance: "0" };
         case "claim_tokens": st.claimedAccount = args[1]; return { payment_definition: "dd".repeat(32), pending: true, tx_result: "{}" };
-        case "generate_identity":
-          st.regSeq += 1;
-          st.pendingCommit = st.regSeq === 1 ? COMMIT : COMMIT2;
-          return { id_commitment: st.pendingCommit, id_secret_hash: SECRET };
-        case "register": {
-          // Deliberately strict so a call-site regression fails here.
+        case "register":
+          // The pre-0.7.0 spelling. The wire renamed it (register is a C/C++
+          // keyword — generated clients could not carry the spec name), so a
+          // call-site regression fails loudly here.
+          return err("invalid_argument", "mock: no method 'register' on wire 0.7.0 — call register_membership");
+        case "register_membership": {
+          // Deliberately strict so a call-site regression fails here: the
+          // scope pair, then the RegistryOptions array with a decimal-string
+          // rate_limit (the module rejects non-string values / non-arrays).
           if (args.length !== 3)
-            return { error: { kind: "invalid_argument", message: "mock: register takes 3 args (registry_id, rln_identifier_hex, options_json), got " + args.length } };
+            return err("invalid_argument", "mock: register_membership takes 3 args (registry_id, rln_identifier_hex, options_json), got " + args.length);
+          if (!/^(0x)?[0-9a-f]{64}$/.test(String(args[1])))
+            return err("invalid_argument", "mock: rln_identifier_hex must be 32-byte hex, got " + args[1]);
           var opts;
           try { opts = JSON.parse(args[2]); } catch (e) { opts = null; }
           if (!Array.isArray(opts) || opts.some(function (o) { return !o || typeof o.key !== "string" || !o.key || typeof o.value !== "string"; }))
-            return { error: { kind: "invalid_argument", message: "mock: options_json must be a RegistryOptions array of {key,value} string pairs" } };
-          st.memberships.push({ credential: { identity_commitment: st.pendingCommit }, membership_hash: "ee".repeat(32), registry_id: args[0], state: "pending", submitted_at: 1700000000, tx_result: TXRESULT });
-          return { membership_hash: "ee".repeat(32), registry_id: args[0], state: "pending" };
+            return err("invalid_argument", "mock: options_json must be a RegistryOptions array of {key,value} string pairs");
+          var rate = 0;
+          for (var oi = 0; oi < opts.length; oi++) if (opts[oi].key === "rate_limit") rate = parseInt(opts[oi].value, 10);
+          if (!(rate > 0))
+            return err("invalid_argument", "mock: rate_limit must be a positive decimal string");
+          // The credential is minted in-module and only its commitment is
+          // ever released. First registration keeps the golden "aa"
+          // commitment; a later one (the ghost / New-membership path) gets a
+          // distinct one so the list holds two separate pills.
+          st.regSeq += 1;
+          var commit = st.regSeq === 1 ? COMMIT : COMMIT2;
+          var view = { credential: { identity_commitment: commit }, leaf_index: 5, membership_hash: "ee".repeat(32), rate_limit: rate, registry_id: args[0], rln_identifier: args[1], state: "pending", submitted_at: 1700000000 };
+          var row = JSON.parse(JSON.stringify(view));
+          row.tx_result = TXRESULT;
+          st.memberships.push(row);
+          return view;
         }
         case "get_membership_state": {
-          var m = findMem(args[1]);
+          if (args.length !== 2)
+            return err("invalid_argument", "mock: get_membership_state takes 2 args (registry_id, rln_identifier_hex), got " + args.length);
+          var m = findScoped(args[0], args[1]);
           if (!m) return { registry_id: args[0], state: "unknown" };
-          if (cfg.registerState === "failed") { m.state = "failed"; m.failed_reason = cfg.registerFailReason; return { registry_id: args[0], state: "failed" }; }
-          m.state = cfg.registerState; m.leaf_index = 5; m.rate_limit = 300;
-          return { leaf_index: 5, rate_limit: 300, registry_id: args[0], state: cfg.registerState };
+          if (cfg.registerState === "failed") { m.state = "failed"; m.failed_reason = cfg.registerFailReason; m.retryable = true; return { registry_id: args[0], state: "failed" }; }
+          m.state = cfg.registerState;
+          return { leaf_index: m.leaf_index, membership_hash: m.membership_hash, rate_limit: m.rate_limit, registry_id: args[0], state: cfg.registerState };
         }
         case "get_membership":
           return { clock_timestamp: 1700003000, grace_period_duration: 600, grace_period_start_timestamp: 1700005580, leaf_index: 5, rate_limit: 300, registered: true, state: cfg.registerState };
-        default: return { error: { kind: "internal", message: "mock: unhandled " + method } };
+        default: return err("internal", "mock: unhandled " + method);
       }
     }
     root.bridgeOverride = {
@@ -174,11 +209,12 @@ function resetExpr(cfg) {
   return `(function () {
     var f = onboardingView.flowController;
     f.walletPhase = "idle"; f.walletError = ""; f.mnemonic = ""; f.walletCreated = false;
-    f.syncPhase = "idle"; f.syncError = ""; f.syncStart = 0; f.lastSynced = -1; f.syncTarget = 0; f.syncAttempts = 0; f.syncChunkRetries = 0; f.syncToppedUp = false;
+    f.syncPhase = "idle"; f.syncError = ""; f.syncStart = 0; f.lastSynced = -1; f.syncTarget = 0; f.syncAttempts = 0; f.syncChunkTarget = 0; f.syncToppedUp = false;
     f.unlockPhase = "idle"; f.unlockError = "";
     f.autoUnlockPhase = "idle"; f.autoUnlockKind = ""; f.started = false;
     f.fundPhase = "idle"; f.fundError = ""; f.pricePerUnit = ""; f.claimAmount = 0; f.holdingHex = ""; f.claimPolls = 0;
-    f.regPhase = "idle"; f.regError = ""; f.regState = ""; f.commitment = ""; f.rateLimitMismatch = false; f.secretHash = ""; f.password = "";
+    f.regPhase = "idle"; f.regError = ""; f.regState = ""; f.commitment = ""; f.rateLimitMismatch = false; f.password = "";
+    f.registrationMode = "wallet"; f.gifterPhase = "idle"; f.gifterStage = ""; f.gifterError = "";
     f.claimPollMs = 20; f.statePollMs = 20; f.claimPollBudget = ${cfg.claimBudget ?? 36};
     f.transientRetryMs = 15; f.transientRetryMax = 3;
     onboardingView.currentStep = 0; onboardingView.priorNotice = ""; root.preAdvancedMode = ""; root.mode = "probe";
@@ -206,6 +242,12 @@ test("flow: golden path lands the first membership in a celebrating list", async
   if (skipped !== true) throw new Error("password screen not skipped after auto-unlock");
   await app.click("Get started");
   await waitPhase(app, "regPhase", "done", 12000);
+  // The 0.7.0 wire: registration goes through register_membership with the
+  // (registry_id, rln_identifier_hex, options_json) scope; the old spelling
+  // must never be dialled.
+  const glog = await callLog(app);
+  if (!glog.includes("register_membership") || glog.includes("register"))
+    throw new Error(`registration did not use register_membership: ${glog.join(",")}`);
   await waitMode(app, "status");
   if (await evalExpr(app, "membershipView.celebrate") !== true)
     throw new Error("first membership did not celebrate");
@@ -347,6 +389,36 @@ test("flow: a relaunch with one membership reads 'Your Memberships', never celeb
   await app.expectTexts(["Your Memberships", pet, "300 msg/epoch", "+ New Membership"]);
   if (await evalExpr(app, "membershipView.celebrate") !== false)
     throw new Error("a relaunch (not a completion) must never celebrate");
+});
+
+// 5d. The LIP vocabulary: a terminal state the logos namespace never emits
+//     today (slashed) must still route like any settled-unusable state —
+//     onboarding with the "no longer active" notice — and its detail card
+//     offers Re-register; a state outside the vocabulary entirely degrades to
+//     the neutral badge rather than crashing the list.
+test("flow: LIP terminal and unknown states degrade gracefully", async (app) => {
+  const c = "aa".repeat(32), c2 = "cc".repeat(32);
+  await setup(app, { autoUnlock: "created", memberships: [
+    { credential: { identity_commitment: c }, membership_hash: "ee".repeat(32), leaf_index: 5, rate_limit: 300, state: "slashed", submitted_at: 1 },
+    { credential: { identity_commitment: c2 }, membership_hash: "ff".repeat(32), leaf_index: 6, rate_limit: 100, state: "state_from_the_future", submitted_at: 1 }] });
+  await waitMode(app, "onboarding");
+  if (await evalExpr(app, "onboardingView.priorNotice") === "")
+    throw new Error("a slashed membership must trigger the 'no longer active' notice");
+  await evalExpr(app, `root.showDetail("${c}")`);
+  await waitMode(app, "detail");
+  await waitFor(app, async () => {
+    if (await evalExpr(app, "detailCard.found") !== true) throw new Error("card not loaded");
+  }, "detail card to load");
+  if (await evalExpr(app, "detailCard.renewable") !== true) throw new Error("slashed must be renewable");
+  if (await evalExpr(app, "detailCard.liveState") !== "slashed") throw new Error("state not shown verbatim");
+  await evalExpr(app, `root.showDetail("${c2}")`);
+  await waitFor(app, async () => {
+    if (await evalExpr(app, "detailCard.liveState") !== "state_from_the_future") throw new Error("card not reloaded");
+  }, "unknown-state card to load");
+  if (await evalExpr(app, "M.stateRank('state_from_the_future') > M.stateRank('slashed')") !== true)
+    throw new Error("unknown states must sort after every known one");
+  if (await evalExpr(app, "M.isKnownState('erased_awaits_withdrawal') && !M.isKnownState('state_from_the_future')") !== true)
+    throw new Error("vocabulary check wrong");
 });
 
 // 6. Error branches: sync fail, claim timeout, register failed.

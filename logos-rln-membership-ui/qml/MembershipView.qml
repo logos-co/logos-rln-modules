@@ -55,7 +55,7 @@ Item {
             if (r.error) {
                 // A transient hiccup must not replace the shown memberships
                 // with an error — keep the last-known list; the next tick retries.
-                if (!M.isTransientError(r.error.kind)) view.error = M.errorText(r.error)
+                if (!M.isTransientError(r.error)) view.error = M.errorText(r.error)
                 return
             }
             view.error = ""
