@@ -71,7 +71,6 @@ runtime):
 
 ```sh
 LEZ_RLN_TESTNET_TESTS=1 cargo test testnet_ -- --nocapture
-# registry selection (default shared-faucet):
 LEZ_RLN_TESTNET_DEPLOYMENT=shared-5ade-v2 LEZ_RLN_TESTNET_TESTS=1 cargo test testnet_
 ```
 

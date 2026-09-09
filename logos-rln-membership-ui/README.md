@@ -74,10 +74,11 @@ above (advisory, never a data source on its own). Polling remains the
 portable fallback every host can rely on — its cadence widens to 60s once
 events are armed, staying at 10s otherwise.
 
-The registry field is prefilled with the shared-faucet testnet registry
-(descriptor under `../deployments/shared-faucet/`); the registry id's 64-hex
-segment doubles as the config account id for faucet calls (the rln module's
-`resolve_account_id` passes 64-hex through).
+The registry field is prefilled with the current hosted-testnet registry
+(`TESTNET_REGISTRY_ID` in `qml/membership.js`; its descriptor lives under
+logos-lez-rln's `deployments/`); the registry id's 64-hex segment doubles as
+the config account id for faucet calls (the rln module's `resolve_account_id`
+passes 64-hex through).
 
 The Wallet tab's primary flow is one click: "Use basecamp wallet" asks the
 membership module to provision `wallet-home/` under its own host-stamped
