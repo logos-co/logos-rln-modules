@@ -15,12 +15,8 @@ var LIBP2P_MODULE = "libp2p_module";
 var GIFTER_MODULE = "rln_gifter_module";
 var CAPTURE_MODULE = "keycard_capture_module";
 
-// testnet-shrink-verify registry (CAIP-10; descriptor under
-// logos-lez-rln deployments/testnet-shrink-verify/) — the GUI's prefill,
-// freely editable. The previous shared-faucet instance died with the
-// testnet reset; its config account no longer exists on-chain.
 var TESTNET_REGISTRY_ID =
-    "logos:testnet:2fdff09aec02fe4f03157c77bddfa36bd3fd4c8ac546558daf4fe174647e5542";
+    "logos:testnet:ffa111d7384f0f78d1b0927d38a5c34b6a7d11508cf327cc210610c43e43a219";
 
 var RATE_LIMIT_MIN = 100;
 var RATE_LIMIT_MAX = 600;
@@ -42,8 +38,6 @@ function sc(x) {
     return Math.round(x * UI_SCALE);
 }
 
-// The deployed testnet sequencer (testnet-shrink-verify deployment)
-// — prefill for provision_wallet_home's wallet_config.json.
 var TESTNET_SEQUENCER_ADDR = "https://testnet.lez.logos.co/";
 
 // The wallet's open/create_new take a statistics_path since LEZ v0.2.2

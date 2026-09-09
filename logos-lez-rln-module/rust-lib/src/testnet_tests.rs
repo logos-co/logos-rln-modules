@@ -12,8 +12,8 @@
 //! The registry under test comes from a logos-lez-rln checkout's deployment
 //! records: `<LEZ_RLN_CHECKOUT>/deployments/<name>/deployment.json`
 //! (checkout default: `../logos-lez-rln` next to this repo), `<name>` =
-//! `LEZ_RLN_TESTNET_DEPLOYMENT` (default `shared-faucet`, the shared
-//! testnet deployment). The sequencer is reached over its public JSON-RPC
+//! `LEZ_RLN_TESTNET_DEPLOYMENT` (default `DEFAULT_DEPLOYMENT`, the current
+//! hosted-testnet deployment). The sequencer is reached over its public JSON-RPC
 //! (`getAccount` — the same read the wallet module's `get_account_public`
 //! serves this module at runtime) via a `curl` subprocess, so the shipping
 //! crate gains no HTTP/TLS dependency and Cargo.lock stays untouched.
@@ -59,13 +59,15 @@ struct Deployment {
     merkle_program_id_hex: String,
 }
 
+const DEFAULT_DEPLOYMENT: &str = "testnet-faucet-260908";
+
 /// Gate + deployment loader. `None` = skip (gate unset).
 fn testnet() -> Option<Deployment> {
     if std::env::var("LEZ_RLN_TESTNET_TESTS").ok().as_deref() != Some("1") {
         eprintln!("testnet test skipped: set LEZ_RLN_TESTNET_TESTS=1 to run against the live registry");
         return None;
     }
-    let name = std::env::var("LEZ_RLN_TESTNET_DEPLOYMENT").unwrap_or_else(|_| "shared-faucet".to_string());
+    let name = std::env::var("LEZ_RLN_TESTNET_DEPLOYMENT").unwrap_or_else(|_| DEFAULT_DEPLOYMENT.to_string());
     // Deployment descriptors live with the programs in logos-co/logos-lez-rln;
     // LEZ_RLN_CHECKOUT points at that checkout (default: a sibling of this
     // repo).
