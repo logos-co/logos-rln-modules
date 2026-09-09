@@ -57,14 +57,30 @@ reference implementation `logos-package-manager-ui`):
 | GUI action | call |
 |---|---|
 | Unlock / lock keystore | `liblogos_rln_module.unlock_keystore(password)` / `lock_keystore()` |
-| Register (generates the identity in-module) | `liblogos_rln_module.register(registry_id, rln_identifier_hex, options_json)` with `options_json` = the RegistryOptions array `[{"key":"rate_limit","value":"…"},{"key":"funding_holding_account_id","value":"…"}]` (built by `M.registryOptions`); the credential never leaves the module |
-| Confirmation poll | `liblogos_rln_module.get_membership_state(registry_id, rln_identifier_hex)` every 10s until the pending window settles |
-| Memberships list | `liblogos_rln_module.get_memberships(registry_id)` (public view, works locked) |
+| Register (generates the identity in-module) | `liblogos_rln_module.register_membership(registry_id, rln_identifier_hex, options_json)` — the 0.7.0 wire's name for the spec's `register` — with `options_json` = the RegistryOptions array `[{"key":"rate_limit","value":"…"},{"key":"funding_holding_account_id","value":"…"}]` (built by `M.registryOptions`; the delegated path adds `delegated`/`gifter_peer_id`/`gifter_multiaddr`/`auth_type`/`auth_provider`); reply = the public Membership view, `state:"pending"` on a fresh submit; the credential never leaves the module |
+| Confirmation poll | `liblogos_rln_module.get_membership_state(registry_id, rln_identifier_hex)` every 10s until the pending window settles — `{registry_id, state}` + `membership_hash`/`leaf_index`/`rate_limit` once known |
+| Memberships list | `liblogos_rln_module.get_memberships(registry_id)` (public view, works locked); a `failed` row carries `failed_reason` + `retryable` |
+| Live expiry context (detail card) | `liblogos_lez_rln_module.get_membership(config_hex, commitment)` — on-chain clock vs grace-period start, never local time |
 | One-click wallet | `liblogos_rln_module.provision_wallet_home({"sequencer_addr":…})` → wallet-home under the module's basecamp data dir, then `open` when `storage_exists`, else `create_new` + `save` |
 | Open / create wallet | `lez_core.open(config_path, storage_path, statistics_path)` / `create_new(config_path, storage_path, password)` + `save()` (create shows the mnemonic ONCE) |
 | Sync | `get_current_block_height()` (head discovery) → `sync_to_block(head)` retried until it returns 0 **and** `get_last_synced_block()` reaches the head (progress-polled) |
 | Faucet claim | `create_account_public()` → `liblogos_lez_rln_module.get_token_balance` until `exists:false` → `claim_tokens(config_hex, holding_hex, amount)` → balance-polled until the credit lands (hard timeout) |
 | Claim sizing | `liblogos_lez_rln_module.get_registry_bounds(config_hex)` → suggested amount = default rate × `price_per_unit` × 1.2 (editable) |
+
+Every membership call is scoped by `(registry_id, rln_identifier_hex)`; this
+GUI is a management tool, not an RLN application, so it passes the fixed
+zero `M.DEFAULT_RLN_ID` as its scope identifier. Failures on the
+`liblogos_rln_module` methods are the in-band envelope
+`{"error":{"class","kind","message"}}` — `class` (`not_ready` |
+`transient` | `budget_exhausted` | `permanent`) decides whether the UI
+auto-retries (`M.isTransientError`), `kind` picks the hint shown
+(`M.ERROR_HINTS`). Membership `state` is the LIP `MembershipStatus`
+vocabulary (`M.MEMBERSHIP_STATES`: `active`, `grace_period`, `pending`,
+`expired`, `erased_awaits_withdrawal`, `failed`, `erased`, `slashed`,
+`unknown`); `pending`/`active`/`grace_period` count as usable (status card),
+every other settled state offers Re-register, and a string outside the list
+renders with the neutral badge. The wire is documented in the module's
+`rust-lib/liblogos_rln_module.lidl` and `docs/wire-binding.md`.
 
 State changes also push via the module's `membership_state_changed` event when
 the host bridge supports `LogosQmlBridge.onModuleEvent`/`moduleEventReceived`
@@ -106,7 +122,7 @@ likewise accepted and never funds the holding — the credit is polled with a
 
 - `ui-tests.mjs` — 5 hermetic static-chrome checks (no bridge → the
   deterministic onboarding fallback).
-- `flow-tests.mjs` — 14 deterministic state-machine scenarios driven by a
+- `flow-tests.mjs` — 15 deterministic state-machine scenarios driven by a
   scripted **mock bridge**. `Main.qml`'s `bridgeOverride` (null in
   production) is injected via the inspector's `evaluate` command with a JS
   object whose `callModuleAsync` replies from a fixture table matching the
@@ -117,9 +133,12 @@ likewise accepted and never funds the holding — the credit is polled with a
   advanced↔simple transition regressions, registry-edit guarding,
   new-membership sync-reset, the completion→list handoff with the one-shot
   "You're in!" celebration (first membership only; a second membership and a
-  relaunch read "Your Memberships"), the sync/claim/register error branches,
-  and the transient-transport auto-retry (recovery + non-transient-not-retried)
-  — no daemon, no faucet spend.
+  relaunch read "Your Memberships"), the LIP state vocabulary (a `slashed`
+  row routes to onboarding + Re-register, an unknown string degrades), the
+  sync/claim/register error branches, and the transient-transport auto-retry
+  (recovery + non-transient-not-retried) — no daemon, no faucet spend. The
+  mock's `register_membership` is strict (arity, 32-byte scope id, the
+  RegistryOptions array) and the old `register` spelling answers an error.
 
 For exhaustive per-branch state-machine coverage the right tool is a Qt
 Quick Test (`tst_OnboardingFlow.qml`) C++ harness; it needs a new C++ test
@@ -131,7 +150,7 @@ scope here (the mock-bridge harness covers the happy path + key cases).
 ```sh
 nix run 'path:.'                     # mount the view in logos-standalone-app
 nix build 'path:.#lgx'               # the .lgx bundle basecamp installs
-nix build 'path:.#integration-test'  # runs tests/*.mjs (5 hermetic + 14 flow)
+nix build 'path:.#integration-test'  # runs tests/*.mjs (5 hermetic + 15 flow)
 ```
 
 (`path:` because plain `.` resolves through the parent git repo and would

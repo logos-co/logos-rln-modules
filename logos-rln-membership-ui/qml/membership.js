@@ -1,7 +1,9 @@
 // Shared plumbing for the RLN membership GUI: logos-bridge reply parsing,
 // error rendering, and small formatting helpers. Wire shapes come from
-// rust-lib/liblogos_rln_module.lidl (failures {"error":{"class":…,"kind":…,
-// "message":…}}) and liblogos_lez_rln_module (""-on-error convention).
+// liblogos_rln_module.lidl (wire 0.7.0 — the merged RLN-API LIP: failures
+// are the in-band envelope {"error":{"class":…,"kind":…,"message":…}},
+// membership states are the MembershipStatus vocabulary in MEMBERSHIP_STATES
+// below) and liblogos_lez_rln_module.lidl (2.0.0, ""-on-error convention).
 .pragma library
 
 var RLN_MODULE = "liblogos_rln_module";
@@ -22,9 +24,10 @@ var RATE_LIMIT_MIN = 100;
 var RATE_LIMIT_MAX = 600;
 var RATE_LIMIT_DEFAULT = 300;
 
-// register()'s options_json: the spec RegistryOptions ARRAY of {"key","value"}
-// string pairs — rate_limit rides in the array, not as a positional arg, and
-// every value is stringified (the module rejects non-string values).
+// register_membership's options_json: the spec RegistryOptions ARRAY of
+// {"key","value"} string pairs — rate_limit rides in the array, not as a
+// positional arg, and every value is stringified (the module rejects
+// non-string values).
 function registryOptions(rateLimit, extras) {
     var arr = [{ key: "rate_limit", value: String(rateLimit) }];
     for (var k in extras) {
@@ -34,10 +37,11 @@ function registryOptions(rateLimit, extras) {
     return JSON.stringify(arr);
 }
 
-// register / get_membership_state / select_membership take a MembershipScope
-// (registry_id + rln_identifier). This GUI is a management tool, not an RLN
-// application, so it passes a fixed default rln_identifier; an application
-// generating proofs passes its own 32-byte scope key.
+// register_membership / get_membership_state / select_membership take a
+// MembershipScope (registry_id + rln_identifier_hex). This GUI is a
+// management tool, not an RLN application, so it passes a fixed default
+// rln_identifier; an application generating proofs passes its own 32-byte
+// scope key.
 var DEFAULT_RLN_ID =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -104,15 +108,29 @@ function libp2pError(r) {
     return (r && typeof r.error === "string" && r.error !== "") ? r.error : "";
 }
 
+// The wire's coarse RlnErrorKind ("class": not_ready | transient |
+// budget_exhausted | permanent), assigned to the kinds this file mints
+// locally so every error object carries one: the transport/host kinds are
+// transient (a retry self-heals), no_bridge is permanent.
+var LOCAL_ERROR_CLASS = {
+    bridge_failure: "transient",
+    timeout: "transient",
+    empty_reply: "transient",
+    bad_reply: "transient",
+    no_bridge: "permanent"
+};
+
 function mkError(kind, message) {
-    return { error: { kind: kind, message: message } };
+    return { error: { "class": LOCAL_ERROR_CLASS[kind] || "permanent", kind: kind, message: message } };
 }
 
 // Normalize bridge replies. LogosQmlBridge double-encodes tstr replies;
 // bridge-level failures arrive as plain objects with a STRING error field;
 // the wallet module returns bare scalars and raw strings, with "" signaling
 // failure. JSON-object replies pass through, scalars and raw strings become
-// {value:…}, and every failure becomes {error:{kind,message}}.
+// {value:…}, and every failure becomes {error:{class,kind,message}} — the
+// module's own envelope passes through untouched, locally minted ones get
+// their class from LOCAL_ERROR_CLASS.
 function parseReply(payload) {
     var v;
     try { v = JSON.parse(payload); } catch (e) {
@@ -199,7 +217,9 @@ function decodeMembershipStateChanged(data) {
 }
 
 // One-line hints for the error kinds a user can act on (the lidl's kinds
-// plus the local ones minted by parseReply/call above).
+// plus the local ones minted by parseReply/call above), keyed by kind with
+// the four wire classes as the fallback for kinds this table does not name
+// (the lidl allows new kinds to appear over time — switch on class, log kind).
 var ERROR_HINTS = {
     locked: "Unlock the keystore with your password first.",
     bad_password: "The password does not match the existing keystore.",
@@ -207,16 +227,24 @@ var ERROR_HINTS = {
     no_usable_membership: "No active or grace-period membership to select.",
     ambiguous_selection: "More than one candidate — pass a selector.",
     invalid_argument: "Check the field formats (hex lengths, CAIP-10 registry id, rate limit bounds).",
+    unknown_registry: "No registry provider handles this registry id's namespace.",
+    unknown_membership: "The module holds no record of that membership.",
     bridge_failure: "The module is not loaded or connected in this host.",
     no_bridge: "Not running inside a Logos host application.",
     empty_reply: "The module reported a failure — is the wallet open and synced, and the network reachable?",
-    keychain_unavailable: "Couldn't reach the OS keychain — enter your password to continue."
+    keychain_unavailable: "Couldn't reach the OS keychain — enter your password to continue.",
+    budget_exhausted: "This epoch's rate limit is spent — retry next epoch.",
+    not_ready: "The module is not ready yet — retry in a moment.",
+    transient: "A temporary failure — retrying usually succeeds.",
+    permanent: "Retrying as-is cannot succeed — change the input or the setup first.",
+    internal: "Unexpected module failure — check the host log."
 };
 
 function errorText(err) {
     var kind = err && err.kind ? err.kind : "unknown";
+    var cls = err && err["class"] ? String(err["class"]) : "";
     var msg = err && err.message ? err.message : "";
-    var hint = ERROR_HINTS[kind];
+    var hint = ERROR_HINTS[kind] || ERROR_HINTS[cls];
     return kind + ": " + msg + (hint ? "\n" + hint : "");
 }
 
@@ -290,6 +318,20 @@ function suggestedClaimAmount(rate, priceStr) {
     return Math.ceil(rate * price * 1.2);
 }
 
+// The MembershipStatus wire strings (module docs/wire-binding.md), best
+// state first — the memberships list sorts by this order. erased_awaits_
+// withdrawal and slashed complete the spec vocabulary; the logos namespace
+// never emits them today. A state outside this list (a future addition)
+// degrades to the neutral badge and sorts last — never a crash.
+var MEMBERSHIP_STATES = [
+    "active", "grace_period", "pending", "expired",
+    "erased_awaits_withdrawal", "failed", "erased", "slashed", "unknown"
+];
+
+function isKnownState(s) {
+    return MEMBERSHIP_STATES.indexOf(s) >= 0;
+}
+
 // States that land the user on the status card. Pending counts so a relaunch
 // mid-confirmation resumes on the card; it joins select()'s usable set
 // (active/grace_period) within the 300s confirmation window or flips to failed.
@@ -298,17 +340,20 @@ function isUsableState(s) {
 }
 
 // Terminal states the user can act on by re-registering (the detail card's
-// Re-register affordance).
+// Re-register affordance): every settled state that is neither usable nor
+// unknown. failed is terminal on this wire (it never blocks a fresh
+// registration); slashed / erased_awaits_withdrawal / erased / expired all
+// mean the registry no longer serves this identity.
 function isRenewable(s) {
-    return s === "failed" || s === "expired" || s === "erased";
+    return s === "failed" || s === "expired" || s === "erased"
+        || s === "erased_awaits_withdrawal" || s === "slashed";
 }
 
-// Sort rank for the memberships list, best state first; unknown states sort
-// last.
+// Sort rank for the memberships list, best state first; states outside the
+// vocabulary sort after every known one.
 function stateRank(s) {
-    var order = ["active", "grace_period", "pending", "expired", "failed", "erased"];
-    var i = order.indexOf(s);
-    return i < 0 ? order.length : i;
+    var i = MEMBERSHIP_STATES.indexOf(s);
+    return i < 0 ? MEMBERSHIP_STATES.length : i;
 }
 
 // A wire number that may be absent (pending memberships have no leaf/rate
@@ -329,8 +374,21 @@ var TRANSIENT_ERROR_KINDS = {
     provider_failure: true
 };
 
-function isTransientError(kind) {
-    return TRANSIENT_ERROR_KINDS[kind] === true;
+// err is the error object ({class,kind,message}) or, for a caller that only
+// has it, the bare kind string. The wire's class is authoritative ("switch
+// on class, log kind" — module docs/wire-binding.md): class "transient" is
+// retryable whatever the kind; the kind table covers locally minted errors
+// and modules that carry no class (liblogos_lez_rln_module answers "" →
+// empty_reply). not_ready is deliberately NOT retried here: it includes
+// `locked`, which needs the user's password, not a timer.
+function isTransientError(err) {
+    if (typeof err === "string")
+        return TRANSIENT_ERROR_KINDS[err] === true;
+    if (!err)
+        return false;
+    if (err["class"] === "transient")
+        return true;
+    return TRANSIENT_ERROR_KINDS[err.kind] === true;
 }
 
 // Deterministic petname for a public commitment — a display alias, never an
