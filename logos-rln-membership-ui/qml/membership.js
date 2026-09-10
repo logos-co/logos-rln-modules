@@ -384,8 +384,6 @@ var TRANSIENT_ERROR_KINDS = {
 // empty_reply). not_ready is deliberately NOT retried here: it includes
 // `locked`, which needs the user's password, not a timer.
 function isTransientError(err) {
-    if (typeof err === "string")
-        return TRANSIENT_ERROR_KINDS[err] === true;
     if (!err)
         return false;
     if (err["class"] === "transient")
