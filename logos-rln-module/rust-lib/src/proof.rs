@@ -92,8 +92,10 @@ pub(crate) struct RateLimitProof {
     share_y: [u8; 32],
     nullifier: [u8; 32],
     /// The spec's `epoch[32]`, decoded — carried on proofs this module
-    /// generates; `None` for a wire proof reconstructed without one, which
-    /// `validate_proof` resolves by scanning instead of checking directly.
+    /// generates; `None` for a wire proof reconstructed without one.
+    /// `validate_proof` compares a carried epoch against the one the caller's
+    /// timestamp derives, and lets an absent epoch pass: the external
+    /// nullifier it recomputes already binds the proof to that epoch.
     epoch: Option<u64>,
 }
 
@@ -108,9 +110,9 @@ impl RateLimitProof {
     /// attach it afterward.
     fn from_parts(proof: Proof, values: RLNProofValues) -> Result<Self, ProofError> {
         let (share_y, nullifier) = single_values(&values)?;
-        let root = fr_to_u32(&values.root());
-        let external_nullifier = fr_to_u32(&values.external_nullifier());
-        let share_x = fr_to_u32(&values.x());
+        let root = fr_to_bytes32(&values.root());
+        let external_nullifier = fr_to_bytes32(&values.external_nullifier());
+        let share_x = fr_to_bytes32(&values.x());
         let rln_proof = RLNProof::new(proof, values);
         let mut canonical = Vec::new();
         rln_proof
@@ -121,17 +123,16 @@ impl RateLimitProof {
             root,
             external_nullifier,
             share_x,
-            share_y: fr_to_u32(&share_y),
-            nullifier: fr_to_u32(&nullifier),
+            share_y: fr_to_bytes32(&share_y),
+            nullifier: fr_to_bytes32(&nullifier),
             epoch: None,
         })
     }
 
-    /// The root the proof was generated against — the value `validate_proof`
-    /// checks against its valid-root window. Production verification reads
-    /// the root out of the canonical bytes inside zerokit; this decoded view
-    /// serves tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The root the proof was generated against. `validate_proof` reads this
+    /// on the hot path to pre-check the valid-root window — a miss answers
+    /// `invalid` and nudges the root refresher. Zerokit verifies against the
+    /// root inside the canonical bytes; this is the decoded view of it.
     pub(crate) fn root(&self) -> [u8; 32] {
         self.root
     }
@@ -272,8 +273,9 @@ impl RateLimitProof {
     }
 
     /// The epoch this proof carries (the spec's `epoch[32]`, decoded), or
-    /// `None` for a wire proof reconstructed without one — `validate_proof`
-    /// checks the former directly and resolves the latter by scanning.
+    /// `None` for a wire proof reconstructed without one. `validate_proof`
+    /// compares a carried epoch directly; an absent one rides on the external
+    /// nullifier, which already binds the proof to the caller's epoch.
     pub(crate) fn epoch(&self) -> Option<u64> {
         self.epoch
     }
@@ -361,22 +363,22 @@ fn signal_to_x(signal: &[u8]) -> Fr {
 /// 32-byte LE value a proof's `external_nullifier` field must equal — the
 /// verify-side application + epoch-freshness binding.
 pub(crate) fn expected_external_nullifier(epoch: u64, rln_identifier: &[u8; 32]) -> [u8; 32] {
-    fr_to_u32(&external_nullifier(epoch, rln_identifier))
+    fr_to_bytes32(&external_nullifier(epoch, rln_identifier))
 }
 
 /// `Fr` → 32-byte LE (arkworks `serialize_compressed`, which for `Fr` is the
 /// 32-byte LE canonical form). A short write would silently corrupt
 /// security-relevant bytes, so it is asserted rather than tolerated.
-fn fr_to_u32(fr: &Fr) -> [u8; 32] {
+fn fr_to_bytes32(fr: &Fr) -> [u8; 32] {
     let mut out = [0u8; 32];
     fr.serialize_compressed(&mut out[..])
         .expect("Fr canonical LE form is exactly 32 bytes");
     out
 }
 
-/// `SecretFr` → 32-byte LE, same encoding as [`fr_to_u32`]. The caller owns
-/// the lifetime of the returned copy.
-fn secret_to_u32(secret: &SecretFr) -> [u8; 32] {
+/// `SecretFr` → 32-byte LE, same encoding as [`fr_to_bytes32`]. The caller
+/// owns the lifetime of the returned copy.
+fn secret_to_bytes32(secret: &SecretFr) -> [u8; 32] {
     let mut out = [0u8; 32];
     secret
         .serialize_compressed(&mut out[..])
@@ -404,8 +406,8 @@ pub(crate) fn generate_identity() -> Result<(String, String), ProofError> {
     let keys = IdentityKeys::generate_seeded::<PoseidonHash, ChaCha20Rng>(&seed);
     seed.zeroize();
     Ok((
-        bytes_to_hex(&fr_to_u32(&keys.id_commitment())),
-        bytes_to_hex(&secret_to_u32(&keys.identity_secret())),
+        bytes_to_hex(&fr_to_bytes32(&keys.id_commitment())),
+        bytes_to_hex(&secret_to_bytes32(&keys.identity_secret())),
     ))
 }
 
@@ -521,7 +523,7 @@ pub(crate) fn recover_identity_secret_hex(
     // compute_id_secret fails only on equal share_x (DivisionByZero).
     let secret = compute_id_secret(share1, share2)
         .map_err(|e| ProofError::Engine(format!("recover id secret: {e}")))?;
-    Ok(bytes_to_hex(&secret_to_u32(&secret)))
+    Ok(bytes_to_hex(&secret_to_bytes32(&secret)))
 }
 
 /// Build a proof from a seed over a synthetic zero-sibling depth-20 path — for
@@ -536,7 +538,7 @@ pub(crate) fn generate_for_test(
 ) -> RateLimitProof {
     let keys = IdentityKeys::generate_seeded::<PoseidonHash, ChaCha20Rng>(seed);
     let material = WitnessMaterial {
-        identity_secret_hash_hex: bytes_to_hex(&secret_to_u32(&keys.identity_secret())),
+        identity_secret_hash_hex: bytes_to_hex(&secret_to_bytes32(&keys.identity_secret())),
         rate_limit: 100,
         message_id: 0,
         path_elements_hex: vec!["00".repeat(32); RLN_TREE_DEPTH],
@@ -560,7 +562,7 @@ mod tests {
 
     fn material_from_seed(seed: &[u8], rate_limit: u64, message_id: u64) -> WitnessMaterial {
         let keys = IdentityKeys::generate_seeded::<PoseidonHash, ChaCha20Rng>(seed);
-        let secret_hex = bytes_to_hex(&secret_to_u32(&keys.identity_secret()));
+        let secret_hex = bytes_to_hex(&secret_to_bytes32(&keys.identity_secret()));
         let (elements, indices) = zero_path();
         WitnessMaterial {
             identity_secret_hash_hex: secret_hex,
@@ -583,11 +585,11 @@ mod tests {
         // Identity derivation (zerokit seeded keygen, LE hex).
         let keys = IdentityKeys::generate_seeded::<PoseidonHash, ChaCha20Rng>(&[7u8; 32]);
         assert_eq!(
-            bytes_to_hex(&secret_to_u32(&keys.identity_secret())),
+            bytes_to_hex(&secret_to_bytes32(&keys.identity_secret())),
             "3c87aa7480ec2cad022ef39c256ddb6e4fb083c7d4a0dfdc4eee891feda7a62b"
         );
         assert_eq!(
-            bytes_to_hex(&fr_to_u32(&keys.id_commitment())),
+            bytes_to_hex(&fr_to_bytes32(&keys.id_commitment())),
             "08772427f3a88a9787e8f899c13dc10c2b0a226d7500c99edba0f993ba770729"
         );
 
@@ -595,13 +597,13 @@ mod tests {
         // hash_to_field_le(rln_identifier)) — NOT nwaku's keccak construction.
         let rln_id = [9u8; 32];
         assert_eq!(
-            bytes_to_hex(&fr_to_u32(&external_nullifier(1231028105, &rln_id))),
+            bytes_to_hex(&fr_to_bytes32(&external_nullifier(1231028105, &rln_id))),
             "a432bb300aeda21d8c14186e134639ecac20732e9ebcbb73139741cef293612a"
         );
 
         // x = hash_to_field_le(signal).
         assert_eq!(
-            bytes_to_hex(&fr_to_u32(&signal_to_x(b"Hello, RLN!"))),
+            bytes_to_hex(&fr_to_bytes32(&signal_to_x(b"Hello, RLN!"))),
             "9af96b554db1bc4bfb806f3bcd587c8c0ee80d4d79c440a87b51861235461412"
         );
 
