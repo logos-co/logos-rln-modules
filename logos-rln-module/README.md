@@ -185,8 +185,9 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   root resolves on the caller's retry; `generate_proof`'s Merkle snapshot
   also feeds its `valid_roots` into the window.
 - **Wire conventions.** Every reply is a compact JSON object (alphabetical
-  keys); failures are `{"error":{"kind":…,"message":…}}`. The sibling
-  module's `""`-on-error convention is NOT used here.
+  keys); failures are `{"error":{"class":…,"kind":…,"message":…}}` —
+  switch on `class`, log `kind`. The sibling module's `""`-on-error
+  convention is NOT used here.
 - **Provisional leaf_index.** `register` returns the provider's pre-submit
   estimate; the authoritative value is re-read from the registry at the
   pending→active transition (spec MUST). Consumers needing the leaf for

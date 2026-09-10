@@ -28,7 +28,8 @@
 //!
 //! Wire conventions: every method returns a compact JSON object (serde_json
 //! ⇒ alphabetical keys); failures are
-//! `{"error":{"kind":…,"message":…}}` — see `ErrorKind`. The sibling RLN
+//! `{"error":{"class":…,"kind":…,"message":…}}` — consumers switch on
+//! `class` (see `ErrorKind::class`) and log `kind`. The sibling RLN
 //! module's ""-on-error convention is not used here.
 //!
 //! Concurrency is "multi" (metadata.json): handlers take `&self` and
