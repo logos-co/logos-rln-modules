@@ -444,11 +444,11 @@
       },
       "locked": {
         "dir": "logos-lez-rln-module",
-        "lastModified": 1789064160,
-        "narHash": "sha256-cjqpemhHnMvFwWv5wmFTNZI5NEY7KPyxKU8QnR5hjRE=",
+        "lastModified": 1789064341,
+        "narHash": "sha256-5HKlltnnIANrU3sG89WCthdYQLIqAWkojggFJ92e6Eo=",
         "ref": "fix/module-dep-chain-resolution",
-        "rev": "ecc8bcb6618c8a803a15178843ad3d1e7aa691cd",
-        "revCount": 67,
+        "rev": "c56869db0d477212d8c3937c8fd85fcb6f27909b",
+        "revCount": 61,
         "type": "git",
         "url": "https://github.com/logos-co/logos-rln-modules"
       },
