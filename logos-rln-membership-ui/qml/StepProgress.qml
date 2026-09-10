@@ -13,12 +13,6 @@ ColumnLayout {
 
     required property OnboardingFlow flow
 
-    // Item 1 folds wallet provision/open/create into "syncing".
-    readonly property string syncStatus:
-        (flow.walletPhase === "error" || flow.syncPhase === "error") ? "error"
-        : flow.syncPhase === "done" ? "done"
-        : flow.walletPhase === "idle" ? "upcoming" : "active"
-
     readonly property string currentError:
         flow.walletPhase === "error" ? flow.walletError
         : flow.syncPhase === "error" ? flow.syncError
