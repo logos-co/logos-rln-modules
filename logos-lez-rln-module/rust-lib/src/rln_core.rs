@@ -341,11 +341,17 @@ pub fn merkle_proofs_exec(
         let subtree_id = u32::try_from(leaf_index / SUBTREE_LEAVES as u64)
             .map_err(|_| RlnError::InvalidLeafIndex)?;
 
+        // A PRESENT entry that is empty is the legitimate Absent case (the
+        // subtree account is not initialized yet). A MISSING entry means the
+        // caller's plan and this call disagree — substituting empty there
+        // would prove against default nodes and mint a wrong-but-plausible
+        // proof, which is exactly what the caller's tri-state fetch refuses
+        // to do.
         let subtree_data: &[u8] = subtrees
             .iter()
             .find(|(id, _)| *id == subtree_id)
             .map(|(_, data)| *data)
-            .unwrap_or(&[]);
+            .ok_or(RlnError::InvalidLeafIndex)?;
 
         let proof = build_merkle_proof(main_data, subtree_data, leaf_index)?;
 
@@ -592,6 +598,32 @@ mod tests {
         assert_eq!(membership_status(1_000, 50, 1_000), "grace_period");
         assert_eq!(membership_status(1_000, 50, 1_049), "grace_period");
         assert_eq!(membership_status(1_000, 50, 1_050), "expired");
+    }
+
+    /// A `tree_main` account long enough for `build_merkle_proof`'s guards,
+    /// declaring the full tree depth.
+    fn make_tree_main() -> Vec<u8> {
+        let mut main = vec![0u8; OFFSET_CACHED_NODES + (TREE_DEPTH + 1) * 32];
+        main[OFFSET_DEPTH] = TREE_DEPTH as u8;
+        main
+    }
+
+    // A subtree the caller never supplied is a plan/exec disagreement, not
+    // the legitimate "not initialized yet" case. Substituting empty there
+    // would build a proof over default nodes — plausible, and wrong.
+    #[test]
+    fn exec_refuses_a_leaf_whose_subtree_was_not_supplied() {
+        let main = make_tree_main();
+        let Err(err) = merkle_proofs_exec(&main, &[], &[0]) else {
+            panic!("a leaf whose subtree was not supplied must not prove");
+        };
+        assert!(matches!(err, RlnError::InvalidLeafIndex), "got: {err}");
+
+        // Present-but-empty stays legitimate: that is FetchOutcome::Absent.
+        assert!(
+            merkle_proofs_exec(&main, &[(0, &[])], &[0]).is_ok(),
+            "an absent (present-but-empty) subtree still proves"
+        );
     }
 
     // Pins the Register instruction's word encoding (risc0-serde: variant
