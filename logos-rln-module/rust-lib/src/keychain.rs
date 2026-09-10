@@ -25,8 +25,9 @@
 //! canonicalized — macOS /var<->/private/var churn would orphan items), so
 //! each module instance owns exactly one item. Missing item + credentials
 //! present maps to keychain_unavailable (never invent a secret over an
-//! existing keystore). Caveat: deleting an auto-created account's item
-//! orphans its credentials — the user never saw the secret.
+//! existing keystore). Self-provisioning does NOT write a keychain item: it
+//! writes the module-owned `rln_autounlock.secret`, and deleting THAT file
+//! orphans the credentials it unlocks — the user never saw the secret.
 
 use crate::registry_id;
 use crate::sealed_store::store as sealed;
@@ -122,8 +123,10 @@ fn run_security_batch(line: &str) -> Result<(), String> {
     }
 }
 
-/// Non-macOS: no OS keychain backend — every call maps to
-/// keychain_unavailable and the UI falls back to the password screen.
+/// Non-macOS: no OS keychain backend. `remember_keystore_password` answers
+/// keychain_unavailable and the UI falls back to the password screen; a READ
+/// folds to a noted miss instead, so a not-yet-provisioned store still
+/// self-provisions from its own secret file.
 #[cfg(not(target_os = "macos"))]
 struct Unavailable;
 
