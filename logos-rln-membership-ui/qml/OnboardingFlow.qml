@@ -1,6 +1,8 @@
-// Non-visual onboarding controller: wallet -> sync -> keystore password ->
-// faucet claim -> registration, as sequential idempotent phases with
-// observable progress. Each phase duplicates an Advanced view's logic and
+// Non-visual onboarding controller. The wizard runs the keystore password
+// first (its step's Next fires checkPassword), then wallet -> sync -> faucet
+// claim -> registration; the phase letters below are ids, not the sequence.
+// Sequential idempotent phases with observable progress. Each phase
+// duplicates an Advanced view's logic and
 // carries a "mirrors <view>.<fn> — keep in sync" cross-reference. An Item
 // (not QtObject) so it can own the poll Timers.
 import QtQuick
@@ -26,8 +28,10 @@ Item {
     // Phase A — wallet (provision + open/create).
     property string walletPhase: "idle"
     property string walletError: ""
-    // Captured from create_new but not displayed; kept for a future
-    // recovery/export surface.
+    // Captured from create_new. The WIZARD never renders it — only the
+    // Advanced Wallet tab shows a mnemonic, and only for a wallet it created
+    // there. Kept for a future recovery/export surface (and reset by the
+    // flow tests).
     property string mnemonic: ""
     property bool walletCreated: false
 

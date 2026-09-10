@@ -1,8 +1,8 @@
 // Register flow: unlock keystore -> register_membership (the membership
 // module generates the credential) -> poll get_membership_state until the
 // pending window settles. The funding holding account is either typed in or
-// auto-filled by the Wallet tab's faucet claim (Main.qml wires
-// WalletView.funded to fundingAccount).
+// auto-filled by the Wallet tab's faucet claim (AdvancedView.qml wires
+// WalletView.onFunded to fundingAccount).
 import QtQuick
 import QtQuick.Layouts
 import Logos.Theme
@@ -15,7 +15,8 @@ LogosScrollView {
     required property var bridge
     required property string registryId
 
-    // Written by Main.qml when the Wallet tab confirms a funded holding.
+    // Written by AdvancedView.qml's WalletView.onFunded, when the Wallet tab
+    // confirms a funded holding.
     property alias fundingAccount: fundingField.text
 
     // Keystore session (unlock holds the password module-side; lock drops it).

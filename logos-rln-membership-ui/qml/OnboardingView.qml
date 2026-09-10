@@ -17,8 +17,9 @@ Item {
 
     property alias priorNotice: flow.priorNotice
     property alias hasExistingAccount: flow.hasExistingAccount
-    // Read-only handle to the flow controller for the mock-bridge test
-    // harness; prod-inert.
+    // Read-only handle to the flow controller. Production reads it: Main.qml
+    // drives the startup probe through it and binds it into MembershipView
+    // and MembershipCard. The mock-bridge tests drive it too.
     readonly property alias flowController: flow
 
     signal completed()
