@@ -13,24 +13,15 @@
 
     logos-core.url = "github:logos-co/logos-cpp-sdk/25c88f4d48fa95ea4437194bcf60bd8d0cf84a74";
 
-    # lez v0.2.2 exactly — the hosted testnet's era. NOT upstream main:
-    # cd47b9e's tx-polling binds wallet_ffi_poll_transaction_status (post-
-    # v0.2.2), and 87fca2a1's wallet storage renames PrivateKeyHolder's
-    # nullifier_secret_key to a derived authorization_secret_key, which
-    # rejects every v0.2.2-written storage.json (and lez-rln's host tools
-    # still write the v0.2.2 schema).
-    logos-execution-zone.url = "github:logos-blockchain/logos-execution-zone?rev=d6e4ae694e7419f5906b340c232704466a1917b7";
+    logos-execution-zone.url = "github:logos-blockchain/logos-execution-zone?rev=d8596eb734bf9c9ce801afb92df06098a2eb098a";
 
     logos-wallet-module = {
-      url = "github:logos-blockchain/logos-execution-zone-module?rev=549cf1159f20fa0c3fe8e88a5ab71de68a5aa34b";
+      url = "github:logos-blockchain/logos-execution-zone-module?rev=0ea57f8a1c57539d6ee0961a9cd27b064685b9e8";
       inputs.logos-execution-zone.follows = "logos-execution-zone";
     };
 
     logos-module-viewer.url = "github:logos-co/logos-module-viewer";
 
-    # Deliberately no nested `follows` on these path inputs: the builder pins
-    # its own rust-overlay/toolchain and the duplicated nixpkgs nodes already
-    # lock the same rev.
     logos-lez-rln-module.url = "path:./logos-lez-rln-module";
     logos-rln-module.url = "path:./logos-rln-module";
   };
@@ -63,13 +54,7 @@
         let
           walletModulePackage = logos-wallet-module.packages.${system}.lgx;
 
-          # The sim builds with `--override-input logos-lez-rln-module
-          # path:...` so the gitignored staged logos-rust-sdk-src is visible;
-          # the default covers in-tree builds.
           lezRlnModule = logos-lez-rln-module.packages.${system};
-
-          # The main RLN module (RLN-MEMBERSHIP-MANAGEMENT spec); refresh its
-          # gitignored logos-rust-sdk-src via `nix run ./logos-rln-module#generate`.
           rlnModule = logos-rln-module.packages.${system};
         in
         {
