@@ -11,7 +11,7 @@
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
     # Name matches metadata.json#dependencies; the builder resolves by name.
-    lez_core.url = "github:logos-blockchain/logos-execution-zone-module?rev=549cf1159f20fa0c3fe8e88a5ab71de68a5aa34b";
+    lez_core.url = "github:logos-blockchain/logos-execution-zone-module?rev=0ea57f8a1c57539d6ee0961a9cd27b064685b9e8";
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:
