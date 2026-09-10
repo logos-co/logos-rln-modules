@@ -11,9 +11,9 @@
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
     # Name matches metadata.json#dependencies; the builder resolves by name.
-    # DRAFT: logos-execution-zone#876, which applies logos-nix's crates.io
-    # overlays. Drop this input and the follows once it merges.
-    logos-execution-zone.url = "github:logos-blockchain/logos-execution-zone?rev=8dafbf50f65909c5965feabd1e6262380c968908";
+    # Overrides lez_core's own pin, which predates the crates.io fetch fix
+    # (logos-execution-zone#876). Drop once lez_core bumps past it.
+    logos-execution-zone.url = "github:logos-blockchain/logos-execution-zone?ref=dev";
     lez_core = {
       url = "github:logos-blockchain/logos-execution-zone-module?rev=0ea57f8a1c57539d6ee0961a9cd27b064685b9e8";
       inputs.logos-execution-zone.follows = "logos-execution-zone";
