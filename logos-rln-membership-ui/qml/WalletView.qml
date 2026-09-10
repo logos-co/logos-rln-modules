@@ -154,7 +154,9 @@ LogosScrollView {
     // Unsynced wallets silently drop transactions, so keep re-issuing
     // sync_to_block until it reports SUCCESS (0) and the wallet's own last
     // synced block reaches the target. No client timeout: a fresh wallet
-    // takes minutes; progressTimer surfaces movement meanwhile.
+    // takes minutes. The module serves no reads while a sync_to_block is in
+    // flight, so progressTimer reports movement BETWEEN attempts, not during
+    // one.
     function runSyncAttempt() {
         syncAttempts += 1
         report("Syncing to block " + syncTarget + " (attempt " + syncAttempts

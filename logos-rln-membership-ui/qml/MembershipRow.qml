@@ -46,20 +46,20 @@ Item {
 
     // ---- segment state helpers (progress) ----------------------------------
     // Segment 1 folds wallet provision/open/create into "syncing".
-    function syncState() {
+    function syncSegState() {
         if (!flow) return "upcoming"
         if (flow.walletPhase === "error" || flow.syncPhase === "error") return "error"
         if (flow.syncPhase === "done") return "done"
         if (flow.walletPhase === "idle") return "upcoming"
         return "active"
     }
-    function fundState() {
+    function fundSegState() {
         if (!flow) return "upcoming"
         return flow.fundPhase === "error" ? "error"
              : flow.fundPhase === "done" ? "done"
              : flow.fundPhase === "running" ? "active" : "upcoming"
     }
-    function regState() {
+    function regSegState() {
         if (!flow) return "upcoming"
         return flow.regPhase === "error" ? "error"
              : flow.regPhase === "done" ? "done"
@@ -70,11 +70,11 @@ Item {
     // fine print in StepProgress below the row.
     readonly property var activeSeg: {
         var segs = [
-            { st: syncState(), active: "Syncing with Logos Blockchain...", done: "Synced!",
+            { st: syncSegState(), active: "Syncing with Logos Blockchain...", done: "Synced!",
               shortErr: "Setup failed", retry: "Retry" },
-            { st: fundState(), active: "Claiming faucet tokens...", done: "Tokens Received!",
+            { st: fundSegState(), active: "Claiming faucet tokens...", done: "Tokens Received!",
               shortErr: "Couldn't get tokens", retry: "Retry" },
-            { st: regState(), active: "Registering membership...", done: "Registered!",
+            { st: regSegState(), active: "Registering membership...", done: "Registered!",
               shortErr: "Registration failed", retry: "Try again" }
         ]
         for (var i = 0; i < segs.length; i++)
@@ -110,7 +110,7 @@ Item {
 
             Repeater {
                 model: root.rowKind === "progress"
-                       ? [root.syncState(), root.fundState(), root.regState()] : []
+                       ? [root.syncSegState(), root.fundSegState(), root.regSegState()] : []
 
                 Item {
                     id: seg

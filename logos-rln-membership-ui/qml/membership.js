@@ -65,9 +65,9 @@ function statsPathFor(storagePath) {
     return (i >= 0 ? storagePath.substring(0, i + 1) : "") + "statistics.json";
 }
 
-// StepGifter prefills, both freely editable. Defaults point at the local dev
-// gifter (tools/run-local-gifter.sh), whose fixed node key keeps this peerId
-// stable across restarts.
+// StepGifter prefills, both freely editable. Defaults point at a local dev
+// gifter run from the logos-rln-gifter checkout, whose fixed node key keeps
+// this peerId stable across restarts.
 var GIFTER_PEER_ID_DEFAULT = "16Uiu2HAm8KkYKyhBK5f8ZcSDJP947bxCqVRRbzP8DKDigqePtX2Y";
 var GIFTER_MULTIADDR_DEFAULT = "/ip4/127.0.0.1/tcp/9000";
 
@@ -111,7 +111,9 @@ function libp2pError(r) {
 // The wire's coarse RlnErrorKind ("class": not_ready | transient |
 // budget_exhausted | permanent), assigned to the kinds this file mints
 // locally so every error object carries one: the transport/host kinds are
-// transient (a retry self-heals), no_bridge is permanent.
+// transient (a retry self-heals), no_bridge is permanent. `timeout` is not
+// minted here — it arrives as a module payload — but it stays in the table
+// to mirror the mock's CLASS_OF.
 var LOCAL_ERROR_CLASS = {
     bridge_failure: "transient",
     timeout: "transient",

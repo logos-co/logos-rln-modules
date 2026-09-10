@@ -87,7 +87,7 @@ function mockExpr(cfg) {
     var TXHASH = "12".repeat(32);
     var TXRESULT = JSON.stringify({ leaf_index: 5, payment_definition: "dd".repeat(32), tx_result: JSON.stringify({ error: "", secrets: [], success: true, tx_hash: TXHASH }) });
     // The wire's error envelope: class is the coarse RlnErrorKind the UI
-    // switches on, kind refines it (docs/wire-binding.md "Error envelope").
+    // switches on, kind refines it (the module's docs/wire-binding.md "Error envelope").
     var CLASS_OF = { bridge_failure: "transient", empty_reply: "transient", bad_reply: "transient", timeout: "transient", provider_failure: "transient", not_ready: "not_ready", locked: "not_ready", budget_exhausted: "budget_exhausted" };
     function err(kind, message) {
       return { error: { "class": CLASS_OF[kind] || "permanent", kind: kind, message: message } };

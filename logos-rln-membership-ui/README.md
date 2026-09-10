@@ -14,8 +14,9 @@ timeout, any error → onboarding so the splash never hangs):
 - **Onboarding wizard** (default with no usable membership): five explicit
   steps — Welcome, Password (one password for wallet storage + keystore,
   checked via `unlock_keystore` before the slow steps), Wallet setup
-  (provision + open/create + sync with live progress; mnemonic shown once,
-  non-blocking), Get tokens (computed faucet claim with the 180s countdown),
+  (provision + open/create + sync with live progress, non-blocking; the
+  mnemonic is shown by the Advanced Wallet tab, not by the wizard), Get
+  tokens (computed faucet claim with the 180s countdown),
   Activate (register + confirmation poll). `OnboardingFlow.qml` is the
   non-visual controller; step bodies live in a StackLayout so Back keeps
   state.
