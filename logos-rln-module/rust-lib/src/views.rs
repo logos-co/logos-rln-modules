@@ -155,7 +155,9 @@ impl EpochQuotaView {
     }
 }
 
-/// `start`'s reply. Not a `.lidl` record; all fields are always present.
+/// `start`'s reply. Not a `.lidl` record. Every field but `overrides` is
+/// always present; that one is omitted unless a `registries` entry set a
+/// per-registry epoch size or max gap, which the common `start()` does not.
 #[derive(Serialize)]
 pub(crate) struct StartReply {
     epoch_size_sec: u64,
