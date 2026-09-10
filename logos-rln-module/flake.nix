@@ -10,6 +10,8 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
+    # Name matches metadata.json#dependencies; the builder resolves by name.
+    liblogos_lez_rln_module.url = "path:../logos-lez-rln-module";
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:
@@ -36,6 +38,9 @@
         in m // {
           liblogos_rln_module = m.default;
         });
+
+      # The builder walks a dependency's config + inputs to bundle the chain.
+      inherit (module) config;
 
       # `nix run .#generate` materialises the two gitignored inputs rust-lib/
       # references: the provider scaffold at rust-lib/generated/ and the SDK
