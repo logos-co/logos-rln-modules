@@ -272,11 +272,6 @@ pub(crate) fn live_worker_count() -> usize {
     crate::lock(&SUP).running
 }
 
-#[cfg(test)]
-pub(crate) fn generation() -> u64 {
-    crate::lock(&SUP).generation
-}
-
 /// Reset to a fresh NeverStarted supervisor; the generation bump makes any
 /// straggling worker from a previous test exit at its next check. Callers
 /// hold the crate's global-state test lock.
@@ -381,13 +376,13 @@ mod tests {
         let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
         start(|| {});
-        let g1 = generation();
+        let g1 = generation_for_test();
         assert!(live_worker_count() >= 2);
         stop();
         assert_eq!(live_worker_count(), 0);
         assert!(is_stopped());
         start(|| {});
-        assert!(generation() > g1);
+        assert!(generation_for_test() > g1);
         assert!(!is_stopped());
         assert!(live_worker_count() >= 2);
         stop();

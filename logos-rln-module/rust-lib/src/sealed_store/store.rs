@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 use zeroize::Zeroizing;
 
 use crate::lifecycle::{
-    CacheFile, CacheState, MembershipRecord, MembershipState, StoredCredential, FORMAT_CACHE,
+    CacheFile, CacheState, MembershipRecord, MembershipState, StoredCredential,
 };
 use crate::rate_limit::{remaining, reserve_slot, AllocError, AllocationState, EpochAllocation};
 use crate::registry_id;
@@ -28,9 +28,6 @@ use crate::{ApiError, ErrorKind};
 /// `ApiError`, so the text carries the whole diagnosis on its own.
 #[derive(Debug)]
 pub enum OpenError {
-    /// The host stamped no instance persistence path (constructed by the
-    /// caller — `open` itself always receives a dir).
-    NoPersistencePath(String),
     DirLockHeld(String),
     OldFormatPresent(String),
     Unreadable(String),
@@ -39,8 +36,7 @@ pub enum OpenError {
 impl core::fmt::Display for OpenError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            OpenError::NoPersistencePath(m)
-            | OpenError::DirLockHeld(m)
+            OpenError::DirLockHeld(m)
             | OpenError::OldFormatPresent(m)
             | OpenError::Unreadable(m) => f.write_str(m),
         }
@@ -1113,9 +1109,8 @@ fn write_allocations(dir: &Path, inner: &mut Inner) -> Result<(), ApiError> {
 
 fn write_cache(dir: &Path, inner: &Inner) -> Result<(), ApiError> {
     let file = CacheFile {
-        format: FORMAT_CACHE.to_string(),
-        version: format::FORMAT_VERSION,
         entries: inner.cache.clone(),
+        ..CacheFile::new()
     };
     fs::write_atomic_loose_json(dir, format::CACHE_FILE, &file)
         .map_err(|e| ApiError::internal(&format!("cache save: {e}")))
