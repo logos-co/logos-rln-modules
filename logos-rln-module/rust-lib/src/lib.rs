@@ -761,9 +761,7 @@ fn register_impl(
     let hash = registry_id::membership_hash(&registry.canonical, &commitment);
     let credential = StoredCredential {
         identity_commitment: commitment_hex.clone(),
-        identity_nullifier: None,
         identity_secret_hash: secret_hash_hex,
-        identity_trapdoor: None,
         registry_id: registry.canonical.clone(),
     };
 
@@ -1799,9 +1797,7 @@ mod tests {
         };
         let credential = StoredCredential {
             identity_commitment: commitment_hex.to_string(),
-            identity_nullifier: None,
             identity_secret_hash: secret_hex.to_string(),
-            identity_trapdoor: None,
             registry_id: registry.to_string(),
         };
         store.insert(hash, identity, &credential, 100).expect("seed insert");

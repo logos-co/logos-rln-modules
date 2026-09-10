@@ -66,11 +66,7 @@ impl MembershipState {
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub(crate) struct StoredCredential {
     pub(crate) identity_commitment: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) identity_nullifier: Option<String>,
     pub(crate) identity_secret_hash: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) identity_trapdoor: Option<String>,
     /// Authenticated by the credential AEAD's AAD — no separate cross-check.
     pub(crate) registry_id: String,
 }
