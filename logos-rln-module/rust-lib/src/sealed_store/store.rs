@@ -101,7 +101,6 @@ struct Inner {
 /// The read-only publication: identity + cache + alloc + quarantine clones.
 struct Snapshot {
     records: BTreeMap<String, MembershipRecord>,
-    has_credentials: bool,
 }
 
 pub struct Store {
@@ -383,8 +382,11 @@ impl Store {
     /// to decide whether inventing a secret is safe: a store whose credentials
     /// are all quarantined (e.g. the allocations file was deleted) must NOT
     /// look fresh, or auto-unlock would generate a secret it can never verify.
+    /// Quarantine-independent by construction: build_snapshot inserts one
+    /// record per sealed credential whether or not it is quarantined, so an
+    /// all-quarantined store still answers true.
     pub fn has_credentials(&self) -> bool {
-        self.snapshot_arc().has_credentials
+        !self.snapshot_arc().records.is_empty()
     }
 
     pub fn is_provisioned(&self) -> bool {
@@ -1133,10 +1135,7 @@ fn build_snapshot(inner: &Inner) -> Snapshot {
             );
         }
     }
-    // Quarantine-independent: an all-quarantined store is still not fresh (see
-    // Store::has_credentials — the keychain auto-unlock safety gate).
-    let has_credentials = !records.is_empty();
-    Snapshot { records, has_credentials }
+    Snapshot { records }
 }
 
 #[cfg(test)]
