@@ -1583,12 +1583,9 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
                 prev.close();
             }
             *cell = StoreCell::Unready(
-                sealed_store::store::OpenError::NoPersistencePath(
-                    "no instance persistence path from the host — keystore ops are \
-                     disabled (no silent cwd fallback; see README)"
-                        .to_string(),
-                )
-                .to_string(),
+                "no instance persistence path from the host — keystore ops are \
+                 disabled (no silent cwd fallback; see README)"
+                    .to_string(),
             );
         } else {
             self.open_store(std::path::PathBuf::from(&ctx.instance_persistence_path));

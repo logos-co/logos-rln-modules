@@ -17,10 +17,6 @@ pub enum CryptoError {
     BadPassword,
     /// Hex/length problems in stored fields.
     Malformed(&'static str),
-    /// Header declares parameters this crate doesn't speak. Reserved for
-    /// format evolution — nothing constructs it yet.
-    #[allow(dead_code)]
-    Unsupported(&'static str),
     /// No CSPRNG available (seal/generate only).
     NoEntropy,
     /// KDF machinery rejected its inputs.
@@ -34,7 +30,6 @@ impl core::fmt::Display for CryptoError {
                 write!(f, "AEAD open failed (wrong password or tampered data)")
             }
             CryptoError::Malformed(what) => write!(f, "malformed {what}"),
-            CryptoError::Unsupported(what) => write!(f, "unsupported {what}"),
             CryptoError::NoEntropy => write!(f, "no CSPRNG available"),
             CryptoError::Kdf(what) => write!(f, "kdf failure: {what}"),
         }
