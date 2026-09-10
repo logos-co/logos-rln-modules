@@ -1,7 +1,7 @@
 //! RLN core logic — register/proof/funding planning and account decoding,
 //! called from `lib.rs` as plain Rust (no C ABI).
 
-use borsh::BorshDeserialize;
+use borsh::{BorshDeserialize, BorshSerialize};
 use rln_layouts::{
     combine_seeds, label_seed, u32_seed,
     MembershipState, TreeMainLayout, ROOT_HISTORY_SIZE,
@@ -147,11 +147,14 @@ fn derive_pda(program_id: &[u8; 32], pda_seed: &[u8; 32]) -> [u8; 32] {
     hash.into()
 }
 
-/// risc0-serde an instruction into its u32 words — the deployed programs'
-/// wire format (LE words on the wire); `send_generic_public_transaction`
-/// takes the words directly.
-fn serialize_instruction<T: Serialize>(instruction: &T) -> Result<Vec<u32>, RlnError> {
-    risc0_zkvm::serde::to_vec(instruction).map_err(|_| RlnError::SerializationError)
+/// Borsh-encode an instruction — the deployed programs' wire format.
+///
+/// LEZ v0.2.5 decodes a program's instruction with borsh and widened the
+/// instruction stream from `u32` words to plain bytes, so this and the guests
+/// have to flip together: a risc0-serde payload does not decode, and the
+/// mismatch shows up as a failed execution rather than a type error.
+fn serialize_instruction<T: BorshSerialize>(instruction: &T) -> Result<Vec<u8>, RlnError> {
+    borsh::to_vec(instruction).map_err(|_| RlnError::SerializationError)
 }
 
 /// Parse tree-main account data and return the valid roots.
@@ -419,13 +422,13 @@ pub fn register_plan(
     })
 }
 
-/// Build the `Instruction::Register` payload as risc0-serde u32 words.
+/// Build the `Instruction::Register` payload as borsh bytes.
 pub fn register_build_instruction(
     tree_id: &[u8; 32],
     id_commitment: &[u8; 32],
     rate_limit: u64,
     subtree_id: u32,
-) -> Result<Vec<u32>, RlnError> {
+) -> Result<Vec<u8>, RlnError> {
     let instruction = rln_layouts::Instruction::Register {
         tree_id: *tree_id,
         id_commitment: *id_commitment,
@@ -502,13 +505,13 @@ pub fn token_holding_info(data: &[u8]) -> Result<([u8; 32], u128), RlnError> {
 /// program-authorized — no human key).
 ///
 /// `program_owner`: the REGISTRATION program id (the claim tx targets this
-/// program). Returns `(payment_def_id, instruction_words)`; the tx account
+/// program). Returns `(payment_def_id, instruction_bytes)`; the tx account
 /// order is `[config, payment_def, dest (signer)]`.
 pub fn claim_plan(
     config_data: &[u8],
     program_owner: &[u8; 32],
     amount: u128,
-) -> Result<([u8; 32], Vec<u32>), RlnError> {
+) -> Result<([u8; 32], Vec<u8>), RlnError> {
     if config_data.len() < CONFIG_STATE_MIN_SIZE {
         return Err(RlnError::InvalidConfig);
     }
@@ -626,18 +629,46 @@ mod tests {
         );
     }
 
-    // Pins the Register instruction's word encoding (risc0-serde: variant
-    // index 3, one word per u8, u64 as lo/hi words).
+    // Pins the Register instruction's byte encoding (borsh: a one-byte variant
+    // discriminant, fixed-width arrays inline, integers little-endian).
+    //
+    // This is consensus wire format shared with the deployed guest, so a change
+    // here is a change the whole chain has to make at once. It used to be
+    // risc0-serde u32 words; LEZ v0.2.5 moved every program's instruction
+    // decoding to borsh.
     #[test]
-    fn register_instruction_words_pin() {
-        let words = register_build_instruction(&[0xAB; 32], &[0xCD; 32], 0x1_0000_0002, 7).unwrap();
-        assert_eq!(words.len(), 68);
-        assert_eq!(words[0], 3, "Register variant index");
-        assert_eq!(&words[1..33], &[0xABu32; 32], "tree_id, one word per byte");
-        assert_eq!(&words[33..65], &[0xCDu32; 32], "id_commitment");
-        assert_eq!(words[65], 2, "rate_limit low word");
-        assert_eq!(words[66], 1, "rate_limit high word");
-        assert_eq!(words[67], 7, "subtree_id");
+    fn register_instruction_bytes_pin() {
+        let bytes = register_build_instruction(&[0xAB; 32], &[0xCD; 32], 0x1_0000_0002, 7).unwrap();
+        assert_eq!(bytes.len(), 1 + 32 + 32 + 8 + 4);
+        assert_eq!(bytes[0], 3, "Register variant discriminant");
+        assert_eq!(&bytes[1..33], &[0xABu8; 32], "tree_id");
+        assert_eq!(&bytes[33..65], &[0xCDu8; 32], "id_commitment");
+        assert_eq!(
+            &bytes[65..73],
+            &[2, 0, 0, 0, 1, 0, 0, 0],
+            "rate_limit, little-endian u64"
+        );
+        assert_eq!(&bytes[73..77], &[7, 0, 0, 0], "subtree_id, little-endian u32");
+    }
+
+    // The guest decodes what this encodes, so the two must round-trip.
+    #[test]
+    fn register_instruction_round_trips_through_borsh() {
+        let bytes = register_build_instruction(&[0xAB; 32], &[0xCD; 32], 0x1_0000_0002, 7).unwrap();
+        let decoded = rln_layouts::Instruction::try_from_slice(&bytes).expect("decodes");
+        let rln_layouts::Instruction::Register {
+            tree_id,
+            id_commitment,
+            rate_limit,
+            subtree_id,
+        } = decoded
+        else {
+            panic!("expected a Register instruction");
+        };
+        assert_eq!(tree_id, [0xAB; 32]);
+        assert_eq!(id_commitment, [0xCD; 32]);
+        assert_eq!(rate_limit, 0x1_0000_0002);
+        assert_eq!(subtree_id, 7);
     }
 
     #[test]

@@ -384,26 +384,55 @@ fn resolve_config_context(config_account_id: &str, who: &str) -> Option<RlnConfi
     })
 }
 
-/// The risc0-serde u32 instruction words as the JSON array
-/// `send_generic_public_transaction` expects.
-fn words_to_json(words: &[u32]) -> Vec<serde_json::Value> {
-    words.iter().map(|&w| serde_json::Value::from(w)).collect()
+/// Borsh instruction bytes in the shape the module protocol carries a byte
+/// array: `{"_bytes": "<base64url, unpadded>"}`.
+///
+/// The instruction stream used to be `u32` words and travelled as a plain JSON
+/// array. LEZ v0.2.5 made it bytes, and the wallet module's parameter changed
+/// with it, so a JSON array of numbers no longer binds.
+fn bytes_to_json(bytes: &[u8]) -> serde_json::Value {
+    serde_json::json!({ "_bytes": base64url(bytes) })
 }
 
-/// Submit one `send_generic_public_transaction` — the frozen 4-element args
-/// array `[account_ids, signing_reqs, instruction_words, program_id]` — with
+/// Unpadded base64url, per the module protocol's byte-argument encoding.
+fn base64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        let indices = [
+            (triple >> 18) & 0x3F,
+            (triple >> 12) & 0x3F,
+            (triple >> 6) & 0x3F,
+            triple & 0x3F,
+        ];
+        // 3 input bytes make 4 output characters; 2 make 3, and 1 makes 2.
+        for index in indices.iter().take(chunk.len() + 1) {
+            out.push(ALPHABET[*index as usize] as char);
+        }
+    }
+    out
+}
+
+/// Submit one `send_generic_public_transaction` — the args array
+/// `[account_ids, signing_reqs, instruction, program_id, payer]` — with
 /// the 180s tx timeout (a sequencer submit can far outlive the 20s protocol
 /// default). `None` = failed, already logged.
 fn send_generic_tx(
     who: &str,
     account_ids: Vec<String>,
     signing_reqs: Vec<bool>,
-    instruction_words: Vec<serde_json::Value>,
+    instruction: serde_json::Value,
     program_id_hex: String,
+    payer_hex: String,
 ) -> Option<String> {
     let send_result = wallet_call(
         "send_generic_public_transaction",
-        &serde_json::json!([account_ids, signing_reqs, instruction_words, program_id_hex]),
+        &serde_json::json!([account_ids, signing_reqs, instruction, program_id_hex, payer_hex]),
         TX_TIMEOUT,
     );
     if send_result.is_empty() {
@@ -764,7 +793,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
                 return String::new();
             }
         };
-        let instruction_words = words_to_json(&instruction);
+        let instruction = bytes_to_json(&instruction);
 
         // Account order must match methods/guest/src/program.rs::register:
         //   config, tree_main, user_holding (signer), treasury, bottom_subtree,
@@ -784,12 +813,15 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             .map(|a| *a == user_holding_hex)
             .collect();
 
+        // The account that authorizes the spend also covers the fee, so it has
+        // to hold native balance as well as tokens.
         let Some(send_result) = send_generic_tx(
             "register_member",
             account_ids,
             signing_reqs,
-            instruction_words,
+            instruction,
             bytes_to_hex(&ctx.program_owner),
+            user_holding_hex.clone(),
         ) else {
             reg_in_flight(|m| m.remove(&reg_key));
             return String::new();
@@ -834,10 +866,11 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         // Submitted under the REGISTRATION program (the config's program_owner).
         let Some(send_result) = send_generic_tx(
             "claim_tokens",
-            vec![ctx.config_hex.clone(), payment_def_hex.clone(), dest_hex],
+            vec![ctx.config_hex.clone(), payment_def_hex.clone(), dest_hex.clone()],
             vec![false, false, true],
-            words_to_json(&instruction),
+            bytes_to_json(&instruction),
             bytes_to_hex(&ctx.program_owner),
+            dest_hex,
         ) else {
             return String::new();
         };
