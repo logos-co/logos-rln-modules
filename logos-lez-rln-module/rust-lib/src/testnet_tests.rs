@@ -443,7 +443,8 @@ fn base58_roundtrip_matches_known_vector() {
     let clock = rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES;
     let encoded = b58_encode(&clock);
     assert_eq!(b58_decode32(&encoded), clock);
-    // Pinned against the deployment record's config account.
+    // A fixed vector, not a live account: it pins the base58 alphabet and
+    // the leading-zero handling, and belongs to no deployment record.
     assert_eq!(
         bytes_to_hex(&b58_decode32("Ds9aBzioxnDf6yfUnCHGS7evBnpMnknyJgiMEJcV7uVG")),
         "bf24f9e9f0440d7c7268cfc5ce6edb981feda003104c9d96ca276443ccc0a607"

@@ -40,9 +40,10 @@
 //! periodic reads.
 
 // Author code is unsafe-free: every outbound call goes through the SDK's
-// safe surface (`modules()`, `PluginProxy`). The only `unsafe` in this crate
-// is the generated module-impl scaffold, which owns the C ABI and is exempted
-// where it is included.
+// safe surface (`modules()`, `PluginProxy`). Three sites are exempted from
+// `deny(unsafe_code)`, all C-ABI boundaries rather than logic: the generated
+// module-impl scaffold, the panic-hook install it wraps, and the test-only
+// link stubs that stand in for the host's `lp_*` symbols.
 #![deny(unsafe_code)]
 
 use std::sync::{Arc, Mutex, Weak};

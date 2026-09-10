@@ -22,9 +22,10 @@
 //! serialize every in-flight call behind one nested wait.
 
 // Author code is unsafe-free: every outbound call goes through the SDK's
-// safe `PluginProxy`. The only `unsafe` in this crate is the generated
-// module-impl scaffold, which owns the C ABI and is exempted where it is
-// included.
+// safe `PluginProxy`. Three sites are exempted from `deny(unsafe_code)`, all
+// of them C-ABI boundaries rather than logic: the generated module-impl
+// scaffold, the install hook it resolves by linkage, and the test-only link
+// stubs that stand in for the host's `lp_*` symbols.
 #![deny(unsafe_code)]
 
 use std::sync::{mpsc, Arc, Mutex};
@@ -319,18 +320,18 @@ fn fetch_account_data(account_id_hex: &str, owner_out: Option<&mut Vec<u8>>) -> 
         READ_TIMEOUT,
     );
     if json.is_empty() {
-        eprintln!("fetchAccountData failed: empty response for {account_id_hex}");
+        eprintln!("fetch_account_data failed: empty response for {account_id_hex}");
         return None;
     }
     let parsed = serde_json::from_str::<serde_json::Value>(&json).ok();
     let Some(obj) = parsed.as_ref().and_then(|v| v.as_object()) else {
         let head: String = json.chars().take(200).collect();
-        eprintln!("fetchAccountData failed: not a JSON object for {account_id_hex} got: {head}");
+        eprintln!("fetch_account_data failed: not a JSON object for {account_id_hex} got: {head}");
         return None;
     };
     let data_hex = obj.get("data").and_then(|v| v.as_str()).unwrap_or("");
     if data_hex.is_empty() {
-        eprintln!("fetchAccountData failed: empty data for {account_id_hex}");
+        eprintln!("fetch_account_data failed: empty data for {account_id_hex}");
         return None;
     }
     if let Some(owner_out) = owner_out {
@@ -343,7 +344,7 @@ fn fetch_account_data(account_id_hex: &str, owner_out: Option<&mut Vec<u8>>) -> 
                 Some(owner) => *owner_out = owner,
                 None => {
                     let head: String = owner_hex.chars().take(80).collect();
-                    eprintln!("fetchAccountData: malformed program_owner hex: {head}");
+                    eprintln!("fetch_account_data: malformed program_owner hex: {head}");
                     return None;
                 }
             }
@@ -461,7 +462,7 @@ fn derive_register_plan(
     ) {
         Ok(plan) => Some(plan),
         Err(e) => {
-            eprintln!("{who}: register_plan FFI failed: {e}");
+            eprintln!("{who}: register_plan failed: {e}");
             None
         }
     }
@@ -506,7 +507,7 @@ fn get_valid_roots_impl(rln_account_id_hex: &str) -> String {
     let plan = match native::merkle_proofs_plan(&ctx.config_data, &ctx.program_owner, &[]) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("get_valid_roots: merkle_proofs_plan FFI error: {e}");
+            eprintln!("get_valid_roots: merkle_proofs_plan failed: {e}");
             return String::new();
         }
     };
@@ -520,7 +521,7 @@ fn get_valid_roots_impl(rln_account_id_hex: &str) -> String {
     let roots = match native::get_valid_roots(&main_data) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("get_valid_roots: get_valid_roots FFI error: {e}");
+            eprintln!("get_valid_roots: valid_roots_from_main failed: {e}");
             return String::new();
         }
     };
@@ -560,7 +561,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
     {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("get_merkle_proofs: plan FFI error: {e}");
+            eprintln!("get_merkle_proofs: merkle_proofs_plan failed: {e}");
             return String::new();
         }
     };
@@ -569,7 +570,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
     // subtree reads are bracketed by two main-account fetches; equal
     // valid_roots windows prove no mutation occurred and the (main, subtree)
     // pair is consistent.
-    const K_MAX_SNAPSHOT_ATTEMPTS: usize = 5;
+    const MAX_SNAPSHOT_ATTEMPTS: usize = 5;
     let main_hex = bytes_to_hex(&plan.main_account_id);
     let subtree_count = plan.subtree_count as usize;
 
@@ -577,7 +578,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
     let mut stable_roots: Vec<[u8; 32]> = Vec::new();
     let mut consistent = false;
 
-    for attempt in 0..K_MAX_SNAPSHOT_ATTEMPTS {
+    for attempt in 0..MAX_SNAPSHOT_ATTEMPTS {
         // Snapshot A — opens the read window.
         let Some(main_data) = fetch_account_data(&main_hex, None) else {
             eprintln!("get_merkle_proofs: failed to fetch main account {main_hex}");
@@ -586,7 +587,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
         let roots_a = match native::get_valid_roots(&main_data) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("get_merkle_proofs: get_valid_roots(A) FFI error: {e}");
+                eprintln!("get_merkle_proofs: valid_roots(A) failed: {e}");
                 return String::new();
             }
         };
@@ -622,7 +623,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
         let roots_b = match native::get_valid_roots(&main_data_b) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("get_merkle_proofs: get_valid_roots(B) FFI error: {e}");
+                eprintln!("get_merkle_proofs: valid_roots(B) failed: {e}");
                 return String::new();
             }
         };
@@ -641,7 +642,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
         proofs = match native::merkle_proofs_exec(&main_data, &subtree_refs, &leaf_indices) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("get_merkle_proofs: exec FFI error: {e}");
+                eprintln!("get_merkle_proofs: merkle_proofs_exec failed: {e}");
                 return String::new();
             }
         };
@@ -654,7 +655,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
         // Never ship an internally-inconsistent proof (the poller keeps its
         // previous consistent cachedProof instead).
         eprintln!(
-            "get_merkle_proofs: no consistent tree snapshot after {K_MAX_SNAPSHOT_ATTEMPTS} attempts"
+            "get_merkle_proofs: no consistent tree snapshot after {MAX_SNAPSHOT_ATTEMPTS} attempts"
         );
         return String::new();
     }
@@ -759,7 +760,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         ) {
             Ok(words) => words,
             Err(e) => {
-                eprintln!("register_member: build_instruction FFI error: {e}");
+                eprintln!("register_member: register_build_instruction failed: {e}");
                 reg_in_flight(|m| m.remove(&reg_key));
                 return String::new();
             }
@@ -877,9 +878,9 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         }
     }
 
-    // ---- v1.1 additive surface (see the lidl): registry-provider reads for
-    // the membership management module. Same conventions as the frozen
-    // methods: "" = error, compact alphabetical JSON otherwise.
+    // ---- registry-provider reads, consumed by the membership management
+    // module. Same conventions as the rest of the contract: "" = error,
+    // compact alphabetical JSON otherwise.
 
     fn get_membership(&self, config_account_id: String, id_commitment_hex: String) -> String {
         let Some(id_commitment) = hex_to_bytes32(&id_commitment_hex) else {
