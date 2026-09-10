@@ -14,7 +14,7 @@ use std::sync::Mutex;
 
 use crate::provider::RegistryProvider;
 use crate::registry_id::CanonicalRegistryId;
-use crate::{json_str_array, json_u8_array, lock, ApiError};
+use crate::{lock, ApiError, ErrorKind};
 
 struct CachedPath {
     path_elements_hex: Vec<String>,
@@ -23,6 +23,27 @@ struct CachedPath {
 }
 
 static PATHS: Mutex<Option<HashMap<String, CachedPath>>> = Mutex::new(None);
+
+
+/// Decode one field of a provider `get_merkle_proof` reply, so a cache hit
+/// and a cache miss build identically-shaped witnesses.
+fn json_str_array(v: &serde_json::Value, key: &str) -> Result<Vec<String>, ApiError> {
+    v.get(key)
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|e| e.as_str().map(String::from)).collect())
+        .ok_or_else(|| {
+            ApiError::new(ErrorKind::ProviderFailure, &format!("merkle proof missing {key}"))
+        })
+}
+
+fn json_u8_array(v: &serde_json::Value, key: &str) -> Result<Vec<u8>, ApiError> {
+    v.get(key)
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|e| e.as_u64().map(|n| n as u8)).collect())
+        .ok_or_else(|| {
+            ApiError::new(ErrorKind::ProviderFailure, &format!("merkle proof missing {key}"))
+        })
+}
 
 /// The cached path for `hash`, or `None` on a cold cache or a leaf_index
 /// mismatch (the stale-leaf guard). Miss fallback: [`fill_path_cache`].

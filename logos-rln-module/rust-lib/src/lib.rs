@@ -358,34 +358,22 @@ struct DelegatedOptions {
     auth_args: Option<String>,
 }
 
-/// Read a RegistryOptions flat boolean field: the spec's char* key/value
-/// pairs make every value a JSON string, so "true" is the only truthy
-/// spelling and a JSON bool is a type error, not a coercion.
-fn flat_bool_option(options: &serde_json::Value, key: &str) -> Result<bool, ApiError> {
-    match options.get(key) {
-        Some(serde_json::Value::Bool(_)) => Err(ApiError::new(
-            ErrorKind::InvalidArgument,
-            &format!(
-                "options_json.{key} must be the string \"true\"/\"false\", not a JSON boolean"
-            ),
-        )),
-        Some(v) => Ok(v.as_str() == Some("true")),
-        None => Ok(false),
-    }
+/// Read a RegistryOptions flat boolean field. `parse_registry_options` has
+/// already rejected every non-string value and stored each pair as a
+/// `Value::String`, so the only question left is which string: the spec's
+/// char* pairs make "true" the one truthy spelling.
+fn flat_bool_option(options: &serde_json::Value, key: &str) -> bool {
+    options.get(key).and_then(|v| v.as_str()) == Some("true")
 }
 
-/// Read a RegistryOptions flat string field: absent and "" both mean unset;
-/// any non-string JSON value is a type error.
-fn flat_str_option(options: &serde_json::Value, key: &str) -> Result<Option<String>, ApiError> {
-    match options.get(key) {
-        None => Ok(None),
-        Some(serde_json::Value::String(s)) if s.is_empty() => Ok(None),
-        Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
-        Some(_) => Err(ApiError::new(
-            ErrorKind::InvalidArgument,
-            &format!("options_json.{key} must be a string (flat char* option)"),
-        )),
-    }
+/// Read a RegistryOptions flat string field; absent and "" both mean unset.
+/// String-typed by construction — see `flat_bool_option`.
+fn flat_str_option(options: &serde_json::Value, key: &str) -> Option<String> {
+    options
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 /// Applied when the common "rate_limit" option key is absent (spec: "absent,
@@ -633,7 +621,7 @@ fn register_impl(
     // vocabulary). Validated up front so a malformed request never mints a
     // credential.
     let (rate_limit, opts) = parse_registry_options(options_json)?;
-    let delegated = if flat_bool_option(&opts, "delegated")? {
+    let delegated = if flat_bool_option(&opts, "delegated") {
         Some(DelegatedOptions {
             gifter_peer_id: opts
                 .get("gifter_peer_id")
@@ -645,10 +633,10 @@ fn register_impl(
                 .and_then(|x| x.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            auth_type: flat_str_option(&opts, "auth_type")?,
-            auth_payload: flat_str_option(&opts, "auth_payload")?,
-            auth_provider: flat_str_option(&opts, "auth_provider")?,
-            auth_args: flat_str_option(&opts, "auth_args")?,
+            auth_type: flat_str_option(&opts, "auth_type"),
+            auth_payload: flat_str_option(&opts, "auth_payload"),
+            auth_provider: flat_str_option(&opts, "auth_provider"),
+            auth_args: flat_str_option(&opts, "auth_args"),
         })
     } else {
         None
@@ -827,11 +815,12 @@ fn get_membership_state_impl(
     let (registry, _, rln_id_hex) = parse_scope(registry_id_raw, rln_identifier_hex)?;
     let prov = provider_of(&registry)?;
 
-    // A missing store (no persistence path) degrades to no local records.
-    let records = store
-        .as_ref()
-        .map(|s| records_for_registry(s, &registry))
-        .unwrap_or_default();
+    // A missing store (no persistence path) degrades to no local records,
+    // which the empty-candidates arm below answers as `unknown`.
+    let Ok(store) = store else {
+        return ok_json(views::MembershipStateView::unknown(&registry.canonical));
+    };
+    let records = records_for_registry(&store, &registry);
     let candidates: Vec<_> = scope_candidates(&records, &rln_id_hex)
         .into_iter()
         .filter(|r| !r.quarantined)
@@ -845,8 +834,6 @@ fn get_membership_state_impl(
             "multiple memberships back this scope; use get_memberships / select_membership",
         ));
     }
-    // Records exist, so the store does too.
-    let store = store?;
     let record = &candidates[0];
     let hash = &record.hash;
 
@@ -1163,27 +1150,6 @@ fn proof_error(e: proof::ProofError) -> ApiError {
         proof::ProofError::BadInput(m) => ApiError::new(ErrorKind::InvalidArgument, &m),
         proof::ProofError::Engine(m) => ApiError::new(ErrorKind::Transient, &m),
     }
-}
-
-/// Decode one field of a provider `get_merkle_proof` reply. Shared with
-/// `path_cache.rs` so cache hits and misses build identically-shaped
-/// witnesses.
-pub(crate) fn json_str_array(v: &serde_json::Value, key: &str) -> Result<Vec<String>, ApiError> {
-    v.get(key)
-        .and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|e| e.as_str().map(String::from)).collect())
-        .ok_or_else(|| {
-            ApiError::new(ErrorKind::ProviderFailure, &format!("merkle proof missing {key}"))
-        })
-}
-
-pub(crate) fn json_u8_array(v: &serde_json::Value, key: &str) -> Result<Vec<u8>, ApiError> {
-    v.get(key)
-        .and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|e| e.as_u64().map(|n| n as u8)).collect())
-        .ok_or_else(|| {
-            ApiError::new(ErrorKind::ProviderFailure, &format!("merkle proof missing {key}"))
-        })
 }
 
 /// Spec generate_proof(scope, signal, timestamp): pick the scope's usable
