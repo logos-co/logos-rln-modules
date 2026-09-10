@@ -10,6 +10,14 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
+    # Overrides lez_core's own pin, which predates the crates.io fetch fix
+    # (logos-execution-zone#876). Drop once lez_core bumps past it.
+    logos-execution-zone.url = "github:logos-blockchain/logos-execution-zone?ref=dev";
+    # Name matches metadata.json#dependencies; the builder resolves by name.
+    lez_core = {
+      url = "github:logos-blockchain/logos-execution-zone-module?rev=0ea57f8a1c57539d6ee0961a9cd27b064685b9e8";
+      inputs.logos-execution-zone.follows = "logos-execution-zone";
+    };
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:
@@ -38,6 +46,9 @@
         in m // {
           liblogos_lez_rln_module = m.default;
         });
+
+      # The builder walks a dependency's config + inputs to bundle the chain.
+      inherit (module) config;
 
       # `nix run .#generate` materialises the two gitignored inputs rust-lib/
       # references: the provider scaffold at rust-lib/generated/ and the SDK

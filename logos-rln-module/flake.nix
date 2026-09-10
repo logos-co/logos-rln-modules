@@ -10,6 +10,10 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
+    # Name matches metadata.json#dependencies; the builder resolves by name.
+    # Not path:../ — a relative input resolves against the store root once a
+    # consumer walks the chain transitively, and evaluation fails.
+    liblogos_lez_rln_module.url = "git+https://github.com/logos-co/logos-rln-modules?ref=fix/module-dep-chain-resolution&dir=logos-lez-rln-module";
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:
@@ -36,6 +40,9 @@
         in m // {
           liblogos_rln_module = m.default;
         });
+
+      # The builder walks a dependency's config + inputs to bundle the chain.
+      inherit (module) config;
 
       # `nix run .#generate` materialises the two gitignored inputs rust-lib/
       # references: the provider scaffold at rust-lib/generated/ and the SDK
