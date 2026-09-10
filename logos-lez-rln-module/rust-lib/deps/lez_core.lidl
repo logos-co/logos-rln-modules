@@ -9,11 +9,11 @@
 ; account_id_from_base58; fetch_account_data* -> get_account_public;
 ; register_member / claim_tokens ->
 ; send_generic_public_transaction. The caller passes
-; account_ids/signing_requirements/instruction as QVariant-wrapped
-; QVariantLists and treats an EMPTY string return as failure.
+; account_ids/signing_requirements as QVariant-wrapped QVariantLists and the
+; instruction as bytes, and treats an EMPTY string return as failure.
 ; Original C++ call-site evidence: git show 4b403c1:logos-lez-rln-module/src/logos_lez_rln_module.cpp
 module lez_core {
-  version "0.4.0"
+  version "0.4.1"
 
   ; Decode a base58 account id to 64 hex chars; empty string on failure.
   method account_id_from_base58(base58_str: tstr) -> tstr description "Decode a base58 account id to 64 hex chars; empty string on failure."
@@ -23,10 +23,16 @@ module lez_core {
   ; membership/config state out of data.
   method get_account_public(account_id_hex: tstr) -> tstr description "Fetch public account state as JSON {program_owner, balance, nonce, data} (all hex); empty string on failure."
 
-  ; instruction is a list of u32 words (borsh Vec<u32> LE re-packed by the
-  ; caller); typed `any` because today's C++ codegen maps
-  ; std::vector<uint32_t> to the opaque QVariant. Success returns JSON
-  ; {success, tx_hash, secrets, error}; failure returns {success, tx_hash,
-  ; error} (no secrets key) or the empty string if the QtRO call itself dies.
-  method send_generic_public_transaction(account_ids: [tstr], signing_requirements: [bool], instruction: any, program_id_hex: tstr) -> tstr description "Submit a generic public transaction: parallel account_ids/signing_requirements arrays, u32-word instruction stream, 32-byte program id hex. Returns JSON {success, tx_hash, secrets, error} (no secrets key on failure)."
+  ; instruction is the borsh encoding of the program's Instruction enum. It
+  ; was a list of u32 words until LEZ v0.2.5 moved every program's instruction
+  ; decoding to borsh and widened the stream to bytes.
+  ;
+  ; payer_account_id_hex names the account the fee is drawn from; empty means
+  ; let the wallet choose. v0.2.5 charges a fee on every non-exempt public
+  ; transaction and drops those that carry none.
+  ;
+  ; Success returns JSON {success, tx_hash, secrets, error}; failure returns
+  ; {success, tx_hash, error} (no secrets key) or the empty string if the QtRO
+  ; call itself dies.
+  method send_generic_public_transaction(account_ids: [tstr], signing_requirements: [bool], instruction: bstr, program_id_hex: tstr, payer_account_id_hex: tstr) -> tstr description "Submit a generic public transaction: parallel account_ids/signing_requirements arrays, borsh instruction bytes, 32-byte program id hex, and the account the fee is drawn from. Returns JSON {success, tx_hash, secrets, error} (no secrets key on failure)."
 }

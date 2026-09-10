@@ -384,40 +384,6 @@ fn resolve_config_context(config_account_id: &str, who: &str) -> Option<RlnConfi
     })
 }
 
-/// Borsh instruction bytes in the shape the module protocol carries a byte
-/// array: `{"_bytes": "<base64url, unpadded>"}`.
-///
-/// The instruction stream used to be `u32` words and travelled as a plain JSON
-/// array. LEZ v0.2.5 made it bytes, and the wallet module's parameter changed
-/// with it, so a JSON array of numbers no longer binds.
-fn bytes_to_json(bytes: &[u8]) -> serde_json::Value {
-    serde_json::json!({ "_bytes": base64url(bytes) })
-}
-
-/// Unpadded base64url, per the module protocol's byte-argument encoding.
-fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        let indices = [
-            (triple >> 18) & 0x3F,
-            (triple >> 12) & 0x3F,
-            (triple >> 6) & 0x3F,
-            triple & 0x3F,
-        ];
-        // 3 input bytes make 4 output characters; 2 make 3, and 1 makes 2.
-        for index in indices.iter().take(chunk.len() + 1) {
-            out.push(ALPHABET[*index as usize] as char);
-        }
-    }
-    out
-}
-
 /// Submit one `send_generic_public_transaction` — the args array
 /// `[account_ids, signing_reqs, instruction, program_id, payer]` — with
 /// the 180s tx timeout (a sequencer submit can far outlive the 20s protocol
@@ -793,7 +759,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
                 return String::new();
             }
         };
-        let instruction = bytes_to_json(&instruction);
+        let instruction = logos_rust_sdk::bytes::encode(&instruction);
 
         // Account order must match methods/guest/src/program.rs::register:
         //   config, tree_main, user_holding (signer), treasury, bottom_subtree,
@@ -868,7 +834,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             "claim_tokens",
             vec![ctx.config_hex.clone(), payment_def_hex.clone(), dest_hex.clone()],
             vec![false, false, true],
-            bytes_to_json(&instruction),
+            logos_rust_sdk::bytes::encode(&instruction),
             bytes_to_hex(&ctx.program_owner),
             dest_hex,
         ) else {
