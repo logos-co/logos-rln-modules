@@ -1171,21 +1171,12 @@ fn generate_proof_impl(
     let (registry, rln_identifier, rln_id_hex) =
         parse_scope(registry_id_raw, rln_identifier_hex)?;
     let prov = provider_of(&registry)?;
-    // Readiness gate FIRST (spec: not_ready before anything else).
-    let (size, gap) = epoch_params_for(&registry.canonical)?;
-    // The epoch derives from the CONSUMER's timestamp — the value stamped on
-    // the message — so the receiver's timestamp->epoch check lines up by
-    // construction.
-    let epoch = epoch_of_timestamp(timestamp, size)?;
-    // A stale or future timestamp fails fast instead of minting a proof the
-    // verifier would reject as not fresh.
-    let now_epoch = rate_limit::current_epoch(now_unix(), size);
-    if !epoch_in_window(epoch, now_epoch, gap) {
-        return Err(ApiError::new(
-            ErrorKind::InvalidArgument,
-            "timestamp is outside the acceptable epoch window (now ± max_epoch_gap)",
-        ));
-    }
+    // Readiness gate FIRST (spec: not_ready before anything else). The epoch
+    // derives from the CONSUMER's timestamp — the value stamped on the
+    // message — so the receiver's timestamp->epoch check lines up by
+    // construction, and a stale or future one fails fast instead of minting
+    // a proof the verifier would reject as not fresh.
+    let (epoch, size, gap, now_epoch) = fresh_epoch_for(&registry.canonical, timestamp)?;
     let signal = registry_id::hex_to_vec(signal_hex)
         .ok_or_else(|| ApiError::new(ErrorKind::InvalidArgument, "signal must be hex"))?;
 
@@ -1276,6 +1267,26 @@ fn epoch_of_timestamp(timestamp: &str, epoch_size_sec: u64) -> Result<u64, ApiEr
 /// acceptable when within now ± max_epoch_gap of the module clock.
 fn epoch_in_window(epoch: u64, now_epoch: u64, gap: u64) -> bool {
     (now_epoch.saturating_sub(gap)..=now_epoch.saturating_add(gap)).contains(&epoch)
+}
+
+/// The readiness + freshness gate `generate_proof` and `get_epoch_quota`
+/// share: resolve the registry's epoch parameters, derive the caller's epoch
+/// from its timestamp, and refuse a stale or future one. The two must agree
+/// — a timestamp generate_proof would refuse is refused by the quota read
+/// too (spec: permanent) — so the rule has one home. Returns the caller's
+/// epoch and the observation it was checked against: `(epoch, size, gap,
+/// now_epoch)`.
+fn fresh_epoch_for(registry: &str, timestamp: &str) -> Result<(u64, u64, u64, u64), ApiError> {
+    let (size, gap) = epoch_params_for(registry)?;
+    let epoch = epoch_of_timestamp(timestamp, size)?;
+    let now_epoch = rate_limit::current_epoch(now_unix(), size);
+    if !epoch_in_window(epoch, now_epoch, gap) {
+        return Err(ApiError::new(
+            ErrorKind::InvalidArgument,
+            "timestamp is outside the acceptable epoch window (now ± max_epoch_gap)",
+        ));
+    }
+    Ok((epoch, size, gap, now_epoch))
 }
 
 /// Whether a proof is bound to `expected_epoch` — the epoch derived from
@@ -1415,15 +1426,7 @@ fn get_epoch_quota_impl(
     provider_of(&registry)?;
     // Readiness gate FIRST. The single epoch observation is fixed by the
     // caller's timestamp: taken once, it keys the remaining lookup.
-    let (size, gap) = epoch_params_for(&registry.canonical)?;
-    let epoch_index = epoch_of_timestamp(timestamp, size)?;
-    let now_epoch = rate_limit::current_epoch(now_unix(), size);
-    if !epoch_in_window(epoch_index, now_epoch, gap) {
-        return Err(ApiError::new(
-            ErrorKind::InvalidArgument,
-            "timestamp is outside the acceptable epoch window (now ± max_epoch_gap)",
-        ));
-    }
+    let (epoch_index, size, ..) = fresh_epoch_for(&registry.canonical, timestamp)?;
 
     let store = store?;
     let records = records_for_registry(&store, &registry);
