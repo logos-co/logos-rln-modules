@@ -11,7 +11,9 @@
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
     # Name matches metadata.json#dependencies; the builder resolves by name.
-    liblogos_lez_rln_module.url = "path:../logos-lez-rln-module";
+    # Not path:../ — a relative input resolves against the store root once a
+    # consumer walks the chain transitively, and evaluation fails.
+    liblogos_lez_rln_module.url = "git+https://github.com/logos-co/logos-rln-modules?ref=fix/module-dep-chain-resolution&dir=logos-lez-rln-module";
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:

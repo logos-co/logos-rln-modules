@@ -500,14 +500,21 @@
         "logos-module-builder": "logos-module-builder_11"
       },
       "locked": {
-        "path": "../logos-lez-rln-module",
-        "type": "path"
+        "dir": "logos-lez-rln-module",
+        "lastModified": 1789032849,
+        "narHash": "sha256-UhHxJ4mMDIDdD1xcL0c6DZhbnP7GPlyqtCAgr3xolgA=",
+        "ref": "fix/module-dep-chain-resolution",
+        "rev": "12b841c759b44cda20cbd88c8e390e16fd6b81ac",
+        "revCount": 59,
+        "type": "git",
+        "url": "https://github.com/logos-co/logos-rln-modules"
       },
       "original": {
-        "path": "../logos-lez-rln-module",
-        "type": "path"
-      },
-      "parent": []
+        "dir": "logos-lez-rln-module",
+        "ref": "fix/module-dep-chain-resolution",
+        "type": "git",
+        "url": "https://github.com/logos-co/logos-rln-modules"
+      }
     },
     "logos-blockchain-circuits": {
       "inputs": {
