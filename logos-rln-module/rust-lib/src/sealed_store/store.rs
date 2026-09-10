@@ -19,7 +19,7 @@ use crate::sealed_store::format::{
     self, AllocRow, AllocationsFile, IdentityBlock, SealedEntry, SealedFile, Section,
 };
 use crate::sealed_store::fs;
-use crate::sealed_store::hex::{bytes_to_hex, hex_to_vec};
+use crate::registry_id::{bytes_to_hex, hex_to_vec};
 use crate::{ApiError, ErrorKind};
 
 // ------------------------------------------------------------------- opening
@@ -334,7 +334,7 @@ impl Store {
         if !inner.raw_sections.is_empty() {
             let mut stored_macs = BTreeMap::new();
             for (hash, s) in &inner.raw_sections {
-                if let Some(m) = hex_to_vec(&s.mac).and_then(|v| <[u8; 32]>::try_from(v).ok()) {
+                if let Some(m) = registry_id::hex_to_bytes32(&s.mac) {
                     stored_macs.insert(hash.clone(), m);
                 }
             }
@@ -954,7 +954,7 @@ fn load_allocations(
             "the allocations file's store_uuid does not match the sealed header (a foreign \
              or partially restored file)",
         );
-        let root = hex_to_vec(&file.root_mac).and_then(|v| <[u8; 32]>::try_from(v).ok());
+        let root = registry_id::hex_to_bytes32(&file.root_mac);
         return LoadedAllocations {
             sections: BTreeMap::new(),
             raw_sections: file.sections,
@@ -997,7 +997,7 @@ fn load_allocations(
             }
         }
     }
-    let root = hex_to_vec(&file.root_mac).and_then(|v| <[u8; 32]>::try_from(v).ok());
+    let root = registry_id::hex_to_bytes32(&file.root_mac);
     LoadedAllocations { sections, raw_sections: file.sections, root_mac_raw: root }
 }
 
@@ -1092,9 +1092,7 @@ fn write_allocations(dir: &Path, inner: &mut Inner) -> Result<(), ApiError> {
                 mac: bytes_to_hex(&mac),
             }
         };
-        let mac_bytes = hex_to_vec(&section.mac)
-            .and_then(|v| <[u8; 32]>::try_from(v).ok())
-            .unwrap_or([0u8; 32]);
+        let mac_bytes = registry_id::hex_to_bytes32(&section.mac).unwrap_or([0u8; 32]);
         macs.insert(hash.clone(), mac_bytes);
         sections.insert(hash.clone(), section);
     }

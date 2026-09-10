@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::sealed_store::hex::{bytes_to_hex, hex_to_vec};
+use crate::registry_id::{bytes_to_hex, hex_to_vec};
 
 #[derive(Debug)]
 pub enum CryptoError {

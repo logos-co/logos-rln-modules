@@ -211,7 +211,7 @@ pub fn detect(dir: &Path) -> FormatPresence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sealed_store::hex::bytes_to_hex;
+    use crate::registry_id::bytes_to_hex;
 
     const UUID: [u8; 16] = [
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
