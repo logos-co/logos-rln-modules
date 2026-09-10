@@ -123,7 +123,7 @@ likewise accepted and never funds the holding — the credit is polled with a
 
 - `ui-tests.mjs` — 5 hermetic static-chrome checks (no bridge → the
   deterministic onboarding fallback).
-- `flow-tests.mjs` — 15 deterministic state-machine scenarios driven by a
+- `flow-tests.mjs` — 14 deterministic state-machine scenarios driven by a
   scripted **mock bridge**. `Main.qml`'s `bridgeOverride` (null in
   production) is injected via the inspector's `evaluate` command with a JS
   object whose `callModuleAsync` replies from a fixture table matching the

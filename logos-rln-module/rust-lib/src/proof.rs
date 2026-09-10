@@ -762,6 +762,8 @@ mod tests {
         let json = proof.to_json();
         let restored = RateLimitProof::from_json(&json).expect("from_json");
         assert_eq!(restored.root(), root);
+        assert_eq!(proof.epoch(), Some(42));
+        assert_eq!(restored.epoch(), Some(42), "the epoch survives the round trip");
         assert!(verify(&restored, b"signal", &[root]).expect("verify"));
     }
 
@@ -790,17 +792,6 @@ mod tests {
         let mut tampered = canonical;
         tampered[20] = 0xff;
         assert_eq!(epoch_from_bytes(&tampered), None);
-    }
-
-    #[test]
-    fn epoch_survives_generate_and_json_roundtrip() {
-        let material = material_from_seed(&[3u8; 32], 100, 1);
-        let rln_id = [4u8; 32];
-        let proof = generate(&material, b"signal", 42, &rln_id).expect("generate");
-        assert_eq!(proof.epoch(), Some(42));
-
-        let restored = RateLimitProof::from_json(&proof.to_json()).expect("from_json");
-        assert_eq!(restored.epoch(), Some(42));
     }
 
     // The generate_proof handler's reply carries "epoch" as a u64 index, and

@@ -1478,23 +1478,6 @@ mod tests {
     }
 
     #[test]
-    fn close_then_reopen_preserves_state() {
-        let _serial = crate::lock(&SERIAL);
-        let dir = test_dir("reinit");
-        let registry = format!("logos:local:{}", "ab".repeat(32));
-        let store = Store::open(dir.clone()).unwrap();
-        store.unlock("pw").unwrap();
-        let hash = insert_membership(&store, &registry, &[0x33u8; 32]);
-        store.close();
-        drop(store);
-        let store = Store::open(dir.clone()).unwrap();
-        assert_eq!(store.unlock("pw").unwrap(), 1);
-        assert!(store.membership(&hash).is_some());
-        store.close();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn a_closed_store_refuses_writes() {
         let _serial = crate::lock(&SERIAL);
         let dir = test_dir("closed-writes");

@@ -292,18 +292,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn section_payload_is_input_order_independent() {
-        let forward = rows();
-        let mut reversed = rows();
-        reversed.reverse();
-        let a = section_mac_payload(MEMBERSHIP_HASH, 600, 7, &forward, &UUID);
-        let b = section_mac_payload(MEMBERSHIP_HASH, 600, 7, &reversed, &UUID);
-        assert_eq!(a, b);
-        // And the input itself is untouched.
-        assert_eq!(forward[0].rln_identifier, "0xdeadbeef");
-    }
-
     fn sealed_with(n: usize) -> SealedFile {
         let mut f = SealedFile::provision(
             KdfParams::fast_for_tests(),

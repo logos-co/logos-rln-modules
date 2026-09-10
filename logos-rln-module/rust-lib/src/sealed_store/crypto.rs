@@ -218,20 +218,6 @@ mod tests {
     }
 
     #[test]
-    fn kdf_runs_counts_each_derive() {
-        // Other tests derive concurrently, so the counter is only pinned to
-        // "moves by at least one per derive" here; the exactly-one claim is
-        // the later unlock test's, in isolation.
-        let params = KdfParams::fast_for_tests();
-        let before = kdf_runs();
-        let _ = MasterKey::derive("pw", &params).unwrap();
-        let mid = kdf_runs();
-        assert!(mid > before);
-        let _ = MasterKey::derive("pw", &params).unwrap();
-        assert!(kdf_runs() > mid);
-    }
-
-    #[test]
     fn generate_uses_production_params_and_fresh_salt() {
         let p = KdfParams::generate().unwrap();
         assert_eq!(p.m_cost_kib, 65536);

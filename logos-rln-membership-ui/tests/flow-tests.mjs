@@ -363,7 +363,7 @@ test("flow: a second membership lands in the list without celebrating", async (a
   // A usable membership routes straight to the list — a relaunch, so no celebration.
   await waitMode(app, "status");
   const petOld = await evalExpr(app, `M.petname("${cOld}")`);
-  await app.expectTexts(["Your Memberships", petOld]);
+  await app.expectTexts(["Your Memberships", petOld, "200 msg/epoch", "+ New Membership"]);
   if (await evalExpr(app, "membershipView.celebrate") !== false)
     throw new Error("relaunch into the list must not celebrate");
   await evalExpr(app, "root.startNewMembership()");
@@ -377,18 +377,6 @@ test("flow: a second membership lands in the list without celebrating", async (a
   await app.expectTexts(["Your Memberships", petOld, petNew, "+ New Membership"]);
   if (await evalExpr(app, "membershipView.celebrate") !== false)
     throw new Error("a second membership must not celebrate");
-});
-
-// 5c. A relaunch with one membership reads "Your Memberships": celebration is
-//     tied to the completion event, not the launch count.
-test("flow: a relaunch with one membership reads 'Your Memberships', never celebrates", async (app) => {
-  const c = "aa".repeat(32);
-  await setup(app, { memberships: [{ credential: { identity_commitment: c }, membership_hash: "ee".repeat(32), leaf_index: 5, rate_limit: 300, state: "active", submitted_at: 1 }] });
-  await waitMode(app, "status");
-  const pet = await evalExpr(app, `M.petname("${c}")`);
-  await app.expectTexts(["Your Memberships", pet, "300 msg/epoch", "+ New Membership"]);
-  if (await evalExpr(app, "membershipView.celebrate") !== false)
-    throw new Error("a relaunch (not a completion) must never celebrate");
 });
 
 // 5d. The LIP vocabulary: a terminal state the logos namespace never emits
