@@ -86,7 +86,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// land in the same slot.
 type RegInFlightMap = std::collections::HashMap<String, (String, Instant)>;
 
-static REG_IN_FLIGHT: Mutex<Option<RegInFlightMap>> = Mutex::new(None);
+static REG_IN_FLIGHT: std::sync::LazyLock<Mutex<RegInFlightMap>> =
+    std::sync::LazyLock::new(|| Mutex::new(RegInFlightMap::new()));
 
 /// A submission that never applies on-chain must be re-submittable in the
 /// same session, so entries expire; 300s still covers both the seconds-apart
@@ -94,10 +95,9 @@ static REG_IN_FLIGHT: Mutex<Option<RegInFlightMap>> = Mutex::new(None);
 const REG_IN_FLIGHT_TTL: Duration = Duration::from_secs(300);
 
 fn reg_in_flight<R>(f: impl FnOnce(&mut RegInFlightMap) -> R) -> R {
-    let mut guard = lock(&REG_IN_FLIGHT);
-    let map = guard.get_or_insert_with(RegInFlightMap::new);
+    let mut map = lock(&REG_IN_FLIGHT);
     map.retain(|_, (_, inserted_at)| inserted_at.elapsed() < REG_IN_FLIGHT_TTL);
-    f(map)
+    f(&mut map)
 }
 
 /// Warm the process-lifetime wallet client. Called from `on_context_ready`
@@ -214,11 +214,10 @@ mod lp_test_transport {
 /// Trim whitespace and strip an optional 0x/0X prefix.
 fn strip_hex_prefix(s: &str) -> &str {
     let trimmed = s.trim();
-    if trimmed.len() >= 2 && (trimmed.starts_with("0x") || trimmed.starts_with("0X")) {
-        &trimmed[2..]
-    } else {
-        trimmed
-    }
+    trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed)
 }
 
 /// Trims whitespace, strips an optional 0x/0X prefix, requires an even
@@ -301,8 +300,8 @@ fn fetch_account_data_tri_state(account_id_hex: &str) -> FetchOutcome {
 }
 
 /// Some(data) only for a populated, well-formed account; logs nothing. Used
-/// where "not yet present" is an expected state (register_member pre-check,
-/// membership polls).
+/// where "not yet present" is an expected state — today only
+/// register_member's idempotency pre-check.
 fn fetch_account_data_quiet(account_id_hex: &str) -> Option<Vec<u8>> {
     match fetch_account_data_tri_state(account_id_hex) {
         FetchOutcome::Present(data) => Some(data),
@@ -714,20 +713,20 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         // for this (tree_id, id_commitment), recover its leaf_index instead
         // of resubmitting — the on-chain Register handler enforces uniqueness
         // via Claim::Pda, so a resubmit always fails.
-        if let Some(existing) = fetch_account_data_quiet(&membership_pda_hex) {
-            if existing.len() >= 64 {
-                if let Ok(membership) = native::decode_membership(&existing) {
-                    eprintln!(
-                        "register_member: membership already exists at leaf {} — skipping resubmit",
-                        membership.leaf_index
-                    );
-                    return serde_json::json!({
-                        "leaf_index": membership.leaf_index as i64,
-                        "already_registered": true,
-                    })
-                    .to_string();
-                }
-            }
+        // decode_membership carries its own length guard (DataTooShort), so
+        // a short or absent account simply fails to decode.
+        if let Some(membership) = fetch_account_data_quiet(&membership_pda_hex)
+            .and_then(|existing| native::decode_membership(&existing).ok())
+        {
+            eprintln!(
+                "register_member: membership already exists at leaf {} — skipping resubmit",
+                membership.leaf_index
+            );
+            return serde_json::json!({
+                "leaf_index": membership.leaf_index as i64,
+                "already_registered": true,
+            })
+            .to_string();
         }
 
         // In-flight dedup (see REG_IN_FLIGHT): the first caller submits;
