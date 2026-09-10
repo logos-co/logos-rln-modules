@@ -1238,7 +1238,16 @@ fn generate_proof_impl(
     let record = store
         .membership(&hash)
         .ok_or_else(|| ApiError::new(ErrorKind::UnknownMembership, "selected membership vanished"))?;
-    let leaf_index = record.cache.leaf_index.unwrap_or(0);
+    // Leaf 0 is a VALID leaf: defaulting here would prove against the wrong
+    // membership and burn a message-id slot doing it. The cache is
+    // deliberately unauthenticated (lifecycle.rs), so refuse rather than
+    // guess — and refuse BEFORE the reservation below.
+    let leaf_index = record.cache.leaf_index.ok_or_else(|| {
+        ApiError::new(
+            ErrorKind::UnknownMembership,
+            "the selected membership carries no leaf_index",
+        )
+    })?;
     let rate_limit = record.cache.rate_limit.unwrap_or(0);
 
     // Decrypt the credential in-module (requires an unlocked keystore).
@@ -2546,6 +2555,57 @@ mod tests {
     // client) — provider_failure proves a registry read was attempted. A
     // pre-filled cache (synthetic zero-sibling depth-20 path) must let
     // generate_proof succeed with ZERO registry I/O.
+    // The cache sits outside the authenticated surface, so an `active` row
+    // with no leaf_index is reachable by tampering. Leaf 0 is a valid leaf:
+    // proving against it would spend a message-id slot on a proof no
+    // verifier accepts, so the refusal must come BEFORE the reservation.
+    #[test]
+    fn generate_proof_impl_refuses_a_usable_row_without_a_leaf_index() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-ms-no-leaf-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (imp, store) = imp_with_store(dir.clone());
+        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+
+        let reg = format!("logos:local:{}", "ab".repeat(32));
+        let rln_id_hex = "ef".repeat(32);
+        let (commitment_hex, secret_hex) = proof::generate_identity().expect("test identity");
+        let commitment =
+            registry_id::hex_to_bytes32(&commitment_hex).expect("generated commitment is 32 bytes");
+        let hash = registry_id::membership_hash(&reg, &commitment);
+
+        seed_membership(
+            &store,
+            &hash,
+            &reg,
+            &commitment_hex,
+            &rln_id_hex,
+            &secret_hex,
+            MembershipState::Active,
+            5,
+            300,
+        );
+        // A warm path for leaf 0 would be served if the code defaulted.
+        path_cache::set_path_for_test(
+            &hash,
+            vec!["00".repeat(32); proof::RLN_TREE_DEPTH],
+            vec![0u8; proof::RLN_TREE_DEPTH],
+            0,
+        );
+        store
+            .update_cache(&hash, |m| m.leaf_index = None)
+            .expect("clear the leaf");
+
+        let err =
+            generate_proof_impl(Ok(store.clone()), &reg, &rln_id_hex, "aa", &now_unix().to_string())
+                .expect_err("a usable row without a leaf must not prove against leaf 0");
+        assert_eq!(err.kind, ErrorKind::UnknownMembership, "got: {}", err.message);
+        assert!(err.message.contains("leaf_index"), "got: {}", err.message);
+
+        sealed_store::store::publish(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn generate_proof_impl_serves_cached_path_with_zero_registry_io() {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);

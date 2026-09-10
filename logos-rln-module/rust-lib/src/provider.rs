@@ -305,6 +305,46 @@ fn provider_failure(method: &str) -> ApiError {
     )
 }
 
+/// Decode a `get_membership` reply. Every field the sibling promises is
+/// required: a missing one is a provider fault, never a defaultable value.
+/// `registered` most of all — the poller treats an authoritative "not
+/// registered" as proof a live membership was erased and acts destructively,
+/// so a reply that never said it must degrade to `ProviderFailure`, which
+/// leaves the record untouched. (`leaf_index` has the same hazard from the
+/// other side: leaf 0 is a VALID leaf, so defaulting would prove against the
+/// wrong membership.)
+fn parse_membership_reply(raw: &str) -> Result<ProviderMembership, ApiError> {
+    let fault = |msg: String| ApiError::new(ErrorKind::ProviderFailure, &msg);
+    let v: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| fault(format!("get_membership reply parse: {e}")))?;
+    let registered = v
+        .get("registered")
+        .and_then(|x| x.as_bool())
+        .ok_or_else(|| fault("get_membership: reply carries no registered flag".to_string()))?;
+    if !registered {
+        return Ok(ProviderMembership {
+            registered: false,
+            state: MembershipState::Unknown,
+            leaf_index: 0,
+            rate_limit: 0,
+        });
+    }
+    let required = |key: &str| {
+        v.get(key)
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| fault(format!("get_membership: registered member missing {key}")))
+    };
+    Ok(ProviderMembership {
+        registered: true,
+        state: serde_json::from_value::<MembershipState>(
+            v.get("state").cloned().unwrap_or(serde_json::Value::Null),
+        )
+        .map_err(|_| fault("get_membership: unrecognized state".to_string()))?,
+        leaf_index: required("leaf_index")?,
+        rate_limit: required("rate_limit")?,
+    })
+}
+
 impl RegistryProvider for LezRlnProvider {
     fn get_membership(
         &self,
@@ -323,43 +363,7 @@ impl RegistryProvider for LezRlnProvider {
                 )
             }),
         )?;
-        let v: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|e| ApiError::new(ErrorKind::ProviderFailure, &format!("get_membership reply parse: {e}")))?;
-        let registered = v.get("registered").and_then(|x| x.as_bool()).unwrap_or(false);
-        if !registered {
-            return Ok(ProviderMembership {
-                registered: false,
-                state: MembershipState::Unknown,
-                leaf_index: 0,
-                rate_limit: 0,
-            });
-        }
-        // For a registered member these fields are the registry's contract —
-        // a missing one is a provider fault, never a defaultable value (leaf 0
-        // is a VALID leaf; defaulting would prove against the wrong
-        // membership).
-        let required = |key: &str| {
-            v.get(key).and_then(|x| x.as_u64()).ok_or_else(|| {
-                ApiError::new(
-                    ErrorKind::ProviderFailure,
-                    &format!("get_membership: registered member missing {key}"),
-                )
-            })
-        };
-        Ok(ProviderMembership {
-            registered: true,
-            state: serde_json::from_value::<MembershipState>(
-                v.get("state").cloned().unwrap_or(serde_json::Value::Null),
-            )
-            .map_err(|_| {
-                ApiError::new(
-                    ErrorKind::ProviderFailure,
-                    "get_membership: unrecognized state",
-                )
-            })?,
-            leaf_index: required("leaf_index")?,
-            rate_limit: required("rate_limit")?,
-        })
+        parse_membership_reply(&raw)
     }
 
     fn register_async(
@@ -534,6 +538,56 @@ mod lp_test_transport {
 mod tests {
     use super::*;
     use crate::registry_id;
+
+    // A reply that never claimed "not registered" must not be read as one:
+    // the poller acts on an authoritative absence by erasing the membership.
+    #[test]
+    fn a_reply_without_registered_is_a_provider_failure() {
+        for raw in [
+            r#"{"state":"active","leaf_index":7,"rate_limit":100}"#,
+            r#"{"registered":"false"}"#,
+            r#"{"registered":null}"#,
+            r#"{}"#,
+        ] {
+            let Err(err) = parse_membership_reply(raw) else {
+                panic!("{raw} must not read as an authoritative absence");
+            };
+            assert_eq!(err.kind, ErrorKind::ProviderFailure, "{raw}");
+            assert!(err.message.contains("registered"), "{raw}: {}", err.message);
+        }
+    }
+
+    #[test]
+    fn an_authoritative_absence_still_reads_as_not_registered() {
+        let Ok(pm) = parse_membership_reply(r#"{"registered":false}"#) else {
+            panic!("an explicit registered:false is a valid answer");
+        };
+        assert!(!pm.registered);
+        assert_eq!(pm.state, MembershipState::Unknown);
+    }
+
+    #[test]
+    fn a_registered_member_needs_every_contract_field() {
+        let Ok(pm) = parse_membership_reply(
+            r#"{"registered":true,"state":"active","leaf_index":0,"rate_limit":100}"#,
+        ) else {
+            panic!("a complete reply must decode");
+        };
+        assert!(pm.registered);
+        assert_eq!(pm.leaf_index, 0, "leaf 0 is a valid leaf");
+        assert_eq!(pm.rate_limit, 100);
+
+        for raw in [
+            r#"{"registered":true,"state":"active","rate_limit":100}"#,
+            r#"{"registered":true,"state":"active","leaf_index":7}"#,
+            r#"{"registered":true,"leaf_index":7,"rate_limit":100}"#,
+        ] {
+            let Err(err) = parse_membership_reply(raw) else {
+                panic!("{raw} is missing a contract field");
+            };
+            assert_eq!(err.kind, ErrorKind::ProviderFailure, "{raw}");
+        }
+    }
 
     // With the test transport (no client), every provider path must degrade
     // to provider_failure — never panic, never wedge.

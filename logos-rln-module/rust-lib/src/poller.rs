@@ -259,12 +259,15 @@ pub(crate) fn refresh_paths() {
             }
         };
         let Some(provider) = provider_for(&registry.namespace) else { continue };
-        if let Err(e) = path_cache::fill_path_cache(
-            &registry,
-            hash,
-            record.cache.leaf_index.unwrap_or(0),
-            provider,
-        ) {
+        // Leaf 0 is a VALID leaf, so a usable row without one cannot be
+        // defaulted — that would cache the wrong membership's path. The cache
+        // is deliberately unauthenticated (see lifecycle.rs), so this pairing
+        // is reachable by tampering, never by the module's own writers.
+        let Some(leaf_index) = record.cache.leaf_index else {
+            eprintln!("membership poller: {hash} is usable but carries no leaf_index — path refresh skipped");
+            continue;
+        };
+        if let Err(e) = path_cache::fill_path_cache(&registry, hash, leaf_index, provider) {
             // Keep the previous cache entry — a slightly-stale but still
             // verifiable path beats none.
             eprintln!("membership poller: {hash} path refresh failed: {}", e.message);
