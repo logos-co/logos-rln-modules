@@ -577,6 +577,10 @@ static REGISTER_IN_FLIGHT: Mutex<Option<std::collections::HashSet<(String, Strin
 struct RegisterClaim(String, String);
 
 impl RegisterClaim {
+    /// Taken BEFORE argument validation, so any test that reaches
+    /// `register_impl` contends on this process-global set: tests that do not
+    /// serialize on `TEST_GLOBAL_LOCK` must use a scope of their own, or a
+    /// concurrent registration's claim surfaces as their result.
     fn take(registry: &str, rln_id_hex: &str) -> Result<RegisterClaim, ApiError> {
         let mut set = REGISTER_IN_FLIGHT.lock().unwrap();
         let set = set.get_or_insert_with(std::collections::HashSet::new);
@@ -2752,7 +2756,11 @@ mod tests {
     #[test]
     fn register_validates_arguments_before_touching_anything() {
         let imp = LogosRlnModuleImpl::default();
-        let rln_id = "ef".repeat(32);
+        // Its own scope: register_impl takes the process-global RegisterClaim
+        // before it validates arguments, so sharing the suite's (ab.., ef..)
+        // fixture would make a concurrent register test's in-flight claim
+        // surface here instead of the expected argument error.
+        let rln_id = "7a".repeat(32);
 
         let out = imp.register_membership("not-caip10".into(), rln_id.clone(), String::new());
         assert!(out.contains(r#""kind":"invalid_argument""#), "got: {out}");
@@ -2764,7 +2772,7 @@ mod tests {
         );
         assert!(out.contains(r#""kind":"unknown_registry""#), "got: {out}");
 
-        let logos = format!("logos:local:{}", "ab".repeat(32));
+        let logos = format!("logos:local:{}", "8b".repeat(32));
         let out = imp.register_membership(logos.clone(), rln_id, opts_arr(&[("rate_limit", "0")]));
         assert!(out.contains(r#""kind":"invalid_argument""#), "got: {out}");
 
@@ -3008,8 +3016,9 @@ mod tests {
     #[test]
     fn register_rejects_non_string_values_and_non_array_options() {
         let imp = LogosRlnModuleImpl::default();
-        let registry = format!("logos:local:{}", "ab".repeat(32));
-        let rln_id = "ef".repeat(32);
+        // Its own scope, for the RegisterClaim reason above.
+        let registry = format!("logos:local:{}", "9d".repeat(32));
+        let rln_id = "6e".repeat(32);
 
         let out = imp.register_membership(
             registry.clone(),
