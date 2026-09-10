@@ -399,7 +399,9 @@ impl Store {
         &self.dir
     }
 
-    #[allow(dead_code)] // consumer surface: views read the record's flag; the tests read this
+    /// Test-only: production reads `quarantined` straight off the snapshot
+    /// record. `cfg(test)` rather than an allow, so the compiler keeps that true.
+    #[cfg(test)]
     pub fn is_quarantined(&self, hash: &str) -> bool {
         self.snapshot_arc().records.get(hash).map(|r| r.quarantined).unwrap_or(false)
     }
@@ -1428,8 +1430,8 @@ mod tests {
         drop(store);
         std::fs::write(&alloc_path, &honest).unwrap();
 
-        // Regression for the suppressed-escalation reissue path: a decoy
-        // tamper on B must not mask A's splice.
+        // A decoy tamper on section B must not let A's spliced older
+        // section ride through unnoticed.
         let store = Store::open(dir.clone()).unwrap();
         store.unlock("pw").unwrap();
         assert_eq!(store.reserve_message_id(&hash_a, "aa", 10, 9, 5, 600).unwrap(), 1);
@@ -1519,7 +1521,8 @@ mod tests {
 
     #[test]
     fn all_quarantined_store_is_not_fresh() {
-        // L1: auto-unlock must never invent a secret it can never verify.
+        // Auto-unlock must never invent a secret it cannot verify: a store
+        // whose every entry is quarantined still HAS credentials.
         let _serial = crate::lock(&SERIAL);
         let dir = test_dir("not-fresh");
         let registry = format!("logos:local:{}", "ef".repeat(32));
@@ -1952,8 +1955,7 @@ mod tests {
         let dir = test_dir("overcount-sealed");
         std::fs::create_dir_all(&dir).unwrap();
 
-        // A parse-cap breach is corrupt, not a refusal: .bad + fresh empty
-        // (I2b).
+        // A parse-cap breach is corrupt, not a refusal: .bad + fresh empty.
         let mut credentials = serde_json::Map::new();
         for i in 0..=format::MAX_CREDENTIALS {
             credentials.insert(

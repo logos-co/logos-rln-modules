@@ -23,12 +23,12 @@ pub(crate) fn install_once() {
                 .unwrap_or("<non-string panic payload>");
             match info.location() {
                 Some(loc) => eprintln!(
-                    "rln_membership: panic at {}:{}:{}: {msg}",
+                    "membership panic at {}:{}:{}: {msg}",
                     loc.file(),
                     loc.line(),
                     loc.column()
                 ),
-                None => eprintln!("rln_membership: panic at <unknown location>: {msg}"),
+                None => eprintln!("membership panic at <unknown location>: {msg}"),
             }
             previous(info);
         }));

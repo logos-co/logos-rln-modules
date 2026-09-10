@@ -20,9 +20,10 @@
 //!    beats nothing.
 //!
 //! Runs whether or not the keystore is unlocked: everything here touches
-//! only plaintext-safe sidecar metadata. All provider calls from this
-//! worker take `provider_call`'s async+channel path automatically (owner
-//! -thread contract). A transient failure never kills the worker: each tick
+//! only plaintext-safe sidecar metadata. Provider calls from this worker go
+//! out through `provider.rs`'s async twin + channel wait, like every other
+//! caller — the module is concurrency "multi", so a slow registry read holds
+//! up nothing else. A transient failure never kills the worker: each tick
 //! body runs under `catch_unwind` (pure Rust, no FFI frames — safe to
 //! catch); only the supervisor retires it (`stop()`, or a restart's
 //! generation bump).
