@@ -512,9 +512,7 @@ mod tests {
         };
         let credential = crate::lifecycle::StoredCredential {
             identity_commitment: "11".repeat(32),
-            identity_nullifier: None,
             identity_secret_hash: "22".repeat(32),
-            identity_trapdoor: None,
             registry_id: registry,
         };
         store.insert(&"cd".repeat(32), identity, &credential, 100).expect("fixture credential");

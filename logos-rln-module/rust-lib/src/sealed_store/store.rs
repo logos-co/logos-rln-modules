@@ -1186,9 +1186,7 @@ mod tests {
     fn credential_for(registry: &str, commitment: &[u8; 32]) -> StoredCredential {
         StoredCredential {
             identity_commitment: registry_id::bytes_to_hex(commitment),
-            identity_nullifier: None,
             identity_secret_hash: "77".repeat(32),
-            identity_trapdoor: None,
             registry_id: registry.to_string(),
         }
     }
