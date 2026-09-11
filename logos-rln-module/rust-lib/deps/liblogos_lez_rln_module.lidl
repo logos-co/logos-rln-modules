@@ -36,9 +36,10 @@ module liblogos_lez_rln_module {
   method get_valid_roots(rln_account_id_hex: tstr) -> tstr
 
   ; Whether that module's own wallet is open and usable:
-  ; {"detail":s,"ready":b}. Never fails. Since v3.0.0 the provider links the
-  ; LEZ wallet crate and brings a wallet up itself, so every method above
-  ; answers "" until this reports ready — which is a retry, not a failure.
+  ; {"detail":s,"ready":b,"state":"pending"|"ready"|"failed"}. Never fails.
+  ; Since v3.0.0 the provider links the LEZ wallet crate and brings a wallet
+  ; up itself, so every method above answers "" until this reports ready.
+  ; Branch on `state`: "pending" is worth retrying, "failed" is not.
   method wallet_status() -> tstr
 
   ; Derive a fresh public account in this module's own wallet, persist it and

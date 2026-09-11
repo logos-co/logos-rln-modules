@@ -66,11 +66,12 @@ module liblogos_lez_rln_module {
   ; "total_registrations":N}; "" on error.
   method get_registry_bounds(config_account_id: tstr) -> tstr
 
-  ; Whether this module's wallet is open and usable: {"detail":s,"ready":b}.
-  ; Never fails. `ready` false with an empty-ish detail means bring-up is
-  ; still in flight (open + first sync); a populated detail is the reason it
-  ; gave up, and every chain-facing method below will answer "" until it is
-  ; resolved. A consumer polls this to tell "not yet" from "broken".
+  ; Whether this module's wallet is open and usable:
+  ; {"detail":s,"ready":b,"state":"pending"|"ready"|"failed"}. Never fails.
+  ; Branch on `state`, not on `ready`: the distinction that matters is
+  ; retry-or-give-up. "pending" is bring-up still in flight (open + first
+  ; sync) and worth waiting on; "failed" will not resolve by waiting, and
+  ; `detail` says why. Every chain-facing method answers "" until "ready".
   method wallet_status() -> tstr
 
   ; Derive a fresh public account in this module's own wallet, persist it and

@@ -479,10 +479,19 @@ pub(crate) fn create_holding_account() -> String {
 /// a consumer uses to tell "still coming up" from "broken".
 pub(crate) fn status_json() -> String {
     let state = lock(&STATE);
-    let (ready, detail) = match &state.readiness {
-        Readiness::Ready => (true, String::new()),
-        Readiness::Pending => (false, "coming up".to_owned()),
-        Readiness::Failed(reason) => (false, reason.clone()),
+    // `state` is the field a consumer branches on, because the distinction
+    // that matters is not ready-or-not but retry-or-give-up: "pending" means
+    // wait, "failed" means waiting longer will not help. `detail` is for a
+    // human reading a log.
+    let (name, detail) = match &state.readiness {
+        Readiness::Ready => ("ready", String::new()),
+        Readiness::Pending => ("pending", "opening the wallet".to_owned()),
+        Readiness::Failed(reason) => ("failed", reason.clone()),
     };
-    serde_json::json!({ "detail": detail, "ready": ready }).to_string()
+    serde_json::json!({
+        "detail": detail,
+        "ready": name == "ready",
+        "state": name,
+    })
+    .to_string()
 }
