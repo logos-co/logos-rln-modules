@@ -13,7 +13,7 @@
     # Name matches metadata.json#dependencies; the builder resolves by name.
     # Not path:../ — a relative input resolves against the store root once a
     # consumer walks the chain transitively, and evaluation fails.
-    liblogos_lez_rln_module.url = "git+https://github.com/logos-co/logos-rln-modules?ref=feat/lez-v0.2.5&dir=logos-lez-rln-module";
+    liblogos_lez_rln_module.url = "git+https://github.com/logos-co/logos-rln-modules?ref=feat/lez-module-owns-wallet&dir=logos-lez-rln-module";
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:

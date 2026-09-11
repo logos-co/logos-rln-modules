@@ -97,7 +97,7 @@ version = "0.1.0"
 source = "git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a#8e2b119ea4e18faee58c4c469943cb1beaab742a"
 dependencies = [
  "borsh",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
  "risc0-zkvm",
 ]
 
@@ -458,7 +458,7 @@ version = "0.1.0"
 source = "git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a#8e2b119ea4e18faee58c4c469943cb1beaab742a"
 dependencies = [
  "borsh",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
  "risc0-zkvm",
 ]
 
@@ -594,7 +594,7 @@ version = "0.1.0"
 source = "git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a#8e2b119ea4e18faee58c4c469943cb1beaab742a"
 dependencies = [
  "borsh",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
 ]
 
 [[package]]
@@ -874,7 +874,7 @@ version = "0.1.0"
 source = "git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a#8e2b119ea4e18faee58c4c469943cb1beaab742a"
 dependencies = [
  "borsh",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
  "risc0-zkvm",
 ]
 
@@ -884,7 +884,7 @@ version = "0.1.0"
 source = "git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a#8e2b119ea4e18faee58c4c469943cb1beaab742a"
 dependencies = [
  "borsh",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
  "risc0-zkvm",
 ]
 
@@ -1139,7 +1139,7 @@ version = "0.1.0"
 source = "git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a#8e2b119ea4e18faee58c4c469943cb1beaab742a"
 dependencies = [
  "borsh",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
 ]
 
 [[package]]
@@ -1189,7 +1189,7 @@ dependencies = [
  "fee_core",
  "hex",
  "lee",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
  "log",
  "logos-blockchain-common-http-client",
  "ping_core",
@@ -1358,7 +1358,7 @@ version = "0.1.0"
 source = "git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a#8e2b119ea4e18faee58c4c469943cb1beaab742a"
 dependencies = [
  "borsh",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
  "risc0-zkvm",
  "serde",
 ]
@@ -2140,7 +2140,7 @@ version = "0.1.0"
 source = "git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a#8e2b119ea4e18faee58c4c469943cb1beaab742a"
 dependencies = [
  "borsh",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
 ]
 
 [[package]]
@@ -2160,7 +2160,7 @@ version = "0.1.0"
 source = "git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a#8e2b119ea4e18faee58c4c469943cb1beaab742a"
 dependencies = [
  "borsh",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
  "thiserror 2.0.20",
 ]
 
@@ -3570,7 +3570,7 @@ dependencies = [
  "itertools 0.14.0",
  "k256 0.13.4",
  "lee",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
  "ml-kem",
  "rand 0.8.7",
  "serde",
@@ -3661,7 +3661,7 @@ dependencies = [
  "build_utils",
  "hex",
  "k256 0.13.4",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
  "log",
  "program_loader_core",
  "rand 0.8.7",
@@ -3669,22 +3669,6 @@ dependencies = [
  "risc0-zkvm",
  "serde_with",
  "sha2 0.10.9",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "lee_core"
-version = "0.1.0"
-source = "git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.5-rc2#d8596eb734bf9c9ce801afb92df06098a2eb098a"
-dependencies = [
- "base58",
- "borsh",
- "bytesize",
- "chacha20",
- "ml-kem",
- "risc0-zkvm",
- "serde",
- "serde_with",
  "thiserror 2.0.20",
 ]
 
@@ -3719,7 +3703,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "token_core 0.1.0 (git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.5-rc2)",
+ "token_core",
  "tokio",
  "wallet",
 ]
@@ -5764,7 +5748,7 @@ version = "0.1.0"
 source = "git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a#8e2b119ea4e18faee58c4c469943cb1beaab742a"
 dependencies = [
  "borsh",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
 ]
 
 [[package]]
@@ -6009,7 +5993,7 @@ version = "0.1.0"
 source = "git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a#8e2b119ea4e18faee58c4c469943cb1beaab742a"
 dependencies = [
  "borsh",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
  "risc0-binfmt",
 ]
 
@@ -7244,7 +7228,7 @@ dependencies = [
  "common",
  "hex",
  "lee",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
  "serde",
  "serde_with",
 ]
@@ -7265,7 +7249,7 @@ source = "git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119
 dependencies = [
  "borsh",
  "ed25519-dalek",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
  "serde",
 ]
 
@@ -7890,7 +7874,7 @@ dependencies = [
  "clock_core",
  "faucet_core",
  "fee_core",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
  "programs",
  "sequencer_stake_core",
 ]
@@ -7932,7 +7916,7 @@ source = "git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119
 dependencies = [
  "key_protocol",
  "lee",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
  "programs",
  "serde",
  "system_accounts",
@@ -8054,20 +8038,10 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 [[package]]
 name = "token_core"
 version = "0.1.0"
-source = "git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.5-rc2#d8596eb734bf9c9ce801afb92df06098a2eb098a"
-dependencies = [
- "borsh",
- "lee_core 0.1.0 (git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.5-rc2)",
- "serde",
-]
-
-[[package]]
-name = "token_core"
-version = "0.1.0"
 source = "git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a#8e2b119ea4e18faee58c4c469943cb1beaab742a"
 dependencies = [
  "borsh",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
  "serde",
 ]
 
@@ -8767,7 +8741,7 @@ dependencies = [
  "key_protocol",
  "keycard_wallet",
  "lee",
- "lee_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "lee_core",
  "log",
  "optfield",
  "program_loader_core",
@@ -8780,7 +8754,7 @@ dependencies = [
  "system_accounts",
  "testnet_initial_state",
  "thiserror 2.0.20",
- "token_core 0.1.0 (git+https://github.com/adklempner/logos-execution-zone.git?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a)",
+ "token_core",
  "tokio",
  "url",
  "zeroize",
