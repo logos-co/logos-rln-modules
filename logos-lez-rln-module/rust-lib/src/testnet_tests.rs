@@ -297,7 +297,10 @@ fn testnet_register_plan_derives_the_deployed_accounts() {
     );
     assert_eq!(plan.tree_main_account_id, proofs_plan.main_account_id);
     assert_eq!(plan.clock_account_id, rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES);
-    assert!(plan.next_leaf_index < (1u64 << 20), "leaf index inside TREE_DEPTH");
+    assert!(
+        plan.next_leaf_index < (1u64 << rln_layouts::TREE_DEPTH),
+        "leaf index inside TREE_DEPTH"
+    );
     eprintln!("live tree: next_leaf_index {}", plan.next_leaf_index);
 }
 

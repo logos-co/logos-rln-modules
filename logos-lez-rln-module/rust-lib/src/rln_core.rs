@@ -680,7 +680,11 @@ mod tests {
         let expected_main_id =
             derive_pda(&program_owner, &combine_seeds(&[&label_seed("main"), &tree_id]));
 
-        let plan = merkle_proofs_plan(&config_data, &program_owner, &[0, 1, 1025]).unwrap();
+        // Two leaves in the first subtree and one in the second, wherever the
+        // tree's geometry puts that boundary.
+        let second_subtree_leaf = SUBTREE_LEAVES as u64 + 1;
+        let plan =
+            merkle_proofs_plan(&config_data, &program_owner, &[0, 1, second_subtree_leaf]).unwrap();
         assert_eq!(expected_main_id, plan.main_account_id);
         assert_eq!(plan.subtree_count, 2);
         assert_eq!(plan.subtree_ids[0], 0);
