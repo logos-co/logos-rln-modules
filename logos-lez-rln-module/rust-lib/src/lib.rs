@@ -384,6 +384,41 @@ fn resolve_config_context(config_account_id: &str, who: &str) -> Option<RlnConfi
     })
 }
 
+/// The account that pays a transaction's fee, as 32-byte hex, or empty to let
+/// the wallet charge the signing account.
+///
+/// v0.2.5 charges every public transaction, and the fee is reserved from a
+/// *native* balance. A freshly created holding has tokens and no native
+/// balance at all, so making the signer pay means a registration is refused
+/// before it runs, with only "Incorrect fee" to say why.
+///
+/// `LEZ_RLN_PAYER` names a funded account the wallet already holds a key for —
+/// the same variable the host tools use. It accepts base58 or hex, since the
+/// tooling that mints the payer prints base58 and the wallet interface wants
+/// hex. Unset means self-pay, which is right wherever the signing account is
+/// itself funded.
+fn fee_payer_hex() -> String {
+    let Ok(raw) = std::env::var("LEZ_RLN_PAYER") else {
+        return String::new();
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    if hex_to_bytes32(raw).is_some() {
+        return raw.to_ascii_lowercase();
+    }
+    let resolved = wallet_call(
+        "account_id_from_base58",
+        &serde_json::json!([raw]),
+        READ_TIMEOUT,
+    );
+    if resolved.is_empty() {
+        eprintln!("LEZ_RLN_PAYER is neither 32-byte hex nor a base58 account id: {raw}");
+    }
+    resolved
+}
+
 /// Submit one `send_generic_public_transaction` — the args array
 /// `[account_ids, signing_reqs, instruction, program_id, payer]` — with
 /// the 180s tx timeout (a sequencer submit can far outlive the 20s protocol
@@ -779,15 +814,13 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             .map(|a| *a == user_holding_hex)
             .collect();
 
-        // The account that authorizes the spend also covers the fee, so it has
-        // to hold native balance as well as tokens.
         let Some(send_result) = send_generic_tx(
             "register_member",
             account_ids,
             signing_reqs,
             instruction,
             bytes_to_hex(&ctx.program_owner),
-            user_holding_hex.clone(),
+            fee_payer_hex(),
         ) else {
             reg_in_flight(|m| m.remove(&reg_key));
             return String::new();
@@ -836,7 +869,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             vec![false, false, true],
             logos_rust_sdk::bytes::encode(&instruction),
             bytes_to_hex(&ctx.program_owner),
-            dest_hex,
+            fee_payer_hex(),
         ) else {
             return String::new();
         };
