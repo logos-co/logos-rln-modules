@@ -212,6 +212,14 @@ fn prepare_storage(storage_path: &Path) -> anyhow::Result<()> {
     let mut storage = if storage_path.exists() {
         Storage::from_path(storage_path)?
     } else {
+        // Loud on purpose. A home staged for a deployment carries the payer's
+        // derivation in its storage; creating an empty wallet over a home that
+        // was meant to have one registers nothing, and says why only much
+        // later and only as a fee refusal.
+        eprintln!(
+            "lez-rln wallet: no storage at {} — creating an empty wallet",
+            storage_path.display()
+        );
         Storage::new("")?.0
     };
 
