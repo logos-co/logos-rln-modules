@@ -28,12 +28,12 @@
 // stubs that stand in for the host's `lp_*` symbols.
 #![deny(unsafe_code)]
 
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use logos_rust_sdk::{LogosModuleSDK, PluginProxy};
 
 mod rln_core;
+mod wallet;
 use rln_core as native;
 use rln_core::{bytes_to_hex, RlnRegisterPlan};
 
@@ -52,20 +52,6 @@ mod generated {
     ));
 }
 pub(crate) use generated::*;
-
-const WALLET_MODULE: &str = "lez_core";
-/// Timeout on account_id_from_base58 / get_account_public.
-const READ_TIMEOUT: Duration = Duration::from_secs(60);
-/// Timeout on send_generic_public_transaction.
-const TX_TIMEOUT: Duration = Duration::from_secs(180);
-/// The protocol owns timeout enforcement; this margin only guards the channel
-/// wait against a callback that never fires.
-const REPLY_MARGIN: Duration = Duration::from_secs(10);
-
-/// The process-lifetime wallet client. Held strongly here because the SDK's
-/// client cache keeps only weak references — a transient proxy would create
-/// and destroy a client per call.
-static WALLET_CLIENT: Mutex<Option<Arc<PluginProxy>>> = Mutex::new(None);
 
 /// Lock a mutex, recovering the guard from a poisoned lock (a panicked
 /// handler must not wedge every later one).
@@ -100,59 +86,6 @@ fn reg_in_flight<R>(f: impl FnOnce(&mut RegInFlightMap) -> R) -> R {
     f(&mut map)
 }
 
-/// Warm the process-lifetime wallet client. Called from `on_context_ready`
-/// on the host's main Qt thread so the one-time construction happens at load
-/// rather than inside the first dispatch. At protocol 0.9 that is a courtesy,
-/// not a requirement: `lp_client_create` constructs a Qt-affine client on the
-/// Qt main thread whoever calls it, so a worker that finds no client may
-/// create one lazily (`wallet_client`). The origin announced is this module's
-/// own name, latched by the generated scaffold (`set_module_origin`).
-fn init_wallet_client() {
-    let _ = wallet_client();
-}
-
-/// The shared wallet client, created on first use. The lock is released
-/// before the caller makes any SDK call.
-fn wallet_client() -> Arc<PluginProxy> {
-    let mut slot = lock(&WALLET_CLIENT);
-    Arc::clone(slot.get_or_insert_with(|| Arc::new(LogosModuleSDK::new().plugin(WALLET_MODULE))))
-}
-
-/// JSON-array args in, string result out. Failure (transport error, timeout,
-/// dispatch refusal, non-string result) yields "" — the wallet module's own
-/// error value on this wire.
-///
-/// Always the async call plus a channel wait: the SDK runs the callback from
-/// the module's Qt event loop once the reply lands (never inline, never on
-/// this thread), so a `concurrency:"multi"` worker blocks only on its channel
-/// and the loop keeps serving every other call.
-fn wallet_call(method: &str, args: &serde_json::Value, timeout: Duration) -> String {
-    let client = wallet_client();
-    let (tx, rx) = mpsc::channel::<Result<serde_json::Value, logos_rust_sdk::LogosError>>();
-    client.call_json_async_with_timeout(method, args, timeout, move |result| {
-        let _ = tx.send(result);
-    });
-    match rx.recv_timeout(timeout + REPLY_MARGIN) {
-        Ok(Ok(serde_json::Value::String(s))) => s,
-        Ok(Ok(other)) => {
-            eprintln!("wallet_call: {method} non-string reply: {other}");
-            String::new()
-        }
-        Ok(Err(e)) => {
-            if matches!(&e, logos_rust_sdk::LogosError::Other(m) if m.starts_with("Failed to create protocol client")) {
-                // Construction failed (name refused); drop it so the next call
-                // retries instead of failing forever on a stale proxy.
-                *lock(&WALLET_CLIENT) = None;
-            }
-            eprintln!("wallet_call: {method} failed: {e}");
-            String::new()
-        }
-        Err(_) => {
-            eprintln!("wallet_call: {method} reply channel timed out");
-            String::new()
-        }
-    }
-}
 
 /// The unit-test binary links no logos-protocol archive, yet the SDK's client
 /// path references the `lp_*` symbols by name. Define the ones that path can
@@ -259,11 +192,7 @@ fn resolve_account_id(id: &str) -> String {
     if stripped.len() == 64 {
         return stripped.to_string();
     }
-    wallet_call(
-        "account_id_from_base58",
-        &serde_json::json!([id]),
-        READ_TIMEOUT,
-    )
+    wallet::account_id_from_base58(id)
 }
 
 /// Tri-state fetch: Present / legitimately Absent (empty data) / Error
@@ -275,11 +204,7 @@ enum FetchOutcome {
 }
 
 fn fetch_account_data_tri_state(account_id_hex: &str) -> FetchOutcome {
-    let json = wallet_call(
-        "get_account_public",
-        &serde_json::json!([account_id_hex]),
-        READ_TIMEOUT,
-    );
+    let json = wallet::get_account_public(account_id_hex);
     if json.is_empty() {
         return FetchOutcome::Error;
     }
@@ -313,11 +238,7 @@ fn fetch_account_data_quiet(account_id_hex: &str) -> Option<Vec<u8>> {
 /// 32-byte program_owner; an empty owner field is tolerated and leaves
 /// `owner_out` empty.
 fn fetch_account_data(account_id_hex: &str, owner_out: Option<&mut Vec<u8>>) -> Option<Vec<u8>> {
-    let json = wallet_call(
-        "get_account_public",
-        &serde_json::json!([account_id_hex]),
-        READ_TIMEOUT,
-    );
+    let json = wallet::get_account_public(account_id_hex);
     if json.is_empty() {
         eprintln!("fetch_account_data failed: empty response for {account_id_hex}");
         return None;
@@ -408,33 +329,29 @@ fn fee_payer_hex() -> String {
     if hex_to_bytes32(raw).is_some() {
         return raw.to_ascii_lowercase();
     }
-    let resolved = wallet_call(
-        "account_id_from_base58",
-        &serde_json::json!([raw]),
-        READ_TIMEOUT,
-    );
+    let resolved = wallet::account_id_from_base58(raw);
     if resolved.is_empty() {
         eprintln!("LEZ_RLN_PAYER is neither 32-byte hex nor a base58 account id: {raw}");
     }
     resolved
 }
 
-/// Submit one `send_generic_public_transaction` — the args array
-/// `[account_ids, signing_reqs, instruction, program_id, payer]` — with
-/// the 180s tx timeout (a sequencer submit can far outlive the 20s protocol
-/// default). `None` = failed, already logged.
+/// Submit one public transaction through the module's own wallet. `None` =
+/// failed, already logged.
 fn send_generic_tx(
     who: &str,
     account_ids: Vec<String>,
     signing_reqs: Vec<bool>,
-    instruction: serde_json::Value,
+    instruction: Vec<u8>,
     program_id_hex: String,
     payer_hex: String,
 ) -> Option<String> {
-    let send_result = wallet_call(
-        "send_generic_public_transaction",
-        &serde_json::json!([account_ids, signing_reqs, instruction, program_id_hex, payer_hex]),
-        TX_TIMEOUT,
+    let send_result = wallet::send_generic_public_transaction(
+        &account_ids,
+        &signing_reqs,
+        &instruction,
+        &program_id_hex,
+        &payer_hex,
     );
     if send_result.is_empty() {
         eprintln!("{who}: transaction failed");
@@ -699,8 +616,18 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
 struct LogosLezRlnModuleImpl;
 
 impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
-    fn on_context_ready(&self, _ctx: &RustModuleContext) {
-        init_wallet_client();
+    /// Whether the wallet this module owns is usable. Never fails — a
+    /// consumer polls it to tell "still coming up" from "broken", because
+    /// every chain-facing method answers "" in both cases.
+    fn wallet_status(&self) -> String {
+        wallet::status_json()
+    }
+
+    fn on_context_ready(&self, ctx: &RustModuleContext) {
+        // Bring-up runs on its own thread: this hook fires on the host's Qt
+        // main thread, and opening a wallet calibrates sequencers and then
+        // syncs the chain — work the loop must not be holding.
+        wallet::spawn_bring_up(&ctx.instance_persistence_path);
     }
 
     fn get_valid_roots(&self, rln_account_id_hex: String) -> String {
@@ -794,8 +721,6 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
                 return String::new();
             }
         };
-        let instruction = logos_rust_sdk::bytes::encode(&instruction);
-
         // Account order must match methods/guest/src/program.rs::register:
         //   config, tree_main, user_holding (signer), treasury, bottom_subtree,
         //   clock_account, membership (init).
@@ -867,7 +792,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             "claim_tokens",
             vec![ctx.config_hex.clone(), payment_def_hex.clone(), dest_hex.clone()],
             vec![false, false, true],
-            logos_rust_sdk::bytes::encode(&instruction),
+            instruction,
             bytes_to_hex(&ctx.program_owner),
             fee_payer_hex(),
         ) else {

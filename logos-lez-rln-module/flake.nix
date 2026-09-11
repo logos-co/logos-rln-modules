@@ -10,13 +10,9 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
-    # Must match the root flake's pin.
-    logos-execution-zone.url = "github:adklempner/logos-execution-zone?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a";
-    # Name matches metadata.json#dependencies; the builder resolves by name.
-    lez_core = {
-      url = "github:logos-blockchain/logos-execution-zone-module?rev=0ea57f8a1c57539d6ee0961a9cd27b064685b9e8";
-      inputs.logos-execution-zone.follows = "logos-execution-zone";
-    };
+    # The module has no module-level dependencies: it links the LEZ wallet
+    # crate directly (rust-lib/Cargo.toml) rather than calling the lez_core
+    # module, so nothing here resolves a dependency lidl any more.
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:
@@ -86,7 +82,6 @@
               logos-lidl-gen "$root/rust-lib/liblogos_lez_rln_module.lidl" --provider \
                 --concurrency multi \
                 --protocol-version ${protocolVersion} \
-                --dep lez_core="$root/rust-lib/deps/lez_core.lidl" \
                 -o "$root/rust-lib/generated/provider_gen.rs"
               echo "staging the SDK source at logos-rust-sdk-src/ ..."
               rm -rf "''${root:?}/logos-rust-sdk-src"

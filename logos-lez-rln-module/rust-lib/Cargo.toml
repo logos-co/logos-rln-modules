@@ -24,6 +24,16 @@ panic = "abort"
 # layout change.
 rln-layouts = { git = "https://github.com/logos-co/logos-lez-rln.git", rev = "cdf6d6758eca2fbe3630e4635abe069dd06ee1cc" }
 token_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.2.5-rc2" }
+# The wallet, in-process. This module owns its own WalletCore instead of
+# calling the lez_core module over lp: a host has exactly one lez_core wallet
+# handle and no way to close it, so sharing it means racing every other app
+# for the handle — and losing that race means inheriting a gas limit this
+# module cannot read, let alone raise. The fork rev is the same one the root
+# flake pins; it is the one whose wallet takes its gas limit from config.
+wallet = { git = "https://github.com/adklempner/logos-execution-zone.git", rev = "8e2b119ea4e18faee58c4c469943cb1beaab742a" }
+lee = { git = "https://github.com/adklempner/logos-execution-zone.git", rev = "8e2b119ea4e18faee58c4c469943cb1beaab742a" }
+anyhow = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 risc0-zkvm = { version = "3.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
 borsh = { version = "1", default-features = false, features = ["derive"] }

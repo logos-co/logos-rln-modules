@@ -8,11 +8,18 @@
 ; v2.0.0 dropped the C++-era wire freeze: generate_identity,
 ; compute_rate_commitment, is_member_registered, mint_tokens, the two
 ; start_*_broadcast methods and the valid_roots / merkle_proof events.
+; v3.0.0 dropped the lez_core dependency: this module links the LEZ wallet
+; crate and owns its own WalletCore, because a host has exactly one lez_core
+; wallet handle, no way to close it, and no way to read back the gas limit it
+; was opened with — and a registration needs a limit five times the stock
+; default. Configuration moved with the wallet: LEZ_RLN_SEQUENCER names the
+; chain, LEZ_RLN_PAYER the fee payer, LEZ_RLN_PAYER_KEY its signing key (a
+; fee is reserved from a native balance and the payer must sign, so a wallet
+; this module creates can sign but never pay for itself).
 module liblogos_lez_rln_module {
-  version "2.0.0"
+  version "3.0.0"
   description "RLN registry provider (LEZ chain reads + registration/funding txs)"
   category "blockchain"
-  depends [lez_core]
 
   ; Compact JSON array of 32-byte lowercase-hex roots (current + non-zero
   ; history), or "" on error.
@@ -58,4 +65,11 @@ module liblogos_lez_rln_module {
   ; "max_total_rate_limit":N,"min_rate_limit":100,"price_per_unit":"<decimal>",
   ; "total_registrations":N}; "" on error.
   method get_registry_bounds(config_account_id: tstr) -> tstr
+
+  ; Whether this module's wallet is open and usable: {"detail":s,"ready":b}.
+  ; Never fails. `ready` false with an empty-ish detail means bring-up is
+  ; still in flight (open + first sync); a populated detail is the reason it
+  ; gave up, and every chain-facing method below will answer "" until it is
+  ; resolved. A consumer polls this to tell "not yet" from "broken".
+  method wallet_status() -> tstr
 }
