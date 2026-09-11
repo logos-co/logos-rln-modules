@@ -32,6 +32,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 
+mod base58;
 mod rln_core;
 mod wallet;
 use rln_core as native;

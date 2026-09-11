@@ -1,92 +1,270 @@
-//! The wallet this module owns, in-process.
+//! The wallet this module owns.
 //!
 //! Every registry read and every transaction used to go out over lp to the
 //! `lez_core` module. That module holds exactly one wallet handle per host,
 //! `open` and `create_new` both refuse while one is open, and there is no
-//! close — so whichever app opened first owned the only wallet, and the
-//! others inherited whatever config it was opened with. For this module that
-//! is not survivable: a registration costs ~9.1M cycles, the gas limit a
-//! transaction declares comes from the wallet's config, the stock default is
-//! 2,000,000, and `lez_core` exposes no way to read the limit back. Losing
-//! the race meant every registration refused with a bare "Incorrect fee".
+//! close — so whichever app opened first owned the only wallet, and the others
+//! inherited whatever config it was opened with. For this module that is not
+//! untidy but fatal: the gas limit a transaction declares comes from the
+//! wallet's config, a registration costs ~9.1M cycles against a stock default
+//! of 2,000,000, and `lez_core` exposes no way to read the limit back. Losing
+//! that race meant every registration refused with a bare "Incorrect fee".
 //!
-//! So this module links the wallet crate and keeps a `WalletCore` of its own,
-//! under its own host-stamped persistence dir. Nothing else can take it, the
-//! gas limit is ours to set, and the lp round trip disappears from the read
-//! path.
+//! So this module links `wallet_ffi` itself and holds a handle of its own.
+//! That is the same prebuilt library `lez_core` links, resolved through
+//! `externalLibInputs` from the LEZ flake — deliberately not the `wallet`
+//! crate compiled here. Compiling it needs a prebuilt rapidsnark, the circuits
+//! tree, a pre-fetched risc0 recursion archive and, on macOS, a Metal
+//! toolchain stub and an unsandboxed build; the LEZ flake supplies all of that
+//! and a module flake cannot.
 //!
-//! What it cannot do is pay its own way. A fee is reserved from a *native*
-//! balance; the payer must sign, so the wallet has to hold its key; and
-//! native balance only enters an account at genesis, over the L1 bridge, or
-//! by transfer from something already funded. A wallet created here can sign
-//! but never pay, so a funded payer's key has to be handed in —
+//! The symbols below resolve at the final plugin link, the way the SDK's `lp_*`
+//! calls already do, so `cargo test` links them against the stub at the bottom
+//! of this file instead.
+//!
+//! What the wallet cannot do is pay its own way. A fee is reserved from a
+//! *native* balance; the payer must sign, so the wallet has to hold its key;
+//! and native balance enters an account only at genesis, over the L1 bridge,
+//! or by transfer from something already funded. A wallet created here can
+//! sign but never pay, so a funded key has to be handed in —
 //! `LEZ_RLN_PAYER_KEY` — and `LEZ_RLN_PAYER` names which account to declare.
 
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
-use wallet::account::{AccountIdWithPrivacy, Label};
-use wallet::storage::Storage;
-use wallet::{AccountIdentity, WalletCore};
+use crate::base58;
+use crate::rln_core::bytes_to_hex;
 
-use lee::AccountId;
+/// An existing wallet home to adopt instead of provisioning one under the
+/// module's persistence dir. This is the variable the LEZ wallet itself reads
+/// and the one the e2e harness and Basecamp already export, so a home staged
+/// by `tools/deployments/stage.sh` — config, storage and the payer's
+/// derivation together — is adopted whole with no extra configuration.
+const HOME_ENV: &str = "LEE_WALLET_HOME_DIR";
 
-/// The account the payer is labelled under in our own storage, matching the
-/// label `mint_payer` uses so an adopted deployment wallet reads the same.
-const PAYER_LABEL: &str = "rln-fee-payer";
-
-/// The sequencer this module's wallet talks to. There is no default on
-/// purpose: `WalletConfig::from_path_or_initialize_default` would otherwise
-/// write a config pointing at the public testnet, and a module silently
-/// talking to the wrong chain is worse than one that refuses to start.
+/// The sequencer a home we provision ourselves should point at. No default on
+/// purpose: the wallet would otherwise write a config aimed at the public
+/// testnet, and a module silently talking to the wrong chain is worse than one
+/// that refuses to start.
 const SEQUENCER_ENV: &str = "LEZ_RLN_SEQUENCER";
 
-/// A funded account's private key (32-byte hex), imported so the wallet can
-/// sign as the fee payer. See the module header for why this cannot be
-/// bootstrapped. Not needed when the adopted wallet home already holds a
+/// A funded account's private key as 32-byte hex, imported so the wallet can
+/// sign as the fee payer. Not needed when the adopted home already holds a
 /// funded account — a staged deployment wallet does.
 const PAYER_KEY_ENV: &str = "LEZ_RLN_PAYER_KEY";
 
-/// An existing wallet home to adopt instead of provisioning one under the
-/// module's persistence dir. This is the variable the wallet crate itself
-/// reads (`wallet::HOME_DIR_ENV_VAR`) and the one the e2e harness and
-/// Basecamp already export, so a home staged by `tools/deployments/stage.sh`
-/// — config, storage and the payer's derivation together — is adopted whole
-/// with no extra configuration.
-const HOME_ENV: &str = wallet::HOME_DIR_ENV_VAR;
-
 /// How long a handler waits for bring-up before giving up. Consumers already
-/// retry a failed read; blocking a dispatch thread for the whole first sync
+/// retry a failed read; blocking a dispatch thread for a whole first sync
 /// would wedge the module under `concurrency:"multi"`.
 const READY_WAIT: Duration = Duration::from_secs(30);
 
-/// The wallet's execution gas limit. Gas is cycles in v0.2.5 and a
-/// registration costs ~9.1M, so the wallet's own 2,000,000 default refuses
-/// one outright. This is the per-transaction ceiling the sequencer allows,
-/// and unused gas is refunded, so a cheaper call still pays less.
+/// The wallet's execution gas limit, for a home we provision. Gas is cycles in
+/// v0.2.5 and a registration costs ~9.1M, so the wallet's own 2,000,000
+/// default refuses one outright. This is the per-transaction ceiling the
+/// sequencer allows; unused gas is refunded, so a cheaper call still pays less.
 const GAS_LIMIT: u64 = 10_000_000;
 
+#[allow(unsafe_code)]
+mod ffi {
+    //! Declarations for the `wallet_ffi` library. `#[allow(unsafe_code)]` is
+    //! scoped to this module, as it is for the generated scaffold and the lp
+    //! test transport: the crate keeps `deny(unsafe_code)` everywhere else.
+    use std::ffi::{c_char, c_void};
+
+    pub type WalletHandle = c_void;
+
+    pub const SUCCESS: i32 = 0;
+    /// `WALLET_NOT_INITIALIZED`, the code the test transport answers with.
+    pub const NO_WALLET: i32 = 3;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct Bytes32 {
+        pub data: [u8; 32],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct U128 {
+        pub data: [u8; 16],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct ProgramId {
+        pub data: [u32; 8],
+    }
+
+    #[repr(C)]
+    pub struct Account {
+        pub program_owner: Bytes32,
+        pub balance: U128,
+        pub data: *const u8,
+        pub data_len: usize,
+        pub nonce: U128,
+    }
+
+    impl Default for Account {
+        fn default() -> Self {
+            Self {
+                program_owner: Bytes32::default(),
+                balance: U128::default(),
+                data: std::ptr::null(),
+                data_len: 0,
+                nonce: U128::default(),
+            }
+        }
+    }
+
+    /// The two kinds this module uses: a public account either signs or does
+    /// not. The enum is wider; the private variants never appear here.
+    pub const KIND_PUBLIC: i32 = 0;
+    pub const KIND_PUBLIC_NO_SIGN: i32 = 1;
+
+    #[repr(C)]
+    pub struct AccountIdentity {
+        pub kind: i32,
+        pub account_id: Bytes32,
+        pub key_path: *mut c_char,
+        pub authorization_secret_key: Bytes32,
+        pub nullifier_secret_key: Bytes32,
+        pub nullifier_public_key: Bytes32,
+        pub viewing_public_key: *const u8,
+        pub viewing_public_key_len: usize,
+        pub identifier: U128,
+    }
+
+    impl AccountIdentity {
+        pub fn public(account_id: [u8; 32], signs: bool) -> Self {
+            Self {
+                kind: if signs { KIND_PUBLIC } else { KIND_PUBLIC_NO_SIGN },
+                account_id: Bytes32 { data: account_id },
+                key_path: std::ptr::null_mut(),
+                authorization_secret_key: Bytes32::default(),
+                nullifier_secret_key: Bytes32::default(),
+                nullifier_public_key: Bytes32::default(),
+                viewing_public_key: std::ptr::null(),
+                viewing_public_key_len: 0,
+                identifier: U128::default(),
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct TransactionResult {
+        pub tx_hash: *mut c_char,
+        pub success: bool,
+        pub secrets_data: *const Bytes32,
+        pub secrets_size: usize,
+    }
+
+    impl Default for TransactionResult {
+        fn default() -> Self {
+            Self {
+                tx_hash: std::ptr::null_mut(),
+                success: false,
+                secrets_data: std::ptr::null(),
+                secrets_size: 0,
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct CreateWalletOutput {
+        pub wallet: *mut WalletHandle,
+        pub mnemonic: *mut c_char,
+    }
+
+    extern "C" {
+        pub fn wallet_ffi_open(
+            config_path: *const c_char,
+            storage_path: *const c_char,
+            statistics_path: *const c_char,
+        ) -> *mut WalletHandle;
+
+        pub fn wallet_ffi_create_new(
+            config_path: *const c_char,
+            storage_path: *const c_char,
+            statistics_path: *const c_char,
+            password: *const c_char,
+        ) -> CreateWalletOutput;
+
+        pub fn wallet_ffi_save(handle: *mut WalletHandle) -> i32;
+
+        pub fn wallet_ffi_import_public_account(
+            handle: *mut WalletHandle,
+            private_key_hex: *const c_char,
+        ) -> i32;
+
+        pub fn wallet_ffi_create_account_public(
+            handle: *mut WalletHandle,
+            out_account_id: *mut Bytes32,
+        ) -> i32;
+
+        pub fn wallet_ffi_get_account_public(
+            handle: *mut WalletHandle,
+            account_id: *const Bytes32,
+            out_account: *mut Account,
+        ) -> i32;
+
+        pub fn wallet_ffi_free_account_data(account: *mut Account);
+
+        pub fn wallet_ffi_send_generic_public_transaction(
+            handle: *mut WalletHandle,
+            account_identities: *const AccountIdentity,
+            account_identities_size: usize,
+            instruction_data: *const u8,
+            instruction_data_size: usize,
+            program_id: ProgramId,
+            payer: *const Bytes32,
+            out_result: *mut TransactionResult,
+        ) -> i32;
+
+        pub fn wallet_ffi_free_transaction_result(result: *mut TransactionResult);
+
+        pub fn wallet_ffi_sync_to_block(handle: *mut WalletHandle, block_id: u64) -> i32;
+
+        pub fn wallet_ffi_get_current_block_height(
+            handle: *mut WalletHandle,
+            out_block_height: *mut u64,
+        ) -> i32;
+    }
+}
+
+#[allow(unsafe_code)]
+mod handle {
+    /// The opaque wallet pointer.
+    ///
+    /// `wallet_ffi` locks the wallet inside every entry point, so the pointer
+    /// is safe to share between threads; the `RwLock` around it is about *our*
+    /// sequencing (a derivation must not overlap a read), not its.
+    pub struct Handle(pub *mut super::ffi::WalletHandle);
+
+    // SAFETY: the pointer is opaque — this crate never dereferences it — and
+    // every library entry point takes the wallet's own lock before use.
+    unsafe impl Send for Handle {}
+    unsafe impl Sync for Handle {}
+}
+use handle::Handle;
+
 pub(crate) enum Readiness {
-    /// Bring-up has not run, or is still opening/syncing.
+    /// Bring-up has not finished: still opening, importing or syncing.
     Pending,
     /// Open and caught up to the head it last observed.
     Ready,
-    /// Bring-up failed; the string is the reason, already logged.
+    /// Bring-up gave up; the string is the reason, already logged.
     Failed(String),
 }
 
 struct State {
     readiness: Readiness,
-    /// Behind an `Arc<RwLock<_>>` so a handler can take its own reference and
-    /// release the state lock before calling: this module is
-    /// `concurrency:"multi"` and holding that lock across a sequencer round
-    /// trip would serialize every handler behind one call — the wedge the
-    /// single -> multi bump was made to escape. Reads and sends take `&self`
-    /// and share a read guard; deriving an account or syncing takes `&mut`
-    /// and excludes them, which is the honest model anyway — the wallet
-    /// serves no reads while a sync runs.
-    wallet: Option<Arc<RwLock<WalletCore>>>,
+    /// Shared for reads and sends, exclusive for deriving an account. Callers
+    /// clone the `Arc` and drop the state lock before calling: holding it
+    /// across a sequencer round trip would serialize every handler, the wedge
+    /// the `single` -> `multi` concurrency bump was made to escape.
+    wallet: Option<Arc<RwLock<Handle>>>,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -97,22 +275,13 @@ static STATE: Mutex<State> = Mutex::new(State {
 /// Signalled once bring-up settles, either way.
 static SETTLED: Condvar = Condvar::new();
 
-static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("wallet runtime")
-});
-
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Kick bring-up on its own thread. Called from `on_context_ready`, which
-/// runs on the host's Qt main thread — opening a wallet there would block the
-/// loop for the whole calibration-and-sync, so nothing here may be done
-/// inline.
+/// Kick bring-up on its own thread. Called from `on_context_ready`, which runs
+/// on the host's Qt main thread — opening a wallet calibrates sequencers and
+/// then syncs the chain, work the loop must not be holding.
 pub(crate) fn spawn_bring_up(persistence_path: &str) {
     let home = match std::env::var(HOME_ENV) {
         Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir.trim()),
@@ -152,8 +321,8 @@ fn bring_up(home: &Path) {
 
     // An existing config is authoritative and is never rewritten: adopting a
     // home means adopting the chain it already points at, and re-pointing a
-    // wallet that already holds registered memberships would strand them.
-    // Only a home we are provisioning ourselves needs to be told a sequencer.
+    // wallet that holds registered memberships would strand them. Only a home
+    // we provision ourselves needs to be told a sequencer.
     if !config_path.exists() {
         let sequencer = std::env::var(SEQUENCER_ENV).unwrap_or_default();
         let sequencer = sequencer.trim();
@@ -171,103 +340,136 @@ fn bring_up(home: &Path) {
         }
     }
 
-    if let Err(e) = prepare_storage(&storage_path) {
-        fail(&format!("wallet storage: {e}"));
-        return;
-    }
-
-    let opened = RUNTIME.block_on(WalletCore::new_update_chain(
-        config_path,
-        storage_path,
-        statistics_path,
-        None,
-    ));
-    let mut core = match opened {
-        Ok(core) => core,
+    let handle = match open_or_create(&config_path, &storage_path, &statistics_path) {
+        Ok(h) => h,
         Err(e) => {
-            fail(&format!("open: {e}"));
+            fail(&e);
             return;
         }
     };
 
-    match sync(&mut core) {
+    if let Err(e) = import_payer_key(&handle) {
+        fail(&e);
+        return;
+    }
+
+    match sync(&handle) {
         Ok(head) => eprintln!("lez-rln wallet: synced to block {head}"),
-        // Reads go to the sequencer, not to local state, so a wallet that
-        // opened but has not caught up is still useful; a send tops it up.
+        // Account reads go to the sequencer rather than to local state, so a
+        // wallet that opened but has not caught up still answers them.
         Err(e) => eprintln!("lez-rln wallet: initial sync incomplete: {e}"),
     }
 
     let mut state = lock(&STATE);
-    state.wallet = Some(Arc::new(RwLock::new(core)));
+    state.wallet = Some(Arc::new(RwLock::new(handle)));
     state.readiness = Readiness::Ready;
     SETTLED.notify_all();
     eprintln!("lez-rln wallet: ready ({})", home.display());
 }
 
-/// Load or create the storage, and import the fee payer's key when one is
-/// configured. Done on `Storage` directly, before `WalletCore` opens, the way
-/// `mint_payer` does it — `WalletCore` reaches for a sequencer as it opens,
-/// and the import must be persisted before that.
-fn prepare_storage(storage_path: &Path) -> anyhow::Result<()> {
-    let mut storage = if storage_path.exists() {
-        Storage::from_path(storage_path)?
-    } else {
-        // Loud on purpose. A home staged for a deployment carries the payer's
-        // derivation in its storage; creating an empty wallet over a home that
-        // was meant to have one registers nothing, and says why only much
-        // later and only as a fee refusal.
-        eprintln!(
-            "lez-rln wallet: no storage at {} — creating an empty wallet",
-            storage_path.display()
-        );
-        Storage::new("")?.0
-    };
+#[allow(unsafe_code)]
+fn open_or_create(config: &Path, storage: &Path, statistics: &Path) -> Result<Handle, String> {
+    let c = cstring(config)?;
+    let s = cstring(storage)?;
+    let t = cstring(statistics)?;
 
-    let mut dirty = !storage_path.exists();
-
-    if let Ok(raw) = std::env::var(PAYER_KEY_ENV) {
-        let raw = raw.trim();
-        if !raw.is_empty() {
-            let label = Label::new(PAYER_LABEL);
-            if storage.resolve_label(&label).is_none() {
-                let key = parse_private_key(raw)?;
-                storage.key_chain_mut().add_imported_public_account(key);
-                let account = imported_account_id(raw)?;
-                storage
-                    .add_label(label, AccountIdWithPrivacy::Public(account))
-                    .ok();
-                dirty = true;
-                eprintln!("lez-rln wallet: imported the fee payer {account}");
-            }
+    if storage.exists() {
+        // SAFETY: three valid null-terminated paths, alive across the call.
+        let raw = unsafe { ffi::wallet_ffi_open(c.as_ptr(), s.as_ptr(), t.as_ptr()) };
+        if raw.is_null() {
+            return Err(format!("open {} returned no handle", storage.display()));
         }
+        return Ok(Handle(raw));
     }
 
-    if dirty {
-        storage.save_to_path(storage_path)?;
+    // Loud on purpose. A home staged for a deployment carries the payer's
+    // derivation in its storage; creating an empty wallet over a home that was
+    // meant to have one registers nothing, and says why only much later and
+    // only as a fee refusal.
+    eprintln!(
+        "lez-rln wallet: no storage at {} — creating an empty wallet",
+        storage.display()
+    );
+    // This wallet build does not use the password for storage encryption
+    // (storage.json is plaintext either way), so there is nothing to remember
+    // and nothing gained by inventing a secret here.
+    let pw = CString::new("").map_err(|e| e.to_string())?;
+    // SAFETY: four valid null-terminated strings, alive across the call.
+    let out = unsafe { ffi::wallet_ffi_create_new(c.as_ptr(), s.as_ptr(), t.as_ptr(), pw.as_ptr()) };
+    if out.wallet.is_null() {
+        return Err(format!(
+            "create_new at {} returned no handle",
+            storage.display()
+        ));
     }
+    Ok(Handle(out.wallet))
+}
+
+#[allow(unsafe_code)]
+fn import_payer_key(handle: &Handle) -> Result<(), String> {
+    let Ok(raw) = std::env::var(PAYER_KEY_ENV) else {
+        return Ok(());
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(());
+    }
+    if crate::hex_to_bytes32(raw).is_none() {
+        return Err(format!("{PAYER_KEY_ENV} is not 32-byte hex"));
+    }
+    let key = CString::new(raw).map_err(|e| e.to_string())?;
+    // SAFETY: a live handle and a valid null-terminated hex string.
+    let rc = unsafe { ffi::wallet_ffi_import_public_account(handle.0, key.as_ptr()) };
+    if rc != ffi::SUCCESS {
+        return Err(format!("{PAYER_KEY_ENV} import failed (code {rc})"));
+    }
+    save(handle);
+    eprintln!("lez-rln wallet: imported the fee payer's key");
     Ok(())
 }
 
-fn parse_private_key(hex: &str) -> anyhow::Result<lee::PrivateKey> {
-    let bytes = crate::hex_to_bytes32(hex)
-        .ok_or_else(|| anyhow::anyhow!("{PAYER_KEY_ENV} is not 32-byte hex"))?;
-    lee::PrivateKey::try_new(bytes)
-        .map_err(|e| anyhow::anyhow!("{PAYER_KEY_ENV} is not a valid private key: {e:?}"))
+#[allow(unsafe_code)]
+fn save(handle: &Handle) {
+    // SAFETY: a live handle.
+    let rc = unsafe { ffi::wallet_ffi_save(handle.0) };
+    if rc != ffi::SUCCESS {
+        eprintln!("lez-rln wallet: save failed (code {rc})");
+    }
 }
 
-fn imported_account_id(hex: &str) -> anyhow::Result<AccountId> {
-    let key = parse_private_key(hex)?;
-    Ok(AccountId::from(&lee::PublicKey::new_from_private_key(&key)))
+/// Catch the wallet up to the head.
+///
+/// The wallet serves no reads while a sync runs, but during bring-up nothing
+/// is being served yet — handlers wait on `SETTLED` — so this takes the whole
+/// range in one call.
+#[allow(unsafe_code)]
+fn sync(handle: &Handle) -> Result<u64, String> {
+    let mut head: u64 = 0;
+    // SAFETY: a live handle and a valid out-pointer.
+    let rc = unsafe { ffi::wallet_ffi_get_current_block_height(handle.0, &raw mut head) };
+    if rc != ffi::SUCCESS {
+        return Err(format!("chain head unavailable (code {rc})"));
+    }
+    // SAFETY: a live handle.
+    let rc = unsafe { ffi::wallet_ffi_sync_to_block(handle.0, head) };
+    if rc != ffi::SUCCESS {
+        return Err(format!("sync to {head} failed (code {rc})"));
+    }
+    Ok(head)
 }
 
-/// The config this module writes for itself. The shape mirrors what
-/// `tools/deployments/stage.sh` emits and what the membership module's
-/// `provision_wallet_home` writes, so a home staged by either is readable
-/// here and vice versa.
+fn cstring(path: &Path) -> Result<CString, String> {
+    CString::new(path.to_string_lossy().as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The config this module writes for a home it provisions itself. The shape
+/// mirrors what `tools/deployments/stage.sh` emits and what the membership
+/// module's `provision_wallet_home` writes, so a home staged by either is
+/// readable here and vice versa.
 fn wallet_config_json(sequencer: &str) -> String {
     serde_json::json!({
-        // v0.2.5 reads `sequencers`; the flat field is what the rc6-era
-        // wallet read. Neither denies unknown fields, so both can ride along.
+        // v0.2.5 reads `sequencers`; the flat field is what the rc6-era wallet
+        // read. Neither denies unknown fields, so both can ride along.
         "sequencer_addr": sequencer,
         "sequencers": [{ "sequencer_addr": sequencer }],
         "seq_poll_timeout": "30s",
@@ -275,84 +477,48 @@ fn wallet_config_json(sequencer: &str) -> String {
         "seq_poll_max_retries": 10,
         "seq_block_poll_max_amount": 100,
         "gas_limit": GAS_LIMIT,
-        // The default is 100 sequential probes per sequencer, which blocks
-        // the open for minutes against a slow chain. One sequencer, 3 probes.
+        // The default is 100 sequential probes per sequencer, which blocks the
+        // open for minutes against a slow chain. One sequencer, 3 probes.
         "multi_sequencer_client_config": { "distribution_limit": 1, "calibration_limit": 3 },
     })
     .to_string()
 }
 
-/// Catch the wallet up to the head.
-///
-/// The wallet serves no reads while a sync runs, but during bring-up nothing
-/// is being served yet — handlers wait on `SETTLED` — so this can take the
-/// whole range in one call. `sync_to_block` is a no-op when the cursor is
-/// already past the target, which makes the top-up before a send free.
-fn sync(core: &mut WalletCore) -> anyhow::Result<u64> {
-    RUNTIME.block_on(async {
-        let head = core.get_last_block_id().await?;
-        core.sync_to_block(head).await?;
-        Ok(head)
-    })
-}
-
-/// Run `f` against the open wallet, waiting out bring-up if it is still in
-/// flight. `None` means the wallet is unusable — the caller reports the same
-/// empty string lez_core used to return.
-/// The wallet handle, once bring-up has settled. `None` means unusable, and
-/// the caller reports the same empty string lez_core used to return.
-fn wallet_handle(who: &str) -> Option<Arc<RwLock<WalletCore>>> {
-    {
-        let mut state = lock(&STATE);
-        loop {
-            match &state.readiness {
-                Readiness::Ready => break,
-                Readiness::Failed(reason) => {
-                    eprintln!("{who}: wallet unavailable: {reason}");
+/// The wallet, once bring-up has settled. `None` means unusable, and the
+/// caller reports the same empty string `lez_core` used to return.
+fn wallet(who: &str) -> Option<Arc<RwLock<Handle>>> {
+    let mut state = lock(&STATE);
+    loop {
+        match &state.readiness {
+            Readiness::Ready => break,
+            Readiness::Failed(reason) => {
+                eprintln!("{who}: wallet unavailable: {reason}");
+                return None;
+            }
+            Readiness::Pending => {
+                let (guard, timeout) = SETTLED
+                    .wait_timeout(state, READY_WAIT)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state = guard;
+                if timeout.timed_out() {
+                    eprintln!("{who}: wallet still coming up after {READY_WAIT:?}");
                     return None;
-                }
-                Readiness::Pending => {
-                    let (guard, timeout) = SETTLED
-                        .wait_timeout(state, READY_WAIT)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    state = guard;
-                    if timeout.timed_out() {
-                        eprintln!("{who}: wallet still coming up after {READY_WAIT:?}");
-                        return None;
-                    }
                 }
             }
         }
-        Some(Arc::clone(state.wallet.as_ref()?))
-        // The state lock is released here, before the call runs.
     }
+    state.wallet.clone()
+    // The state lock is released here, before the caller's call runs.
 }
 
-/// Run `f` against the wallet under a shared guard — reads and sends, which
-/// take `&self` and may overlap.
-fn with_wallet<R>(who: &str, f: impl FnOnce(&WalletCore) -> R) -> Option<R> {
-    let handle = wallet_handle(who)?;
-    let core = handle.read().unwrap_or_else(|p| p.into_inner());
-    Some(f(&core))
-}
-
-/// Run `f` against the wallet under an exclusive guard — deriving an account
-/// or syncing, which take `&mut` and must not overlap a read.
-fn with_wallet_mut<R>(who: &str, f: impl FnOnce(&mut WalletCore) -> R) -> Option<R> {
-    let handle = wallet_handle(who)?;
-    let mut core = handle.write().unwrap_or_else(|p| p.into_inner());
-    Some(f(&mut core))
-}
-
-// --- the three operations the module used to make over lp ------------------
-
-/// Decode a base58 account id to 64 hex chars; empty string on failure.
-/// Needs no wallet — kept here so every account-id conversion lives together.
-pub(crate) fn account_id_from_base58(base58: &str) -> String {
-    match base58.trim().parse::<AccountId>() {
-        Ok(id) => crate::rln_core::bytes_to_hex(id.value()),
-        Err(e) => {
-            eprintln!("account_id_from_base58({base58}): {e}");
+/// Decode a base58 account id to 64 hex chars; empty string on failure. Needs
+/// no wallet, so it answers before bring-up has finished — which matters,
+/// because the fee payer is resolved on the register path.
+pub(crate) fn account_id_from_base58(id: &str) -> String {
+    match base58::decode32(id.trim()) {
+        Some(bytes) => bytes_to_hex(&bytes),
+        None => {
+            eprintln!("account_id_from_base58: {id} is not a base58 account id");
             String::new()
         }
     }
@@ -361,33 +527,48 @@ pub(crate) fn account_id_from_base58(base58: &str) -> String {
 /// Public account state as the JSON `{program_owner, balance, nonce, data}`
 /// (all hex) that `lez_core` returned, so the parsing above is unchanged.
 /// Empty string on failure.
+#[allow(unsafe_code)]
 pub(crate) fn get_account_public(account_id_hex: &str) -> String {
     let Some(bytes) = crate::hex_to_bytes32(account_id_hex) else {
         eprintln!("get_account_public: {account_id_hex} is not 32-byte hex");
         return String::new();
     };
-    let id = AccountId::new(bytes);
-    let fetched = with_wallet("get_account_public", |core| {
-        RUNTIME.block_on(core.get_account_public(id))
-    });
-    match fetched {
-        Some(Ok(account)) => serde_json::json!({
-            "program_owner": crate::rln_core::bytes_to_hex(account.program_owner.value()),
-            "balance": account.balance.to_string(),
-            "nonce": account.nonce.0.to_string(),
-            "data": crate::rln_core::bytes_to_hex(&account.data),
-        })
-        .to_string(),
-        Some(Err(e)) => {
-            eprintln!("get_account_public({account_id_hex}): {e}");
-            String::new()
-        }
-        None => String::new(),
+    let Some(wallet) = wallet("get_account_public") else {
+        return String::new();
+    };
+    let guard = wallet.read().unwrap_or_else(|p| p.into_inner());
+    let id = ffi::Bytes32 { data: bytes };
+    let mut account = ffi::Account::default();
+    // SAFETY: a live handle, a stack id alive across the call, and an out
+    // struct we own.
+    let rc =
+        unsafe { ffi::wallet_ffi_get_account_public(guard.0, &raw const id, &raw mut account) };
+    if rc != ffi::SUCCESS {
+        eprintln!("get_account_public({account_id_hex}): code {rc}");
+        return String::new();
     }
+    // SAFETY: on success the library hands back a pointer it owns, valid for
+    // `data_len` bytes until `wallet_ffi_free_account_data`.
+    let data = if account.data.is_null() || account.data_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(account.data, account.data_len) }.to_vec()
+    };
+    let out = serde_json::json!({
+        "program_owner": bytes_to_hex(&account.program_owner.data),
+        "balance": u128::from_le_bytes(account.balance.data).to_string(),
+        "nonce": u128::from_le_bytes(account.nonce.data).to_string(),
+        "data": bytes_to_hex(&data),
+    })
+    .to_string();
+    // SAFETY: the struct the call just filled, freed exactly once.
+    unsafe { ffi::wallet_ffi_free_account_data(&raw mut account) };
+    out
 }
 
 /// Submit a generic public transaction, answering the JSON
 /// `{success, tx_hash, error}` shape the module already parses.
+#[allow(unsafe_code)]
 pub(crate) fn send_generic_public_transaction(
     account_ids: &[String],
     signing_requirements: &[bool],
@@ -399,80 +580,118 @@ pub(crate) fn send_generic_public_transaction(
         eprintln!("send_generic_public_transaction: account/signing arrays differ in length");
         return String::new();
     }
-    let mut accounts = Vec::with_capacity(account_ids.len());
+    let mut identities = Vec::with_capacity(account_ids.len());
     for (id_hex, signs) in account_ids.iter().zip(signing_requirements) {
         let Some(bytes) = crate::hex_to_bytes32(id_hex) else {
             eprintln!("send_generic_public_transaction: {id_hex} is not 32-byte hex");
             return String::new();
         };
-        let id = AccountId::new(bytes);
-        accounts.push(if *signs {
-            AccountIdentity::Public(id)
-        } else {
-            AccountIdentity::PublicNoSign(id)
-        });
+        identities.push(ffi::AccountIdentity::public(bytes, *signs));
     }
-    let Some(program_bytes) = crate::hex_to_bytes32(program_id_hex) else {
-        eprintln!("send_generic_public_transaction: program id {program_id_hex} is not 32-byte hex");
+    let Some(program) = crate::hex_to_bytes32(program_id_hex) else {
+        eprintln!(
+            "send_generic_public_transaction: program id {program_id_hex} is not 32-byte hex"
+        );
         return String::new();
     };
-    let program = AccountId::new(program_bytes);
+    // A ProgramId is eight u32 words, each little-endian, and an AccountId is
+    // their concatenation (lee program/mod.rs) — so this is the inverse.
+    let mut program_id = ffi::ProgramId::default();
+    for (word, chunk) in program_id.data.iter_mut().zip(program.chunks_exact(4)) {
+        *word = u32::from_le_bytes(chunk.try_into().unwrap_or([0; 4]));
+    }
 
     // Empty means self-pay, matching the lez_core contract.
     let payer = if payer_account_id_hex.trim().is_empty() {
         None
     } else {
         match crate::hex_to_bytes32(payer_account_id_hex) {
-            Some(bytes) => Some(AccountId::new(bytes)),
+            Some(bytes) => Some(ffi::Bytes32 { data: bytes }),
             None => {
-                eprintln!("send_generic_public_transaction: payer {payer_account_id_hex} is not 32-byte hex");
+                eprintln!(
+                    "send_generic_public_transaction: payer {payer_account_id_hex} is not \
+                     32-byte hex"
+                );
                 return String::new();
             }
         }
     };
+    let payer_ptr = payer.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
 
-    let sent = with_wallet("send_generic_public_transaction", |core| {
-        RUNTIME.block_on(core.send_pub_tx_paid_by(accounts, instruction.to_vec(), program, payer))
-    });
-    match sent {
-        Some(Ok(hash)) => serde_json::json!({
-            "success": true,
-            "tx_hash": crate::rln_core::bytes_to_hex(hash.as_ref()),
-            "error": "",
+    let Some(wallet) = wallet("send_generic_public_transaction") else {
+        return String::new();
+    };
+    let guard = wallet.read().unwrap_or_else(|p| p.into_inner());
+    let mut result = ffi::TransactionResult::default();
+    // SAFETY: a live handle; identities, instruction and payer all outlive the
+    // call; the out struct is ours.
+    let rc = unsafe {
+        ffi::wallet_ffi_send_generic_public_transaction(
+            guard.0,
+            identities.as_ptr(),
+            identities.len(),
+            instruction.as_ptr(),
+            instruction.len(),
+            program_id,
+            payer_ptr,
+            &raw mut result,
+        )
+    };
+    if rc != ffi::SUCCESS {
+        eprintln!("send_generic_public_transaction failed: code {rc}");
+        // SAFETY: freeing the out struct is the library's contract whether or
+        // not the call filled it.
+        unsafe { ffi::wallet_ffi_free_transaction_result(&raw mut result) };
+        return serde_json::json!({
+            "success": false,
+            "tx_hash": "",
+            "error": format!("wallet_ffi error {rc}"),
         })
-        .to_string(),
-        Some(Err(e)) => {
-            eprintln!("send_generic_public_transaction failed: {e}");
-            serde_json::json!({ "success": false, "tx_hash": "", "error": e.to_string() })
-                .to_string()
-        }
-        None => String::new(),
+        .to_string();
     }
+    // SAFETY: on success tx_hash is null or a null-terminated string the
+    // library owns until the free below.
+    let tx_hash = if result.tx_hash.is_null() {
+        String::new()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(result.tx_hash) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let success = result.success;
+    // SAFETY: the struct the call just filled, freed exactly once.
+    unsafe { ffi::wallet_ffi_free_transaction_result(&raw mut result) };
+
+    serde_json::json!({ "error": "", "success": success, "tx_hash": tx_hash }).to_string()
 }
 
 /// Derive a fresh public account in this module's own wallet and persist it,
 /// returning it as 64 hex chars. Empty string on failure.
 ///
-/// Account derivation is deterministic from the wallet's seed, so this hands
-/// back the next unused slot rather than a random one; a caller that needs an
-/// account nothing has claimed on-chain yet checks the balance and asks
-/// again. It lives here because the wallet does: the accounts this module
-/// signs with have to be ones its own storage knows.
+/// Derivation is deterministic from the wallet's seed, so this hands back the
+/// next slot rather than a random one; a caller that needs an account nothing
+/// has claimed on-chain yet checks the balance and asks again. It lives here
+/// because the wallet does: the accounts this module signs with have to be
+/// ones its own storage knows.
+#[allow(unsafe_code)]
 pub(crate) fn create_holding_account() -> String {
-    let created = with_wallet_mut("create_holding_account", |core| {
-        let (account, _chain_index) = core.create_new_account_public(None);
-        // Derivation alone does not persist; without this the account is gone
-        // on the next open and nothing can sign for it.
-        core.store_persistent_data().map(|()| account)
-    });
-    match created {
-        Some(Ok(account)) => crate::rln_core::bytes_to_hex(account.value()),
-        Some(Err(e)) => {
-            eprintln!("create_holding_account: {e}");
-            String::new()
-        }
-        None => String::new(),
+    let Some(wallet) = wallet("create_holding_account") else {
+        return String::new();
+    };
+    // Exclusive: deriving mutates the key chain, and a read mid-derivation
+    // would see a wallet halfway through it.
+    let guard = wallet.write().unwrap_or_else(|p| p.into_inner());
+    let mut out = ffi::Bytes32::default();
+    // SAFETY: a live handle and an out struct we own.
+    let rc = unsafe { ffi::wallet_ffi_create_account_public(guard.0, &raw mut out) };
+    if rc != ffi::SUCCESS {
+        eprintln!("create_holding_account: code {rc}");
+        return String::new();
     }
+    // Derivation alone does not persist; without this the account is gone on
+    // the next open and nothing can sign for it.
+    save(&guard);
+    bytes_to_hex(&out.data)
 }
 
 /// What the module can say about its wallet without one being open — the read
@@ -494,4 +713,150 @@ pub(crate) fn status_json() -> String {
         "state": name,
     })
     .to_string()
+}
+
+/// The unit-test binary links no `wallet_ffi`, yet the code above names its
+/// symbols. Define them as a "no wallet" transport — every entry point answers
+/// `WALLET_NOT_INITIALIZED` and the constructors hand back null — so a test
+/// exercises the argument handling above and never reaches a real wallet. The
+/// real symbols come from the library at the final plugin link.
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod wallet_ffi_test_transport {
+    use super::ffi;
+    use std::ffi::c_char;
+
+    #[no_mangle]
+    pub extern "C" fn wallet_ffi_open(
+        _c: *const c_char,
+        _s: *const c_char,
+        _t: *const c_char,
+    ) -> *mut ffi::WalletHandle {
+        std::ptr::null_mut()
+    }
+
+    #[no_mangle]
+    pub extern "C" fn wallet_ffi_create_new(
+        _c: *const c_char,
+        _s: *const c_char,
+        _t: *const c_char,
+        _p: *const c_char,
+    ) -> ffi::CreateWalletOutput {
+        ffi::CreateWalletOutput {
+            wallet: std::ptr::null_mut(),
+            mnemonic: std::ptr::null_mut(),
+        }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn wallet_ffi_save(_h: *mut ffi::WalletHandle) -> i32 {
+        ffi::NO_WALLET
+    }
+
+    #[no_mangle]
+    pub extern "C" fn wallet_ffi_import_public_account(
+        _h: *mut ffi::WalletHandle,
+        _k: *const c_char,
+    ) -> i32 {
+        ffi::NO_WALLET
+    }
+
+    #[no_mangle]
+    pub extern "C" fn wallet_ffi_create_account_public(
+        _h: *mut ffi::WalletHandle,
+        _o: *mut ffi::Bytes32,
+    ) -> i32 {
+        ffi::NO_WALLET
+    }
+
+    #[no_mangle]
+    pub extern "C" fn wallet_ffi_get_account_public(
+        _h: *mut ffi::WalletHandle,
+        _a: *const ffi::Bytes32,
+        _o: *mut ffi::Account,
+    ) -> i32 {
+        ffi::NO_WALLET
+    }
+
+    #[no_mangle]
+    pub extern "C" fn wallet_ffi_free_account_data(_a: *mut ffi::Account) {}
+
+    #[no_mangle]
+    #[allow(clippy::too_many_arguments)]
+    pub extern "C" fn wallet_ffi_send_generic_public_transaction(
+        _h: *mut ffi::WalletHandle,
+        _ai: *const ffi::AccountIdentity,
+        _ais: usize,
+        _i: *const u8,
+        _is: usize,
+        _p: ffi::ProgramId,
+        _payer: *const ffi::Bytes32,
+        _o: *mut ffi::TransactionResult,
+    ) -> i32 {
+        ffi::NO_WALLET
+    }
+
+    #[no_mangle]
+    pub extern "C" fn wallet_ffi_free_transaction_result(_r: *mut ffi::TransactionResult) {}
+
+    #[no_mangle]
+    pub extern "C" fn wallet_ffi_sync_to_block(_h: *mut ffi::WalletHandle, _b: u64) -> i32 {
+        ffi::NO_WALLET
+    }
+
+    #[no_mangle]
+    pub extern "C" fn wallet_ffi_get_current_block_height(
+        _h: *mut ffi::WalletHandle,
+        _o: *mut u64,
+    ) -> i32 {
+        ffi::NO_WALLET
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_base58_payer_resolves_without_a_wallet() {
+        // The conversion is local now, so it answers before bring-up — which
+        // matters, because the fee payer is resolved on the register path.
+        assert_eq!(
+            account_id_from_base58("FqNyaKjaeUxjMxJszC88Z6SUUL8pxBgN6qRHC4ZsJjgn"),
+            "dc6857ef4236ef416fb6357c1f9988a7c7558b07492d7284c411b3864a1fccf3"
+        );
+        assert_eq!(account_id_from_base58("not an account"), "");
+    }
+
+    #[test]
+    fn status_never_fails_and_starts_pending() {
+        let s = status_json();
+        assert!(s.contains(r#""state":"pending""#), "got {s}");
+        assert!(s.contains(r#""ready":false"#), "got {s}");
+    }
+
+    #[test]
+    fn mismatched_account_and_signing_arrays_are_refused_before_any_call() {
+        // Returns before touching the wallet, so it holds with none open.
+        let out = send_generic_public_transaction(
+            &["ab".repeat(32)],
+            &[true, false],
+            &[1, 2, 3],
+            &"cd".repeat(32),
+            "",
+        );
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn a_malformed_program_id_is_refused_before_any_call() {
+        let out = send_generic_public_transaction(
+            &["ab".repeat(32)],
+            &[true],
+            &[1, 2, 3],
+            "not-hex",
+            "",
+        );
+        assert_eq!(out, "");
+    }
 }

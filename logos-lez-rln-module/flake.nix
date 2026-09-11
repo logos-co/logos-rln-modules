@@ -10,9 +10,21 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
-    # The module has no module-level dependencies: it links the LEZ wallet
-    # crate directly (rust-lib/Cargo.toml) rather than calling the lez_core
-    # module, so nothing here resolves a dependency lidl any more.
+    # No module-level dependencies since 3.0.0: this module links wallet_ffi
+    # and holds its own wallet handle rather than calling the lez_core module,
+    # so nothing here resolves a dependency lidl any more.
+    #
+    # The library comes PREBUILT from the LEZ flake — the same package lez_core
+    # links. Compiling the wallet crate here instead would need a prebuilt
+    # rapidsnark, the circuits tree, a pre-fetched risc0 recursion archive and,
+    # on macOS, a Metal toolchain stub and an unsandboxed build; the LEZ flake
+    # supplies all of that and a module flake cannot.
+    #
+    # Must match the root flake's pin: the wallet takes its gas limit from
+    # config only on this fork, and a registration needs five times the stock
+    # default.
+    logos-execution-zone.url =
+      "github:adklempner/logos-execution-zone?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a";
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:
@@ -21,18 +33,26 @@
       systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ];
       forAllSystems = fn: nixpkgs.lib.genAttrs systems fn;
 
-      # The builder runs logos-lidl-gen to emit the C ABI scaffold (+ the
-      # typed lez_core dependency client) at rust-lib/generated/,
-      # compiles the staticlib, and wraps it in the Qt cdylib glue, driven by
-      # metadata.json — including concurrency:"multi" (see README "Design
-      # constraints").
+      # The builder runs logos-lidl-gen to emit the C ABI scaffold at
+      # rust-lib/generated/, compiles the staticlib, and wraps it in the Qt
+      # cdylib glue, driven by metadata.json — including concurrency:"multi"
+      # (see README "Design constraints").
       #
       # RISC0_SKIP_BUILD_KERNELS comes from metadata nix.rust.env: risc0-zkvm
       # is serde-only here, no proving.
+      #
+      # wallet_ffi is the LEZ flake's own `wallet` package — the prebuilt
+      # library, header included — wired exactly as lez_core wires it.
       module = logos-module-builder.lib.mkLogosModule {
         src = ./.;
         configFile = ./metadata.json;
         flakeInputs = inputs;
+        externalLibInputs = {
+          wallet_ffi = {
+            input = inputs.logos-execution-zone;
+            packages.default = "wallet";
+          };
+        };
       };
     in
     {

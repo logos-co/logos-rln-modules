@@ -19,14 +19,21 @@
     }
   },
   "nix": {
-    "external_libraries": [],
+    "external_libraries": [
+      {
+        "name": "wallet_ffi"
+      }
+    ],
     "packages": {
       "build": [],
       "runtime": []
     },
     "cmake": {
       "find_packages": [],
-      "extra_include_dirs": []
+      "extra_include_dirs": [],
+      "extra_link_libraries": [
+        "wallet_ffi"
+      ]
     },
     "rust": {
       "toolchain": "1.94.0",
