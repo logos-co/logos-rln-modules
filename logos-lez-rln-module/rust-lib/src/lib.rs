@@ -616,6 +616,13 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
 struct LogosLezRlnModuleImpl;
 
 impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
+    /// Derive a fresh public account in this module's own wallet. The
+    /// accounts it signs with have to be ones its own storage knows, so a
+    /// consumer that needs a holding to fund and register with asks here.
+    fn create_holding_account(&self) -> String {
+        wallet::create_holding_account()
+    }
+
     /// Whether the wallet this module owns is usable. Never fails — a
     /// consumer polls it to tell "still coming up" from "broken", because
     /// every chain-facing method answers "" in both cases.

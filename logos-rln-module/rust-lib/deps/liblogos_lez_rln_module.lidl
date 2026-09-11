@@ -40,4 +40,13 @@ module liblogos_lez_rln_module {
   ; LEZ wallet crate and brings a wallet up itself, so every method above
   ; answers "" until this reports ready — which is a retry, not a failure.
   method wallet_status() -> tstr
+
+  ; Derive a fresh public account in this module's own wallet, persist it and
+  ; return it as 64 hex chars; "" on failure. Since v3.0.0 the accounts this
+  ; module signs with must be ones ITS storage knows, so a caller that needs
+  ; a holding to fund and register with asks here rather than deriving one in
+  ; some other wallet. Derivation is deterministic from the wallet seed, so
+  ; this returns the next slot, not a random account: a caller wanting one
+  ; nothing has claimed on-chain checks get_token_balance and asks again.
+  method create_holding_account() -> tstr
 }

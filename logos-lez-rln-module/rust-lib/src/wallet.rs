@@ -23,7 +23,7 @@
 //! `LEZ_RLN_PAYER_KEY` — and `LEZ_RLN_PAYER` names which account to declare.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
 use wallet::account::{AccountIdWithPrivacy, Label};
@@ -78,13 +78,15 @@ pub(crate) enum Readiness {
 
 struct State {
     readiness: Readiness,
-    /// Behind an `Arc` so a handler can take a reference and release the
-    /// state lock before it calls: this module is `concurrency:"multi"` and
-    /// holding the lock across a sequencer round trip would serialize every
-    /// handler behind one call — the exact wedge the single -> multi bump
-    /// was made to escape. Every method a handler uses takes `&self`; only
-    /// bring-up needs `&mut`, and it runs before the `Arc` is published.
-    wallet: Option<Arc<WalletCore>>,
+    /// Behind an `Arc<RwLock<_>>` so a handler can take its own reference and
+    /// release the state lock before calling: this module is
+    /// `concurrency:"multi"` and holding that lock across a sequencer round
+    /// trip would serialize every handler behind one call — the wedge the
+    /// single -> multi bump was made to escape. Reads and sends take `&self`
+    /// and share a read guard; deriving an account or syncing takes `&mut`
+    /// and excludes them, which is the honest model anyway — the wallet
+    /// serves no reads while a sync runs.
+    wallet: Option<Arc<RwLock<WalletCore>>>,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -196,7 +198,7 @@ fn bring_up(home: &Path) {
     }
 
     let mut state = lock(&STATE);
-    state.wallet = Some(Arc::new(core));
+    state.wallet = Some(Arc::new(RwLock::new(core)));
     state.readiness = Readiness::Ready;
     SETTLED.notify_all();
     eprintln!("lez-rln wallet: ready ({})", home.display());
@@ -289,8 +291,10 @@ fn sync(core: &mut WalletCore) -> anyhow::Result<u64> {
 /// Run `f` against the open wallet, waiting out bring-up if it is still in
 /// flight. `None` means the wallet is unusable — the caller reports the same
 /// empty string lez_core used to return.
-fn with_wallet<R>(who: &str, f: impl FnOnce(&WalletCore) -> R) -> Option<R> {
-    let core = {
+/// The wallet handle, once bring-up has settled. `None` means unusable, and
+/// the caller reports the same empty string lez_core used to return.
+fn wallet_handle(who: &str) -> Option<Arc<RwLock<WalletCore>>> {
+    {
         let mut state = lock(&STATE);
         loop {
             match &state.readiness {
@@ -311,10 +315,25 @@ fn with_wallet<R>(who: &str, f: impl FnOnce(&WalletCore) -> R) -> Option<R> {
                 }
             }
         }
-        Arc::clone(state.wallet.as_ref()?)
+        Some(Arc::clone(state.wallet.as_ref()?))
         // The state lock is released here, before the call runs.
-    };
+    }
+}
+
+/// Run `f` against the wallet under a shared guard — reads and sends, which
+/// take `&self` and may overlap.
+fn with_wallet<R>(who: &str, f: impl FnOnce(&WalletCore) -> R) -> Option<R> {
+    let handle = wallet_handle(who)?;
+    let core = handle.read().unwrap_or_else(|p| p.into_inner());
     Some(f(&core))
+}
+
+/// Run `f` against the wallet under an exclusive guard — deriving an account
+/// or syncing, which take `&mut` and must not overlap a read.
+fn with_wallet_mut<R>(who: &str, f: impl FnOnce(&mut WalletCore) -> R) -> Option<R> {
+    let handle = wallet_handle(who)?;
+    let mut core = handle.write().unwrap_or_else(|p| p.into_inner());
+    Some(f(&mut core))
 }
 
 // --- the three operations the module used to make over lp ------------------
@@ -418,6 +437,31 @@ pub(crate) fn send_generic_public_transaction(
             eprintln!("send_generic_public_transaction failed: {e}");
             serde_json::json!({ "success": false, "tx_hash": "", "error": e.to_string() })
                 .to_string()
+        }
+        None => String::new(),
+    }
+}
+
+/// Derive a fresh public account in this module's own wallet and persist it,
+/// returning it as 64 hex chars. Empty string on failure.
+///
+/// Account derivation is deterministic from the wallet's seed, so this hands
+/// back the next unused slot rather than a random one; a caller that needs an
+/// account nothing has claimed on-chain yet checks the balance and asks
+/// again. It lives here because the wallet does: the accounts this module
+/// signs with have to be ones its own storage knows.
+pub(crate) fn create_holding_account() -> String {
+    let created = with_wallet_mut("create_holding_account", |core| {
+        let (account, _chain_index) = core.create_new_account_public(None);
+        // Derivation alone does not persist; without this the account is gone
+        // on the next open and nothing can sign for it.
+        core.store_persistent_data().map(|()| account)
+    });
+    match created {
+        Some(Ok(account)) => crate::rln_core::bytes_to_hex(account.value()),
+        Some(Err(e)) => {
+            eprintln!("create_holding_account: {e}");
+            String::new()
         }
         None => String::new(),
     }
