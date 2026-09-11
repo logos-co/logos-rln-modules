@@ -33,18 +33,30 @@ use std::sync::LazyLock;
 
 use rand_chacha::ChaCha20Rng;
 use rln::prelude::{
-    compute_id_secret, default_graph_single, default_zkey_single, hash_to_field_le,
-    ArkGroth16Backend, CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, IdentityKeys,
-    PoseidonHash, Proof, RLNBuilder, RLNMerkleProof, RLNProof, RLNProofValues, RLNWitnessInput,
-    SecretFr, Stateless, VerifyProofError, DEFAULT_TREE_DEPTH, RLN,
+    compute_id_secret, graph_from_raw, hash_to_field_le, zkey_from_raw, ArkGroth16Backend, CanonicalDeserialize,
+    CanonicalSerialize, Fr, Hasher, IdentityKeys, PoseidonHash, Proof, RLNBuilder, RLNMerkleProof,
+    RLNProof, RLNProofValues, RLNWitnessInput, SecretFr, Stateless, VerifyProofError, RLN,
 };
 use zeroize::Zeroize;
 
 use crate::registry_id::{bytes_to_hex, hex_to_bytes32, hex_to_vec};
 
-/// The circuit's fixed Merkle depth (zerokit stateless default = 20); a
-/// supplied path MUST have this length or witness construction fails.
-pub(crate) const RLN_TREE_DEPTH: usize = DEFAULT_TREE_DEPTH;
+/// The circuit's fixed Merkle depth; a supplied path MUST have this length or
+/// witness construction fails.
+///
+/// Not zerokit's default of 20 any more. LEZ v0.2.5 meters a transaction by its
+/// gas limit at one gas per cycle and refuses anything over ten million, and an
+/// on-chain merkle insert costs ~902,000 cycles per level — so a depth-20 tree
+/// cannot be registered into at all. The registry is depth 9 now, and this is
+/// the smallest circuit zerokit publishes that can cover it.
+pub(crate) const RLN_TREE_DEPTH: usize = 10;
+
+/// zerokit ships depth-10 artifacts in its repository but excludes them from
+/// the crates.io package to stay under the size limit, so they are vendored
+/// here. Verified identical in circuit version to the crate's embedded
+/// depth-20 pair, which matches the repository's byte for byte.
+const DEPTH_10_GRAPH: &[u8] = include_bytes!("../resources/tree_depth_10/graph.bin");
+const DEPTH_10_ZKEY: &[u8] = include_bytes!("../resources/tree_depth_10/rln_final.arkzkey");
 
 /// Failures the proof engine can raise. `Invalid` is NOT modelled here — a
 /// proof that simply does not verify is `Ok(false)` from [`verify`], so the
@@ -291,9 +303,15 @@ impl RateLimitProof {
 /// the per-message verify path.
 static RLN_STATELESS: LazyLock<RLN<Stateless, ArkGroth16Backend<PoseidonHash>>> =
     LazyLock::new(|| {
+        // `graph_from_raw` is told the depth it should find, so a mismatched
+        // artifact fails loudly here at first use rather than producing proofs
+        // against a tree shape nobody expects.
         RLNBuilder::stateless()
-            .graph(default_graph_single().clone())
-            .zkey(default_zkey_single().clone())
+            .graph(
+                graph_from_raw(DEPTH_10_GRAPH, Some(RLN_TREE_DEPTH), None)
+                    .expect("vendored depth-10 graph must load"),
+            )
+            .zkey(zkey_from_raw(DEPTH_10_ZKEY).expect("vendored depth-10 zkey must load"))
             .build()
     });
 
@@ -578,8 +596,14 @@ mod tests {
     // are randomized, so the proof is pinned structurally (layout) while its
     // public values are pinned byte-exact. Inputs: seed = 32×0x07,
     // rln_identifier = 32×0x09, epoch index = 1231028105, signal =
-    // "Hello, RLN!", zero-sibling all-left depth-20 path.
+    // "Hello, RLN!", zero-sibling all-left depth-10 path.
     // A change here breaks cross-node verification — never rebind silently.
+    //
+    // REBOUND for the depth-10 circuit. `root` is the only value that moved,
+    // because the circuit folds the path to produce it and the path is now ten
+    // levels rather than twenty; every other value here is depth-independent
+    // and is unchanged, which is the evidence that nothing else shifted. Every
+    // verifier must ship the depth-10 artifacts for these to match.
     #[test]
     fn frozen_interop_vectors() {
         // Identity derivation (zerokit seeded keygen, LE hex).
@@ -614,7 +638,7 @@ mod tests {
             .to_json();
         assert_eq!(
             j["root"].as_str().unwrap(),
-            "e6b1124d580df28efdb5a009ee7eb485cc33625df6b98fc058054217160d8a07"
+            "16f5e233ad4c8ee7d66d1b0909f942e3384eb12721296690d340cc77ff41aa1b"
         );
         assert_eq!(
             j["nullifier"].as_str().unwrap(),
