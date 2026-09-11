@@ -10,9 +10,8 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
-    # Overrides lez_core's own pin, which predates the crates.io fetch fix
-    # (logos-execution-zone#876). Drop once lez_core bumps past it.
-    logos-execution-zone.url = "github:logos-blockchain/logos-execution-zone?ref=dev";
+    # Must match the root flake's pin.
+    logos-execution-zone.url = "github:adklempner/logos-execution-zone?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a";
     # Name matches metadata.json#dependencies; the builder resolves by name.
     lez_core = {
       url = "github:logos-blockchain/logos-execution-zone-module?rev=0ea57f8a1c57539d6ee0961a9cd27b064685b9e8";
