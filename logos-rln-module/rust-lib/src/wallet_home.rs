@@ -46,6 +46,12 @@ pub(crate) fn provision_impl(options_json: &str) -> Result<serde_json::Value, Ap
             "seq_tx_poll_max_blocks": 15,
             "seq_poll_max_retries": 10,
             "seq_block_poll_max_amount": 100,
+            // A registration costs ~9.1M cycles and gas is cycles, so the
+            // wallet's own default of 2,000,000 refuses one outright — with
+            // "Incorrect fee" and nothing to say which limit it hit. Declare
+            // the sequencer's per-transaction ceiling, the most a wallet may
+            // ask for; unused gas is refunded, so a cheaper call pays less.
+            "gas_limit": 10_000_000,
             // v0.2.2 open calibrates each sequencer with calibration_limit
             // sequential probes when no statistics file exists (default 100 —
             // minutes against a slow chain, and open blocks the module's
@@ -155,6 +161,7 @@ mod tests {
                 "seq_tx_poll_max_blocks": 15,
                 "seq_poll_max_retries": 10,
                 "seq_block_poll_max_amount": 100,
+                "gas_limit": 10_000_000,
                 "multi_sequencer_client_config": { "distribution_limit": 1, "calibration_limit": 3 },
             })
         );
