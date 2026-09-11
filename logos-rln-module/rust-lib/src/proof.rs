@@ -404,6 +404,81 @@ fn secret_to_bytes32(secret: &SecretFr) -> [u8; 32] {
     out
 }
 
+/// Extend a registry's Merkle path and root to the circuit's depth.
+///
+/// The on-chain tree is shallower than the circuit: an insert costs one
+/// Poseidon compression per level and LEZ v0.2.5 refuses a transaction needing
+/// more than ten million cycles, which bounds the registry's depth well below
+/// the smallest circuit zerokit publishes. The circuit still demands exactly
+/// [`RLN_TREE_DEPTH`] siblings and folds them into the root it proves against.
+///
+/// The levels the registry does not have are empty by construction — nothing
+/// can ever be inserted above its own capacity — so each missing sibling is the
+/// empty-subtree root of that height and the real tree is always the left
+/// child. Padding is therefore exact rather than an approximation: the root the
+/// circuit computes is the root the registry's tree would have had if it were
+/// built to the circuit's depth.
+///
+/// The same fold has to be applied to every root the registry reports, or a
+/// proof's root would never match the window it is checked against.
+pub(crate) mod depth_bridge {
+    use super::{CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, PoseidonHash,
+        RLN_TREE_DEPTH};
+    use crate::registry_id::{bytes_to_hex, hex_to_bytes32};
+    use std::sync::LazyLock;
+
+    /// `ZERO_LADDER[h]` is the root of an all-empty subtree of height `h`, so
+    /// index 0 is the zero leaf itself. Computed once; the circuit's depth
+    /// bounds how far it is ever needed.
+    static ZERO_LADDER: LazyLock<Vec<Fr>> = LazyLock::new(|| {
+        let mut ladder = vec![Fr::from(0u64)];
+        for height in 1..=RLN_TREE_DEPTH {
+            let below = ladder[height - 1];
+            ladder.push(Hasher::<PoseidonHash>::hash_pair(below, below));
+        }
+        ladder
+    });
+
+    fn fr_to_hex(value: &Fr) -> String {
+        let mut bytes = [0u8; 32];
+        value
+            .serialize_compressed(&mut bytes[..])
+            .expect("a field element serializes into 32 bytes");
+        bytes_to_hex(&bytes)
+    }
+
+    fn fr_from_hex(hex: &str) -> Option<Fr> {
+        let bytes = hex_to_bytes32(hex)?;
+        Fr::deserialize_compressed(&bytes[..]).ok()
+    }
+
+    /// Append the empty-subtree siblings that take a `depth`-level path up to
+    /// the circuit's depth. A path already at or beyond that depth is left
+    /// alone, so a registry deep enough to need no bridging costs nothing.
+    pub(crate) fn pad_path(elements: &mut Vec<String>, indices: &mut Vec<u8>, depth: usize) {
+        for height in depth..RLN_TREE_DEPTH {
+            elements.push(fr_to_hex(&ZERO_LADDER[height]));
+            indices.push(0);
+        }
+    }
+
+    /// Fold a `depth`-level root up to the circuit's depth, the same way
+    /// [`pad_path`] folds the path that produces it.
+    ///
+    /// Returns the root unchanged if it cannot be read as a field element —
+    /// a malformed root is the caller's problem to reject, and silently
+    /// substituting one here would be worse than passing it through.
+    pub(crate) fn fold_root(root_hex: &str, depth: usize) -> String {
+        let Some(mut root) = fr_from_hex(root_hex) else {
+            return root_hex.to_string();
+        };
+        for height in depth..RLN_TREE_DEPTH {
+            root = Hasher::<PoseidonHash>::hash_pair(root, ZERO_LADDER[height]);
+        }
+        fr_to_hex(&root)
+    }
+}
+
 /// LE-hex 32-byte string → `Fr`. A non-canonical value (≥ the field modulus)
 /// is rejected, never reduced.
 fn hex_to_fr(hex: &str, label: &str) -> Result<Fr, ProofError> {
@@ -589,6 +664,88 @@ mod tests {
             path_elements_hex: elements,
             path_indices: indices,
         }
+    }
+
+    /// Padding a path and folding a root must agree, because the circuit
+    /// derives the root it proves against from the path it is handed.
+    ///
+    /// Folding some leaf up through a short path and then lifting that root to
+    /// the circuit's depth has to land on the same value as folding the same
+    /// leaf up through the padded path in one go. If the two ever disagree, a
+    /// proof's root would not be in the window it is checked against and every
+    /// verification would fail — so this is the property the depth bridge
+    /// exists to hold, checked without needing a circuit or a chain.
+    #[test]
+    fn padding_and_folding_agree() {
+        use crate::registry_id::bytes_to_hex;
+
+        const REGISTRY_DEPTH: usize = 9;
+
+        // An arbitrary leaf and an arbitrary short path — the siblings need not
+        // be empty for the algebra to hold, only the padded ones do.
+        let leaf = Hasher::<PoseidonHash>::hash_pair(Fr::from(11u64), Fr::from(22u64));
+        let mut elements: Vec<String> = (0..REGISTRY_DEPTH)
+            .map(|i| {
+                let mut buf = [0u8; 32];
+                Fr::from(i as u64 + 7)
+                    .serialize_compressed(&mut buf[..])
+                    .expect("32 bytes");
+                bytes_to_hex(&buf)
+            })
+            .collect();
+        let mut indices = vec![0u8; REGISTRY_DEPTH];
+
+        let fold_through = |leaf: Fr, elements: &[String], indices: &[u8]| -> Fr {
+            let mut node = leaf;
+            for (hex, &is_right) in elements.iter().zip(indices) {
+                let sibling = hex_to_fr(hex, "sibling").expect("test sibling");
+                node = if is_right == 0 {
+                    Hasher::<PoseidonHash>::hash_pair(node, sibling)
+                } else {
+                    Hasher::<PoseidonHash>::hash_pair(sibling, node)
+                };
+            }
+            node
+        };
+
+        // The root the shallow registry itself would report.
+        let registry_root = fold_through(leaf, &elements, &indices);
+        let mut root_bytes = [0u8; 32];
+        registry_root
+            .serialize_compressed(&mut root_bytes[..])
+            .expect("32 bytes");
+
+        // Lift that root, and separately fold the leaf through the padded path.
+        let lifted = depth_bridge::fold_root(&bytes_to_hex(&root_bytes), REGISTRY_DEPTH);
+        depth_bridge::pad_path(&mut elements, &mut indices, REGISTRY_DEPTH);
+        assert_eq!(elements.len(), RLN_TREE_DEPTH);
+        assert_eq!(indices.len(), RLN_TREE_DEPTH);
+
+        let through_padded = fold_through(leaf, &elements, &indices);
+        let mut padded_bytes = [0u8; 32];
+        through_padded
+            .serialize_compressed(&mut padded_bytes[..])
+            .expect("32 bytes");
+
+        assert_eq!(
+            lifted,
+            bytes_to_hex(&padded_bytes),
+            "a lifted root must equal the root the padded path folds to"
+        );
+    }
+
+    /// A path already at the circuit's depth is passed through untouched, so a
+    /// registry deep enough to need no bridging pays nothing for one.
+    #[test]
+    fn padding_a_full_depth_path_changes_nothing() {
+        let (mut elements, mut indices) = zero_path();
+        let before = elements.clone();
+        depth_bridge::pad_path(&mut elements, &mut indices, RLN_TREE_DEPTH);
+        assert_eq!(elements, before);
+        assert_eq!(elements.len(), RLN_TREE_DEPTH);
+
+        let root = "00".repeat(32);
+        assert_eq!(depth_bridge::fold_root(&root, RLN_TREE_DEPTH), root);
     }
 
     // Frozen interop vectors — the wire contract other implementations must

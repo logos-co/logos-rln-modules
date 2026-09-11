@@ -64,13 +64,27 @@ pub(crate) fn fill_path_cache(
     prov: &dyn RegistryProvider,
 ) -> Result<(), ApiError> {
     let merkle = prov.get_merkle_proof(registry, leaf_index)?;
-    let path_elements_hex = json_str_array(&merkle, "path_elements")?;
-    let path_indices = json_u8_array(&merkle, "path_indices")?;
+    let mut path_elements_hex = json_str_array(&merkle, "path_elements")?;
+    let mut path_indices = json_u8_array(&merkle, "path_indices")?;
+
+    // The registry's tree is shallower than the circuit, so its path and every
+    // root it reports are lifted to the circuit's depth together — see
+    // `proof::depth_bridge`. The reply carries the depth it was built at; a
+    // registry that already matches the circuit is padded by nothing.
+    let depth = merkle
+        .get("depth")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(path_elements_hex.len() as u64) as usize;
+    crate::proof::depth_bridge::pad_path(&mut path_elements_hex, &mut path_indices, depth);
+
     // Adopt the snapshot's valid_roots into the root window (see
     // roots::adopt); older providers may omit the field.
     if let Ok(roots_hex) = json_str_array(&merkle, "valid_roots") {
-        let roots: Vec<[u8; 32]> =
-            roots_hex.iter().filter_map(|h| crate::registry_id::hex_to_bytes32(h)).collect();
+        let roots: Vec<[u8; 32]> = roots_hex
+            .iter()
+            .map(|h| crate::proof::depth_bridge::fold_root(h, depth))
+            .filter_map(|h| crate::registry_id::hex_to_bytes32(&h))
+            .collect();
         crate::roots::adopt(&registry.canonical, roots);
     }
     lock(&PATHS).get_or_insert_with(HashMap::new).insert(
