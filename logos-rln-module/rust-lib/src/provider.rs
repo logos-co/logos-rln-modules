@@ -281,6 +281,49 @@ pub(crate) trait RegistryProvider: Send + Sync {
     ) -> Result<serde_json::Value, ApiError>;
 }
 
+/// Turn a sibling `get_valid_roots` reply into roots at the prover's circuit
+/// depth.
+///
+/// A registry may be shallower than the circuit — ours is depth 9 against a
+/// depth-10 circuit — and `generate_proof` lifts its path and root to the
+/// circuit's depth. The valid-root window has to hold the same shape or the
+/// comparison in `validate_proof` can never match, and a node rejects proofs
+/// it made itself. The lift belongs here because this is the one place every
+/// consumer of these roots goes through.
+///
+/// `{"depth":N,"valid_roots":[…]}` is the current shape. A bare array is a
+/// pre-3.1 sibling that cannot say how deep its tree is; those roots are
+/// passed through, which is right only when the registry already matches the
+/// circuit.
+fn lift_roots_reply(parsed: &serde_json::Value) -> Result<Vec<String>, ApiError> {
+    let bad = |what: &str| {
+        ApiError::new(ErrorKind::ProviderFailure, &format!("roots reply {what}"))
+    };
+    let (depth, roots) = match parsed {
+        serde_json::Value::Array(a) => (crate::proof::RLN_TREE_DEPTH, a),
+        serde_json::Value::Object(o) => {
+            let depth = o
+                .get("depth")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| bad("has no depth"))? as usize;
+            if depth == 0 || depth > crate::proof::RLN_TREE_DEPTH {
+                return Err(bad(&format!("declares an impossible depth {depth}")));
+            }
+            let roots = o
+                .get("valid_roots")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| bad("has no valid_roots"))?;
+            (depth, roots)
+        }
+        _ => return Err(bad("is neither an array nor an object")),
+    };
+    Ok(roots
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(|h| crate::proof::depth_bridge::fold_root(h, depth))
+        .collect())
+}
+
 static LEZ_RLN: LezRlnProvider = LezRlnProvider;
 
 /// Namespace routing (spec MUST). Unknown namespaces are the caller's
@@ -455,9 +498,10 @@ impl RegistryProvider for LezRlnProvider {
                 client.get_valid_roots_async_with_timeout(&registry.account, READ_TIMEOUT, done)
             }),
         )?;
-        serde_json::from_str::<Vec<String>>(&raw).map_err(|e| {
+        let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
             ApiError::new(ErrorKind::ProviderFailure, &format!("roots reply parse: {e}"))
-        })
+        })?;
+        lift_roots_reply(&parsed)
     }
 
     fn get_registry_bounds(
@@ -536,6 +580,62 @@ mod lp_test_transport {
 
 #[cfg(test)]
 mod tests {
+    /// A registry shallower than the circuit must come back LIFTED.
+    ///
+    /// This is the regression for a node rejecting proofs it generated
+    /// itself: `generate_proof` lifts its root to the circuit's depth, and
+    /// the valid-root window is what `validate_proof` compares against. While
+    /// the refresher installed raw depth-9 roots, the two could never match,
+    /// and every proof went invalid roughly ten seconds after the path cache
+    /// last refreshed the window behind its back.
+    #[test]
+    fn a_shallow_registry_reports_roots_at_circuit_depth() {
+        let root = "11".repeat(32);
+        let reply = serde_json::json!({ "depth": 9, "valid_roots": [root.clone()] });
+        let lifted = super::lift_roots_reply(&reply).expect("depth-9 reply");
+        assert_eq!(lifted.len(), 1);
+        assert_ne!(lifted[0], root, "a depth-9 root must not pass through unlifted");
+        assert_eq!(
+            lifted[0],
+            crate::proof::depth_bridge::fold_root(&root, 9),
+            "the window must hold exactly what generate_proof folds to"
+        );
+    }
+
+    /// A registry already at the circuit's depth needs no lift, and must not
+    /// get one — folding it again would invent a root nothing can prove.
+    #[test]
+    fn a_full_depth_registry_passes_through() {
+        let root = "22".repeat(32);
+        let reply = serde_json::json!({
+            "depth": crate::proof::RLN_TREE_DEPTH,
+            "valid_roots": [root.clone()],
+        });
+        assert_eq!(super::lift_roots_reply(&reply).expect("full-depth reply"), vec![root]);
+    }
+
+    /// A pre-3.1 sibling answers a bare array and cannot say how deep its tree
+    /// is. Pass those through rather than guess a depth.
+    #[test]
+    fn a_bare_array_reply_is_still_accepted() {
+        let root = "33".repeat(32);
+        let reply = serde_json::json!([root.clone()]);
+        assert_eq!(super::lift_roots_reply(&reply).expect("legacy reply"), vec![root]);
+    }
+
+    #[test]
+    fn a_reply_with_no_depth_or_an_absurd_one_is_refused() {
+        let root = "44".repeat(32);
+        for bad in [
+            serde_json::json!({ "valid_roots": [root.clone()] }),
+            serde_json::json!({ "depth": 0, "valid_roots": [root.clone()] }),
+            serde_json::json!({ "depth": 99, "valid_roots": [root.clone()] }),
+            serde_json::json!("not a reply"),
+        ] {
+            assert!(super::lift_roots_reply(&bad).is_err(), "accepted {bad}");
+        }
+    }
+
     use super::*;
     use crate::registry_id;
 

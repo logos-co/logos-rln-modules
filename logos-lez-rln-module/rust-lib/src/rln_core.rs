@@ -160,6 +160,20 @@ fn serialize_instruction<T: BorshSerialize>(instruction: &T) -> Result<Vec<u8>, 
 /// Parse tree-main account data and return the valid roots.
 ///
 /// Index 0 = current root. Indices 1..N = non-zero history entries.
+/// The tree's configured depth, from the main account header.
+///
+/// The prover's circuit is deeper than a shrunk registry, so a consumer has to
+/// lift this tree's roots to the circuit's depth before comparing them with a
+/// root a proof carries. It cannot do that without knowing the depth, so
+/// `get_valid_roots` reports this alongside the roots — it is one byte of the
+/// header the caller has already fetched.
+pub fn tree_depth(data: &[u8]) -> Result<u8, RlnError> {
+    if data.len() < TreeMainLayout::SIZE {
+        return Err(RlnError::DataTooShort);
+    }
+    Ok(TreeMainLayout::parse(data).tree_depth)
+}
+
 pub fn get_valid_roots(data: &[u8]) -> Result<Vec<[u8; 32]>, RlnError> {
     if data.len() < TreeMainLayout::SIZE {
         return Err(RlnError::DataTooShort);

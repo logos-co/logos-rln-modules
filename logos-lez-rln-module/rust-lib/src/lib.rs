@@ -473,7 +473,20 @@ fn get_valid_roots_impl(rln_account_id_hex: &str) -> String {
         }
     };
 
-    roots_to_json_array(&roots).to_string()
+    // The depth rides along because the consumer cannot use these roots
+    // without it: a registry shallower than the prover's circuit has every
+    // root lifted to the circuit's depth before it is compared with a root a
+    // proof carries. It costs nothing — the header is already fetched.
+    let depth = match native::tree_depth(&main_data) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("get_valid_roots: tree depth unreadable: {e}");
+            return String::new();
+        }
+    };
+
+    serde_json::json!({ "depth": depth, "valid_roots": roots_to_json_array(&roots) })
+        .to_string()
 }
 
 fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> String {
