@@ -33,18 +33,30 @@ use std::sync::LazyLock;
 
 use rand_chacha::ChaCha20Rng;
 use rln::prelude::{
-    compute_id_secret, default_graph_single, default_zkey_single, hash_to_field_le,
-    ArkGroth16Backend, CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, IdentityKeys,
-    PoseidonHash, Proof, RLNBuilder, RLNMerkleProof, RLNProof, RLNProofValues, RLNWitnessInput,
-    SecretFr, Stateless, VerifyProofError, DEFAULT_TREE_DEPTH, RLN,
+    compute_id_secret, graph_from_raw, hash_to_field_le, zkey_from_raw, ArkGroth16Backend, CanonicalDeserialize,
+    CanonicalSerialize, Fr, Hasher, IdentityKeys, PoseidonHash, Proof, RLNBuilder, RLNMerkleProof,
+    RLNProof, RLNProofValues, RLNWitnessInput, SecretFr, Stateless, VerifyProofError, RLN,
 };
 use zeroize::Zeroize;
 
 use crate::registry_id::{bytes_to_hex, hex_to_bytes32, hex_to_vec};
 
-/// The circuit's fixed Merkle depth (zerokit stateless default = 20); a
-/// supplied path MUST have this length or witness construction fails.
-pub(crate) const RLN_TREE_DEPTH: usize = DEFAULT_TREE_DEPTH;
+/// The circuit's fixed Merkle depth; a supplied path MUST have this length or
+/// witness construction fails.
+///
+/// Not zerokit's default of 20 any more. LEZ v0.2.5 meters a transaction by its
+/// gas limit at one gas per cycle and refuses anything over ten million, and an
+/// on-chain merkle insert costs ~902,000 cycles per level — so a depth-20 tree
+/// cannot be registered into at all. The registry is depth 9 now, and this is
+/// the smallest circuit zerokit publishes that can cover it.
+pub(crate) const RLN_TREE_DEPTH: usize = 10;
+
+/// zerokit ships depth-10 artifacts in its repository but excludes them from
+/// the crates.io package to stay under the size limit, so they are vendored
+/// here. Verified identical in circuit version to the crate's embedded
+/// depth-20 pair, which matches the repository's byte for byte.
+const DEPTH_10_GRAPH: &[u8] = include_bytes!("../resources/tree_depth_10/graph.bin");
+const DEPTH_10_ZKEY: &[u8] = include_bytes!("../resources/tree_depth_10/rln_final.arkzkey");
 
 /// Failures the proof engine can raise. `Invalid` is NOT modelled here — a
 /// proof that simply does not verify is `Ok(false)` from [`verify`], so the
@@ -92,10 +104,16 @@ pub(crate) struct RateLimitProof {
     share_y: [u8; 32],
     nullifier: [u8; 32],
     /// The spec's `epoch[32]`, decoded — carried on proofs this module
-    /// generates; `None` for a wire proof reconstructed without one, which
-    /// `validate_proof` resolves by scanning instead of checking directly.
+    /// generates; `None` for a wire proof reconstructed without one.
+    /// `validate_proof` compares a carried epoch against the one the caller's
+    /// timestamp derives, and lets an absent epoch pass: the external
+    /// nullifier it recomputes already binds the proof to that epoch.
     epoch: Option<u64>,
 }
+
+/// The compressed Groth16 proof's byte length — the spec's `proof[128]`,
+/// and the canonical zerokit serialization's leading segment.
+const GROTH16_LEN: usize = 128;
 
 impl RateLimitProof {
     /// Bundle the Groth16 proof with its public values and capture both the
@@ -104,9 +122,9 @@ impl RateLimitProof {
     /// attach it afterward.
     fn from_parts(proof: Proof, values: RLNProofValues) -> Result<Self, ProofError> {
         let (share_y, nullifier) = single_values(&values)?;
-        let root = fr_to_u32(&values.root());
-        let external_nullifier = fr_to_u32(&values.external_nullifier());
-        let share_x = fr_to_u32(&values.x());
+        let root = fr_to_bytes32(&values.root());
+        let external_nullifier = fr_to_bytes32(&values.external_nullifier());
+        let share_x = fr_to_bytes32(&values.x());
         let rln_proof = RLNProof::new(proof, values);
         let mut canonical = Vec::new();
         rln_proof
@@ -117,28 +135,35 @@ impl RateLimitProof {
             root,
             external_nullifier,
             share_x,
-            share_y: fr_to_u32(&share_y),
-            nullifier: fr_to_u32(&nullifier),
+            share_y: fr_to_bytes32(&share_y),
+            nullifier: fr_to_bytes32(&nullifier),
             epoch: None,
         })
     }
 
-    /// The root the proof was generated against — the value `validate_proof`
-    /// checks against its valid-root window. Production verification reads
-    /// the root out of the canonical bytes inside zerokit; this decoded view
-    /// serves tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The root the proof was generated against. `validate_proof` reads this
+    /// on the hot path to pre-check the valid-root window — a miss answers
+    /// `invalid` and nudges the root refresher. Zerokit verifies against the
+    /// root inside the canonical bytes; this is the decoded view of it.
     pub(crate) fn root(&self) -> [u8; 32] {
         self.root
     }
 
-    /// The spec `RateLimitProof` as a JSON object: `proof` is the canonical
-    /// hex the consumer round-trips unchanged, the rest a decoded view.
-    /// `epoch` (the spec's `epoch[32]`, 32-byte LE hex) is present only when
-    /// this proof carries one.
+    /// The full canonical zerokit serialization as hex — generate_proof's
+    /// `proof_canonical` reply extra. Fed back alone as `{"proof": <hex>}`,
+    /// [`Self::from_json`] recovers every public value from the bytes.
+    pub(crate) fn canonical_hex(&self) -> String {
+        bytes_to_hex(&self.canonical)
+    }
+
+    /// The spec `RateLimitProof` as a JSON object — the decomposed shape:
+    /// `proof` is the bare Groth16 proof (spec `proof[128]`), the rest the
+    /// public values; `epoch` (spec `epoch[32]`, 32-byte LE hex) is present
+    /// only when this proof carries one. [`Self::from_json`] accepts this
+    /// shape and the canonical-blob form alike.
     pub(crate) fn to_json(&self) -> serde_json::Value {
         let mut out = serde_json::json!({
-            "proof": bytes_to_hex(&self.canonical),
+            "proof": bytes_to_hex(&self.canonical[..GROTH16_LEN.min(self.canonical.len())]),
             "root": bytes_to_hex(&self.root),
             "external_nullifier": bytes_to_hex(&self.external_nullifier),
             "share_x": bytes_to_hex(&self.share_x),
@@ -176,7 +201,6 @@ impl RateLimitProof {
         let bytes = hex_to_vec(proof_hex)
             .ok_or_else(|| ProofError::BadInput("proof: not valid hex".into()))?;
 
-        const GROTH16_LEN: usize = 128;
         let canonical: Vec<u8> = if bytes.len() == GROTH16_LEN {
             // Spec-struct shape: rebuild the zerokit proof around the bare
             // Groth16 proof and re-serialize it into the canonical form.
@@ -261,8 +285,9 @@ impl RateLimitProof {
     }
 
     /// The epoch this proof carries (the spec's `epoch[32]`, decoded), or
-    /// `None` for a wire proof reconstructed without one — `validate_proof`
-    /// checks the former directly and resolves the latter by scanning.
+    /// `None` for a wire proof reconstructed without one. `validate_proof`
+    /// compares a carried epoch directly; an absent one rides on the external
+    /// nullifier, which already binds the proof to the caller's epoch.
     pub(crate) fn epoch(&self) -> Option<u64> {
         self.epoch
     }
@@ -278,9 +303,15 @@ impl RateLimitProof {
 /// the per-message verify path.
 static RLN_STATELESS: LazyLock<RLN<Stateless, ArkGroth16Backend<PoseidonHash>>> =
     LazyLock::new(|| {
+        // `graph_from_raw` is told the depth it should find, so a mismatched
+        // artifact fails loudly here at first use rather than producing proofs
+        // against a tree shape nobody expects.
         RLNBuilder::stateless()
-            .graph(default_graph_single().clone())
-            .zkey(default_zkey_single().clone())
+            .graph(
+                graph_from_raw(DEPTH_10_GRAPH, Some(RLN_TREE_DEPTH), None)
+                    .expect("vendored depth-10 graph must load"),
+            )
+            .zkey(zkey_from_raw(DEPTH_10_ZKEY).expect("vendored depth-10 zkey must load"))
             .build()
     });
 
@@ -350,27 +381,102 @@ fn signal_to_x(signal: &[u8]) -> Fr {
 /// 32-byte LE value a proof's `external_nullifier` field must equal — the
 /// verify-side application + epoch-freshness binding.
 pub(crate) fn expected_external_nullifier(epoch: u64, rln_identifier: &[u8; 32]) -> [u8; 32] {
-    fr_to_u32(&external_nullifier(epoch, rln_identifier))
+    fr_to_bytes32(&external_nullifier(epoch, rln_identifier))
 }
 
 /// `Fr` → 32-byte LE (arkworks `serialize_compressed`, which for `Fr` is the
 /// 32-byte LE canonical form). A short write would silently corrupt
 /// security-relevant bytes, so it is asserted rather than tolerated.
-fn fr_to_u32(fr: &Fr) -> [u8; 32] {
+fn fr_to_bytes32(fr: &Fr) -> [u8; 32] {
     let mut out = [0u8; 32];
     fr.serialize_compressed(&mut out[..])
         .expect("Fr canonical LE form is exactly 32 bytes");
     out
 }
 
-/// `SecretFr` → 32-byte LE, same encoding as [`fr_to_u32`]. The caller owns
-/// the lifetime of the returned copy.
-fn secret_to_u32(secret: &SecretFr) -> [u8; 32] {
+/// `SecretFr` → 32-byte LE, same encoding as [`fr_to_bytes32`]. The caller
+/// owns the lifetime of the returned copy.
+fn secret_to_bytes32(secret: &SecretFr) -> [u8; 32] {
     let mut out = [0u8; 32];
     secret
         .serialize_compressed(&mut out[..])
         .expect("SecretFr canonical LE form is exactly 32 bytes");
     out
+}
+
+/// Extend a registry's Merkle path and root to the circuit's depth.
+///
+/// The on-chain tree is shallower than the circuit: an insert costs one
+/// Poseidon compression per level and LEZ v0.2.5 refuses a transaction needing
+/// more than ten million cycles, which bounds the registry's depth well below
+/// the smallest circuit zerokit publishes. The circuit still demands exactly
+/// [`RLN_TREE_DEPTH`] siblings and folds them into the root it proves against.
+///
+/// The levels the registry does not have are empty by construction — nothing
+/// can ever be inserted above its own capacity — so each missing sibling is the
+/// empty-subtree root of that height and the real tree is always the left
+/// child. Padding is therefore exact rather than an approximation: the root the
+/// circuit computes is the root the registry's tree would have had if it were
+/// built to the circuit's depth.
+///
+/// The same fold has to be applied to every root the registry reports, or a
+/// proof's root would never match the window it is checked against.
+pub(crate) mod depth_bridge {
+    use super::{CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, PoseidonHash,
+        RLN_TREE_DEPTH};
+    use crate::registry_id::{bytes_to_hex, hex_to_bytes32};
+    use std::sync::LazyLock;
+
+    /// `ZERO_LADDER[h]` is the root of an all-empty subtree of height `h`, so
+    /// index 0 is the zero leaf itself. Computed once; the circuit's depth
+    /// bounds how far it is ever needed.
+    static ZERO_LADDER: LazyLock<Vec<Fr>> = LazyLock::new(|| {
+        let mut ladder = vec![Fr::from(0u64)];
+        for height in 1..=RLN_TREE_DEPTH {
+            let below = ladder[height - 1];
+            ladder.push(Hasher::<PoseidonHash>::hash_pair(below, below));
+        }
+        ladder
+    });
+
+    fn fr_to_hex(value: &Fr) -> String {
+        let mut bytes = [0u8; 32];
+        value
+            .serialize_compressed(&mut bytes[..])
+            .expect("a field element serializes into 32 bytes");
+        bytes_to_hex(&bytes)
+    }
+
+    fn fr_from_hex(hex: &str) -> Option<Fr> {
+        let bytes = hex_to_bytes32(hex)?;
+        Fr::deserialize_compressed(&bytes[..]).ok()
+    }
+
+    /// Append the empty-subtree siblings that take a `depth`-level path up to
+    /// the circuit's depth. A path already at or beyond that depth is left
+    /// alone, so a registry deep enough to need no bridging costs nothing.
+    pub(crate) fn pad_path(elements: &mut Vec<String>, indices: &mut Vec<u8>, depth: usize) {
+        for height in depth..RLN_TREE_DEPTH {
+            elements.push(fr_to_hex(&ZERO_LADDER[height]));
+            indices.push(0);
+        }
+    }
+
+    /// Fold a `depth`-level root up to the circuit's depth, the same way
+    /// [`pad_path`] folds the path that produces it.
+    ///
+    /// Returns the root unchanged if it cannot be read as a field element —
+    /// a malformed root is the caller's problem to reject, and silently
+    /// substituting one here would be worse than passing it through.
+    pub(crate) fn fold_root(root_hex: &str, depth: usize) -> String {
+        let Some(mut root) = fr_from_hex(root_hex) else {
+            return root_hex.to_string();
+        };
+        for height in depth..RLN_TREE_DEPTH {
+            root = Hasher::<PoseidonHash>::hash_pair(root, ZERO_LADDER[height]);
+        }
+        fr_to_hex(&root)
+    }
 }
 
 /// LE-hex 32-byte string → `Fr`. A non-canonical value (≥ the field modulus)
@@ -393,8 +499,8 @@ pub(crate) fn generate_identity() -> Result<(String, String), ProofError> {
     let keys = IdentityKeys::generate_seeded::<PoseidonHash, ChaCha20Rng>(&seed);
     seed.zeroize();
     Ok((
-        bytes_to_hex(&fr_to_u32(&keys.id_commitment())),
-        bytes_to_hex(&secret_to_u32(&keys.identity_secret())),
+        bytes_to_hex(&fr_to_bytes32(&keys.id_commitment())),
+        bytes_to_hex(&secret_to_bytes32(&keys.identity_secret())),
     ))
 }
 
@@ -510,7 +616,7 @@ pub(crate) fn recover_identity_secret_hex(
     // compute_id_secret fails only on equal share_x (DivisionByZero).
     let secret = compute_id_secret(share1, share2)
         .map_err(|e| ProofError::Engine(format!("recover id secret: {e}")))?;
-    Ok(bytes_to_hex(&secret_to_u32(&secret)))
+    Ok(bytes_to_hex(&secret_to_bytes32(&secret)))
 }
 
 /// Build a proof from a seed over a synthetic zero-sibling depth-20 path — for
@@ -525,7 +631,7 @@ pub(crate) fn generate_for_test(
 ) -> RateLimitProof {
     let keys = IdentityKeys::generate_seeded::<PoseidonHash, ChaCha20Rng>(seed);
     let material = WitnessMaterial {
-        identity_secret_hash_hex: bytes_to_hex(&secret_to_u32(&keys.identity_secret())),
+        identity_secret_hash_hex: bytes_to_hex(&secret_to_bytes32(&keys.identity_secret())),
         rate_limit: 100,
         message_id: 0,
         path_elements_hex: vec!["00".repeat(32); RLN_TREE_DEPTH],
@@ -549,7 +655,7 @@ mod tests {
 
     fn material_from_seed(seed: &[u8], rate_limit: u64, message_id: u64) -> WitnessMaterial {
         let keys = IdentityKeys::generate_seeded::<PoseidonHash, ChaCha20Rng>(seed);
-        let secret_hex = bytes_to_hex(&secret_to_u32(&keys.identity_secret()));
+        let secret_hex = bytes_to_hex(&secret_to_bytes32(&keys.identity_secret()));
         let (elements, indices) = zero_path();
         WitnessMaterial {
             identity_secret_hash_hex: secret_hex,
@@ -560,23 +666,111 @@ mod tests {
         }
     }
 
+    /// Padding a path and folding a root must agree, because the circuit
+    /// derives the root it proves against from the path it is handed.
+    ///
+    /// Folding some leaf up through a short path and then lifting that root to
+    /// the circuit's depth has to land on the same value as folding the same
+    /// leaf up through the padded path in one go. If the two ever disagree, a
+    /// proof's root would not be in the window it is checked against and every
+    /// verification would fail — so this is the property the depth bridge
+    /// exists to hold, checked without needing a circuit or a chain.
+    #[test]
+    fn padding_and_folding_agree() {
+        use crate::registry_id::bytes_to_hex;
+
+        const REGISTRY_DEPTH: usize = 9;
+
+        // An arbitrary leaf and an arbitrary short path — the siblings need not
+        // be empty for the algebra to hold, only the padded ones do.
+        let leaf = Hasher::<PoseidonHash>::hash_pair(Fr::from(11u64), Fr::from(22u64));
+        let mut elements: Vec<String> = (0..REGISTRY_DEPTH)
+            .map(|i| {
+                let mut buf = [0u8; 32];
+                Fr::from(i as u64 + 7)
+                    .serialize_compressed(&mut buf[..])
+                    .expect("32 bytes");
+                bytes_to_hex(&buf)
+            })
+            .collect();
+        let mut indices = vec![0u8; REGISTRY_DEPTH];
+
+        let fold_through = |leaf: Fr, elements: &[String], indices: &[u8]| -> Fr {
+            let mut node = leaf;
+            for (hex, &is_right) in elements.iter().zip(indices) {
+                let sibling = hex_to_fr(hex, "sibling").expect("test sibling");
+                node = if is_right == 0 {
+                    Hasher::<PoseidonHash>::hash_pair(node, sibling)
+                } else {
+                    Hasher::<PoseidonHash>::hash_pair(sibling, node)
+                };
+            }
+            node
+        };
+
+        // The root the shallow registry itself would report.
+        let registry_root = fold_through(leaf, &elements, &indices);
+        let mut root_bytes = [0u8; 32];
+        registry_root
+            .serialize_compressed(&mut root_bytes[..])
+            .expect("32 bytes");
+
+        // Lift that root, and separately fold the leaf through the padded path.
+        let lifted = depth_bridge::fold_root(&bytes_to_hex(&root_bytes), REGISTRY_DEPTH);
+        depth_bridge::pad_path(&mut elements, &mut indices, REGISTRY_DEPTH);
+        assert_eq!(elements.len(), RLN_TREE_DEPTH);
+        assert_eq!(indices.len(), RLN_TREE_DEPTH);
+
+        let through_padded = fold_through(leaf, &elements, &indices);
+        let mut padded_bytes = [0u8; 32];
+        through_padded
+            .serialize_compressed(&mut padded_bytes[..])
+            .expect("32 bytes");
+
+        assert_eq!(
+            lifted,
+            bytes_to_hex(&padded_bytes),
+            "a lifted root must equal the root the padded path folds to"
+        );
+    }
+
+    /// A path already at the circuit's depth is passed through untouched, so a
+    /// registry deep enough to need no bridging pays nothing for one.
+    #[test]
+    fn padding_a_full_depth_path_changes_nothing() {
+        let (mut elements, mut indices) = zero_path();
+        let before = elements.clone();
+        depth_bridge::pad_path(&mut elements, &mut indices, RLN_TREE_DEPTH);
+        assert_eq!(elements, before);
+        assert_eq!(elements.len(), RLN_TREE_DEPTH);
+
+        let root = "00".repeat(32);
+        assert_eq!(depth_bridge::fold_root(&root, RLN_TREE_DEPTH), root);
+    }
+
     // Frozen interop vectors — the wire contract other implementations must
     // match. Every value below is deterministic; only the Groth16 proof bytes
     // are randomized, so the proof is pinned structurally (layout) while its
     // public values are pinned byte-exact. Inputs: seed = 32×0x07,
     // rln_identifier = 32×0x09, epoch index = 1231028105, signal =
-    // "Hello, RLN!", zero-sibling all-left depth-20 path.
+    // "Hello, RLN!", zero-sibling all-left depth-10 path.
     // A change here breaks cross-node verification — never rebind silently.
+    //
+    // REBOUND for the depth-10 circuit. `root` is the only value that moved,
+    // because the circuit folds the path to produce it and the path is now ten
+    // levels rather than twenty; every other value here is depth-independent
+    // and is unchanged, which is the evidence that nothing else shifted. Every
+    // verifier must ship the depth-10 artifacts for these to match.
     #[test]
     fn frozen_interop_vectors() {
         // Identity derivation (zerokit seeded keygen, LE hex).
         let keys = IdentityKeys::generate_seeded::<PoseidonHash, ChaCha20Rng>(&[7u8; 32]);
         assert_eq!(
-            bytes_to_hex(&secret_to_u32(&keys.identity_secret())),
+            bytes_to_hex(&secret_to_bytes32(&keys.identity_secret())),
             "3c87aa7480ec2cad022ef39c256ddb6e4fb083c7d4a0dfdc4eee891feda7a62b"
         );
         assert_eq!(
-            bytes_to_hex(&fr_to_u32(&keys.id_commitment())),
+            bytes_to_hex(&fr_to_bytes32(&keys.id_commitment())),
             "08772427f3a88a9787e8f899c13dc10c2b0a226d7500c99edba0f993ba770729"
         );
 
@@ -584,13 +778,13 @@ mod tests {
         // hash_to_field_le(rln_identifier)) — NOT nwaku's keccak construction.
         let rln_id = [9u8; 32];
         assert_eq!(
-            bytes_to_hex(&fr_to_u32(&external_nullifier(1231028105, &rln_id))),
+            bytes_to_hex(&fr_to_bytes32(&external_nullifier(1231028105, &rln_id))),
             "a432bb300aeda21d8c14186e134639ecac20732e9ebcbb73139741cef293612a"
         );
 
         // x = hash_to_field_le(signal).
         assert_eq!(
-            bytes_to_hex(&fr_to_u32(&signal_to_x(b"Hello, RLN!"))),
+            bytes_to_hex(&fr_to_bytes32(&signal_to_x(b"Hello, RLN!"))),
             "9af96b554db1bc4bfb806f3bcd587c8c0ee80d4d79c440a87b51861235461412"
         );
 
@@ -601,7 +795,7 @@ mod tests {
             .to_json();
         assert_eq!(
             j["root"].as_str().unwrap(),
-            "e6b1124d580df28efdb5a009ee7eb485cc33625df6b98fc058054217160d8a07"
+            "16f5e233ad4c8ee7d66d1b0909f942e3384eb12721296690d340cc77ff41aa1b"
         );
         assert_eq!(
             j["nullifier"].as_str().unwrap(),
@@ -634,12 +828,8 @@ mod tests {
             "cbf8daa2f4d16e31165c6789a738681b0871a5cc775206af276ad4295e185e1e"
         );
 
-        // Canonical serialization layout (zerokit's `RLNProof` LE format):
-        // the 128-byte compressed Groth16 proof, the Single-mode tag byte,
-        // then the 160-byte LE public values — 289 bytes total.
-        let canonical = hex_to_vec(j["proof"].as_str().unwrap()).unwrap();
-        assert_eq!(canonical.len(), 289);
-        assert_eq!(canonical[128], 0x00);
+        let bare = hex_to_vec(j["proof"].as_str().unwrap()).unwrap();
+        assert_eq!(bare.len(), 128, "to_json emits the bare spec proof[128]");
     }
 
     #[test]
@@ -698,12 +888,8 @@ mod tests {
         let root = proof.root();
         let j = proof.to_json();
 
-        // Slice the bare Groth16 proof out of the canonical bytes — exactly
-        // what the spec's proof[128] carries.
-        let canonical = hex_to_vec(j["proof"].as_str().unwrap()).unwrap();
-        let bare = bytes_to_hex(&canonical[..128]);
         let decomposed = serde_json::json!({
-            "proof": bare,
+            "proof": j["proof"],
             "root": j["root"],
             "external_nullifier": j["external_nullifier"],
             "share_x": j["share_x"],
@@ -731,6 +917,24 @@ mod tests {
     }
 
     #[test]
+    fn canonical_blob_alone_round_trips() {
+        let material = material_from_seed(&[5u8; 32], 100, 2);
+        let rln_id = [6u8; 32];
+        let proof = generate(&material, b"net msg", 77, &rln_id).expect("generate");
+        let hex = proof.canonical_hex();
+        assert_eq!(hex.len(), 289 * 2, "Single-mode canonical blob is 289 bytes");
+        assert!(
+            hex.starts_with(proof.to_json()["proof"].as_str().unwrap()),
+            "the blob's leading segment is the bare proof[128]"
+        );
+
+        let restored = RateLimitProof::from_json(&serde_json::json!({ "proof": hex }))
+            .expect("blob-only from_json");
+        assert_eq!(restored.root(), proof.root());
+        assert!(verify(&restored, b"net msg", &[proof.root()]).expect("verify"));
+    }
+
+    #[test]
     fn json_roundtrip_preserves_verification() {
         let material = material_from_seed(&[3u8; 32], 100, 1);
         let rln_id = [4u8; 32];
@@ -739,6 +943,8 @@ mod tests {
         let json = proof.to_json();
         let restored = RateLimitProof::from_json(&json).expect("from_json");
         assert_eq!(restored.root(), root);
+        assert_eq!(proof.epoch(), Some(42));
+        assert_eq!(restored.epoch(), Some(42), "the epoch survives the round trip");
         assert!(verify(&restored, b"signal", &[root]).expect("verify"));
     }
 
@@ -767,17 +973,6 @@ mod tests {
         let mut tampered = canonical;
         tampered[20] = 0xff;
         assert_eq!(epoch_from_bytes(&tampered), None);
-    }
-
-    #[test]
-    fn epoch_survives_generate_and_json_roundtrip() {
-        let material = material_from_seed(&[3u8; 32], 100, 1);
-        let rln_id = [4u8; 32];
-        let proof = generate(&material, b"signal", 42, &rln_id).expect("generate");
-        assert_eq!(proof.epoch(), Some(42));
-
-        let restored = RateLimitProof::from_json(&proof.to_json()).expect("from_json");
-        assert_eq!(restored.epoch(), Some(42));
     }
 
     // The generate_proof handler's reply carries "epoch" as a u64 index, and
