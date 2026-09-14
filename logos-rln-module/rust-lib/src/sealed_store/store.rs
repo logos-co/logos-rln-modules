@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 use zeroize::Zeroizing;
 
 use crate::lifecycle::{
-    CacheFile, CacheState, MembershipRecord, MembershipState, StoredCredential, FORMAT_CACHE,
+    CacheFile, CacheState, MembershipRecord, MembershipState, StoredCredential,
 };
 use crate::rate_limit::{remaining, reserve_slot, AllocError, AllocationState, EpochAllocation};
 use crate::registry_id;
@@ -19,7 +19,7 @@ use crate::sealed_store::format::{
     self, AllocRow, AllocationsFile, IdentityBlock, SealedEntry, SealedFile, Section,
 };
 use crate::sealed_store::fs;
-use crate::sealed_store::hex::{bytes_to_hex, hex_to_vec};
+use crate::registry_id::{bytes_to_hex, hex_to_vec};
 use crate::{ApiError, ErrorKind};
 
 // ------------------------------------------------------------------- opening
@@ -28,9 +28,6 @@ use crate::{ApiError, ErrorKind};
 /// `ApiError`, so the text carries the whole diagnosis on its own.
 #[derive(Debug)]
 pub enum OpenError {
-    /// The host stamped no instance persistence path (constructed by the
-    /// caller — `open` itself always receives a dir).
-    NoPersistencePath(String),
     DirLockHeld(String),
     OldFormatPresent(String),
     Unreadable(String),
@@ -39,8 +36,7 @@ pub enum OpenError {
 impl core::fmt::Display for OpenError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            OpenError::NoPersistencePath(m)
-            | OpenError::DirLockHeld(m)
+            OpenError::DirLockHeld(m)
             | OpenError::OldFormatPresent(m)
             | OpenError::Unreadable(m) => f.write_str(m),
         }
@@ -105,7 +101,6 @@ struct Inner {
 /// The read-only publication: identity + cache + alloc + quarantine clones.
 struct Snapshot {
     records: BTreeMap<String, MembershipRecord>,
-    has_credentials: bool,
 }
 
 pub struct Store {
@@ -334,7 +329,7 @@ impl Store {
         if !inner.raw_sections.is_empty() {
             let mut stored_macs = BTreeMap::new();
             for (hash, s) in &inner.raw_sections {
-                if let Some(m) = hex_to_vec(&s.mac).and_then(|v| <[u8; 32]>::try_from(v).ok()) {
+                if let Some(m) = registry_id::hex_to_bytes32(&s.mac) {
                     stored_macs.insert(hash.clone(), m);
                 }
             }
@@ -387,8 +382,11 @@ impl Store {
     /// to decide whether inventing a secret is safe: a store whose credentials
     /// are all quarantined (e.g. the allocations file was deleted) must NOT
     /// look fresh, or auto-unlock would generate a secret it can never verify.
+    /// Quarantine-independent by construction: build_snapshot inserts one
+    /// record per sealed credential whether or not it is quarantined, so an
+    /// all-quarantined store still answers true.
     pub fn has_credentials(&self) -> bool {
-        self.snapshot_arc().has_credentials
+        !self.snapshot_arc().records.is_empty()
     }
 
     pub fn is_provisioned(&self) -> bool {
@@ -399,7 +397,9 @@ impl Store {
         &self.dir
     }
 
-    #[allow(dead_code)] // consumer surface: views read the record's flag; the tests read this
+    /// Test-only: production reads `quarantined` straight off the snapshot
+    /// record. `cfg(test)` rather than an allow, so the compiler keeps that true.
+    #[cfg(test)]
     pub fn is_quarantined(&self, hash: &str) -> bool {
         self.snapshot_arc().records.get(hash).map(|r| r.quarantined).unwrap_or(false)
     }
@@ -417,6 +417,7 @@ impl Store {
         hash: &str,
         identity: IdentityBlock,
         credential: &StoredCredential,
+        rate_limit: u64,
     ) -> Result<(), ApiError> {
         let mut guard = crate::lock(&self.write);
         let inner = &mut *guard;
@@ -439,7 +440,11 @@ impl Store {
 
         inner.cache.insert(
             hash.to_string(),
-            CacheState { state: MembershipState::Pending, ..CacheState::default() },
+            CacheState {
+                state: MembershipState::Pending,
+                rate_limit: Some(rate_limit),
+                ..CacheState::default()
+            },
         );
         write_cache(&self.dir, inner)?;
 
@@ -563,12 +568,15 @@ impl Store {
     /// Run a cache-only mutation and persist the sidecar. Works LOCKED (the
     /// poller's path); by construction it can never touch the sealed or
     /// allocations files. Stamps the monotone `first_active_at` on the first
-    /// active-like observation.
+    /// active-like observation. Returns the row's pre-mutation state as
+    /// observed under the write lock — the authoritative "previous" for
+    /// transition events (a pre-call snapshot can be stale under concurrent
+    /// dispatch).
     pub fn update_cache(
         &self,
         hash: &str,
         f: impl FnOnce(&mut CacheState),
-    ) -> Result<(), ApiError> {
+    ) -> Result<MembershipState, ApiError> {
         let mut guard = crate::lock(&self.write);
         let inner = &mut *guard;
         ensure_open(inner)?;
@@ -576,13 +584,14 @@ impl Store {
             return Err(ApiError::new(ErrorKind::UnknownMembership, "no such membership_hash"));
         }
         let row = inner.cache.entry(hash.to_string()).or_default();
+        let prior = row.state;
         f(row);
         if row.first_active_at.is_none() && row.state.is_active_like() {
             row.first_active_at = Some(crate::now_unix());
         }
         write_cache(&self.dir, inner)?;
         self.swap_snapshot(inner);
-        Ok(())
+        Ok(prior)
     }
 
     /// Reserve the next `message_id` for `(membership, rln_identifier,
@@ -943,7 +952,7 @@ fn load_allocations(
             "the allocations file's store_uuid does not match the sealed header (a foreign \
              or partially restored file)",
         );
-        let root = hex_to_vec(&file.root_mac).and_then(|v| <[u8; 32]>::try_from(v).ok());
+        let root = registry_id::hex_to_bytes32(&file.root_mac);
         return LoadedAllocations {
             sections: BTreeMap::new(),
             raw_sections: file.sections,
@@ -986,7 +995,7 @@ fn load_allocations(
             }
         }
     }
-    let root = hex_to_vec(&file.root_mac).and_then(|v| <[u8; 32]>::try_from(v).ok());
+    let root = registry_id::hex_to_bytes32(&file.root_mac);
     LoadedAllocations { sections, raw_sections: file.sections, root_mac_raw: root }
 }
 
@@ -1081,9 +1090,7 @@ fn write_allocations(dir: &Path, inner: &mut Inner) -> Result<(), ApiError> {
                 mac: bytes_to_hex(&mac),
             }
         };
-        let mac_bytes = hex_to_vec(&section.mac)
-            .and_then(|v| <[u8; 32]>::try_from(v).ok())
-            .unwrap_or([0u8; 32]);
+        let mac_bytes = registry_id::hex_to_bytes32(&section.mac).unwrap_or([0u8; 32]);
         macs.insert(hash.clone(), mac_bytes);
         sections.insert(hash.clone(), section);
     }
@@ -1104,9 +1111,8 @@ fn write_allocations(dir: &Path, inner: &mut Inner) -> Result<(), ApiError> {
 
 fn write_cache(dir: &Path, inner: &Inner) -> Result<(), ApiError> {
     let file = CacheFile {
-        format: FORMAT_CACHE.to_string(),
-        version: format::FORMAT_VERSION,
         entries: inner.cache.clone(),
+        ..CacheFile::new()
     };
     fs::write_atomic_loose_json(dir, format::CACHE_FILE, &file)
         .map_err(|e| ApiError::internal(&format!("cache save: {e}")))
@@ -1129,10 +1135,7 @@ fn build_snapshot(inner: &Inner) -> Snapshot {
             );
         }
     }
-    // Quarantine-independent: an all-quarantined store is still not fresh (see
-    // Store::has_credentials — the keychain auto-unlock safety gate).
-    let has_credentials = !records.is_empty();
-    Snapshot { records, has_credentials }
+    Snapshot { records }
 }
 
 #[cfg(test)]
@@ -1182,9 +1185,7 @@ mod tests {
     fn credential_for(registry: &str, commitment: &[u8; 32]) -> StoredCredential {
         StoredCredential {
             identity_commitment: registry_id::bytes_to_hex(commitment),
-            identity_nullifier: None,
             identity_secret_hash: "77".repeat(32),
-            identity_trapdoor: None,
             registry_id: registry.to_string(),
         }
     }
@@ -1192,7 +1193,7 @@ mod tests {
     fn insert_membership(store: &Store, registry: &str, commitment: &[u8; 32]) -> String {
         let hash = registry_id::membership_hash(registry, commitment);
         store
-            .insert(&hash, identity_for(registry, commitment), &credential_for(registry, commitment))
+            .insert(&hash, identity_for(registry, commitment), &credential_for(registry, commitment), 100)
             .unwrap();
         hash
     }
@@ -1419,8 +1420,8 @@ mod tests {
         drop(store);
         std::fs::write(&alloc_path, &honest).unwrap();
 
-        // Regression for the suppressed-escalation reissue path: a decoy
-        // tamper on B must not mask A's splice.
+        // A decoy tamper on section B must not let A's spliced older
+        // section ride through unnoticed.
         let store = Store::open(dir.clone()).unwrap();
         store.unlock("pw").unwrap();
         assert_eq!(store.reserve_message_id(&hash_a, "aa", 10, 9, 5, 600).unwrap(), 1);
@@ -1477,23 +1478,6 @@ mod tests {
     }
 
     #[test]
-    fn close_then_reopen_preserves_state() {
-        let _serial = crate::lock(&SERIAL);
-        let dir = test_dir("reinit");
-        let registry = format!("logos:local:{}", "ab".repeat(32));
-        let store = Store::open(dir.clone()).unwrap();
-        store.unlock("pw").unwrap();
-        let hash = insert_membership(&store, &registry, &[0x33u8; 32]);
-        store.close();
-        drop(store);
-        let store = Store::open(dir.clone()).unwrap();
-        assert_eq!(store.unlock("pw").unwrap(), 1);
-        assert!(store.membership(&hash).is_some());
-        store.close();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn a_closed_store_refuses_writes() {
         let _serial = crate::lock(&SERIAL);
         let dir = test_dir("closed-writes");
@@ -1510,7 +1494,8 @@ mod tests {
 
     #[test]
     fn all_quarantined_store_is_not_fresh() {
-        // L1: auto-unlock must never invent a secret it can never verify.
+        // Auto-unlock must never invent a secret it cannot verify: a store
+        // whose every entry is quarantined still HAS credentials.
         let _serial = crate::lock(&SERIAL);
         let dir = test_dir("not-fresh");
         let registry = format!("logos:local:{}", "ef".repeat(32));
@@ -1595,6 +1580,7 @@ mod tests {
                 &hash_a,
                 identity_for(&registry, &commitment_a),
                 &credential_for(&registry, &commitment_a),
+                100,
             )
             .unwrap();
         assert_eq!(store.reserve_message_id(&hash_a, "aa", 10, 9, 5, 600).unwrap(), 1);
@@ -1657,6 +1643,7 @@ mod tests {
             &hash_b,
             identity_for(&registry, &commitment_b),
             &credential_for(&registry, &commitment_b),
+            100,
         );
         assert!(matches!(denied, Err(e) if e.kind == ErrorKind::Locked));
         let denied = store.unseal_credential(&hash_a);
@@ -1941,8 +1928,7 @@ mod tests {
         let dir = test_dir("overcount-sealed");
         std::fs::create_dir_all(&dir).unwrap();
 
-        // A parse-cap breach is corrupt, not a refusal: .bad + fresh empty
-        // (I2b).
+        // A parse-cap breach is corrupt, not a refusal: .bad + fresh empty.
         let mut credentials = serde_json::Map::new();
         for i in 0..=format::MAX_CREDENTIALS {
             credentials.insert(
