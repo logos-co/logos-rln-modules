@@ -1,7 +1,10 @@
 [package]
 name    = "lez_rln_module"
-version = "2.0.0"
+version = "3.1.0"
 edition = "2021"
+# u64::is_multiple_of (clippy's manual_is_multiple_of fix) stabilized in 1.87;
+# the builder pins 1.94.0 (metadata.json nix.rust.toolchain).
+rust-version = "1.87"
 
 [lib]
 name = "liblogos_lez_rln_module"
@@ -19,8 +22,8 @@ panic = "abort"
 # rln-layouts is the on-chain borsh wire format, pinned to the logos-lez-rln
 # rev whose deployed programs it must match; bump the rev together with any
 # layout change.
-rln-layouts = { git = "https://github.com/logos-co/logos-lez-rln.git", rev = "ff02e202cedb3639314478ad2575776fda6f197f" }
-token_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.2.0-rc6" }
+rln-layouts = { git = "https://github.com/logos-co/logos-lez-rln.git", rev = "b02d4f557ce403bd04a753d8fadb66f971e1be60" }
+token_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.2.5-rc2" }
 risc0-zkvm = { version = "3.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
 borsh = { version = "1", default-features = false, features = ["derive"] }
