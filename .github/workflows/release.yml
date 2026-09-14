@@ -212,9 +212,7 @@ jobs:
             if ! (
               set -euo pipefail
               case "$dir" in
-                logos-lez-rln-module)
-                  ( cd "$dir" && bash stage-sources.sh ) ;;
-                logos-rln-module)
+                logos-lez-rln-module|logos-rln-module)
                   nix run "path:./$dir#generate" -L ;;
                 logos-rln-membership-ui)
                   : ;;  # pure QML — no staging
