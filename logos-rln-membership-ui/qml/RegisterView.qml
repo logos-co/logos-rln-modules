@@ -1,8 +1,8 @@
-// Register flow: unlock keystore -> register (the membership module generates
-// the credential) -> poll get_membership_state until the pending window
-// settles. The funding holding account is either typed in or auto-filled by
-// the Wallet tab's faucet claim (Main.qml wires WalletView.funded to
-// fundingAccount).
+// Register flow: unlock keystore -> register_membership (the membership
+// module generates the credential) -> poll get_membership_state until the
+// pending window settles. The funding holding account is either typed in or
+// auto-filled by the Wallet tab's faucet claim (AdvancedView.qml wires
+// WalletView.onFunded to fundingAccount).
 import QtQuick
 import QtQuick.Layouts
 import Logos.Theme
@@ -15,7 +15,8 @@ LogosScrollView {
     required property var bridge
     required property string registryId
 
-    // Written by Main.qml when the Wallet tab confirms a funded holding.
+    // Written by AdvancedView.qml's WalletView.onFunded, when the Wallet tab
+    // confirms a funded holding.
     property alias fundingAccount: fundingField.text
 
     // Keystore session (unlock holds the password module-side; lock drops it).
@@ -74,17 +75,17 @@ LogosScrollView {
         // The credential is generated inside the module; the caller supplies
         // only the scope (registry_id + rln_identifier) and, for the logos
         // namespace, the paying account.
-        var options = JSON.stringify({
+        var options = M.registryOptions(rateSpin.value, {
             funding_holding_account_id: fundingField.text.trim()
         })
         busy = true
         liveState = ""
-        M.call(bridge, M.RLN_MODULE, "register",
-               [registryId, M.DEFAULT_RLN_ID, rateSpin.value, options], function (r) {
+        M.call(bridge, M.RLN_MODULE, "register_membership",
+               [registryId, M.DEFAULT_RLN_ID, options], function (r) {
             view.busy = false
             if (r.error) { view.report(M.errorText(r.error), true); return }
-            // register returns the public Membership view; the commitment is the
-            // only credential-derived value it exposes.
+            // register_membership returns the public Membership view; the
+            // commitment is the only credential-derived value it exposes.
             view.commitment = (r.credential && r.credential.identity_commitment) || ""
             view.liveState = r.state || "pending"
             var note = r.rate_limit_mismatch === true
@@ -108,9 +109,14 @@ LogosScrollView {
                 view.report("Membership ACTIVE at leaf " + r.leaf_index
                     + ". On this testnet it stays active ~43 min before grace_period/expired.", false)
             else if (view.liveState === "failed")
-                view.report("Registration FAILED — see the Memberships tab for the failure reason.", true)
+                view.report("Registration FAILED — see the Memberships tab for the failure reason "
+                    + "and whether it is retryable.", true)
             else
-                view.report("Membership settled in state \"" + view.liveState + "\".", false)
+                // grace_period / expired / erased / erased_awaits_withdrawal /
+                // slashed / unknown — and any state a later wire adds.
+                view.report("Membership settled in state \"" + view.liveState + "\""
+                    + (M.isKnownState(view.liveState) ? "" : " (not in this GUI's vocabulary)")
+                    + ".", !M.isUsableState(view.liveState))
         })
     }
 

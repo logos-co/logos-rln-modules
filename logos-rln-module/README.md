@@ -26,7 +26,7 @@ JSON replies; `scope` = the `registry_id` + `rln_identifier_hex` arg pair):
 | Spec | Method |
 |---|---|
 | `start(config)` / `stop()` | `start(config_json)` / `stop()` |
-| `register(scope, rate_limit, options)` | `register(registry_id, rln_identifier_hex, rate_limit, options_json)` |
+| `register(scope, options)` | `register(registry_id, rln_identifier_hex, options_json)` — `options_json` is the spec `RegistryOptions` array of `{"key","value"}` string pairs (`rate_limit` rides there; default 100) |
 | `get_membership_state(scope)` | `get_membership_state(registry_id, rln_identifier_hex)` |
 | `generate_proof(scope, signal, timestamp)` | `generate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp)` |
 | `validate_proof(scope, signal, timestamp, proof)` | `validate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp, proof_json)` |
@@ -86,9 +86,10 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   confirmation window, erased inference), change-gated transition events,
   submit-error recording policy.
 - `rust-lib/src/provider.rs` — the spec's Registry Provider Interface as a
-  trait + namespace routing; the lez-rln provider is a raw `lp_*` wire
-  client of the sibling module (owner-thread-bound, explicit per-call
-  timeouts; fire-and-record async submission), plus the lazy gifter client
+  trait + namespace routing; the lez-rln provider drives the sibling through
+  the SDK's generated typed client (`modules().liblogos_lez_rln_module`,
+  `*_async_with_timeout` twins with explicit per-call timeouts; fire-and-record
+  async submission), plus the `PluginProxy` gifter client
   for delegated registration (`rln_gifter_module.request` driven with the
   module-generated commitment and the caller's auth-vector selection; the
   vector's producer module binds the auth payload to that commitment).
@@ -178,10 +179,15 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
 - **Verification is hot-path-only.** `validate_proof` reads the locally
   maintained valid-root window and performs zero registry calls; a cold or
   stale window answers `not_ready` rather than serving a false reject.
-  `start` warms the windows of its configured registries.
+  `start` warms the windows of its configured registries. A warm window
+  missing the proof's root answers `invalid` and nudges the background
+  refresher (rate-limited) for one immediate refresh, so a just-published
+  root resolves on the caller's retry; `generate_proof`'s Merkle snapshot
+  also feeds its `valid_roots` into the window.
 - **Wire conventions.** Every reply is a compact JSON object (alphabetical
-  keys); failures are `{"error":{"kind":…,"message":…}}`. The sibling
-  module's `""`-on-error convention is NOT used here.
+  keys); failures are `{"error":{"class":…,"kind":…,"message":…}}` —
+  switch on `class`, log `kind`. The sibling module's `""`-on-error
+  convention is NOT used here.
 - **Provisional leaf_index.** `register` returns the provider's pre-submit
   estimate; the authoritative value is re-read from the registry at the
   pending→active transition (spec MUST). Consumers needing the leaf for

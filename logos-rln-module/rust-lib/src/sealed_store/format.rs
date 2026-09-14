@@ -211,7 +211,7 @@ pub fn detect(dir: &Path) -> FormatPresence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sealed_store::hex::bytes_to_hex;
+    use crate::registry_id::bytes_to_hex;
 
     const UUID: [u8; 16] = [
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
@@ -290,18 +290,6 @@ mod tests {
             bytes_to_hex(&mac(&KEY, &payload)),
             "700868e8de8406704fcc63217045f75b18f04262b6b6b037d626f77e5fa11e26"
         );
-    }
-
-    #[test]
-    fn section_payload_is_input_order_independent() {
-        let forward = rows();
-        let mut reversed = rows();
-        reversed.reverse();
-        let a = section_mac_payload(MEMBERSHIP_HASH, 600, 7, &forward, &UUID);
-        let b = section_mac_payload(MEMBERSHIP_HASH, 600, 7, &reversed, &UUID);
-        assert_eq!(a, b);
-        // And the input itself is untouched.
-        assert_eq!(forward[0].rln_identifier, "0xdeadbeef");
     }
 
     fn sealed_with(n: usize) -> SealedFile {

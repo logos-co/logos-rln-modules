@@ -297,7 +297,10 @@ fn testnet_register_plan_derives_the_deployed_accounts() {
     );
     assert_eq!(plan.tree_main_account_id, proofs_plan.main_account_id);
     assert_eq!(plan.clock_account_id, rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES);
-    assert!(plan.next_leaf_index < (1u64 << 20), "leaf index inside TREE_DEPTH");
+    assert!(
+        plan.next_leaf_index < (1u64 << rln_layouts::TREE_DEPTH),
+        "leaf index inside TREE_DEPTH"
+    );
     eprintln!("live tree: next_leaf_index {}", plan.next_leaf_index);
 }
 
@@ -443,7 +446,8 @@ fn base58_roundtrip_matches_known_vector() {
     let clock = rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES;
     let encoded = b58_encode(&clock);
     assert_eq!(b58_decode32(&encoded), clock);
-    // Pinned against the deployment record's config account.
+    // A fixed vector, not a live account: it pins the base58 alphabet and
+    // the leading-zero handling, and belongs to no deployment record.
     assert_eq!(
         bytes_to_hex(&b58_decode32("Ds9aBzioxnDf6yfUnCHGS7evBnpMnknyJgiMEJcV7uVG")),
         "bf24f9e9f0440d7c7268cfc5ce6edb981feda003104c9d96ca276443ccc0a607"

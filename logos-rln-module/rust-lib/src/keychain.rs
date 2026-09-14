@@ -25,8 +25,9 @@
 //! canonicalized — macOS /var<->/private/var churn would orphan items), so
 //! each module instance owns exactly one item. Missing item + credentials
 //! present maps to keychain_unavailable (never invent a secret over an
-//! existing keystore). Caveat: deleting an auto-created account's item
-//! orphans its credentials — the user never saw the secret.
+//! existing keystore). Self-provisioning does NOT write a keychain item: it
+//! writes the module-owned `rln_autounlock.secret`, and deleting THAT file
+//! orphans the credentials it unlocks — the user never saw the secret.
 
 use crate::registry_id;
 use crate::sealed_store::store as sealed;
@@ -122,8 +123,10 @@ fn run_security_batch(line: &str) -> Result<(), String> {
     }
 }
 
-/// Non-macOS: no OS keychain backend — every call maps to
-/// keychain_unavailable and the UI falls back to the password screen.
+/// Non-macOS: no OS keychain backend. `remember_keystore_password` answers
+/// keychain_unavailable and the UI falls back to the password screen; a READ
+/// folds to a noted miss instead, so a not-yet-provisioned store still
+/// self-provisions from its own secret file.
 #[cfg(not(target_os = "macos"))]
 struct Unavailable;
 
@@ -255,9 +258,16 @@ fn quarantine_secret_file(dir: &std::path::Path) {
     }
 }
 
+/// Serializes the read -> maybe-generate+persist -> unlock walk: two
+/// concurrent auto-unlocks on a fresh store would otherwise both generate,
+/// race the durable secret-file write, and leave one caller's session keyed
+/// to a secret the file no longer holds.
+static AUTO_UNLOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn auto_unlock_core(
     store: &std::sync::Arc<sealed::Store>,
 ) -> Result<(usize, &'static str, Zeroizing<String>), ApiError> {
+    let _walk = AUTO_UNLOCK.lock().unwrap();
     let dir = store.base_dir().to_path_buf();
     let account = account_for_dir(&dir.to_string_lossy());
     let (file_secret, file_note) = read_file_secret(&dir);
@@ -502,12 +512,10 @@ mod tests {
         };
         let credential = crate::lifecycle::StoredCredential {
             identity_commitment: "11".repeat(32),
-            identity_nullifier: None,
             identity_secret_hash: "22".repeat(32),
-            identity_trapdoor: None,
             registry_id: registry,
         };
-        store.insert(&"cd".repeat(32), identity, &credential).expect("fixture credential");
+        store.insert(&"cd".repeat(32), identity, &credential, 100).expect("fixture credential");
         store.lock();
     }
 

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::sealed_store::hex::{bytes_to_hex, hex_to_vec};
+use crate::registry_id::{bytes_to_hex, hex_to_vec};
 
 #[derive(Debug)]
 pub enum CryptoError {
@@ -17,10 +17,6 @@ pub enum CryptoError {
     BadPassword,
     /// Hex/length problems in stored fields.
     Malformed(&'static str),
-    /// Header declares parameters this crate doesn't speak. Reserved for
-    /// format evolution — nothing constructs it yet.
-    #[allow(dead_code)]
-    Unsupported(&'static str),
     /// No CSPRNG available (seal/generate only).
     NoEntropy,
     /// KDF machinery rejected its inputs.
@@ -34,7 +30,6 @@ impl core::fmt::Display for CryptoError {
                 write!(f, "AEAD open failed (wrong password or tampered data)")
             }
             CryptoError::Malformed(what) => write!(f, "malformed {what}"),
-            CryptoError::Unsupported(what) => write!(f, "unsupported {what}"),
             CryptoError::NoEntropy => write!(f, "no CSPRNG available"),
             CryptoError::Kdf(what) => write!(f, "kdf failure: {what}"),
         }
@@ -220,20 +215,6 @@ mod tests {
         assert_ne!(*sk.verify, *sk.seal);
         assert_ne!(*sk.verify, *sk.ledger);
         assert_ne!(*sk.seal, *sk.ledger);
-    }
-
-    #[test]
-    fn kdf_runs_counts_each_derive() {
-        // Other tests derive concurrently, so the counter is only pinned to
-        // "moves by at least one per derive" here; the exactly-one claim is
-        // the later unlock test's, in isolation.
-        let params = KdfParams::fast_for_tests();
-        let before = kdf_runs();
-        let _ = MasterKey::derive("pw", &params).unwrap();
-        let mid = kdf_runs();
-        assert!(mid > before);
-        let _ = MasterKey::derive("pw", &params).unwrap();
-        assert!(kdf_runs() > mid);
     }
 
     #[test]

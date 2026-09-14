@@ -20,9 +20,10 @@
 //!    beats nothing.
 //!
 //! Runs whether or not the keystore is unlocked: everything here touches
-//! only plaintext-safe sidecar metadata. All provider calls from this
-//! worker take `provider_call`'s async+channel path automatically (owner
-//! -thread contract). A transient failure never kills the worker: each tick
+//! only plaintext-safe sidecar metadata. Provider calls from this worker go
+//! out through `provider.rs`'s async twin + channel wait, like every other
+//! caller — the module is concurrency "multi", so a slow registry read holds
+//! up nothing else. A transient failure never kills the worker: each tick
 //! body runs under `catch_unwind` (pure Rust, no FFI frames — safe to
 //! catch); only the supervisor retires it (`stop()`, or a restart's
 //! generation bump).
@@ -112,7 +113,7 @@ fn apply_observed(
     state: MembershipState,
     leaf_index: u64,
     rate_limit: u64,
-) -> Result<(), crate::ApiError> {
+) -> Result<MembershipState, crate::ApiError> {
     sealed::current_or_uninit()?.update_cache(hash, |m| {
         m.state = state;
         m.leaf_index = Some(leaf_index);
@@ -128,9 +129,14 @@ fn apply_observed(
 /// from `pending_records`/`refreshable_records`;
 /// `lifecycle::transition_event` no-ops when `new_state` didn't actually
 /// change anything.
-fn emit_transition(hash: &str, record: &MembershipRecord, new_state: MembershipState) {
+fn emit_transition(
+    hash: &str,
+    record: &MembershipRecord,
+    prior: MembershipState,
+    new_state: MembershipState,
+) {
     if let Some((registry_id, rln_identifier, membership_hash, state, previous)) =
-        lifecycle::transition_event(hash, record, new_state)
+        lifecycle::transition_event(hash, record, prior, new_state)
     {
         crate::emit_membership_state_changed(
             &registry_id,
@@ -163,8 +169,8 @@ fn tick(refresh_states: bool) {
                 Err(e) => {
                     eprintln!("membership poller: confirm update failed: {}", e.message)
                 }
-                Ok(()) => {
-                    emit_transition(hash, &record, state);
+                Ok(prior) => {
+                    emit_transition(hash, &record, prior, state);
                     eprintln!("membership poller: {hash} confirmed {state:?} at leaf {leaf_index}")
                 }
             },
@@ -181,11 +187,12 @@ fn tick(refresh_states: bool) {
                         m.retryable = Some(true);
                     })
                 });
-                if let Err(e) = result {
-                    eprintln!("membership poller: fail update failed: {}", e.message);
-                } else {
-                    emit_transition(hash, &record, MembershipState::Failed);
-                    eprintln!("membership poller: {hash} failed (window elapsed)");
+                match result {
+                    Err(e) => eprintln!("membership poller: fail update failed: {}", e.message),
+                    Ok(prior) => {
+                        emit_transition(hash, &record, prior, MembershipState::Failed);
+                        eprintln!("membership poller: {hash} failed (window elapsed)");
+                    }
                 }
             }
             _ => {}
@@ -203,23 +210,21 @@ fn tick(refresh_states: bool) {
         let hash = &record.hash;
         match observe(&record) {
             Some(RecordUpdate::Observed { state, leaf_index, rate_limit }) => {
-                if apply_observed(hash, state, leaf_index, rate_limit).is_ok() {
-                    emit_transition(hash, &record, state);
+                if let Ok(prior) = apply_observed(hash, state, leaf_index, rate_limit) {
+                    emit_transition(hash, &record, prior, state);
                 }
             }
             Some(RecordUpdate::Absent) => {
                 // Was on the registry (state ∈ active/grace/expired), now
                 // gone: erased/slashed. Consumers MUST stop using it.
-                let updated = sealed::current_or_uninit()
-                    .and_then(|s| {
-                        s.update_cache(hash, |m| {
-                            m.state = MembershipState::Erased;
-                            m.failed_reason = Some("removed_from_registry".to_string());
-                        })
+                let updated = sealed::current_or_uninit().and_then(|s| {
+                    s.update_cache(hash, |m| {
+                        m.state = MembershipState::Erased;
+                        m.failed_reason = Some("removed_from_registry".to_string());
                     })
-                    .is_ok();
-                if updated {
-                    emit_transition(hash, &record, MembershipState::Erased);
+                });
+                if let Ok(prior) = updated {
+                    emit_transition(hash, &record, prior, MembershipState::Erased);
                 }
                 eprintln!("membership poller: {hash} vanished from registry — erased");
             }
@@ -255,12 +260,15 @@ pub(crate) fn refresh_paths() {
             }
         };
         let Some(provider) = provider_for(&registry.namespace) else { continue };
-        if let Err(e) = path_cache::fill_path_cache(
-            &registry,
-            hash,
-            record.cache.leaf_index.unwrap_or(0),
-            provider,
-        ) {
+        // Leaf 0 is a VALID leaf, so a usable row without one cannot be
+        // defaulted — that would cache the wrong membership's path. The cache
+        // is deliberately unauthenticated (see lifecycle.rs), so this pairing
+        // is reachable by tampering, never by the module's own writers.
+        let Some(leaf_index) = record.cache.leaf_index else {
+            eprintln!("membership poller: {hash} is usable but carries no leaf_index — path refresh skipped");
+            continue;
+        };
+        if let Err(e) = path_cache::fill_path_cache(&registry, hash, leaf_index, provider) {
             // Keep the previous cache entry — a slightly-stale but still
             // verifiable path beats none.
             eprintln!("membership poller: {hash} path refresh failed: {}", e.message);

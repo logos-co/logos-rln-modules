@@ -17,35 +17,38 @@ v2.0.0 dropped the C++-era frozen wire surface: `generate_identity`,
 ## Layout
 
 - `metadata.json` — module manifest: `codegen.rust` drives logos-module-builder
-  (lidl scaffold + typed `lez_core` client + Qt cdylib glue).
-- `rust-lib/liblogos_lez_rln_module.lidl` — the module contract (7 methods, no
+  (lidl scaffold + Qt cdylib glue). No module dependencies since 3.0.0.
+- `rust-lib/liblogos_lez_rln_module.lidl` — the module contract (9 methods, no
   events).
-- `rust-lib/deps/lez_core.lidl` — hand-maintained dependency
-  contract for the wallet module, wired via `dependency_overrides`.
-- `rust-lib/src/lib.rs` — the provider implementation (wallet lp client + the
-  7 handlers).
+- `rust-lib/src/wallet.rs` — the wallet this module owns: bring-up, the home it
+  adopts or provisions, and the three chain operations it used to make over lp.
+- `rust-lib/src/lib.rs` — the provider implementation (the handlers).
 - `rust-lib/src/rln_core.rs` — the RLN core (tree/proof/register/funding logic),
   depending only on the shared `rln-layouts` crate.
-- `rust-lib/generated/provider_gen.rs` — checked-in scaffold for local
-  `cargo check`/tests; the nix build regenerates it. Regenerate manually with:
-  `logos-lidl-gen rust-lib/liblogos_lez_rln_module.lidl --provider \
-   --dep lez_core=rust-lib/deps/lez_core.lidl \
-   -o rust-lib/generated/provider_gen.rs`
+- `rust-lib/generated/provider_gen.rs` — gitignored scaffold the nix build
+  regenerates in-derivation; `nix run .#generate` materialises it for local
+  `cargo check`/tests (see "Staged sources").
 
 ## Staged sources (not committed)
 
 mkLogosModule's `rustCrateSrc` stages only the crate dir (plus
 `logos-rust-sdk-src`) into the nix sandbox, so path-deps must live inside the
-module tree. One staged copy is required and is NOT in git:
+module tree. Two inputs the crate references are NOT in git:
 
-- `logos-rust-sdk-src/` — logos-co/logos-rust-sdk at the rev pinned in
-  `stage-sources.sh` (the rev the builder's codegen comes from).
+- `logos-rust-sdk-src/` — logos-co/logos-rust-sdk at the rev the locked
+  builder pins (the rev its codegen comes from).
+- `rust-lib/generated/provider_gen.rs` — the provider scaffold, emitted by
+  that builder's lidl-gen at the protocol
+  version it stamps (`LOGOS_PROTOCOL_VERSION_STRING` of its logos-protocol
+  input).
 
-Refresh it — rsync plus a diff verification that fails on drift — with:
+Materialise both — they cannot drift from what the nix build compiles — with:
 
 ```sh
-./stage-sources.sh
+nix run .#generate        # ./stage-sources.sh is a wrapper kept for callers
 ```
+
+Re-run it after any flake.lock or `.lidl` change.
 
 `rln-layouts` (the shared borsh wire crate) is a normal cargo git dependency
 on logos-co/logos-lez-rln, pinned by rev in `rust-lib/Cargo.toml`; bump the
@@ -80,14 +83,38 @@ PDA-derivation divergence, tree-encoding drift, chain-clock unit changes.
 
 ## Design constraints (read before changing)
 
-- **`concurrency` is `single`, deliberately.** Dispatch runs on the module's
-  own event loop and the blocking `lp_invoke`'s QtRO wait loop pumps that
-  same loop, so wallet round-trips do not deadlock; multi-concurrency has
-  never been validated against this module's callers.
-- **The wallet lp client is created in `on_context_ready` (main Qt thread)**
-  and never lazily in handlers: the creating thread owns the client and must
-  run a Qt event loop (lp owner-thread contract). `wallet_call` picks sync
-  `lp_invoke` on the owner thread and `lp_invoke_async` + channel off it.
+- **`concurrency` is `multi`** (since 2.1.0; it was `single` until a blocked
+  handler was observed wedging the whole module: single-mode dispatch runs ON
+  the subprocess event loop, so one stuck call froze QtRO replica acquisition
+  itself until SIGKILL). Under multi the Qt glue runs each call on its own
+  worker; a stuck handler leaks one worker instead of starving every caller.
+  All state lives in lock-guarded statics; the impl struct has no fields.
+- **The wallet is this module's own, in-process** (`rust-lib/src/wallet.rs`),
+  since 3.0.0. It links the LEZ `wallet` crate rather than calling the
+  `lez_core` module, because a host has exactly one `lez_core` wallet handle,
+  `open`/`create_new` both refuse while one is open, there is no close, and
+  nothing reads back the gas limit a wallet was opened with. A registration
+  needs ~9.1M cycles against a stock 2,000,000 default, so losing that race
+  meant every registration refused with a bare "Incorrect fee". The crate
+  keeps `#![deny(unsafe_code)]`: the Rust crate, never the C ABI.
+- **It cannot pay its own way, and that is structural.** A fee is reserved
+  from a *native* balance, the payer must sign so the wallet has to hold its
+  key, and native balance enters an account only at genesis, over the bridge,
+  or by transfer from something already funded. `LEZ_RLN_PAYER_KEY` hands in
+  one funded key — imported, so it grants that one account and wipes nothing,
+  unlike a mnemonic restore. A wallet home staged by
+  `tools/deployments/stage.sh` needs none of that: adopting one through
+  `LEE_WALLET_HOME_DIR` brings its payer derivation with it.
+- **Bring-up runs on its own thread.** `on_context_ready` fires on the host's
+  Qt main thread, and opening a wallet calibrates sequencers and then syncs
+  the chain. Handlers wait on a condvar for a bounded window and answer an
+  empty string if it has not settled; the status method is how a consumer
+  tells "still coming up" from "broken".
+- **The wallet sits behind a read-write lock.** Reads and sends take a shared
+  guard; deriving an account or syncing takes an exclusive one — the honest
+  model, since the wallet serves no reads while a sync runs. The state lock is
+  released before any call: holding it across a round trip would serialize
+  every handler, the wedge the `single` -> `multi` bump was made to escape.
 - **`REG_IN_FLIGHT` dedup in `register_member`**: callers can fire
   register_member twice within seconds for the same membership. An on-chain
   idempotency pre-check cannot see a tx that is still confirming (60-90s on

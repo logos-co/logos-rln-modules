@@ -1,6 +1,6 @@
 [package]
 name = "rln_module"
-version = "0.6.0"
+version = "0.7.2"
 edition = "2021"
 # std File::try_lock / TryLockError (keystore process lock) stabilized in 1.89.
 rust-version = "1.89"
@@ -40,6 +40,5 @@ rln = { version = "3.0.0", default-features = false }
 rand_chacha = "0.3"
 
 # The runtime SDK, staged by the module builder (codegen.rust) from the same
-# logos-rust-sdk rev its generator came from. Keep the stage-sources.sh pin
-# in ../../logos-lez-rln-module identical.
+# logos-rust-sdk rev its generator came from.
 logos-rust-sdk = { path = "../logos-rust-sdk-src" }

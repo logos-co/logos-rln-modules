@@ -4,24 +4,37 @@
 //! proofs, membership PDA + lifecycle state, registry bounds), the Register
 //! tx, and the faucet funding flow (claim_tokens / get_token_balance). The
 //! chain logic lives in-crate (`mod rln_core`, plain Rust — no C ABI), and
-//! wallet access is over raw `lp_*` protocol calls to the wallet module
-//! (`lez_core`) with per-call timeouts (60s reads, 180s
-//! registration tx) — the SDK's generated typed client has no per-call
-//! timeout and would cap every call at the 20s protocol default.
+//! wallet access goes through the SDK's `PluginProxy` to the wallet module
+//! (`lez_core`) with per-call timeouts (60s reads, 180s registration tx)
+//! via `call_json_async_with_timeout` — no raw `lp_*` ABI in this crate.
 //!
 //! Identity and credential generation live in the membership
 //! module (secrets never cross the module wire); this module only ever sees
 //! the public id_commitment.
 //!
-//! Concurrency is SINGLE: dispatch runs on the module's own event loop, and
-//! the blocking lp_invoke's QtRO wait loop pumps that same loop, so wallet
-//! round-trips do not deadlock the process.
+//! Concurrency is "multi" (metadata.json, since 2.1.0): handlers run on Qt
+//! worker threads and overlap, so one wallet round-trip stuck in a slow
+//! sequencer read no longer wedges every other call. Every handler reaches
+//! the wallet through the ASYNC call plus a channel wait (`wallet_call`): the
+//! SDK delivers the reply from the module's Qt event loop, so the worker only
+//! blocks on its channel and the loop stays free. The synchronous twin is
+//! never used from a worker — it would marshal onto the main thread and
+//! serialize every in-flight call behind one nested wait.
 
-use std::ffi::{c_char, c_int, CStr, CString};
+// Author code is unsafe-free: every outbound call goes through the SDK's
+// safe `PluginProxy`. Three sites are exempted from `deny(unsafe_code)`, all
+// of them C-ABI boundaries rather than logic: the generated module-impl
+// scaffold, the install hook it resolves by linkage, and the test-only link
+// stubs that stand in for the host's `lp_*` symbols.
+#![deny(unsafe_code)]
+
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+
+mod base58;
 mod rln_core;
+mod wallet;
 use rln_core as native;
 use rln_core::{bytes_to_hex, RlnRegisterPlan};
 
@@ -33,120 +46,13 @@ mod testnet_tests;
 mod generated {
     #![allow(warnings)]
     #![allow(clippy::all)]
+    #![allow(unsafe_code)]
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/generated/provider_gen.rs"
     ));
 }
 pub(crate) use generated::*;
-
-const WALLET_MODULE: &str = "lez_core";
-/// Timeout on account_id_from_base58 / get_account_public.
-const READ_TIMEOUT_MS: c_int = 60_000;
-/// Timeout on send_generic_public_transaction.
-const TX_TIMEOUT_MS: c_int = 180_000;
-
-// ---------------------------------------------------------------- lp raw ABI
-//
-// The lp_* consumer C ABI (the symbols resolve against the protocol archive
-// linked into this plugin), declared here because the SDK's PluginProxy
-// hardcodes timeout_ms = 0 (the 20s protocol default) with no public escape
-// hatch. One shared client for the wallet target.
-#[cfg(not(test))]
-mod lp {
-    use std::ffi::{c_char, c_int};
-
-    #[repr(C)]
-    pub struct LpClient {
-        _private: [u8; 0],
-    }
-
-    /// Result callback for `lp_invoke_async`: `ok != 0` → `json` is the
-    /// result value; `ok == 0` → canonical error object. `json` is only
-    /// valid for the duration of the callback.
-    pub type LpResultCb =
-        extern "C" fn(ok: c_int, json: *const c_char, user_data: *mut std::ffi::c_void);
-
-    extern "C" {
-        pub fn lp_client_create(
-            target_module: *const c_char,
-            origin_module: *const c_char,
-            target_transport_json: *const c_char,
-            capability_transport_json: *const c_char,
-        ) -> *mut LpClient;
-        pub fn lp_invoke(
-            client: *mut LpClient,
-            method: *const c_char,
-            args_json: *const c_char,
-            timeout_ms: c_int,
-            out_result_json: *mut *mut c_char,
-            out_error_json: *mut *mut c_char,
-        ) -> c_int;
-        pub fn lp_invoke_async(
-            client: *mut LpClient,
-            method: *const c_char,
-            args_json: *const c_char,
-            timeout_ms: c_int,
-            cb: LpResultCb,
-            user_data: *mut std::ffi::c_void,
-        ) -> c_int;
-        pub fn lp_string_free(s: *mut c_char);
-    }
-
-    pub const LP_OK: c_int = 0;
-}
-
-// The unit-test binary has no protocol archive to resolve lp_* against
-// (the SDK leaves them for final plugin link); stub them as "no client".
-#[cfg(test)]
-mod lp {
-    use std::ffi::{c_char, c_int};
-
-    pub struct LpClient {
-        _private: [u8; 0],
-    }
-
-    pub type LpResultCb =
-        extern "C" fn(ok: c_int, json: *const c_char, user_data: *mut std::ffi::c_void);
-
-    pub unsafe fn lp_client_create(
-        _target_module: *const c_char,
-        _origin_module: *const c_char,
-        _target_transport_json: *const c_char,
-        _capability_transport_json: *const c_char,
-    ) -> *mut LpClient {
-        std::ptr::null_mut()
-    }
-    pub unsafe fn lp_invoke(
-        _client: *mut LpClient,
-        _method: *const c_char,
-        _args_json: *const c_char,
-        _timeout_ms: c_int,
-        _out_result_json: *mut *mut c_char,
-        _out_error_json: *mut *mut c_char,
-    ) -> c_int {
-        -3
-    }
-    pub unsafe fn lp_invoke_async(
-        _client: *mut LpClient,
-        _method: *const c_char,
-        _args_json: *const c_char,
-        _timeout_ms: c_int,
-        _cb: LpResultCb,
-        _user_data: *mut std::ffi::c_void,
-    ) -> c_int {
-        -3
-    }
-    pub unsafe fn lp_string_free(_s: *mut c_char) {}
-
-    pub const LP_OK: c_int = 0;
-}
-
-struct WalletHandle(*mut lp::LpClient);
-unsafe impl Send for WalletHandle {}
-
-static WALLET_CLIENT: Mutex<Option<WalletHandle>> = Mutex::new(None);
-static WALLET_OWNER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
 
 /// Lock a mutex, recovering the guard from a poisoned lock (a panicked
 /// handler must not wedge every later one).
@@ -167,7 +73,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// land in the same slot.
 type RegInFlightMap = std::collections::HashMap<String, (String, Instant)>;
 
-static REG_IN_FLIGHT: Mutex<Option<RegInFlightMap>> = Mutex::new(None);
+static REG_IN_FLIGHT: std::sync::LazyLock<Mutex<RegInFlightMap>> =
+    std::sync::LazyLock::new(|| Mutex::new(RegInFlightMap::new()));
 
 /// A submission that never applies on-chain must be re-submittable in the
 /// same session, so entries expire; 300s still covers both the seconds-apart
@@ -175,179 +82,65 @@ static REG_IN_FLIGHT: Mutex<Option<RegInFlightMap>> = Mutex::new(None);
 const REG_IN_FLIGHT_TTL: Duration = Duration::from_secs(300);
 
 fn reg_in_flight<R>(f: impl FnOnce(&mut RegInFlightMap) -> R) -> R {
-    let mut guard = lock(&REG_IN_FLIGHT);
-    let map = guard.get_or_insert_with(RegInFlightMap::new);
+    let mut map = lock(&REG_IN_FLIGHT);
     map.retain(|_, (_, inserted_at)| inserted_at.elapsed() < REG_IN_FLIGHT_TTL);
-    f(map)
+    f(&mut map)
 }
 
-/// Create the process-lifetime wallet lp client. MUST run on the host's main
-/// Qt thread: lp_client_create makes the calling thread the client's owner
-/// thread, the owner thread must run a Qt event loop (logos_protocol.h), and
-/// async results are delivered FROM that thread. on_context_ready fires at
-/// module load on the loader's thread — the main Qt loop — which is the only
-/// thread of ours guaranteed to keep pumping for the process lifetime.
-/// (Creating the client lazily inside a handler pins it to an ephemeral
-/// concurrency:"multi" dispatch worker, and every reply is lost.)
-fn init_wallet_client() {
-    let mut slot = lock(&WALLET_CLIENT);
-    if slot.is_some() {
-        return;
-    }
-    let (Ok(target), Ok(origin)) = (CString::new(WALLET_MODULE), CString::new("core")) else {
-        return;
-    };
-    let raw = unsafe {
-        lp::lp_client_create(
-            target.as_ptr(),
-            origin.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    if raw.is_null() {
-        eprintln!("wallet_call: lp_client_create failed for {WALLET_MODULE}");
-        return;
-    }
-    *slot = Some(WalletHandle(raw));
-    *lock(&WALLET_OWNER) = Some(std::thread::current().id());
-}
 
-/// Reply slot for one in-flight wallet invoke: the trampoline reclaims the
-/// box and sends (ok, raw json) exactly once, from the client's owner thread.
-struct WalletReply {
-    tx: std::sync::mpsc::Sender<(bool, String)>,
-}
+/// The unit-test binary links no logos-protocol archive, yet the SDK's client
+/// path references the `lp_*` symbols by name. Define the ones that path can
+/// reach as a "no client" transport — `lp_client_create` answers NULL, so
+/// every call fails cleanly with the SDK's own error and nothing below the
+/// ABI is ever exercised. The real symbols come from the protocol archive at
+/// the final plugin link.
+#[cfg(test)]
+mod lp_test_transport {
+    // `#[no_mangle]` definitions are what the crate-wide `deny(unsafe_code)`
+    // exists to flag; these five exist only to give the test binary a link
+    // target, and never run past returning "no client".
+    #![allow(unsafe_code)]
+    use std::ffi::{c_char, c_int, c_void};
 
-extern "C" fn wallet_reply_trampoline(
-    ok: c_int,
-    json: *const c_char,
-    user_data: *mut std::ffi::c_void,
-) {
-    if user_data.is_null() {
-        return;
-    }
-    let reply = unsafe { Box::from_raw(user_data as *mut WalletReply) };
-    let raw = if json.is_null() {
-        String::new()
-    } else {
-        unsafe { CStr::from_ptr(json) }.to_string_lossy().into_owned()
-    };
-    let _ = reply.tx.send((ok != 0, raw));
-}
-
-/// The JSON string value of a raw lp result, or "" for anything else.
-fn lp_result_to_string(raw: &str) -> String {
-    match serde_json::from_str::<serde_json::Value>(raw) {
-        Ok(serde_json::Value::String(s)) => s,
-        _ => String::new(),
-    }
-}
-
-/// JSON-array args in, string result out. Failure (lp error, timeout,
-/// non-string result) yields "".
-///
-/// Two paths by thread, per the lp_client owner-thread contract
-/// (logos_protocol.h):
-/// - On the owner thread (single-concurrency dispatch runs there): the
-///   synchronous lp_invoke — its internal QtRO wait loop keeps pumping the
-///   owner loop, so wallet round-trips do not deadlock dispatch.
-/// - Off the owner thread: lp_invoke_async ("safe to call from any thread")
-///   + a channel wait; the reply is delivered from the owner thread
-///   whenever it pumps.
-fn wallet_call(method: &str, args: &serde_json::Value, timeout_ms: c_int) -> String {
-    let client = {
-        let slot = lock(&WALLET_CLIENT);
-        match slot.as_ref() {
-            Some(h) => h.0,
-            None => {
-                eprintln!("wallet_call: {method} no wallet client");
-                return String::new();
-            }
-        }
-    };
-    let (Ok(method_c), Ok(args_c)) = (
-        CString::new(method),
-        CString::new(args.to_string()),
-    ) else {
-        eprintln!("wallet_call: {method} args not CString-safe");
-        return String::new();
-    };
-
-    let on_owner_thread = lock(&WALLET_OWNER)
-        .map(|id| id == std::thread::current().id())
-        .unwrap_or(false);
-    if on_owner_thread {
-        let mut result_json: *mut c_char = std::ptr::null_mut();
-        let mut error_json: *mut c_char = std::ptr::null_mut();
-        let rc = unsafe {
-            lp::lp_invoke(
-                client,
-                method_c.as_ptr(),
-                args_c.as_ptr(),
-                timeout_ms,
-                &mut result_json,
-                &mut error_json,
-            )
-        };
-        if rc != lp::LP_OK {
-            if !error_json.is_null() {
-                let message = unsafe { CStr::from_ptr(error_json) }.to_string_lossy();
-                eprintln!("wallet_call: {method} lp error {rc}: {message}");
-                unsafe { lp::lp_string_free(error_json) };
-            } else {
-                eprintln!("wallet_call: {method} lp error {rc}");
-            }
-            return String::new();
-        }
-        let raw = if result_json.is_null() {
-            String::new()
-        } else {
-            let s = unsafe { CStr::from_ptr(result_json) }
-                .to_string_lossy()
-                .into_owned();
-            unsafe { lp::lp_string_free(result_json) };
-            s
-        };
-        return lp_result_to_string(&raw);
+    #[no_mangle]
+    pub extern "C" fn lp_client_create(
+        _target_module: *const c_char,
+        _origin_module: *const c_char,
+        _target_transport_json: *const c_char,
+        _capability_transport_json: *const c_char,
+    ) -> *mut c_void {
+        std::ptr::null_mut()
     }
 
-    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
-    let user_data = Box::into_raw(Box::new(WalletReply { tx })) as *mut std::ffi::c_void;
-    let rc = unsafe {
-        lp::lp_invoke_async(
-            client,
-            method_c.as_ptr(),
-            args_c.as_ptr(),
-            timeout_ms,
-            wallet_reply_trampoline,
-            user_data,
-        )
-    };
-    if rc != lp::LP_OK {
-        eprintln!("wallet_call: {method} lp_invoke_async dispatch failed rc={rc}");
-        return String::new();
+    #[no_mangle]
+    pub extern "C" fn lp_client_destroy(_client: *mut c_void) {}
+
+    #[no_mangle]
+    pub extern "C" fn lp_invoke(
+        _client: *mut c_void,
+        _method: *const c_char,
+        _args_json: *const c_char,
+        _timeout_ms: c_int,
+        _out_result_json: *mut *mut c_char,
+        _out_error_json: *mut *mut c_char,
+    ) -> c_int {
+        -3
     }
 
-    // The protocol owns timeout enforcement (timeout_ms above); the margin
-    // only guards against a callback that never fires.
-    let wait = Duration::from_millis(timeout_ms as u64 + 10_000);
-    let (ok, raw) = match rx.recv_timeout(wait) {
-        Ok(reply) => reply,
-        Err(_) => {
-            eprintln!("wallet_call: {method} reply channel timed out");
-            return String::new();
-        }
-    };
-    if !ok {
-        let message = serde_json::from_str::<serde_json::Value>(&raw)
-            .ok()
-            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
-            .unwrap_or(raw);
-        eprintln!("wallet_call: {method} lp error: {message}");
-        return String::new();
+    #[no_mangle]
+    pub extern "C" fn lp_invoke_async(
+        _client: *mut c_void,
+        _method: *const c_char,
+        _args_json: *const c_char,
+        _timeout_ms: c_int,
+        _cb: Option<extern "C" fn(c_int, *const c_char, *mut c_void)>,
+        _user_data: *mut c_void,
+    ) -> c_int {
+        -3
     }
-    lp_result_to_string(&raw)
+
+    #[no_mangle]
+    pub extern "C" fn lp_string_free(_s: *mut c_char) {}
 }
 
 // ------------------------------------------------------------------- helpers
@@ -355,11 +148,10 @@ fn wallet_call(method: &str, args: &serde_json::Value, timeout_ms: c_int) -> Str
 /// Trim whitespace and strip an optional 0x/0X prefix.
 fn strip_hex_prefix(s: &str) -> &str {
     let trimmed = s.trim();
-    if trimmed.len() >= 2 && (trimmed.starts_with("0x") || trimmed.starts_with("0X")) {
-        &trimmed[2..]
-    } else {
-        trimmed
-    }
+    trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed)
 }
 
 /// Trims whitespace, strips an optional 0x/0X prefix, requires an even
@@ -367,7 +159,7 @@ fn strip_hex_prefix(s: &str) -> &str {
 /// length.
 fn hex_to_bytes(hex: &str, expected_len: Option<usize>) -> Option<Vec<u8>> {
     let digits = strip_hex_prefix(hex);
-    if digits.len() % 2 != 0 {
+    if !digits.len().is_multiple_of(2) {
         return None;
     }
     let bytes = digits.as_bytes();
@@ -401,11 +193,7 @@ fn resolve_account_id(id: &str) -> String {
     if stripped.len() == 64 {
         return stripped.to_string();
     }
-    wallet_call(
-        "account_id_from_base58",
-        &serde_json::json!([id]),
-        READ_TIMEOUT_MS,
-    )
+    wallet::account_id_from_base58(id)
 }
 
 /// Tri-state fetch: Present / legitimately Absent (empty data) / Error
@@ -417,11 +205,7 @@ enum FetchOutcome {
 }
 
 fn fetch_account_data_tri_state(account_id_hex: &str) -> FetchOutcome {
-    let json = wallet_call(
-        "get_account_public",
-        &serde_json::json!([account_id_hex]),
-        READ_TIMEOUT_MS,
-    );
+    let json = wallet::get_account_public(account_id_hex);
     if json.is_empty() {
         return FetchOutcome::Error;
     }
@@ -442,8 +226,8 @@ fn fetch_account_data_tri_state(account_id_hex: &str) -> FetchOutcome {
 }
 
 /// Some(data) only for a populated, well-formed account; logs nothing. Used
-/// where "not yet present" is an expected state (register_member pre-check,
-/// membership polls).
+/// where "not yet present" is an expected state — today only
+/// register_member's idempotency pre-check.
 fn fetch_account_data_quiet(account_id_hex: &str) -> Option<Vec<u8>> {
     match fetch_account_data_tri_state(account_id_hex) {
         FetchOutcome::Present(data) => Some(data),
@@ -455,24 +239,20 @@ fn fetch_account_data_quiet(account_id_hex: &str) -> Option<Vec<u8>> {
 /// 32-byte program_owner; an empty owner field is tolerated and leaves
 /// `owner_out` empty.
 fn fetch_account_data(account_id_hex: &str, owner_out: Option<&mut Vec<u8>>) -> Option<Vec<u8>> {
-    let json = wallet_call(
-        "get_account_public",
-        &serde_json::json!([account_id_hex]),
-        READ_TIMEOUT_MS,
-    );
+    let json = wallet::get_account_public(account_id_hex);
     if json.is_empty() {
-        eprintln!("fetchAccountData failed: empty response for {account_id_hex}");
+        eprintln!("fetch_account_data failed: empty response for {account_id_hex}");
         return None;
     }
     let parsed = serde_json::from_str::<serde_json::Value>(&json).ok();
     let Some(obj) = parsed.as_ref().and_then(|v| v.as_object()) else {
         let head: String = json.chars().take(200).collect();
-        eprintln!("fetchAccountData failed: not a JSON object for {account_id_hex} got: {head}");
+        eprintln!("fetch_account_data failed: not a JSON object for {account_id_hex} got: {head}");
         return None;
     };
     let data_hex = obj.get("data").and_then(|v| v.as_str()).unwrap_or("");
     if data_hex.is_empty() {
-        eprintln!("fetchAccountData failed: empty data for {account_id_hex}");
+        eprintln!("fetch_account_data failed: empty data for {account_id_hex}");
         return None;
     }
     if let Some(owner_out) = owner_out {
@@ -485,7 +265,7 @@ fn fetch_account_data(account_id_hex: &str, owner_out: Option<&mut Vec<u8>>) -> 
                 Some(owner) => *owner_out = owner,
                 None => {
                     let head: String = owner_hex.chars().take(80).collect();
-                    eprintln!("fetchAccountData: malformed program_owner hex: {head}");
+                    eprintln!("fetch_account_data: malformed program_owner hex: {head}");
                     return None;
                 }
             }
@@ -526,27 +306,53 @@ fn resolve_config_context(config_account_id: &str, who: &str) -> Option<RlnConfi
     })
 }
 
-/// The risc0-serde u32 instruction words as the JSON array
-/// `send_generic_public_transaction` expects.
-fn words_to_json(words: &[u32]) -> Vec<serde_json::Value> {
-    words.iter().map(|&w| serde_json::Value::from(w)).collect()
+/// The account that pays a transaction's fee, as 32-byte hex, or empty to let
+/// the wallet charge the signing account.
+///
+/// v0.2.5 charges every public transaction, and the fee is reserved from a
+/// *native* balance. A freshly created holding has tokens and no native
+/// balance at all, so making the signer pay means a registration is refused
+/// before it runs, with only "Incorrect fee" to say why.
+///
+/// `LEZ_RLN_PAYER` names a funded account the wallet already holds a key for —
+/// the same variable the host tools use. It accepts base58 or hex, since the
+/// tooling that mints the payer prints base58 and the wallet interface wants
+/// hex. Unset means self-pay, which is right wherever the signing account is
+/// itself funded.
+fn fee_payer_hex() -> String {
+    let Ok(raw) = std::env::var("LEZ_RLN_PAYER") else {
+        return String::new();
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    if hex_to_bytes32(raw).is_some() {
+        return raw.to_ascii_lowercase();
+    }
+    let resolved = wallet::account_id_from_base58(raw);
+    if resolved.is_empty() {
+        eprintln!("LEZ_RLN_PAYER is neither 32-byte hex nor a base58 account id: {raw}");
+    }
+    resolved
 }
 
-/// Submit one `send_generic_public_transaction` — the frozen 4-element args
-/// array `[account_ids, signing_reqs, instruction_words, program_id]` — with
-/// the 180s tx timeout (a sequencer submit can far outlive the 20s protocol
-/// default). `None` = failed, already logged.
+/// Submit one public transaction through the module's own wallet. `None` =
+/// failed, already logged.
 fn send_generic_tx(
     who: &str,
     account_ids: Vec<String>,
     signing_reqs: Vec<bool>,
-    instruction_words: Vec<serde_json::Value>,
+    instruction: Vec<u8>,
     program_id_hex: String,
+    payer_hex: String,
 ) -> Option<String> {
-    let send_result = wallet_call(
-        "send_generic_public_transaction",
-        &serde_json::json!([account_ids, signing_reqs, instruction_words, program_id_hex]),
-        TX_TIMEOUT_MS,
+    let send_result = wallet::send_generic_public_transaction(
+        &account_ids,
+        &signing_reqs,
+        &instruction,
+        &program_id_hex,
+        &payer_hex,
     );
     if send_result.is_empty() {
         eprintln!("{who}: transaction failed");
@@ -603,7 +409,7 @@ fn derive_register_plan(
     ) {
         Ok(plan) => Some(plan),
         Err(e) => {
-            eprintln!("{who}: register_plan FFI failed: {e}");
+            eprintln!("{who}: register_plan failed: {e}");
             None
         }
     }
@@ -648,7 +454,7 @@ fn get_valid_roots_impl(rln_account_id_hex: &str) -> String {
     let plan = match native::merkle_proofs_plan(&ctx.config_data, &ctx.program_owner, &[]) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("get_valid_roots: merkle_proofs_plan FFI error: {e}");
+            eprintln!("get_valid_roots: merkle_proofs_plan failed: {e}");
             return String::new();
         }
     };
@@ -662,12 +468,25 @@ fn get_valid_roots_impl(rln_account_id_hex: &str) -> String {
     let roots = match native::get_valid_roots(&main_data) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("get_valid_roots: get_valid_roots FFI error: {e}");
+            eprintln!("get_valid_roots: valid_roots_from_main failed: {e}");
             return String::new();
         }
     };
 
-    roots_to_json_array(&roots).to_string()
+    // The depth rides along because the consumer cannot use these roots
+    // without it: a registry shallower than the prover's circuit has every
+    // root lifted to the circuit's depth before it is compared with a root a
+    // proof carries. It costs nothing — the header is already fetched.
+    let depth = match native::tree_depth(&main_data) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("get_valid_roots: tree depth unreadable: {e}");
+            return String::new();
+        }
+    };
+
+    serde_json::json!({ "depth": depth, "valid_roots": roots_to_json_array(&roots) })
+        .to_string()
 }
 
 fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> String {
@@ -702,7 +521,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
     {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("get_merkle_proofs: plan FFI error: {e}");
+            eprintln!("get_merkle_proofs: merkle_proofs_plan failed: {e}");
             return String::new();
         }
     };
@@ -711,7 +530,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
     // subtree reads are bracketed by two main-account fetches; equal
     // valid_roots windows prove no mutation occurred and the (main, subtree)
     // pair is consistent.
-    const K_MAX_SNAPSHOT_ATTEMPTS: usize = 5;
+    const MAX_SNAPSHOT_ATTEMPTS: usize = 5;
     let main_hex = bytes_to_hex(&plan.main_account_id);
     let subtree_count = plan.subtree_count as usize;
 
@@ -719,7 +538,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
     let mut stable_roots: Vec<[u8; 32]> = Vec::new();
     let mut consistent = false;
 
-    for attempt in 0..K_MAX_SNAPSHOT_ATTEMPTS {
+    for attempt in 0..MAX_SNAPSHOT_ATTEMPTS {
         // Snapshot A — opens the read window.
         let Some(main_data) = fetch_account_data(&main_hex, None) else {
             eprintln!("get_merkle_proofs: failed to fetch main account {main_hex}");
@@ -728,7 +547,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
         let roots_a = match native::get_valid_roots(&main_data) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("get_merkle_proofs: get_valid_roots(A) FFI error: {e}");
+                eprintln!("get_merkle_proofs: valid_roots(A) failed: {e}");
                 return String::new();
             }
         };
@@ -764,7 +583,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
         let roots_b = match native::get_valid_roots(&main_data_b) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("get_merkle_proofs: get_valid_roots(B) FFI error: {e}");
+                eprintln!("get_merkle_proofs: valid_roots(B) failed: {e}");
                 return String::new();
             }
         };
@@ -783,7 +602,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
         proofs = match native::merkle_proofs_exec(&main_data, &subtree_refs, &leaf_indices) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("get_merkle_proofs: exec FFI error: {e}");
+                eprintln!("get_merkle_proofs: merkle_proofs_exec failed: {e}");
                 return String::new();
             }
         };
@@ -796,7 +615,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
         // Never ship an internally-inconsistent proof (the poller keeps its
         // previous consistent cachedProof instead).
         eprintln!(
-            "get_merkle_proofs: no consistent tree snapshot after {K_MAX_SNAPSHOT_ATTEMPTS} attempts"
+            "get_merkle_proofs: no consistent tree snapshot after {MAX_SNAPSHOT_ATTEMPTS} attempts"
         );
         return String::new();
     }
@@ -811,20 +630,37 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
 struct LogosLezRlnModuleImpl;
 
 impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
-    fn on_context_ready(&mut self, _ctx: &RustModuleContext) {
-        init_wallet_client();
+    /// Derive a fresh public account in this module's own wallet. The
+    /// accounts it signs with have to be ones its own storage knows, so a
+    /// consumer that needs a holding to fund and register with asks here.
+    fn create_holding_account(&self) -> String {
+        wallet::create_holding_account()
     }
 
-    fn get_valid_roots(&mut self, rln_account_id_hex: String) -> String {
+    /// Whether the wallet this module owns is usable. Never fails — a
+    /// consumer polls it to tell "still coming up" from "broken", because
+    /// every chain-facing method answers "" in both cases.
+    fn wallet_status(&self) -> String {
+        wallet::status_json()
+    }
+
+    fn on_context_ready(&self, ctx: &RustModuleContext) {
+        // Bring-up runs on its own thread: this hook fires on the host's Qt
+        // main thread, and opening a wallet calibrates sequencers and then
+        // syncs the chain — work the loop must not be holding.
+        wallet::spawn_bring_up(&ctx.instance_persistence_path);
+    }
+
+    fn get_valid_roots(&self, rln_account_id_hex: String) -> String {
         get_valid_roots_impl(&rln_account_id_hex)
     }
 
-    fn get_merkle_proofs(&mut self, config_account_id: String, leaf_indices_json: String) -> String {
+    fn get_merkle_proofs(&self, config_account_id: String, leaf_indices_json: String) -> String {
         get_merkle_proofs_impl(&config_account_id, &leaf_indices_json)
     }
 
     fn register_member(
-        &mut self,
+        &self,
         config_account_id: String,
         user_holding_account_id: String,
         id_commitment_hex: String,
@@ -855,20 +691,20 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         // for this (tree_id, id_commitment), recover its leaf_index instead
         // of resubmitting — the on-chain Register handler enforces uniqueness
         // via Claim::Pda, so a resubmit always fails.
-        if let Some(existing) = fetch_account_data_quiet(&membership_pda_hex) {
-            if existing.len() >= 64 {
-                if let Ok(membership) = native::decode_membership(&existing) {
-                    eprintln!(
-                        "register_member: membership already exists at leaf {} — skipping resubmit",
-                        membership.leaf_index
-                    );
-                    return serde_json::json!({
-                        "leaf_index": membership.leaf_index as i64,
-                        "already_registered": true,
-                    })
-                    .to_string();
-                }
-            }
+        // decode_membership carries its own length guard (DataTooShort), so
+        // a short or absent account simply fails to decode.
+        if let Some(membership) = fetch_account_data_quiet(&membership_pda_hex)
+            .and_then(|existing| native::decode_membership(&existing).ok())
+        {
+            eprintln!(
+                "register_member: membership already exists at leaf {} — skipping resubmit",
+                membership.leaf_index
+            );
+            return serde_json::json!({
+                "leaf_index": membership.leaf_index as i64,
+                "already_registered": true,
+            })
+            .to_string();
         }
 
         // In-flight dedup (see REG_IN_FLIGHT): the first caller submits;
@@ -901,13 +737,11 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         ) {
             Ok(words) => words,
             Err(e) => {
-                eprintln!("register_member: build_instruction FFI error: {e}");
+                eprintln!("register_member: register_build_instruction failed: {e}");
                 reg_in_flight(|m| m.remove(&reg_key));
                 return String::new();
             }
         };
-        let instruction_words = words_to_json(&instruction);
-
         // Account order must match methods/guest/src/program.rs::register:
         //   config, tree_main, user_holding (signer), treasury, bottom_subtree,
         //   clock_account, membership (init).
@@ -930,8 +764,9 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             "register_member",
             account_ids,
             signing_reqs,
-            instruction_words,
+            instruction,
             bytes_to_hex(&ctx.program_owner),
+            fee_payer_hex(),
         ) else {
             reg_in_flight(|m| m.remove(&reg_key));
             return String::new();
@@ -952,7 +787,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
     }
 
     fn claim_tokens(
-        &mut self,
+        &self,
         config_account_id: String,
         dest_account_id: String,
         amount: i64,
@@ -976,10 +811,11 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         // Submitted under the REGISTRATION program (the config's program_owner).
         let Some(send_result) = send_generic_tx(
             "claim_tokens",
-            vec![ctx.config_hex.clone(), payment_def_hex.clone(), dest_hex],
+            vec![ctx.config_hex.clone(), payment_def_hex.clone(), dest_hex.clone()],
             vec![false, false, true],
-            words_to_json(&instruction),
+            instruction,
             bytes_to_hex(&ctx.program_owner),
+            fee_payer_hex(),
         ) else {
             return String::new();
         };
@@ -991,7 +827,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         .to_string()
     }
 
-    fn get_token_balance(&mut self, account_id: String) -> String {
+    fn get_token_balance(&self, account_id: String) -> String {
         let account_hex = resolve_account_id(&account_id);
         if account_hex.is_empty() {
             eprintln!("get_token_balance: failed to resolve account");
@@ -1019,11 +855,11 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         }
     }
 
-    // ---- v1.1 additive surface (see the lidl): registry-provider reads for
-    // the membership management module. Same conventions as the frozen
-    // methods: "" = error, compact alphabetical JSON otherwise.
+    // ---- registry-provider reads, consumed by the membership management
+    // module. Same conventions as the rest of the contract: "" = error,
+    // compact alphabetical JSON otherwise.
 
-    fn get_membership(&mut self, config_account_id: String, id_commitment_hex: String) -> String {
+    fn get_membership(&self, config_account_id: String, id_commitment_hex: String) -> String {
         let Some(id_commitment) = hex_to_bytes32(&id_commitment_hex) else {
             eprintln!("get_membership: invalid id_commitment hex");
             return String::new();
@@ -1096,7 +932,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         .to_string()
     }
 
-    fn get_registry_bounds(&mut self, config_account_id: String) -> String {
+    fn get_registry_bounds(&self, config_account_id: String) -> String {
         let Some(ctx) = resolve_config_context(&config_account_id, "get_registry_bounds") else {
             return String::new();
         };
@@ -1127,6 +963,9 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
     }
 }
 
+// The one `no_mangle` the scaffold contract requires of author code: the
+// generated `__logos_install_hook` resolves this symbol by linkage.
+#[allow(unsafe_code)]
 #[no_mangle]
 pub extern "Rust" fn logos_module_install() {
     install::<LogosLezRlnModuleImpl>();

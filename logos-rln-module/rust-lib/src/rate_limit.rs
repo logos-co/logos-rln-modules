@@ -222,8 +222,8 @@ mod tests {
 
     #[test]
     fn rewound_clock_never_reissues_a_pruned_epoch() {
-        // Audit cause B: a rewound clock re-admits pruned epoch 10 at the
-        // window check; the persisted floor must refuse it.
+        // A rewound clock re-admits pruned epoch 10 at the window check;
+        // the persisted floor must refuse it.
         let mut alloc = AllocationState::default();
         assert_eq!(reserve_slot(&mut alloc, APP_A, 10, 9, 5), Ok(0));
         assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 11, 5), Ok(0));
@@ -291,8 +291,8 @@ mod tests {
 
     #[test]
     fn widened_epoch_gap_never_resurrects_pruned_epochs() {
-        // Audit cause D: a restart with a wider gap re-admits pruned epoch 9
-        // past the window check; the persisted floor must refuse it.
+        // A restart with a wider gap re-admits pruned epoch 9 past the
+        // window check; the persisted floor must refuse it.
         let mut alloc = AllocationState::default();
         assert_eq!(reserve_slot(&mut alloc, APP_A, 9, 8, 5), Ok(0));
         assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 11, 5), Ok(0));

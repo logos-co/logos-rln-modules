@@ -2,9 +2,11 @@
 // the module in logos-standalone-app under the logos-qt-mcp test framework
 // (`nix build .#integration-test`). Backend modules are not loaded, so the
 // startup probe's get_memberships errors and the app lands deterministically
-// in onboarding mode. Hermetically untestable (covered by the live basecamp
-// smoke): the membership status card, step progression past the password step
-// (no text-input API), and the wizard->card completion handoff. expectTexts
+// in onboarding mode. This file drives static chrome only: with no
+// text-input API, anything behind the password field is out of reach HERE.
+// The membership status card, the post-password progression and the
+// wizard->card handoff are covered hermetically by flow-tests.mjs, under this
+// same nix target. expectTexts
 // matches elements regardless of visibility; click() needs a visible element,
 // so clickable labels are chosen mutually disjoint across all views.
 import { resolve } from "node:path";

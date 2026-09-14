@@ -53,6 +53,11 @@ struct Supervisor {
     /// captured generation no longer matches is from a superseded run and
     /// exits at its next check — the mechanism that makes detaching safe.
     generation: u64,
+    /// Bumped by nudge(): asks the tick loops waiting in `wait_tick_or_nudge`
+    /// for one immediate out-of-band tick. Non-subscribers keep their own
+    /// cadence — a remote peer's proofs must not be able to drive this
+    /// module's other registry reads.
+    nudges: u64,
     /// Live (spawned, not yet returned) workers — stop()'s join condition
     /// and the tests' observability seam.
     running: usize,
@@ -64,6 +69,7 @@ struct Supervisor {
 static SUP: Mutex<Supervisor> = Mutex::new(Supervisor {
     state: WorkerState::NeverStarted,
     generation: 0,
+    nudges: 0,
     running: 0,
     poller: None,
     refresher: None,
@@ -76,17 +82,53 @@ pub(crate) fn is_stopped() -> bool {
     STOPPED.load(Ordering::SeqCst)
 }
 
-/// Interruptible tick sleep. Returns `true` when the worker should run its
-/// tick body, `false` when it should exit (stopped, or superseded by a newer
-/// generation). A `stop()` or restart wakes the wait immediately.
+/// Interruptible tick sleep, ignoring nudges: only this loop's own timeout
+/// (or a `stop()`/restart) ends it. Returns `true` when the worker should
+/// run its tick body, `false` when it should exit (stopped, or superseded
+/// by a newer generation).
 pub(crate) fn wait_tick(my_gen: u64, dur: Duration) -> bool {
+    wait(my_gen, dur, false)
+}
+
+/// [`wait_tick`] for a loop that subscribes to nudges: a [`nudge`] counts as
+/// this loop's due tick. Subscribe only a loop whose work is what the nudger
+/// asks for (see the `nudges` field).
+pub(crate) fn wait_tick_or_nudge(my_gen: u64, dur: Duration) -> bool {
+    wait(my_gen, dur, true)
+}
+
+fn wait(my_gen: u64, dur: Duration, honor_nudge: bool) -> bool {
     let guard = crate::lock(&SUP);
+    let entry_nudges = guard.nudges;
     let (sup, timeout) = CVAR
         .wait_timeout_while(guard, dur, |s| {
-            s.generation == my_gen && s.state != WorkerState::Stopped
+            s.generation == my_gen
+                && s.state != WorkerState::Stopped
+                && (!honor_nudge || s.nudges == entry_nudges)
         })
         .unwrap_or_else(|p| p.into_inner());
-    timeout.timed_out() && sup.generation == my_gen && sup.state != WorkerState::Stopped
+    // A non-subscriber woken by the broadcast finds its predicate still
+    // true and sleeps out the remainder — it is never a due tick for it.
+    (timeout.timed_out() || (honor_nudge && sup.nudges != entry_nudges))
+        && sup.generation == my_gen
+        && sup.state != WorkerState::Stopped
+}
+
+/// The raw wake for the subscribed tick loops ([`wait_tick_or_nudge`]);
+/// callers rate-limit themselves (see roots::nudge).
+pub(crate) fn nudge() {
+    crate::lock(&SUP).nudges += 1;
+    CVAR.notify_all();
+}
+
+#[cfg(test)]
+pub(crate) fn nudges_for_test() -> u64 {
+    crate::lock(&SUP).nudges
+}
+
+#[cfg(test)]
+pub(crate) fn generation_for_test() -> u64 {
+    crate::lock(&SUP).generation
 }
 
 /// Spawn `body(generation)` into `slot` if permitted and not already alive.
@@ -181,9 +223,13 @@ pub(crate) fn start(warm: impl FnOnce() + Send + 'static) {
             let _ = handle.join();
         }
     }
-    let gen = sup.generation;
-    sup.warm = Some(spawn_into("rln-warm", gen, warm));
-    sup.running += 1;
+    // Re-check under the lock: a stop() interleaved since this start's
+    // first section must not get a fresh warm worker spawned behind it.
+    if sup.state != WorkerState::Stopped {
+        let gen = sup.generation;
+        sup.warm = Some(spawn_into("rln-warm", gen, warm));
+        sup.running += 1;
+    }
 }
 
 /// stop(): forbid spawning, wake every sleeping worker, wait up to [`GRACE`]
@@ -224,11 +270,6 @@ pub(crate) fn stop() {
 #[cfg(test)]
 pub(crate) fn live_worker_count() -> usize {
     crate::lock(&SUP).running
-}
-
-#[cfg(test)]
-pub(crate) fn generation() -> u64 {
-    crate::lock(&SUP).generation
 }
 
 /// Reset to a fresh NeverStarted supervisor; the generation bump makes any
@@ -277,6 +318,44 @@ mod tests {
     // crate's designated global-state lock and starts from a clean reset.
 
     #[test]
+    fn nudge_wakes_only_the_subscribed_loop() {
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        reset_for_test();
+        let gen = generation_for_test();
+
+        // Both waits far outlast the test: only a nudge can return either.
+        let woke = Arc::new(AtomicBool::new(false));
+        let woke2 = woke.clone();
+        let subscriber = std::thread::spawn(move || {
+            woke2.store(wait_tick_or_nudge(gen, Duration::from_secs(60)), Ordering::SeqCst);
+        });
+        let returned = Arc::new(AtomicBool::new(false));
+        let returned2 = returned.clone();
+        let bystander = std::thread::spawn(move || {
+            let due = wait_tick(gen, Duration::from_secs(60));
+            returned2.store(true, Ordering::SeqCst);
+            due
+        });
+
+        std::thread::sleep(Duration::from_millis(100)); // let both park
+        let began = Instant::now();
+        nudge();
+        subscriber.join().unwrap();
+        assert!(woke.load(Ordering::SeqCst), "a nudge must count as a DUE tick, not a spurious wake");
+        assert!(began.elapsed() < Duration::from_secs(5), "nudge wake took {:?}", began.elapsed());
+
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !returned.load(Ordering::SeqCst),
+            "a nudge must not accelerate a loop that does not subscribe to it"
+        );
+
+        // The generation bump is the bystander's exit signal — no minute wait.
+        reset_for_test();
+        assert!(!bystander.join().unwrap(), "a superseded waiter must not report a due tick");
+    }
+
+    #[test]
     fn stop_joins_workers_quickly() {
         let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
@@ -297,13 +376,13 @@ mod tests {
         let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
         start(|| {});
-        let g1 = generation();
+        let g1 = generation_for_test();
         assert!(live_worker_count() >= 2);
         stop();
         assert_eq!(live_worker_count(), 0);
         assert!(is_stopped());
         start(|| {});
-        assert!(generation() > g1);
+        assert!(generation_for_test() > g1);
         assert!(!is_stopped());
         assert!(live_worker_count() >= 2);
         stop();

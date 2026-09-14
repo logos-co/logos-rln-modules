@@ -1,6 +1,8 @@
 // Membership lifecycle state as a LogosBadge with a per-state status color,
-// covering every state the merged-state view can report: pending/failed/
-// active/grace_period/expired/erased/unknown.
+// covering the full MembershipStatus vocabulary (M.MEMBERSHIP_STATES):
+// pending/failed/active/grace_period/expired/erased_awaits_withdrawal/
+// erased/slashed/unknown. Anything else (a state a later wire adds) falls
+// through to the neutral color — the text still renders verbatim.
 import QtQuick
 import Logos.Theme
 import Logos.Controls
@@ -16,5 +18,7 @@ LogosBadge {
          : membershipState === "expired"      ? Theme.palette.textTertiary
          : membershipState === "failed"       ? Theme.palette.error
          : membershipState === "erased"       ? Theme.palette.error
+         : membershipState === "erased_awaits_withdrawal" ? Theme.palette.warning
+         : membershipState === "slashed"      ? Theme.palette.error
          : Theme.palette.textSecondary
 }

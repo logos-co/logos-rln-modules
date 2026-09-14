@@ -1,7 +1,7 @@
 //! RLN core logic — register/proof/funding planning and account decoding,
 //! called from `lib.rs` as plain Rust (no C ABI).
 
-use borsh::BorshDeserialize;
+use borsh::{BorshDeserialize, BorshSerialize};
 use rln_layouts::{
     combine_seeds, label_seed, u32_seed,
     MembershipState, TreeMainLayout, ROOT_HISTORY_SIZE,
@@ -143,20 +143,37 @@ fn derive_pda(program_id: &[u8; 32], pda_seed: &[u8; 32]) -> [u8; 32] {
     input[32..64].copy_from_slice(program_id);
     input[64..96].copy_from_slice(pda_seed);
 
-    let hash = Sha256::digest(&input);
+    let hash = Sha256::digest(input);
     hash.into()
 }
 
-/// risc0-serde an instruction into its u32 words — the deployed programs'
-/// wire format (LE words on the wire); `send_generic_public_transaction`
-/// takes the words directly.
-fn serialize_instruction<T: Serialize>(instruction: &T) -> Result<Vec<u32>, RlnError> {
-    risc0_zkvm::serde::to_vec(instruction).map_err(|_| RlnError::SerializationError)
+/// Borsh-encode an instruction — the deployed programs' wire format.
+///
+/// LEZ v0.2.5 decodes a program's instruction with borsh and widened the
+/// instruction stream from `u32` words to plain bytes, so this and the guests
+/// have to flip together: a risc0-serde payload does not decode, and the
+/// mismatch shows up as a failed execution rather than a type error.
+fn serialize_instruction<T: BorshSerialize>(instruction: &T) -> Result<Vec<u8>, RlnError> {
+    borsh::to_vec(instruction).map_err(|_| RlnError::SerializationError)
 }
 
 /// Parse tree-main account data and return the valid roots.
 ///
 /// Index 0 = current root. Indices 1..N = non-zero history entries.
+/// The tree's configured depth, from the main account header.
+///
+/// The prover's circuit is deeper than a shrunk registry, so a consumer has to
+/// lift this tree's roots to the circuit's depth before comparing them with a
+/// root a proof carries. It cannot do that without knowing the depth, so
+/// `get_valid_roots` reports this alongside the roots — it is one byte of the
+/// header the caller has already fetched.
+pub fn tree_depth(data: &[u8]) -> Result<u8, RlnError> {
+    if data.len() < TreeMainLayout::SIZE {
+        return Err(RlnError::DataTooShort);
+    }
+    Ok(TreeMainLayout::parse(data).tree_depth)
+}
+
 pub fn get_valid_roots(data: &[u8]) -> Result<Vec<[u8; 32]>, RlnError> {
     if data.len() < TreeMainLayout::SIZE {
         return Err(RlnError::DataTooShort);
@@ -235,7 +252,7 @@ pub fn build_merkle_proof(
         let is_right = (current_index % 2) as u8;
         path_indices[i] = is_right;
 
-        let sibling_index = if current_index % 2 == 0 {
+        let sibling_index = if current_index.is_multiple_of(2) {
             current_index + 1
         } else {
             current_index - 1
@@ -341,11 +358,17 @@ pub fn merkle_proofs_exec(
         let subtree_id = u32::try_from(leaf_index / SUBTREE_LEAVES as u64)
             .map_err(|_| RlnError::InvalidLeafIndex)?;
 
+        // A PRESENT entry that is empty is the legitimate Absent case (the
+        // subtree account is not initialized yet). A MISSING entry means the
+        // caller's plan and this call disagree — substituting empty there
+        // would prove against default nodes and mint a wrong-but-plausible
+        // proof, which is exactly what the caller's tri-state fetch refuses
+        // to do.
         let subtree_data: &[u8] = subtrees
             .iter()
             .find(|(id, _)| *id == subtree_id)
             .map(|(_, data)| *data)
-            .unwrap_or(&[]);
+            .ok_or(RlnError::InvalidLeafIndex)?;
 
         let proof = build_merkle_proof(main_data, subtree_data, leaf_index)?;
 
@@ -413,13 +436,13 @@ pub fn register_plan(
     })
 }
 
-/// Build the `Instruction::Register` payload as risc0-serde u32 words.
+/// Build the `Instruction::Register` payload as borsh bytes.
 pub fn register_build_instruction(
     tree_id: &[u8; 32],
     id_commitment: &[u8; 32],
     rate_limit: u64,
     subtree_id: u32,
-) -> Result<Vec<u32>, RlnError> {
+) -> Result<Vec<u8>, RlnError> {
     let instruction = rln_layouts::Instruction::Register {
         tree_id: *tree_id,
         id_commitment: *id_commitment,
@@ -496,13 +519,13 @@ pub fn token_holding_info(data: &[u8]) -> Result<([u8; 32], u128), RlnError> {
 /// program-authorized — no human key).
 ///
 /// `program_owner`: the REGISTRATION program id (the claim tx targets this
-/// program). Returns `(payment_def_id, instruction_words)`; the tx account
+/// program). Returns `(payment_def_id, instruction_bytes)`; the tx account
 /// order is `[config, payment_def, dest (signer)]`.
 pub fn claim_plan(
     config_data: &[u8],
     program_owner: &[u8; 32],
     amount: u128,
-) -> Result<([u8; 32], Vec<u32>), RlnError> {
+) -> Result<([u8; 32], Vec<u8>), RlnError> {
     if config_data.len() < CONFIG_STATE_MIN_SIZE {
         return Err(RlnError::InvalidConfig);
     }
@@ -594,18 +617,72 @@ mod tests {
         assert_eq!(membership_status(1_000, 50, 1_050), "expired");
     }
 
-    // Pins the Register instruction's word encoding (risc0-serde: variant
-    // index 3, one word per u8, u64 as lo/hi words).
+    /// A `tree_main` account long enough for `build_merkle_proof`'s guards,
+    /// declaring the full tree depth.
+    fn make_tree_main() -> Vec<u8> {
+        let mut main = vec![0u8; OFFSET_CACHED_NODES + (TREE_DEPTH + 1) * 32];
+        main[OFFSET_DEPTH] = TREE_DEPTH as u8;
+        main
+    }
+
+    // A subtree the caller never supplied is a plan/exec disagreement, not
+    // the legitimate "not initialized yet" case. Substituting empty there
+    // would build a proof over default nodes — plausible, and wrong.
     #[test]
-    fn register_instruction_words_pin() {
-        let words = register_build_instruction(&[0xAB; 32], &[0xCD; 32], 0x1_0000_0002, 7).unwrap();
-        assert_eq!(words.len(), 68);
-        assert_eq!(words[0], 3, "Register variant index");
-        assert_eq!(&words[1..33], &[0xABu32; 32], "tree_id, one word per byte");
-        assert_eq!(&words[33..65], &[0xCDu32; 32], "id_commitment");
-        assert_eq!(words[65], 2, "rate_limit low word");
-        assert_eq!(words[66], 1, "rate_limit high word");
-        assert_eq!(words[67], 7, "subtree_id");
+    fn exec_refuses_a_leaf_whose_subtree_was_not_supplied() {
+        let main = make_tree_main();
+        let Err(err) = merkle_proofs_exec(&main, &[], &[0]) else {
+            panic!("a leaf whose subtree was not supplied must not prove");
+        };
+        assert!(matches!(err, RlnError::InvalidLeafIndex), "got: {err}");
+
+        // Present-but-empty stays legitimate: that is FetchOutcome::Absent.
+        assert!(
+            merkle_proofs_exec(&main, &[(0, &[])], &[0]).is_ok(),
+            "an absent (present-but-empty) subtree still proves"
+        );
+    }
+
+    // Pins the Register instruction's byte encoding (borsh: a one-byte variant
+    // discriminant, fixed-width arrays inline, integers little-endian).
+    //
+    // This is consensus wire format shared with the deployed guest, so a change
+    // here is a change the whole chain has to make at once. It used to be
+    // risc0-serde u32 words; LEZ v0.2.5 moved every program's instruction
+    // decoding to borsh.
+    #[test]
+    fn register_instruction_bytes_pin() {
+        let bytes = register_build_instruction(&[0xAB; 32], &[0xCD; 32], 0x1_0000_0002, 7).unwrap();
+        assert_eq!(bytes.len(), 1 + 32 + 32 + 8 + 4);
+        assert_eq!(bytes[0], 3, "Register variant discriminant");
+        assert_eq!(&bytes[1..33], &[0xABu8; 32], "tree_id");
+        assert_eq!(&bytes[33..65], &[0xCDu8; 32], "id_commitment");
+        assert_eq!(
+            &bytes[65..73],
+            &[2, 0, 0, 0, 1, 0, 0, 0],
+            "rate_limit, little-endian u64"
+        );
+        assert_eq!(&bytes[73..77], &[7, 0, 0, 0], "subtree_id, little-endian u32");
+    }
+
+    // The guest decodes what this encodes, so the two must round-trip.
+    #[test]
+    fn register_instruction_round_trips_through_borsh() {
+        let bytes = register_build_instruction(&[0xAB; 32], &[0xCD; 32], 0x1_0000_0002, 7).unwrap();
+        let decoded = rln_layouts::Instruction::try_from_slice(&bytes).expect("decodes");
+        let rln_layouts::Instruction::Register {
+            tree_id,
+            id_commitment,
+            rate_limit,
+            subtree_id,
+        } = decoded
+        else {
+            panic!("expected a Register instruction");
+        };
+        assert_eq!(tree_id, [0xAB; 32]);
+        assert_eq!(id_commitment, [0xCD; 32]);
+        assert_eq!(rate_limit, 0x1_0000_0002);
+        assert_eq!(subtree_id, 7);
     }
 
     #[test]
@@ -617,7 +694,11 @@ mod tests {
         let expected_main_id =
             derive_pda(&program_owner, &combine_seeds(&[&label_seed("main"), &tree_id]));
 
-        let plan = merkle_proofs_plan(&config_data, &program_owner, &[0, 1, 1025]).unwrap();
+        // Two leaves in the first subtree and one in the second, wherever the
+        // tree's geometry puts that boundary.
+        let second_subtree_leaf = SUBTREE_LEAVES as u64 + 1;
+        let plan =
+            merkle_proofs_plan(&config_data, &program_owner, &[0, 1, second_subtree_leaf]).unwrap();
         assert_eq!(expected_main_id, plan.main_account_id);
         assert_eq!(plan.subtree_count, 2);
         assert_eq!(plan.subtree_ids[0], 0);
