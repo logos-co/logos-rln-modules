@@ -43,6 +43,9 @@ Item {
                     leaf: String(m.leaf_index),
                     membership_hash: m.membership_hash || "",
                     failed_reason: m.failed_reason || "",
+                    // Only ever present alongside failed_reason (spec: a failed
+                    // submission reports whether it is retryable).
+                    retryable: m.retryable,
                     submitted_at: m.submitted_at || 0
                 }
             })
@@ -166,6 +169,9 @@ Item {
                     font.pixelSize: Theme.typography.secondaryText
                     color: Theme.palette.error
                     text: "failed_reason  " + (view.selected ? view.selected.failed_reason : "")
+                        + (view.selected && view.selected.retryable !== undefined
+                           ? "  (" + (view.selected.retryable === true ? "retryable" : "not retryable") + ")"
+                           : "")
                 }
                 LogosText {
                     font.pixelSize: Theme.typography.secondaryText

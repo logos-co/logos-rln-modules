@@ -1,6 +1,8 @@
-// Non-visual onboarding controller: wallet -> sync -> keystore password ->
-// faucet claim -> registration, as sequential idempotent phases with
-// observable progress. Each phase duplicates an Advanced view's logic and
+// Non-visual onboarding controller. The wizard runs the keystore password
+// first (its step's Next fires checkPassword), then wallet -> sync -> faucet
+// claim -> registration; the phase letters below are ids, not the sequence.
+// Sequential idempotent phases with observable progress. Each phase
+// duplicates an Advanced view's logic and
 // carries a "mirrors <view>.<fn> — keep in sync" cross-reference. An Item
 // (not QtObject) so it can own the poll Timers.
 import QtQuick
@@ -26,8 +28,10 @@ Item {
     // Phase A — wallet (provision + open/create).
     property string walletPhase: "idle"
     property string walletError: ""
-    // Captured from create_new but not displayed; kept for a future
-    // recovery/export surface.
+    // Captured from create_new. The WIZARD never renders it — only the
+    // Advanced Wallet tab shows a mnemonic, and only for a wallet it created
+    // there. Kept for a future recovery/export surface (and reset by the
+    // flow tests).
     property string mnemonic: ""
     property bool walletCreated: false
 
@@ -98,9 +102,9 @@ Item {
     property string holdingHex: ""
     property int claimPolls: 0
 
-    // Phase E — registration + confirmation poll. register() generates the
-    // identity credential in-module; this flow only sees the public
-    // commitment from its reply.
+    // Phase E — registration + confirmation poll. register_membership
+    // generates the identity credential in-module; this flow only sees the
+    // public commitment from its reply.
     property string regPhase: "idle"
     property string regError: ""
     property string regState: ""
@@ -109,7 +113,7 @@ Item {
 
     // ---- Gifter path (alternative to Phases A/B/D) -------------------------
     // "gifter" replaces wallet-provision + sync + faucet with one delegated
-    // register() call: the membership module generates the identity, the
+    // register_membership call: the membership module generates the identity, the
     // capture module produces an attestation bound to its commitment, and
     // the gifter node pays for the registration. The Phase E poll tail
     // handles confirmation. Set on Welcome; reset by resetForNewRegistration.
@@ -154,7 +158,7 @@ Item {
 
     function callRetryAttempt(module, method, args, cb, attempt, timeoutMs) {
         M.call(bridge, module, method, args, function (r) {
-            if (r.error && M.isTransientError(r.error.kind) && attempt < flow.transientRetryMax) {
+            if (r.error && M.isTransientError(r.error) && attempt < flow.transientRetryMax) {
                 var t = retryTimerComponent.createObject(flow, { interval: flow.transientRetryMs })
                 t.triggered.connect(function () {
                     t.destroy()
@@ -540,8 +544,9 @@ Item {
     }
 
     // ---- Phase E: registration ----------------------------------------------
-    // mirrors RegisterView.doRegister — keep in sync. register() generates
-    // the identity credential in-module.
+    // mirrors RegisterView.doRegister — keep in sync. register_membership
+    // (the 0.7.0 wire's spelling of the spec's register) generates the
+    // identity credential in-module.
     function startRegistration() {
         if (regPhase === "running" || regPhase === "done")
             return
@@ -561,9 +566,9 @@ Item {
 
     function submitRegistration() {
         // Wallet path only — the gifter path submits via registerDelegated().
-        var options = JSON.stringify({ funding_holding_account_id: holdingHex })
-        callRetry(M.RLN_MODULE, "register",
-               [registryId, M.DEFAULT_RLN_ID, rateLimit, options], function (r) {
+        var options = M.registryOptions(rateLimit, { funding_holding_account_id: holdingHex })
+        callRetry(M.RLN_MODULE, "register_membership",
+               [registryId, M.DEFAULT_RLN_ID, options], function (r) {
             if (r.error) { flow.regPhase = "error"; flow.regError = M.errorText(r.error); return }
             flow.commitment = (r.credential && r.credential.identity_commitment) || ""
             flow.regState = r.state || "pending"
@@ -580,7 +585,7 @@ Item {
         M.call(bridge, M.RLN_MODULE, "get_membership_state",
                [registryId, M.DEFAULT_RLN_ID], function (r) {
             if (r.error) {
-                if (M.isTransientError(r.error.kind))
+                if (M.isTransientError(r.error))
                     return
                 regTimer.stop()
                 flow.regPhase = "error"
@@ -610,31 +615,38 @@ Item {
         })
     }
 
-    // The merged-state view carries no reason; the memberships row does.
+    // The merged-state view carries no reason; the memberships row does
+    // (failed_reason, plus retryable — spec: a failed submission SHALL
+    // report whether it is retryable; never present without the reason).
     function fetchFailureReason() {
         callRetry(M.RLN_MODULE, "get_memberships", [registryId], function (r) {
             var reason = ""
+            var retryable
             if (!r.error) {
                 var rows = r.memberships || []
                 for (var i = 0; i < rows.length; i++) {
                     var full = rows[i].credential ? rows[i].credential.identity_commitment : ""
                     if (full === flow.commitment && rows[i].failed_reason) {
                         reason = String(rows[i].failed_reason)
+                        retryable = rows[i].retryable
                         break
                     }
                 }
             }
             flow.regPhase = "error"
             flow.regError = "Registration FAILED" + (reason !== "" ? ": " + reason : "")
-                + " — Try again re-registers with a fresh identity; if funds ran short, "
-                + "get more tokens first."
+                + (retryable === false
+                   ? " — the module reports this failure is not retryable as-is: fix the "
+                     + "cause (funding, registry, gifter) before trying again."
+                   : " — Try again re-registers with a fresh identity; if funds ran short, "
+                     + "get more tokens first.")
         })
     }
 
     // ---- Gifter path ---------------------------------------------------------
     // Bring up the transport, gate on card presence, then hand the whole
-    // delegated flow to the membership module with one register() call; the
-    // Phase E poll tail drives regPhase to completion.
+    // delegated flow to the membership module with one register_membership
+    // call; the Phase E poll tail drives regPhase to completion.
     function startGifter() {
         if (gifterPhase === "running" || gifterPhase === "done")
             return
@@ -772,16 +784,16 @@ Item {
         })
     }
 
-    // The one delegated call: register() generates the identity in-module and
-    // returns the pending membership immediately; the module then captures,
-    // dials, and registers in the background. Confirmation comes through the
-    // shared Phase E poll.
+    // The one delegated call: register_membership generates the identity
+    // in-module and returns the pending membership immediately; the module
+    // then captures, dials, and registers in the background. Confirmation
+    // comes through the shared Phase E poll.
     function registerDelegated() {
         regPhase = "running"
         regError = ""
         regState = ""
         rateLimitMismatch = false
-        var options = JSON.stringify({
+        var options = M.registryOptions(rateLimit, {
             delegated: "true",
             gifter_peer_id: gifterPeerId.trim(),
             gifter_multiaddr: gifterMultiaddr.trim(),
@@ -790,8 +802,8 @@ Item {
             auth_type: "keycard-attestation",
             auth_provider: M.CAPTURE_MODULE
         })
-        callRetry(M.RLN_MODULE, "register",
-               [registryId, M.DEFAULT_RLN_ID, rateLimit, options], function (r) {
+        callRetry(M.RLN_MODULE, "register_membership",
+               [registryId, M.DEFAULT_RLN_ID, options], function (r) {
             if (r.error) {
                 flow.regPhase = "error"
                 flow.regError = M.errorText(r.error)
