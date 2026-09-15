@@ -41,6 +41,10 @@ env:
   # to that repo for checkout to fetch it).
   GIFTER_REPO: logos-co/logos-rln-gifter
   GIFTER_REV: be6ddc84feec68a7e7ab01562ffeb8128c7cfb98
+  # crates.io's download endpoint returns 403 for pcsc{,-sys} in the
+  # keycard-capture module on GitHub-hosted Ubuntu; pin the upstream git repo
+  # those crates are published from and patch the checked-out module to use it.
+  PCSC_RUST_REV: 822b83e15bb0cfc0f492a17ec9eeb4c4355b3089
   # TEMPORARY SHADOW of the official catalog's lez_core: its published 0.4.0
   # bundles a wallet-ffi that cannot parse the chain's privacy-preserving
   # transactions — wallet sync wedges forever at the first one (testnet block
@@ -174,6 +178,45 @@ jobs:
           jq --arg v "$EZ_MODULE_SHADOW_VERSION" '.version = $v' \
             external/logos-execution-zone-module/metadata.json > _ez_meta.json
           mv _ez_meta.json external/logos-execution-zone-module/metadata.json
+
+      - name: Patch keycard-capture pcsc deps away from crates.io
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import os, re
+
+          rev = os.environ["PCSC_RUST_REV"]
+          source = f"git+https://github.com/bluetech/pcsc-rust?rev={rev}#{rev}"
+          cargo_toml = Path("external/logos-rln-gifter/rust/keycard-capture-module/rust-lib/Cargo.toml")
+          cargo_lock = Path("external/logos-rln-gifter/rust/keycard-capture-module/rust-lib/Cargo.lock")
+
+          cargo_text = cargo_toml.read_text()
+          patch = (
+              "\n[patch.crates-io]\n"
+              f'pcsc = {{ git = "https://github.com/bluetech/pcsc-rust", rev = "{rev}", package = "pcsc" }}\n'
+              f'pcsc-sys = {{ git = "https://github.com/bluetech/pcsc-rust", rev = "{rev}", package = "pcsc-sys" }}\n'
+          )
+          if "[patch.crates-io]" not in cargo_text:
+              cargo_toml.write_text(cargo_text.rstrip() + patch)
+
+          lock_text = cargo_lock.read_text()
+          for name, version in (("pcsc", "2.9.0"), ("pcsc-sys", "1.3.0")):
+              header = f'[[package]]\nname = "{name}"\nversion = "{version}"\n'
+              git_entry = header + f'source = "{source}"\n'
+              if git_entry in lock_text:
+                  continue
+              pattern = (
+                  re.escape(header)
+                  + r'source = "registry\+https://github\.com/rust-lang/crates\.io-index"\n'
+                  + r'checksum = "[^"]+"\n'
+              )
+              lock_text, count = re.subn(pattern, git_entry, lock_text, count=1)
+              if count != 1:
+                  raise SystemExit(f"failed to rewrite {name} {version} in Cargo.lock")
+          cargo_lock.write_text(lock_text)
+          PY
 
       # The heavy zerokit build needs the attic cache.
       - name: Setup Nix and Logos cache
