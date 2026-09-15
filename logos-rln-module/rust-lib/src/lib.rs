@@ -49,6 +49,7 @@
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod ensure;
 mod keychain;
 mod lifecycle;
 mod nullifier_log;
@@ -303,11 +304,24 @@ fn parse_scope(
     Ok((registry, bytes, hex))
 }
 
+/// The provisioning task's progress for a registry, shaped for the reply.
+fn provisioning_view(registry: &str) -> Option<views::ProvisioningView> {
+    ensure::progress(registry)
+        .map(|(step, detail)| views::ProvisioningView::new(step.as_str(), detail))
+}
+
 /// Whether a record backs a scope: registered under the same rln_identifier,
 /// or carrying none — pre-scope legacy records back every application on
 /// their registry.
 fn scope_matches(record: &MembershipRecord, rln_id_hex: &str) -> bool {
     record.identity.rln_identifier == rln_id_hex || record.identity.rln_identifier.is_empty()
+}
+
+/// `scope_matches`'s predicate over raw identifiers, for tests that need to
+/// contrast it with a check that ignores scope entirely.
+#[cfg(test)]
+pub(crate) fn scope_matches_for_test(record_rln_id: &str, scope_rln_id: &str) -> bool {
+    record_rln_id == scope_rln_id || record_rln_id.is_empty()
 }
 
 /// The registry records backing a scope (spec: a membership "MAY back any
@@ -615,6 +629,29 @@ fn register_impl(
     options_json: &str,
 ) -> Result<serde_json::Value, ApiError> {
     let (registry, _, rln_id_hex) = parse_scope(registry_id_raw, rln_identifier_hex)?;
+    register_scoped(store, &registry, &rln_id_hex, options_json)
+}
+
+/// The registration itself, on an ALREADY-PARSED scope.
+///
+/// Split from `register_impl` so an in-module caller can register under an
+/// EMPTY rln_identifier, which the wire deliberately refuses (the spec says
+/// the module holds no default scope, so a caller must name one). An empty
+/// identifier is not a missing value here, it is a registry-wide membership:
+/// `scope_matches` already treats such a record as backing every application
+/// on its registry, and `proof::generate` takes the identifier from the
+/// REQUEST rather than from the credential. One is therefore enough for a
+/// node that does not yet know which applications will use it — which is what
+/// provisioning at start() needs, since `start`'s config names registries and
+/// no scopes.
+pub(crate) fn register_scoped(
+    store: Result<Arc<Store>, ApiError>,
+    registry: &registry_id::CanonicalRegistryId,
+    rln_id_hex: &str,
+    options_json: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let registry = registry.clone();
+    let rln_id_hex = rln_id_hex.to_string();
     let prov = provider_of(&registry)?;
     // Claimed for the whole dispatch (RAII): the live-record scan below is
     // only sound while no sibling register for the same scope is in flight.
@@ -822,7 +859,10 @@ fn get_membership_state_impl(
     // A missing store (no persistence path) degrades to no local records,
     // which the empty-candidates arm below answers as `unknown`.
     let Ok(store) = store else {
-        return ok_json(views::MembershipStateView::unknown(&registry.canonical));
+        return ok_json(
+            views::MembershipStateView::unknown(&registry.canonical)
+                .with_provisioning(provisioning_view(&registry.canonical)),
+        );
     };
     let records = records_for_registry(&store, &registry);
     let candidates: Vec<_> = scope_candidates(&records, &rln_id_hex)
@@ -830,7 +870,10 @@ fn get_membership_state_impl(
         .filter(|r| !r.quarantined)
         .collect();
     if candidates.is_empty() {
-        return ok_json(views::MembershipStateView::unknown(&registry.canonical));
+        return ok_json(
+            views::MembershipStateView::unknown(&registry.canonical)
+                .with_provisioning(provisioning_view(&registry.canonical)),
+        );
     }
     if candidates.len() > 1 {
         return Err(ApiError::new(
@@ -1123,6 +1166,24 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
     // registries' root windows and every usable membership's Merkle path in
     // the background — must not block start() itself.
     let warm_roots = !tracked.is_empty();
+    // Provisioning rides the same one-shot pass, after the warm-up: it may
+    // wait minutes for a wallet and for funding, and start() must not.
+    // Opt out with {"provision": false}; on by default because a config that
+    // names registries is a node that intends to prove against them, and
+    // every attempt is idempotent per scope. Nothing is spent when the config
+    // names no registry.
+    let provision = cfg
+        .get("provision")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let provision_registries = if provision { tracked.clone() } else { Vec::new() };
+    // The rate a provisioned membership asks for. The registry declares no
+    // default yet, so this is the module's, and a caller that wants another
+    // says so here rather than registering by hand.
+    let provision_rate = cfg
+        .get("rate_limit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(DEFAULT_RATE_LIMIT);
     worker::start(move || {
         if warm_roots {
             if let Err(payload) = std::panic::catch_unwind(roots::refresh_all) {
@@ -1131,6 +1192,14 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
         }
         if let Err(payload) = std::panic::catch_unwind(poller::refresh_paths) {
             eprintln!("membership start: path warm-up panicked: {payload:?}");
+        }
+        if !provision_registries.is_empty() {
+            let run = std::panic::AssertUnwindSafe(|| {
+                ensure::run(provision_registries, provision_rate)
+            });
+            if let Err(payload) = std::panic::catch_unwind(run) {
+                eprintln!("membership start: provisioning panicked: {payload:?}");
+            }
         }
     });
 

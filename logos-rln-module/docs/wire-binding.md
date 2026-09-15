@@ -263,9 +263,17 @@ string) requests the per-epoch rate; ABSENT, the module applies
 (planned as a registry-declared parameter in logos-lez-rln). The remaining
 keys are registry-specific:
 
-- **`logos` namespace, direct**: `{"key":"funding_holding_account_id",
-  "value":"<account>"}` — the holding that pays `rate_limit ×
-  price_per_unit`.
+- **`logos` namespace, direct**: no key. The registry takes the native asset
+  and `liblogos_lez_rln_module` pays from its own account, so nothing here
+  selects a payer — this module is registry-agnostic and holds no account ids.
+
+  `funding_holding_account_id` was **mandatory** here until 0.8.0 and is now
+  accepted and ignored (one deprecation line per call). It is ignored rather
+  than rejected because every shipped caller still sends it and a stale conf
+  should not become a permanent registration failure. The break is semantic
+  and one layer down: the account that key names is no longer the account that
+  pays. A caller that needs to pay from a specific account names it on
+  `liblogos_lez_rln_module.register_member`'s `payer_account_id` instead.
 - **`logos` namespace, delegated** (RLN Membership Allocation Protocol):
   `delegated`=`"true"` plus `gifter_peer_id`, `gifter_multiaddr` and the
   optional `auth_type`/`auth_payload`/`auth_provider`/`auth_args` pairs.

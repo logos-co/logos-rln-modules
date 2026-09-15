@@ -107,8 +107,29 @@ pub(crate) struct MembershipStateView {
     membership_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rate_limit: Option<u64>,
+    /// What automatic provisioning is doing, when it is doing anything.
+    /// Additive and omitted otherwise, so a caller that does not know about
+    /// it is unaffected — but `state:"unknown"` is the same answer for "this
+    /// node was never given a membership" and "this node is three minutes
+    /// into acquiring one", and those want different reactions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provisioning: Option<ProvisioningView>,
     registry_id: String,
     state: MembershipState,
+}
+
+/// The provisioning task's current step and a human-readable detail.
+#[derive(Serialize)]
+pub(crate) struct ProvisioningView {
+    step: &'static str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    detail: String,
+}
+
+impl ProvisioningView {
+    pub(crate) fn new(step: &'static str, detail: String) -> Self {
+        ProvisioningView { step, detail }
+    }
 }
 
 impl MembershipStateView {
@@ -117,9 +138,16 @@ impl MembershipStateView {
             leaf_index: None,
             membership_hash: None,
             rate_limit: None,
+            provisioning: None,
             registry_id: registry_id.to_string(),
             state: MembershipState::Unknown,
         }
+    }
+
+    /// Attach provisioning progress, if any is recorded for this registry.
+    pub(crate) fn with_provisioning(mut self, view: Option<ProvisioningView>) -> Self {
+        self.provisioning = view;
+        self
     }
 
     pub(crate) fn resolved(
@@ -130,6 +158,7 @@ impl MembershipStateView {
         rate_limit: u64,
     ) -> Self {
         MembershipStateView {
+            provisioning: None,
             leaf_index: Some(leaf_index),
             membership_hash: Some(hash.to_string()),
             rate_limit: Some(rate_limit),
