@@ -189,6 +189,68 @@ jobs:
         if: startsWith(matrix.variant, 'darwin')
         run: xcodebuild -downloadComponent MetalToolchain
 
+      # crates.io answers the request nix makes for a crate tarball —
+      # /api/v1/crates/<name>/<version>/download — with 403, so any crate the
+      # binary cache does not already carry kills the build outright:
+      # "cannot download crate-<name>-<version>.tar.gz from any mirror".
+      # Which crates that hits is not knowable in advance; it is whatever
+      # missed the cache that day (it was pcsc/pcsc-sys on 2026-09-15).
+      #
+      # static.crates.io serves the identical tarballs and does not 403. A
+      # fixed-output derivation is content-addressed, so a tarball added to
+      # the store under the same name and hash IS that FOD's output and nix
+      # never fetches it. The Cargo.lock checksum is the tarball's sha256, so
+      # every crate is verified against the lock before it is added — a bad
+      # mirror cannot smuggle anything in.
+      - name: Prefetch crate tarballs from static.crates.io
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - $MODULE_DIRS > /tmp/crates.tsv <<'PY'
+          import re, sys
+          from pathlib import Path
+          seen = set()
+          for d in sys.argv[1:]:
+              for lock in Path(d).rglob("Cargo.lock"):
+                  for blk in lock.read_text().split("[[package]]"):
+                      n = re.search(r'^name = "([^"]+)"', blk, re.M)
+                      v = re.search(r'^version = "([^"]+)"', blk, re.M)
+                      c = re.search(r'^checksum = "([0-9a-f]{64})"', blk, re.M)
+                      if not (n and v and c): continue
+                      if not re.search(r'^source = "registry\+', blk, re.M): continue
+                      key = (n.group(1), v.group(1))
+                      if key in seen: continue
+                      seen.add(key)
+                      print("%s\t%s\t%s" % (n.group(1), v.group(1), c.group(1)))
+          PY
+          # macOS runners have shasum, not sha256sum.
+          digest() {
+            if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+            else shasum -a 256 "$1" | cut -d' ' -f1; fi
+          }
+          added=0 present=0 failed=0
+          while IFS=$'\t' read -r name ver sum; do
+            [ -n "${name:-}" ] || continue
+            fod="crate-$name-$ver.tar.gz"
+            # Already in the store (this FOD, or a previous run's prefetch).
+            if compgen -G "/nix/store/*-$fod" >/dev/null; then
+              present=$((present+1)); continue
+            fi
+            tmp="$RUNNER_TEMP/$fod"
+            if ! curl -sSL --retry 3 --max-time 120 -A "logos-rln-modules-ci" \
+                 -o "$tmp" "https://static.crates.io/crates/$name/$name-$ver.crate"; then
+              echo "::warning::prefetch failed for $name $ver — leaving it to nix"
+              failed=$((failed+1)); rm -f "$tmp"; continue
+            fi
+            if [ "$(digest "$tmp")" != "$sum" ]; then
+              echo "::warning::$name $ver checksum does not match Cargo.lock — not adding"
+              failed=$((failed+1)); rm -f "$tmp"; continue
+            fi
+            nix-store --add-fixed sha256 "$tmp" >/dev/null
+            added=$((added+1)); rm -f "$tmp"
+          done < /tmp/crates.tsv
+          echo "prefetch: $added added, $present already in store, $failed left to nix"
+
       - name: Build portable .lgx (${{ matrix.variant }})
         shell: bash
         env:
