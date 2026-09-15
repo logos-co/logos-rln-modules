@@ -52,29 +52,32 @@ pub struct RlnRegisterPlan {
 }
 
 /// `rln_layouts::ConfigState` field offsets (borsh: fixed-width fields in
-/// declaration order, no prefixes). The layout is APPEND-ONLY, so these are
-/// stable across config versions; reading by offset keeps this working
-/// against both pre-policy (240-byte) and policy (296-byte) deployments,
-/// where an exact-size borsh decode would reject the other version.
+/// declaration order, no prefixes).
+///
+/// These were once described as append-only and read against a MINIMUM size,
+/// so one module could serve a 240-byte and a 296-byte config at the same
+/// time. Registration becoming native-only removed six fields from the middle
+/// and the layout is now 144 bytes, which ends both claims: a field removed
+/// from the middle re-points every offset after it.
+///
+/// `ConfigState` carries no version discriminator, so nothing in the account
+/// distinguishes one layout from another — an old config read through these
+/// offsets does not fail, it yields a plausible wrong treasury and a plausible
+/// wrong price. The length is the only signal, which is why callers assert
+/// `CONFIG_STATE_SIZE` exactly rather than a floor.
 pub const CONFIG_OFFSET_TREE_ID: usize = 32;
-// Not read at runtime; kept so the offset table stays complete and the
-// layout-pin test covers the full append-only layout.
-#[allow(dead_code)]
-pub const CONFIG_OFFSET_PAYMENT_TOKEN_ID: usize = 64;
-pub const CONFIG_OFFSET_PRICE_PER_UNIT: usize = 128;
-pub const CONFIG_OFFSET_TREASURY_ACCOUNT_ID: usize = 144;
-pub const CONFIG_OFFSET_TOTAL_REGISTRATIONS: usize = 176;
-pub const CONFIG_OFFSET_MAX_TOTAL_RATE_LIMIT: usize = 184;
-pub const CONFIG_OFFSET_CURRENT_TOTAL_RATE_LIMIT: usize = 192;
-pub const CONFIG_OFFSET_ACTIVE_DURATION: usize = 200;
-pub const CONFIG_OFFSET_GRACE_DURATION: usize = 204;
-// Not read at runtime; see CONFIG_OFFSET_PAYMENT_TOKEN_ID.
-#[allow(dead_code)]
-pub const CONFIG_OFFSET_TOKEN_PROGRAM_ID: usize = 208;
-/// Minimum (pre-policy) ConfigState size — the precheck floor. NOT the full
-/// policy-era size (296, the host's `CONFIG_SIZE`); accepting 240 is what
-/// keeps this working against pre-policy deployments.
-pub const CONFIG_STATE_MIN_SIZE: usize = 240;
+pub const CONFIG_OFFSET_PRICE_PER_UNIT: usize = 64;
+pub const CONFIG_OFFSET_TREASURY_ACCOUNT_ID: usize = 80;
+pub const CONFIG_OFFSET_TOTAL_REGISTRATIONS: usize = 112;
+pub const CONFIG_OFFSET_MAX_TOTAL_RATE_LIMIT: usize = 120;
+pub const CONFIG_OFFSET_CURRENT_TOTAL_RATE_LIMIT: usize = 128;
+pub const CONFIG_OFFSET_ACTIVE_DURATION: usize = 136;
+pub const CONFIG_OFFSET_GRACE_DURATION: usize = 140;
+
+/// Exact serialized size of the config account, from the shared crate rather
+/// than restated here. A config of any other length belongs to a different
+/// program generation and must be refused, not decoded.
+pub const CONFIG_STATE_SIZE: usize = rln_layouts::state::CONFIG_STATE_SIZE;
 
 /// Read a 32-byte field out of raw config-account bytes by offset.
 pub fn config_field_32(config_data: &[u8], offset: usize) -> [u8; 32] {
@@ -84,7 +87,7 @@ pub fn config_field_32(config_data: &[u8], offset: usize) -> [u8; 32] {
 }
 
 /// LE-integer field readers for the same offset scheme (callers pre-check
-/// `CONFIG_STATE_MIN_SIZE`, matching config_field_32's panic-on-short slice).
+/// `CONFIG_STATE_SIZE`, matching config_field_32's panic-on-short slice).
 pub fn config_field_u32(config_data: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(
         config_data[offset..offset + 4]
@@ -281,7 +284,7 @@ pub fn merkle_proofs_plan(
     program_owner: &[u8; 32],
     leaf_indices: &[u64],
 ) -> Result<MerkleProofsPlan, RlnError> {
-    if config_data.len() < CONFIG_STATE_MIN_SIZE {
+    if config_data.len() != CONFIG_STATE_SIZE {
         return Err(RlnError::InvalidConfig);
     }
 
@@ -396,7 +399,7 @@ pub fn register_plan(
     program_owner: &[u8; 32],
     id_commitment: &[u8; 32],
 ) -> Result<RlnRegisterPlan, RlnError> {
-    if config_data.len() < CONFIG_STATE_MIN_SIZE {
+    if config_data.len() != CONFIG_STATE_SIZE {
         return Err(RlnError::InvalidConfig);
     }
     if tree_main_data.len() < TreeMainLayout::SIZE {
@@ -493,51 +496,6 @@ pub fn membership_status(grace_start: u64, grace_duration: u32, now: u64) -> &'s
     }
 }
 
-// ============================================================================
-// Funding plans (claim / balance)
-// ============================================================================
-
-/// Parse a Token-program holding account (borsh `TokenHolding`) → its token
-/// definition id and fungible balance. `Err` for NFT holdings or non-holding
-/// data. `deserialize` (not try_from_slice) tolerates trailing bytes.
-pub fn token_holding_info(data: &[u8]) -> Result<([u8; 32], u128), RlnError> {
-    let mut bytes = data;
-    let holding = token_core::TokenHolding::deserialize(&mut bytes)
-        .map_err(|_| RlnError::SerializationError)?;
-    match holding {
-        token_core::TokenHolding::Fungible {
-            definition_id,
-            balance,
-        } => Ok((*definition_id.value(), balance)),
-        token_core::TokenHolding::NftMaster { .. }
-        | token_core::TokenHolding::NftPrintedCopy { .. } => Err(RlnError::InvalidConfig),
-    }
-}
-
-/// Plan a faucet `ClaimTokens` transaction (faucet-funded deployments: the
-/// payment token definition is the registration program's `payment` PDA,
-/// program-authorized — no human key).
-///
-/// `program_owner`: the REGISTRATION program id (the claim tx targets this
-/// program). Returns `(payment_def_id, instruction_bytes)`; the tx account
-/// order is `[config, payment_def, dest (signer)]`.
-pub fn claim_plan(
-    config_data: &[u8],
-    program_owner: &[u8; 32],
-    amount: u128,
-) -> Result<([u8; 32], Vec<u8>), RlnError> {
-    if config_data.len() < CONFIG_STATE_MIN_SIZE {
-        return Err(RlnError::InvalidConfig);
-    }
-    let tree_id = config_field_32(config_data, CONFIG_OFFSET_TREE_ID);
-    let payment_def_id = derive_pda(
-        program_owner,
-        &combine_seeds(&[&label_seed("payment"), &tree_id]),
-    );
-    let instruction = rln_layouts::Instruction::ClaimTokens { tree_id, amount };
-    let instr = serialize_instruction(&instruction)?;
-    Ok((payment_def_id, instr))
-}
 
 #[cfg(test)]
 mod tests {
@@ -548,8 +506,6 @@ mod tests {
         let cfg = ConfigState {
             merkle_program_id: [0x11; 32],
             tree_id: [0x42; 32],
-            payment_token_id: [0x22; 32],
-            receipt_token_id: [0x23; 32],
             // Exceeds u64::MAX so the u128 offset read is proven 16 bytes wide.
             price_per_unit: 77_000_000_000_000_000_000,
             treasury_account_id: [0x33; 32],
@@ -558,24 +514,18 @@ mod tests {
             current_total_rate_limit: 4_242,
             active_duration_for_new_memberships: 100,
             grace_period_duration_for_new_memberships: 10,
-            token_program_id: [0x44; 32],
-            authorized_registrar: [0x55; 32],
-            free_quota_remaining: 3,
-            faucet_claim_cap: 1_000_000,
         };
         borsh::to_vec(&cfg).unwrap()
     }
 
     // Pins the CONFIG_OFFSET_* consts to rln_layouts::ConfigState's borsh
     // layout: each offset read must recover exactly its field's bytes, and the
-    // last offset-read field must end at or before the 240-byte pre-policy floor.
+    // last one must end exactly at CONFIG_STATE_SIZE.
     #[test]
     fn config_offsets_match_shared_layout() {
         let bytes = make_config_state();
         assert_eq!(config_field_32(&bytes, CONFIG_OFFSET_TREE_ID), [0x42; 32]);
-        assert_eq!(config_field_32(&bytes, CONFIG_OFFSET_PAYMENT_TOKEN_ID), [0x22; 32]);
         assert_eq!(config_field_32(&bytes, CONFIG_OFFSET_TREASURY_ACCOUNT_ID), [0x33; 32]);
-        assert_eq!(config_field_32(&bytes, CONFIG_OFFSET_TOKEN_PROGRAM_ID), [0x44; 32]);
         assert_eq!(
             config_field_u128(&bytes, CONFIG_OFFSET_PRICE_PER_UNIT),
             77_000_000_000_000_000_000
@@ -588,12 +538,60 @@ mod tests {
         );
         assert_eq!(config_field_u32(&bytes, CONFIG_OFFSET_ACTIVE_DURATION), 100);
         assert_eq!(config_field_u32(&bytes, CONFIG_OFFSET_GRACE_DURATION), 10);
+        // The last field ends exactly at the account's length. A floor would
+        // let a config from another generation through; only an exact match
+        // distinguishes this layout, since nothing in the account names it.
         assert_eq!(
-            CONFIG_OFFSET_TOKEN_PROGRAM_ID + 32,
-            CONFIG_STATE_MIN_SIZE,
-            "last offset-read field must fit within the pre-policy floor"
+            CONFIG_OFFSET_GRACE_DURATION + 4,
+            CONFIG_STATE_SIZE,
+            "the offset table must span the whole config, with nothing after it"
         );
-        assert!(bytes.len() >= CONFIG_STATE_MIN_SIZE);
+        assert_eq!(bytes.len(), CONFIG_STATE_SIZE);
+    }
+
+    /// A config account of the wrong length is refused, not decoded.
+    ///
+    /// `ConfigState` carries no version discriminator, so nothing in the bytes
+    /// says which generation they are. Read through this offset table, a
+    /// 296-byte pre-native config does not error — it yields a treasury id and
+    /// a price that are plausible and wrong, and a registration would pay a
+    /// stranger. The predecessor of this guard was `CONFIG_STATE_MIN_SIZE =
+    /// 240`, a floor that admitted exactly that account.
+    ///
+    /// Both sizes below are the real ones: 296 is the config with the payment
+    /// and credit tokens, 240 its ancestor before the policy fields.
+    #[test]
+    fn a_config_of_another_generation_is_refused() {
+        let owner = [0x55; 32];
+        let good = make_config_state();
+        assert_eq!(good.len(), CONFIG_STATE_SIZE);
+
+        for stale_len in [240usize, 296] {
+            let mut stale = good.clone();
+            stale.resize(stale_len, 0);
+            assert!(
+                matches!(
+                    merkle_proofs_plan(&stale, &owner, &[0]),
+                    Err(RlnError::InvalidConfig)
+                ),
+                "a {stale_len}-byte config must be refused, not decoded"
+            );
+            assert!(
+                matches!(
+                    register_plan(&stale, &[0u8; 512], &owner, &[0x77; 32]),
+                    Err(RlnError::InvalidConfig)
+                ),
+                "a {stale_len}-byte config must be refused before registering"
+            );
+        }
+
+        // And the guard is a length check, not a rejection of everything: the
+        // right size gets past it. (What it does next is the other tests'
+        // business; only "not InvalidConfig" is claimed here.)
+        assert!(!matches!(
+            merkle_proofs_plan(&good, &owner, &[0]),
+            Err(RlnError::InvalidConfig)
+        ));
     }
 
     // Pins decode_clock_timestamp to clock_core's borsh ClockAccountData
@@ -650,11 +648,19 @@ mod tests {
     // here is a change the whole chain has to make at once. It used to be
     // risc0-serde u32 words; LEZ v0.2.5 moved every program's instruction
     // decoding to borsh.
+    //
+    // The discriminant moved 3 -> 2 when the registry dropped every token:
+    // InitializeCreditToken sat between Initialize and Register and went with
+    // the credit path, so Register slid down. A borsh variant index IS its
+    // declaration order, which is why this assert is spelled as a literal —
+    // deriving it from the enum would track a renumbering silently, and a
+    // module encoding 3 against a guest that now reads 2 does not fail to
+    // decode, it executes a DIFFERENT instruction.
     #[test]
     fn register_instruction_bytes_pin() {
         let bytes = register_build_instruction(&[0xAB; 32], &[0xCD; 32], 0x1_0000_0002, 7).unwrap();
         assert_eq!(bytes.len(), 1 + 32 + 32 + 8 + 4);
-        assert_eq!(bytes[0], 3, "Register variant discriminant");
+        assert_eq!(bytes[0], 2, "Register variant discriminant");
         assert_eq!(&bytes[1..33], &[0xABu8; 32], "tree_id");
         assert_eq!(&bytes[33..65], &[0xCDu8; 32], "id_commitment");
         assert_eq!(

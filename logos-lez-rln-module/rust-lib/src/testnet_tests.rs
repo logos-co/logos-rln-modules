@@ -239,7 +239,15 @@ fn testnet_config_account_matches_deployment_and_bounds_decode() {
     let Some(dep) = testnet() else { return };
     let (data, owner) = fetch_config(&dep);
 
-    assert!(data.len() >= native::CONFIG_STATE_MIN_SIZE, "config size {}", data.len());
+    // Exact, not a floor: a config of another length belongs to a different
+    // program generation, and every offset read below would decode it into
+    // plausible nonsense rather than failing.
+    assert_eq!(
+        data.len(),
+        native::CONFIG_STATE_SIZE,
+        "config size {} is not this layout",
+        data.len()
+    );
     assert_eq!(
         bytes_to_hex(&owner),
         dep.registration_program_id_hex,

@@ -1,10 +1,11 @@
 ; liblogos_lez_rln_module — the LEZ RLN registry provider. The contract is the
 ; surface its two consumers use: the membership module's registry provider
 ; (register_member / get_membership / get_registry_bounds / get_merkle_proofs
-; / get_valid_roots — see logos-rln-module/rust-lib/deps/) and the
-; membership UI's funding flow (claim_tokens / get_token_balance). Identity
-; and credential generation belong to the membership module, which keeps the
-; secret in-module; this module never handles secrets.
+; / get_valid_roots — see logos-rln-module/rust-lib/deps/) and anything that
+; needs to know whether the module can afford to register (wallet_status /
+; get_native_balance). Identity and credential generation belong to the
+; membership module, which keeps the secret in-module; this module never
+; handles secrets.
 ; v2.0.0 dropped the C++-era wire freeze: generate_identity,
 ; compute_rate_commitment, is_member_registered, mint_tokens, the two
 ; start_*_broadcast methods and the valid_roots / merkle_proof events.
@@ -16,8 +17,16 @@
 ; chain, LEZ_RLN_PAYER the fee payer, LEZ_RLN_PAYER_KEY its signing key (a
 ; fee is reserved from a native balance and the payer must sign, so a wallet
 ; this module creates can sign but never pay for itself).
+; v4.0.0 dropped every token. The registry takes the NATIVE asset only, so
+; claim_tokens, get_token_balance and create_holding_account are gone with the
+; faucet and the holding-account walk they served, and register_member's
+; second parameter is the PAYER — one account that signs the tx, pays the
+; registry price from its native balance and pays the fee. The arity is
+; unchanged on purpose: rln_gifter_module calls this method positionally from
+; out of tree, and dropping a parameter would silently shift id_commitment_hex
+; into the payer slot.
 module liblogos_lez_rln_module {
-  version "3.1.0"
+  version "4.0.0"
   description "RLN registry provider (LEZ chain reads + registration/funding txs)"
   category "blockchain"
 
@@ -43,19 +52,20 @@ module liblogos_lez_rln_module {
   ; {"already_registered":true,"leaf_index":N}; otherwise submits the
   ; Register tx and returns {"leaf_index":N,"pending":true,"tx_result":s}
   ; without waiting for confirmation; "" on error.
-  method register_member(config_account_id: tstr, user_holding_account_id: tstr, id_commitment_hex: tstr, rate_limit: int) -> tstr
+  ; payer_account_id signs the tx, pays rate_limit x price_per_unit of NATIVE
+  ; balance to the treasury, and pays the fee — one account, not the
+  ; pre-4.0.0 (holding signs, LEZ_RLN_PAYER pays) pair. "" selects the
+  ; module's own payer; a caller paying on someone else's behalf (a gifter)
+  ; names its account, whose key this module's wallet must hold.
+  method register_member(config_account_id: tstr, payer_account_id: tstr, id_commitment_hex: tstr, rate_limit: int) -> tstr
 
-  ; Live token-holding balance for account_id.
-  ; {"exists":true,"balance":decimal,"definition":hex} |
-  ; {"exists":false,"balance":"0"} for absent | "" on error (NOT zero).
-  method get_token_balance(account_id: tstr) -> tstr
-
-  ; Faucet claim (faucet-funded deployments): mint `amount` into dest from the
-  ; program-owned payment PDA — no human key. amount is int (like rate_limit)
-  ; — the CLI coerces numeric args to numbers on the wire; practical amounts
-  ; fit i64. Non-blocking; returns
-  ; {"tx_result":s,"payment_definition":hex,"pending":true} or "" on failure.
-  method claim_tokens(config_account_id: tstr, dest_account_id: tstr, amount: int) -> tstr
+  ; Live NATIVE balance of account_id as a decimal STRING (u128 exceeds JSON
+  ; number precision). "" for account_id selects the module's own payer — the
+  ; account register_member would charge. {"account":hex64,"balance":decimal};
+  ; "" on error, NEVER zero: a sequencer that cannot be reached must not read
+  ; as "broke". There is no exists flag, because for native an absent account
+  ; and a zero-balance one are the same answer.
+  method get_native_balance(account_id: tstr) -> tstr
 
   ; Membership PDA read + lifecycle state derived from the on-chain CLOCK_50
   ; timestamp (never local time). {"registered":false} when the PDA is absent
@@ -67,27 +77,23 @@ module liblogos_lez_rln_module {
 
   ; Registry-declared registration bounds: the compile-time rate-limit range
   ; plus ConfigState capacity/pricing/duration fields read by offset.
-  ; price_per_unit is a decimal STRING (u128 exceeds JSON number precision,
-  ; like get_token_balance's balance). {"active_duration":N,
+  ; price_per_unit is a decimal STRING (u128 exceeds JSON number precision)
+  ; and is denominated in NATIVE balance. {"active_duration":N,
   ; "current_total_rate_limit":N,"grace_period_duration":N,"max_rate_limit":600,
   ; "max_total_rate_limit":N,"min_rate_limit":100,"price_per_unit":"<decimal>",
   ; "total_registrations":N}; "" on error.
   method get_registry_bounds(config_account_id: tstr) -> tstr
 
-  ; Whether this module's wallet is open and usable:
-  ; {"detail":s,"ready":b,"state":"pending"|"ready"|"failed"}. Never fails.
+  ; Whether this module's wallet is open and usable, and which account it
+  ; pays with:
+  ; {"detail":s,"payer":hex64,"ready":b,"state":"pending"|"ready"|"failed"}.
+  ; Never fails and never touches the chain — `payer` is read from local
+  ; configuration, so it answers before the first sync, and callers poll this
+  ; as a liveness probe. Ask get_native_balance what that account can afford.
   ; Branch on `state`, not on `ready`: the distinction that matters is
   ; retry-or-give-up. "pending" is bring-up still in flight (open + first
   ; sync) and worth waiting on; "failed" will not resolve by waiting, and
   ; `detail` says why. Every chain-facing method answers "" until "ready".
   method wallet_status() -> tstr
 
-  ; Derive a fresh public account in this module's own wallet, persist it and
-  ; return it as 64 hex chars; "" on failure. Since v3.0.0 the accounts this
-  ; module signs with must be ones ITS storage knows, so a caller that needs
-  ; a holding to fund and register with asks here rather than deriving one in
-  ; some other wallet. Derivation is deterministic from the wallet seed, so
-  ; this returns the next slot, not a random account: a caller wanting one
-  ; nothing has claimed on-chain checks get_token_balance and asks again.
-  method create_holding_account() -> tstr
 }
