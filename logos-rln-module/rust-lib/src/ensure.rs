@@ -28,6 +28,7 @@
 //! returns it. So a restart re-enters this, finds the membership it made last
 //! time, and stops. Nothing here is a "first run" path.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::{
@@ -42,17 +43,55 @@ use crate::{
 /// yet know which applications will use it.
 const REGISTRY_WIDE: &str = "";
 
-/// How long to keep waiting for the wallet, and then for it to be funded.
+/// How long to keep waiting for the wallet.
 ///
-/// Generous on purpose. The funding step is a human or an operator's script
-/// sending value to an account this module just published; minutes is a
-/// normal latency for that, and giving up turns a slow operator into a node
-/// that never registers.
+/// A wallet that never opens is a local fault — a bad home, a locked keystore,
+/// an unreachable sequencer — and none of it gets better by waiting longer, so
+/// this one keeps a deadline. Funding is the opposite and has none; see the
+/// funding wait in `provision_one`.
 const WALLET_WAIT: Duration = Duration::from_secs(300);
-const FUNDING_WAIT: Duration = Duration::from_secs(900);
 
-/// Poll interval for both waits.
+/// Poll interval, and the granularity at which both waits notice they should
+/// stop.
 const TICK: Duration = Duration::from_secs(5);
+
+/// Which provisioning pass is the current one.
+///
+/// `worker::start()` spawns a fresh warm task and DETACHES any still in
+/// flight — the worker API hands that body no generation of its own, and a
+/// repeated `start()` (which is every `configureRln`, so every delivery
+/// bring-up) never sets the stopped flag. So a superseded pass has nothing to
+/// notice, and since the funding wait lost its deadline it would otherwise
+/// poll for the rest of the process's life, one more each time. The deadline
+/// used to hide this by killing such a task within fifteen minutes.
+///
+/// Every pass takes a ticket on entry and both waits check it, so exactly one
+/// pass is ever live and the newest wins — which is the right one, because it
+/// carries the registries and rate the latest `start()` named.
+static EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Should this pass stop — because the module stopped, or because a later
+/// `start()` superseded it?
+fn superseded(mine: u64) -> bool {
+    worker::is_stopped() || EPOCH.load(Ordering::SeqCst) != mine
+}
+
+/// How often to READ the payer's balance, given how long the wait has run.
+///
+/// Funding arrives either promptly — an operator's script transferring as soon
+/// as this module publishes the account — or at human speed, because somebody
+/// has to bridge or buy the balance first. Poll tightly for the first minute so
+/// the common case is not held up, then relax: a wait measured in hours should
+/// cost a read every five minutes, not 720 an hour.
+fn funding_read_interval(waited: Duration) -> Duration {
+    if waited < Duration::from_secs(60) {
+        TICK
+    } else if waited < Duration::from_secs(600) {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(300)
+    }
+}
 
 /// The fee a transaction reserves, over and above the registry's price.
 ///
@@ -96,8 +135,9 @@ impl Step {
 /// runs detached, there is nobody to return to, and one unreachable registry
 /// must not stop the others.
 pub(crate) fn run(registries: Vec<String>, rate_limit: u64) {
+    let mine = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     for raw in registries {
-        if worker::is_stopped() {
+        if superseded(mine) {
             return;
         }
         let registry = match registry_id::parse(&raw) {
@@ -110,7 +150,7 @@ pub(crate) fn run(registries: Vec<String>, rate_limit: u64) {
         // Read per registry rather than captured once: this runs detached and
         // the store can be republished under it (on_context_ready re-opening
         // it), so a handle taken at spawn time could outlive its store.
-        if let Err(e) = provision_one(&registry, rate_limit) {
+        if let Err(e) = provision_one(&registry, rate_limit, mine) {
             record(&registry.canonical, Step::Refused, &e.message);
             eprintln!("provision {}: {}", registry.canonical, e.message);
         }
@@ -120,6 +160,7 @@ pub(crate) fn run(registries: Vec<String>, rate_limit: u64) {
 fn provision_one(
     registry: &registry_id::CanonicalRegistryId,
     rate_limit: u64,
+    mine: u64,
 ) -> Result<(), ApiError> {
     // Does this node already have a membership on this registry — ANY
     // membership, whatever scope it was registered under?
@@ -182,7 +223,7 @@ fn provision_one(
     record(&registry.canonical, Step::WaitingForWallet, "");
     let deadline = Instant::now() + WALLET_WAIT;
     loop {
-        if worker::is_stopped() {
+        if superseded(mine) {
             return Ok(());
         }
         // An Err is the module not answering calls yet — indistinguishable
@@ -227,35 +268,65 @@ fn provision_one(
         Step::AwaitingFunding,
         &format!("{payer} needs {required} native ({price} price + {FEE_RESERVE} fee reserve)"),
     );
-    let deadline = Instant::now() + FUNDING_WAIT;
-    let mut announced = false;
+    // This wait has NO deadline, and that is the point of it.
+    //
+    // Nothing this module can do brings the money about — no program mints
+    // native balance — so a deadline cannot make funding happen sooner. All it
+    // can do is stop watching for it, and stopping is permanent: `run` records
+    // Refused, and `ensure::run` is entered from `start()` and nowhere else, so
+    // a node that timed out never registers again until something calls start()
+    // — which for a desktop app means relaunching it. Acquiring native balance
+    // is a bridge or an exchange, so the fifteen-minute deadline this replaces
+    // failed the ORDINARY case, not an edge one: fund at minute sixteen and the
+    // node was dead with no sign of it but a log line.
+    //
+    // What the deadline did buy was a bound on polling, so that is what backs
+    // off instead. The SLEEP stays at TICK whatever the read schedule says:
+    // `stop()` joins these workers on a short grace, and a thread parked for
+    // five minutes would hold shutdown open for five minutes.
+    let mut waited = Duration::ZERO;
+    let mut due = Duration::ZERO;
+    let mut announced: Option<u128> = None;
     loop {
-        if worker::is_stopped() {
+        if superseded(mine) {
             return Ok(());
         }
-        match prov.payer_balance() {
-            Ok(balance) if balance >= required => break,
-            Ok(balance) => {
-                if !announced {
-                    eprintln!(
-                        "provision {}: waiting for {payer} to hold {required} native \
-                         ({price} price + {FEE_RESERVE} fee reserve); it holds {balance}",
-                        registry.canonical
+        if waited >= due {
+            match prov.payer_balance() {
+                Ok(balance) if balance >= required => break,
+                Ok(balance) => {
+                    // Announce only when the number MOVES. A wait of hours then
+                    // costs a handful of lines rather than one per read, and a
+                    // partial transfer — the case where somebody sent the price
+                    // and not the fee reserve — still shows up.
+                    if announced != Some(balance) {
+                        eprintln!(
+                            "provision {}: waiting for {payer} to hold {required} native \
+                             ({price} price + {FEE_RESERVE} fee reserve); it holds {balance}",
+                            registry.canonical
+                        );
+                        announced = Some(balance);
+                    }
+                    // Refresh the detail too: get_membership_state is the only
+                    // channel that can tell a user their node is waiting on an
+                    // account, and how far off it is.
+                    record(
+                        &registry.canonical,
+                        Step::AwaitingFunding,
+                        &format!(
+                            "{payer} needs {required} native \
+                             ({price} price + {FEE_RESERVE} fee reserve); it holds {balance}"
+                        ),
                     );
-                    announced = true;
                 }
+                // NOT treated as zero: an unreachable sequencer is not a broke
+                // account, and it must not look like one.
+                Err(e) => eprintln!("provision {}: balance read failed: {}", registry.canonical, e.message),
             }
-            // NOT treated as zero: an unreachable sequencer is not a broke
-            // account, and giving up here would be giving up permanently.
-            Err(e) => eprintln!("provision {}: balance read failed: {}", registry.canonical, e.message),
-        }
-        if Instant::now() >= deadline {
-            return Err(ApiError::new(
-                ErrorKind::ProviderFailure,
-                &format!("{payer} was never funded with {required} native"),
-            ));
+            due = waited + funding_read_interval(waited);
         }
         std::thread::sleep(TICK);
+        waited = waited.saturating_add(TICK);
     }
 
     // 4. Register. The same entry point the wire method uses, so the
@@ -336,6 +407,63 @@ pub(crate) fn progress(registry: &str) -> Option<(Step, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only one provisioning pass may be live. `start()` detaches a warm task
+    /// still in flight and the worker API gives that body no generation to
+    /// check, so without this a parked pass would poll for the life of the
+    /// process — and every configureRln, which is every delivery bring-up,
+    /// would add one more.
+    #[test]
+    fn a_later_pass_supersedes_the_one_still_waiting() {
+        let first = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(!superseded(first), "the only pass must not think itself stale");
+
+        let second = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(
+            superseded(first),
+            "the earlier pass must stand down once a later start() takes a ticket"
+        );
+        assert!(!superseded(second), "the newest pass is the one that runs");
+
+        // And the newest is the right one to keep: it carries the registries
+        // and rate the latest start() named, which an older pass never sees.
+        assert!(second > first);
+    }
+
+    /// The funding wait has no deadline, so the read schedule is the only thing
+    /// bounding what an indefinite wait costs. Two properties matter and
+    /// neither is obvious from the arithmetic.
+    #[test]
+    fn the_funding_read_schedule_relaxes_and_never_spins() {
+        let probes = [0, 5, 59, 60, 120, 599, 600, 3600, 86_400];
+        let mut previous = Duration::ZERO;
+        for secs in probes {
+            let interval = funding_read_interval(Duration::from_secs(secs));
+            // Never zero: a zero interval turns the TICK loop into a read every
+            // five seconds forever, which is the cost the backoff exists to
+            // avoid once a wait is measured in hours.
+            assert!(
+                interval >= TICK,
+                "at {secs}s the schedule returned {interval:?}, below one tick"
+            );
+            // Monotonic: waiting longer must never poll HARDER. A schedule that
+            // tightened again would make the cheap case the long one.
+            assert!(
+                interval >= previous,
+                "at {secs}s the schedule tightened from {previous:?} to {interval:?}"
+            );
+            previous = interval;
+        }
+        // The first minute stays tight so an operator's script — which
+        // transfers as soon as this module publishes the account — is not held
+        // up by a backoff meant for human latency.
+        assert_eq!(funding_read_interval(Duration::ZERO), TICK);
+        // And a day in, it is reading twelve times an hour, not 720.
+        assert_eq!(
+            funding_read_interval(Duration::from_secs(86_400)),
+            Duration::from_secs(300)
+        );
+    }
 
     /// The gate this module exists to get right. The fee reserve dominates the
     /// price by two to three orders of magnitude, so an account sized for the
