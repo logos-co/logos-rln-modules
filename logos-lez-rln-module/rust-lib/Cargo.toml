@@ -22,7 +22,7 @@ panic = "abort"
 # rln-layouts is the on-chain borsh wire format, pinned to the logos-lez-rln
 # rev whose deployed programs it must match; bump the rev together with any
 # layout change.
-rln-layouts = { git = "https://github.com/logos-co/logos-lez-rln.git", rev = "5a5d589" }
+rln-layouts = { git = "https://github.com/logos-co/logos-lez-rln.git", rev = "7ea94fc8c42c9a50a49bb291eea17962f88ff0dc" }
 risc0-zkvm = { version = "3.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
 borsh = { version = "1", default-features = false, features = ["derive"] }
