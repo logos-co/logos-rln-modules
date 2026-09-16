@@ -55,6 +55,13 @@ const SEQUENCER_ENV: &str = "LEZ_RLN_SEQUENCER";
 /// funded account — a staged deployment wallet does.
 const PAYER_KEY_ENV: &str = "LEZ_RLN_PAYER_KEY";
 
+/// Where a payer this module derived for itself is recorded, inside the wallet
+/// home. Derivation is deterministic from the seed, so re-deriving would hand
+/// back the same account — but only while nothing else has consumed a slot.
+/// Writing the id down makes the payer survive that, and makes it answerable
+/// before the first chain read.
+const PAYER_FILE: &str = "payer.json";
+
 /// How long a handler waits for bring-up before giving up. Consumers already
 /// retry a failed read; blocking a dispatch thread for a whole first sync
 /// would wedge the module under `concurrency:"multi"`.
@@ -212,6 +219,13 @@ mod ffi {
 
         pub fn wallet_ffi_free_account_data(account: *mut Account);
 
+        pub fn wallet_ffi_get_balance(
+            handle: *mut WalletHandle,
+            account_id: *const Bytes32,
+            is_public: bool,
+            out_balance: *mut [u8; 16],
+        ) -> i32;
+
         pub fn wallet_ffi_send_generic_public_transaction(
             handle: *mut WalletHandle,
             account_identities: *const AccountIdentity,
@@ -261,6 +275,10 @@ pub(crate) enum Readiness {
 
 struct State {
     readiness: Readiness,
+    /// The account this module signs and pays with: `LEZ_RLN_PAYER`, the
+    /// account `LEZ_RLN_PAYER_KEY` imported, or one derived at bring-up.
+    /// Empty until bring-up settles.
+    payer_hex: String,
     /// Shared for reads and sends, exclusive for deriving an account. Callers
     /// clone the `Arc` and drop the state lock before calling: holding it
     /// across a sequencer round trip would serialize every handler, the wedge
@@ -270,8 +288,23 @@ struct State {
 
 static STATE: Mutex<State> = Mutex::new(State {
     readiness: Readiness::Pending,
+    payer_hex: String::new(),
     wallet: None,
 });
+
+/// Held across a submission and nothing else.
+///
+/// A transaction's nonce is read from confirmed on-chain state, not from a
+/// local counter, and it only advances once the transaction settles. Two
+/// submissions from one account that overlap that window therefore build with
+/// the same nonce and one is dropped. Before the registry took the native
+/// asset that needed a shared LEZ_RLN_PAYER to happen; now the signer IS the
+/// payer, so it is the ordinary case.
+///
+/// `REG_IN_FLIGHT` does not cover this — it keys on the membership PDA, so
+/// two DIFFERENT memberships still race. Reads are deliberately outside: the
+/// `single` -> `multi` bump exists to keep them concurrent.
+static SEND_LOCK: Mutex<()> = Mutex::new(());
 
 /// Signalled once bring-up settles, either way.
 static SETTLED: Condvar = Condvar::new();
@@ -354,6 +387,14 @@ fn bring_up(home: &Path) {
         return;
     }
 
+    let payer_hex = match resolve_payer(&handle, home) {
+        Ok(p) => p,
+        Err(e) => {
+            fail(&e);
+            return;
+        }
+    };
+
     match sync(&handle) {
         Ok(head) => eprintln!("lez-rln wallet: synced to block {head}"),
         // Account reads go to the sequencer rather than to local state, so a
@@ -363,6 +404,7 @@ fn bring_up(home: &Path) {
 
     let mut state = lock(&STATE);
     state.wallet = Some(Arc::new(RwLock::new(handle)));
+    state.payer_hex = payer_hex;
     state.readiness = Readiness::Ready;
     SETTLED.notify_all();
     eprintln!("lez-rln wallet: ready ({})", home.display());
@@ -427,6 +469,54 @@ fn import_payer_key(handle: &Handle) -> Result<(), String> {
     save(handle);
     eprintln!("lez-rln wallet: imported the fee payer's key");
     Ok(())
+}
+
+/// The account this module signs and pays with, decided once at bring-up.
+///
+/// Order: `LEZ_RLN_PAYER` if it names one; otherwise the account recorded in
+/// `payer.json` from a previous run; otherwise derive one and write it down.
+///
+/// Deriving is not funding. No program can mint native balance, so a fresh
+/// account is worth nothing until someone transfers to it — which is exactly
+/// why the id is published (`wallet_status`) rather than kept private: an
+/// operator, or the e2e harness, has to be able to send to it.
+#[allow(unsafe_code)]
+fn resolve_payer(handle: &Handle, home: &Path) -> Result<String, String> {
+    let configured = crate::fee_payer_env_hex();
+    if !configured.is_empty() {
+        eprintln!("lez-rln wallet: paying from the configured account {configured}");
+        return Ok(configured);
+    }
+
+    let recorded = home.join(PAYER_FILE);
+    if let Ok(raw) = std::fs::read_to_string(&recorded) {
+        let id = raw.trim().trim_matches('"').to_ascii_lowercase();
+        if crate::hex_to_bytes32(&id).is_some() {
+            eprintln!("lez-rln wallet: paying from {id} (recorded)");
+            return Ok(id);
+        }
+        return Err(format!(
+            "{} does not contain a 32-byte hex account id",
+            recorded.display()
+        ));
+    }
+
+    let mut out = ffi::Bytes32::default();
+    // SAFETY: a live handle and an out struct we own.
+    let rc = unsafe { ffi::wallet_ffi_create_account_public(handle.0, &raw mut out) };
+    if rc != ffi::SUCCESS {
+        return Err(format!("deriving a payer account failed (code {rc})"));
+    }
+    // Derivation alone does not persist; without this the account is gone on
+    // the next open and nothing can sign for it.
+    save(handle);
+    let id = bytes_to_hex(&out.data);
+    std::fs::write(&recorded, &id)
+        .map_err(|e| format!("write {}: {e}", recorded.display()))?;
+    eprintln!(
+        "lez-rln wallet: derived the payer {id} — it holds nothing until something transfers to it"
+    );
+    Ok(id)
 }
 
 #[allow(unsafe_code)]
@@ -627,6 +717,8 @@ pub(crate) fn send_generic_public_transaction(
     // SAFETY: a live handle; identities, instruction and payer all outlive the
     // call; the out struct is ours.
     let rc = unsafe {
+        // One submission at a time; see SEND_LOCK.
+        let _serialized = lock(&SEND_LOCK);
         ffi::wallet_ffi_send_generic_public_transaction(
             guard.0,
             identities.as_ptr(),
@@ -672,27 +764,41 @@ pub(crate) fn send_generic_public_transaction(
 /// Derivation is deterministic from the wallet's seed, so this hands back the
 /// next slot rather than a random one; a caller that needs an account nothing
 /// has claimed on-chain yet checks the balance and asks again. It lives here
-/// because the wallet does: the accounts this module signs with have to be
-/// ones its own storage knows.
+/// The account this module signs and pays with, or "" before bring-up settles.
+pub(crate) fn payer_hex() -> String {
+    lock(&STATE).payer_hex.clone()
+}
+
+/// Live NATIVE balance of `account_hex`, or of this module's payer when empty.
+///
+/// `None` means the question could not be answered — the wallet is not up, the
+/// id is malformed, or the sequencer did not reply. That is deliberately not
+/// zero: a caller deciding whether it can afford to register would read an
+/// unreachable chain as "broke" and give up permanently.
 #[allow(unsafe_code)]
-pub(crate) fn create_holding_account() -> String {
-    let Some(wallet) = wallet("create_holding_account") else {
-        return String::new();
+pub(crate) fn native_balance(account_hex: &str) -> Option<(String, u128)> {
+    let id_hex = if account_hex.trim().is_empty() {
+        payer_hex()
+    } else {
+        account_hex.trim().to_ascii_lowercase()
     };
-    // Exclusive: deriving mutates the key chain, and a read mid-derivation
-    // would see a wallet halfway through it.
-    let guard = wallet.write().unwrap_or_else(|p| p.into_inner());
-    let mut out = ffi::Bytes32::default();
-    // SAFETY: a live handle and an out struct we own.
-    let rc = unsafe { ffi::wallet_ffi_create_account_public(guard.0, &raw mut out) };
-    if rc != ffi::SUCCESS {
-        eprintln!("create_holding_account: code {rc}");
-        return String::new();
+    if id_hex.is_empty() {
+        eprintln!("native_balance: no account given and no payer resolved yet");
+        return None;
     }
-    // Derivation alone does not persist; without this the account is gone on
-    // the next open and nothing can sign for it.
-    save(&guard);
-    bytes_to_hex(&out.data)
+    let bytes = crate::hex_to_bytes32(&id_hex)?;
+    let wallet = wallet("native_balance")?;
+    let guard = wallet.read().unwrap_or_else(|p| p.into_inner());
+    let id = ffi::Bytes32 { data: bytes };
+    let mut out = [0u8; 16];
+    // SAFETY: a live handle, an id we own, and a 16-byte out buffer. is_public
+    // is true because a balance a program can charge is a public one.
+    let rc = unsafe { ffi::wallet_ffi_get_balance(guard.0, &raw const id, true, &raw mut out) };
+    if rc != ffi::SUCCESS {
+        eprintln!("native_balance: {id_hex} read failed (code {rc})");
+        return None;
+    }
+    Some((id_hex, u128::from_le_bytes(out)))
 }
 
 /// What the module can say about its wallet without one being open — the read
@@ -708,8 +814,13 @@ pub(crate) fn status_json() -> String {
         Readiness::Pending => ("pending", "opening the wallet".to_owned()),
         Readiness::Failed(reason) => ("failed", reason.clone()),
     };
+    // `payer` is local configuration, never a chain read: this method is what
+    // a consumer polls to tell "coming up" from "broken", so it must not be
+    // able to block or fail on a sequencer round trip. What that account can
+    // afford is get_native_balance's question.
     serde_json::json!({
         "detail": detail,
+        "payer": state.payer_hex,
         "ready": name == "ready",
         "state": name,
     })
@@ -766,6 +877,16 @@ mod wallet_ffi_test_transport {
     pub extern "C" fn wallet_ffi_create_account_public(
         _h: *mut ffi::WalletHandle,
         _o: *mut ffi::Bytes32,
+    ) -> i32 {
+        ffi::NO_WALLET
+    }
+
+    #[no_mangle]
+    pub extern "C" fn wallet_ffi_get_balance(
+        _h: *mut ffi::WalletHandle,
+        _a: *const ffi::Bytes32,
+        _is_public: bool,
+        _o: *mut [u8; 16],
     ) -> i32 {
         ffi::NO_WALLET
     }

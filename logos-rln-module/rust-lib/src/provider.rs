@@ -279,6 +279,20 @@ pub(crate) trait RegistryProvider: Send + Sync {
         &self,
         registry: &CanonicalRegistryId,
     ) -> Result<serde_json::Value, ApiError>;
+
+    /// Whether the chain-access module's own wallet is usable, and which
+    /// account it pays with: `{detail, payer, ready, state}`. Local to that
+    /// module — it does not touch the chain, so it answers before a sync and
+    /// is safe to poll.
+    fn wallet_status(&self) -> Result<serde_json::Value, ApiError>;
+
+    /// Live NATIVE balance of the account that would pay for a registration.
+    ///
+    /// An error means the question could not be answered, never that the
+    /// balance is zero: a caller waiting to afford a registration would read
+    /// an unreachable sequencer as a permanently broke account and stop
+    /// waiting.
+    fn payer_balance(&self) -> Result<u128, ApiError>;
 }
 
 /// Turn a sibling `get_valid_roots` reply into roots at the prover's circuit
@@ -417,8 +431,11 @@ impl RegistryProvider for LezRlnProvider {
         rate_limit: u64,
         on_done: RegisterCallback,
     ) -> Result<(), ApiError> {
-        // lez-rln RegisterOptions: the funding holding account that pays
-        // rate_limit × price_per_unit.
+        // options_json is still parsed, so a malformed one is still a caller
+        // error — but nothing in it selects who pays any more. Since
+        // liblogos_lez_rln_module 4.0.0 the registry takes the native asset
+        // and the provider pays from its own account, so this module has
+        // nothing to name: it is registry-agnostic and holds no account ids.
         let options: serde_json::Value = if options_json.trim().is_empty() {
             serde_json::json!({})
         } else {
@@ -426,16 +443,23 @@ impl RegistryProvider for LezRlnProvider {
                 ApiError::new(ErrorKind::InvalidArgument, &format!("options_json: {e}"))
             })?
         };
-        let Some(funding) = options
+        // Accepted and ignored rather than rejected. It was MANDATORY until
+        // 0.8.0 and every shipped caller still sends it — the membership UI,
+        // delivery's conf key, Basecamp's chat conf, the nim consumer — from
+        // repos that release on their own schedule. Making a stale conf a
+        // permanent registration failure buys nothing when the key is inert.
+        // Said once per call, because the account it names is no longer the
+        // account that pays, and a caller relying on that needs to know.
+        if options
             .get("funding_holding_account_id")
             .and_then(|x| x.as_str())
-            .filter(|s| !s.is_empty())
-        else {
-            return Err(ApiError::new(
-                ErrorKind::InvalidArgument,
-                "logos registries require options_json.funding_holding_account_id",
-            ));
-        };
+            .is_some_and(|s| !s.is_empty())
+        {
+            eprintln!(
+                "register_membership: funding_holding_account_id is ignored since 0.8.0 — \
+                 the registry module pays from its own account"
+            );
+        }
         // The wire carries `int`; a rate the sibling could not even receive
         // is the caller's error, not a submission to be recorded.
         let rate_limit = i64::try_from(rate_limit).map_err(|_| {
@@ -446,7 +470,8 @@ impl RegistryProvider for LezRlnProvider {
         dispatch_recorded("register_member", on_done, |done| {
             client.register_member_async_with_timeout(
                 &registry.account,
-                funding,
+                // "" = the provider's own payer.
+                "",
                 id_commitment_hex,
                 rate_limit,
                 REGISTER_TIMEOUT,
@@ -518,6 +543,45 @@ impl RegistryProvider for LezRlnProvider {
         serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
             ApiError::new(ErrorKind::ProviderFailure, &format!("bounds reply parse: {e}"))
         })
+    }
+
+    fn wallet_status(&self) -> Result<serde_json::Value, ApiError> {
+        let client = lez_client();
+        let raw = read_reply(
+            "wallet_status",
+            await_reply("wallet_status", READ_TIMEOUT, |done| {
+                client.wallet_status_async_with_timeout(READ_TIMEOUT, done)
+            }),
+        )?;
+        serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
+            ApiError::new(ErrorKind::ProviderFailure, &format!("wallet_status parse: {e}"))
+        })
+    }
+
+    fn payer_balance(&self) -> Result<u128, ApiError> {
+        let client = lez_client();
+        // "" selects that module's own payer. This module is
+        // registry-agnostic and holds no account ids, so it could not name
+        // one even if it wanted to.
+        let raw = read_reply(
+            "get_native_balance",
+            await_reply("get_native_balance", READ_TIMEOUT, |done| {
+                client.get_native_balance_async_with_timeout("", READ_TIMEOUT, done)
+            }),
+        )?;
+        let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            ApiError::new(ErrorKind::ProviderFailure, &format!("balance reply parse: {e}"))
+        })?;
+        // A decimal STRING on the wire: a u128 balance exceeds JSON number
+        // precision, and a truncated one compared against a price is worse
+        // than no answer.
+        parsed
+            .get("balance")
+            .and_then(|b| b.as_str())
+            .and_then(|b| b.parse::<u128>().ok())
+            .ok_or_else(|| {
+                ApiError::new(ErrorKind::ProviderFailure, "balance reply has no decimal balance")
+            })
     }
 }
 
@@ -718,12 +782,52 @@ mod tests {
         assert!(!*lock(&fired), "a synchronous failure must not also reach on_done");
     }
 
+    /// Until 0.8.0 this was `register_requires_funding_option` and asserted
+    /// `InvalidArgument` — the logos namespace refused a register without
+    /// `funding_holding_account_id`. The registry takes the native asset now
+    /// and the sibling pays from its own account, so there is nothing for a
+    /// caller to name and the option is inert.
+    ///
+    /// Reaching `ProviderFailure` is the assertion: that is the dead-transport
+    /// error from the neighbouring test, so the call got PAST validation. An
+    /// `InvalidArgument` here would mean the old gate survived.
     #[test]
-    fn register_requires_funding_option() {
+    fn register_without_a_funding_option_gets_past_validation() {
         let registry = registry_id::parse(&format!("logos:local:{}", "ab".repeat(32))).unwrap();
         let provider = provider_for("logos").unwrap();
         let err = provider
             .register_async(&registry, "{}", &"11".repeat(32), 300, Box::new(|_| {}))
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ProviderFailure);
+    }
+
+    /// A caller that has not been rebuilt still sends the key. It must not
+    /// become a permanent registration failure — that is the whole reason it
+    /// is ignored rather than rejected.
+    #[test]
+    fn register_ignores_a_stale_funding_option() {
+        let registry = registry_id::parse(&format!("logos:local:{}", "ab".repeat(32))).unwrap();
+        let provider = provider_for("logos").unwrap();
+        let err = provider
+            .register_async(
+                &registry,
+                &format!(r#"{{"funding_holding_account_id":"{}"}}"#, "cd".repeat(32)),
+                &"11".repeat(32),
+                300,
+                Box::new(|_| {}),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ProviderFailure);
+    }
+
+    /// Malformed options_json is still the caller's error: relaxing which
+    /// keys matter did not relax whether the document parses.
+    #[test]
+    fn register_still_rejects_unparseable_options() {
+        let registry = registry_id::parse(&format!("logos:local:{}", "ab".repeat(32))).unwrap();
+        let provider = provider_for("logos").unwrap();
+        let err = provider
+            .register_async(&registry, "{not json", &"11".repeat(32), 300, Box::new(|_| {}))
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument);
     }

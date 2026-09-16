@@ -277,7 +277,6 @@ fn fetch_account_data(account_id_hex: &str, owner_out: Option<&mut Vec<u8>>) -> 
 /// The resolved config account (64-hex + raw data) and its 32-byte program
 /// owner — the inputs every on-chain entry point needs.
 struct RlnConfigContext {
-    config_hex: String,
     config_data: Vec<u8>,
     program_owner: [u8; 32],
 }
@@ -297,10 +296,26 @@ fn resolve_config_context(config_account_id: &str, who: &str) -> Option<RlnConfi
         eprintln!("{who}: invalid program_owner size {}", owner_bytes.len());
         return None;
     }
+    // The one place a config account is admitted, and so the one place its
+    // generation is checked. Every field below is read by byte offset and
+    // ConfigState carries no version discriminator, so a config from another
+    // program generation does not fail to decode — it decodes to a plausible
+    // wrong treasury and a plausible wrong price. Length is the only signal
+    // there is, and it has to be exact: the previous floor (240, admitting
+    // both a 240- and a 296-byte layout) was written when fields were only
+    // ever appended, which is no longer true.
+    if config_data.len() != native::CONFIG_STATE_SIZE {
+        eprintln!(
+            "{who}: config account is {} bytes, expected {} — this is a config \
+             from a different program generation, not a short read",
+            config_data.len(),
+            native::CONFIG_STATE_SIZE,
+        );
+        return None;
+    }
     let mut program_owner = [0u8; 32];
     program_owner.copy_from_slice(&owner_bytes);
     Some(RlnConfigContext {
-        config_hex,
         config_data,
         program_owner,
     })
@@ -319,7 +334,9 @@ fn resolve_config_context(config_account_id: &str, who: &str) -> Option<RlnConfi
 /// tooling that mints the payer prints base58 and the wallet interface wants
 /// hex. Unset means self-pay, which is right wherever the signing account is
 /// itself funded.
-fn fee_payer_hex() -> String {
+/// `LEZ_RLN_PAYER` as 64-hex, or "" when unset. Read at bring-up to decide the
+/// module's payer; `fee_payer_hex` is what every send actually uses.
+pub(crate) fn fee_payer_env_hex() -> String {
     let Ok(raw) = std::env::var("LEZ_RLN_PAYER") else {
         return String::new();
     };
@@ -335,6 +352,20 @@ fn fee_payer_hex() -> String {
         eprintln!("LEZ_RLN_PAYER is neither 32-byte hex nor a base58 account id: {raw}");
     }
     resolved
+}
+
+/// The account a transaction declares as its fee payer.
+///
+/// Empty used to mean "self-pay by the signer", which was right when the
+/// signer was a token holding that held no native balance and something else
+/// had to pay. The signer now IS the payer, so the fallback is the account the
+/// wallet resolved at bring-up — configured, imported or derived.
+fn fee_payer_hex() -> String {
+    let configured = fee_payer_env_hex();
+    if !configured.is_empty() {
+        return configured;
+    }
+    wallet::payer_hex()
 }
 
 /// Submit one public transaction through the module's own wallet. `None` =
@@ -359,28 +390,6 @@ fn send_generic_tx(
         return None;
     }
     Some(send_result)
-}
-
-/// Funding-method entry (claim_tokens): reject negative amounts, resolve
-/// the config context and the destination account. `None` = failed, already
-/// logged. Returns `(amount as u128, config context, dest 64-hex)`.
-fn funding_prologue(
-    who: &str,
-    config_account_id: &str,
-    dest_account_id: &str,
-    amount: i64,
-) -> Option<(u128, RlnConfigContext, String)> {
-    if amount < 0 {
-        eprintln!("{who}: negative amount");
-        return None;
-    }
-    let ctx = resolve_config_context(config_account_id, who)?;
-    let dest_hex = resolve_account_id(dest_account_id);
-    if dest_hex.is_empty() {
-        eprintln!("{who}: failed to resolve dest account");
-        return None;
-    }
-    Some((amount as u128, ctx, dest_hex))
 }
 
 fn derive_register_plan(
@@ -630,11 +639,21 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
 struct LogosLezRlnModuleImpl;
 
 impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
-    /// Derive a fresh public account in this module's own wallet. The
-    /// accounts it signs with have to be ones its own storage knows, so a
-    /// consumer that needs a holding to fund and register with asks here.
-    fn create_holding_account(&self) -> String {
-        wallet::create_holding_account()
+    /// Live NATIVE balance, of `account_id` or of this module's own payer when
+    /// empty. A caller asks this to decide whether a registration can be paid
+    /// for, which is why "" on error must never be read as zero — an
+    /// unreachable sequencer is not an empty account.
+    fn get_native_balance(&self, account_id: String) -> String {
+        let Some((account, balance)) = wallet::native_balance(&account_id) else {
+            return String::new();
+        };
+        serde_json::json!({
+            "account": account,
+            // Decimal string: a u128 balance exceeds JSON number precision,
+            // and a consumer comparing against a price must not lose digits.
+            "balance": balance.to_string(),
+        })
+        .to_string()
     }
 
     /// Whether the wallet this module owns is usable. Never fails — a
@@ -662,7 +681,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
     fn register_member(
         &self,
         config_account_id: String,
-        user_holding_account_id: String,
+        payer_account_id: String,
         id_commitment_hex: String,
         rate_limit: i64,
     ) -> String {
@@ -675,9 +694,18 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             return String::new();
         };
 
-        let user_holding_hex = resolve_account_id(&user_holding_account_id);
-        if user_holding_hex.is_empty() {
-            eprintln!("register_member: failed to resolve user holding account");
+        // One account signs the Register tx, pays the registry price from its
+        // NATIVE balance and pays the fee. Empty means "this module's own
+        // payer", which is what a registry-agnostic consumer passes; a caller
+        // paying on someone else's behalf names an account whose key this
+        // wallet holds, because the signature is what authorizes the debit.
+        let payer_hex = if payer_account_id.trim().is_empty() {
+            wallet::payer_hex()
+        } else {
+            resolve_account_id(&payer_account_id)
+        };
+        if payer_hex.is_empty() {
+            eprintln!("register_member: no payer — the wallet has not resolved one yet");
             return String::new();
         }
 
@@ -748,7 +776,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         let account_ids: Vec<String> = vec![
             bytes_to_hex(&plan.config_account_id),
             bytes_to_hex(&plan.tree_main_account_id),
-            user_holding_hex.clone(),
+            payer_hex.clone(),
             bytes_to_hex(&plan.treasury_account_id),
             bytes_to_hex(&plan.subtree_account_id),
             bytes_to_hex(&plan.clock_account_id),
@@ -757,7 +785,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         // Only the user-holding (payer) account signs; the rest are read/PDA/init.
         let signing_reqs: Vec<bool> = account_ids
             .iter()
-            .map(|a| *a == user_holding_hex)
+            .map(|a| *a == payer_hex)
             .collect();
 
         let Some(send_result) = send_generic_tx(
@@ -785,79 +813,6 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         reg_in_flight(|m| m.insert(reg_key, (reply.clone(), Instant::now())));
         reply
     }
-
-    fn claim_tokens(
-        &self,
-        config_account_id: String,
-        dest_account_id: String,
-        amount: i64,
-    ) -> String {
-        let Some((amount_u128, ctx, dest_hex)) =
-            funding_prologue("claim_tokens", &config_account_id, &dest_account_id, amount)
-        else {
-            return String::new();
-        };
-        let (payment_def_id, instruction) =
-            match native::claim_plan(&ctx.config_data, &ctx.program_owner, amount_u128) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("claim_tokens: plan error: {e}");
-                    return String::new();
-                }
-            };
-        let payment_def_hex = bytes_to_hex(&payment_def_id);
-        // Claim tx accounts: [config, payment_def, dest (signer)]; config +
-        // payment_def are program-authorized PDAs, only the destination signs.
-        // Submitted under the REGISTRATION program (the config's program_owner).
-        let Some(send_result) = send_generic_tx(
-            "claim_tokens",
-            vec![ctx.config_hex.clone(), payment_def_hex.clone(), dest_hex.clone()],
-            vec![false, false, true],
-            instruction,
-            bytes_to_hex(&ctx.program_owner),
-            fee_payer_hex(),
-        ) else {
-            return String::new();
-        };
-        serde_json::json!({
-            "tx_result": send_result,
-            "payment_definition": payment_def_hex,
-            "pending": true,
-        })
-        .to_string()
-    }
-
-    fn get_token_balance(&self, account_id: String) -> String {
-        let account_hex = resolve_account_id(&account_id);
-        if account_hex.is_empty() {
-            eprintln!("get_token_balance: failed to resolve account");
-            return String::new();
-        }
-        // Tri-state: Error ("" — sequencer/RPC failure, NOT zero) vs Absent
-        // ({exists:false} — account not credited yet) vs Present.
-        match fetch_account_data_tri_state(&account_hex) {
-            FetchOutcome::Error => String::new(),
-            FetchOutcome::Absent => {
-                serde_json::json!({ "exists": false, "balance": "0" }).to_string()
-            }
-            FetchOutcome::Present(data) => match native::token_holding_info(&data) {
-                Ok((definition_id, balance)) => serde_json::json!({
-                    "exists": true,
-                    "balance": balance.to_string(),
-                    "definition": bytes_to_hex(&definition_id),
-                })
-                .to_string(),
-                Err(e) => {
-                    eprintln!("get_token_balance: holding decode error: {e}");
-                    String::new()
-                }
-            },
-        }
-    }
-
-    // ---- registry-provider reads, consumed by the membership management
-    // module. Same conventions as the rest of the contract: "" = error,
-    // compact alphabetical JSON otherwise.
 
     fn get_membership(&self, config_account_id: String, id_commitment_hex: String) -> String {
         let Some(id_commitment) = hex_to_bytes32(&id_commitment_hex) else {
@@ -936,10 +891,6 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         let Some(ctx) = resolve_config_context(&config_account_id, "get_registry_bounds") else {
             return String::new();
         };
-        if ctx.config_data.len() < native::CONFIG_STATE_MIN_SIZE {
-            eprintln!("get_registry_bounds: config data too short");
-            return String::new();
-        }
         let cfg = &ctx.config_data;
         serde_json::json!({
             "active_duration":
