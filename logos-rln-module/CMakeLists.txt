@@ -48,6 +48,8 @@ if(APPLE)
         "-framework CoreFoundation"
         "-framework Security"
     )
-else()
+# MinGW has no libdl, and LogosModule.cmake already links the Windows system
+# libraries the Rust staticlib needs.
+elseif(NOT WIN32)
     target_link_libraries(liblogos_rln_module_module_plugin PRIVATE pthread dl)
 endif()
