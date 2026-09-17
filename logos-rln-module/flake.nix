@@ -19,7 +19,8 @@
   outputs = inputs@{ self, logos-module-builder, ... }:
     let
       nixpkgs = logos-module-builder.inputs.nixpkgs;
-      systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ];
+      # x86_64-windows is a mingw cross build, produced on a native builder.
+      systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" "x86_64-windows" ];
       forAllSystems = fn: nixpkgs.lib.genAttrs systems fn;
 
       # The builder runs logos-lidl-gen to emit the C ABI scaffold (+ the
