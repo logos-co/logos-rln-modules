@@ -13,7 +13,7 @@
     # Name matches metadata.json#dependencies; the builder resolves by name.
     # Not path:../ — a relative input resolves against the store root once a
     # consumer walks the chain transitively, and evaluation fails.
-    liblogos_lez_rln_module.url = "git+https://github.com/logos-co/logos-rln-modules?ref=main&rev=6e3c6c47d4d1ae7efa635a61a171891c23967fd8&dir=logos-lez-rln-module";
+    liblogos_lez_rln_module.url = "git+https://github.com/richard-ramos/logos-rln-modules?ref=feat/mix-wire-binding&rev=2f5ba3c5574a879adf245ce01400e0c3b0c5a1ff&dir=logos-lez-rln-module";
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:
