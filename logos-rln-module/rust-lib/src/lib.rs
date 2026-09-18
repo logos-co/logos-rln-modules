@@ -1423,8 +1423,20 @@ fn validate_proof_impl(
     let expected_epoch = epoch_of_timestamp(timestamp, size)?;
     let signal = registry_id::hex_to_vec(signal_hex)
         .ok_or_else(|| ApiError::new(ErrorKind::InvalidArgument, "signal must be hex"))?;
-    let proof_value: serde_json::Value = serde_json::from_str(proof_json)
+    let mut proof_value: serde_json::Value = serde_json::from_str(proof_json)
         .map_err(|e| ApiError::new(ErrorKind::InvalidArgument, &format!("proof_json: {e}")))?;
+    // Mix omits this derivable public input on the network. Reconstruct it
+    // from the trusted request scope; cryptographic verification still binds
+    // the received proof to this application and epoch.
+    let derive_external_nullifier = proof_value.get("root").is_some()
+        && proof_value.get("external_nullifier").is_none();
+    if derive_external_nullifier {
+        proof_value["external_nullifier"] = serde_json::Value::String(
+            registry_id::bytes_to_hex(&proof::expected_external_nullifier(
+                expected_epoch, &rln_identifier,
+            )),
+        );
+    }
     let rlp = proof::RateLimitProof::from_json(&proof_value).map_err(proof_error)?;
 
     // Application + epoch binding first — pure local computation, so a stale
@@ -1475,7 +1487,13 @@ fn validate_proof_impl(
             views::VerdictReply::rate_limit_violation(recovered_secret)
         }
     };
-    ok_json(view)
+    let mut reply = ok_json(view)?;
+    if derive_external_nullifier {
+        reply["external_nullifier"] = serde_json::Value::String(
+            registry_id::bytes_to_hex(&bound),
+        );
+    }
+    Ok(reply)
 }
 
 /// Spec get_epoch_quota(scope, timestamp): the epoch of the supplied
@@ -2273,6 +2291,35 @@ mod tests {
         assert_eq!(out, serde_json::json!({ "verdict": "invalid" }));
 
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
+    }
+
+    #[test]
+    fn validate_proof_impl_reconstructs_mix_external_nullifier() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        nullifier_log::reset_for_test();
+        start_impl(r#"{"epoch_size_sec": 10, "max_epoch_gap": 3}"#).unwrap();
+        let registry = format!("logos:local:{}", "dc".repeat(32));
+        let id = [9u8; 32];
+        let scope = registry_id::bytes_to_hex(&id);
+        let signal = b"mix packet";
+        let signal_hex = registry_id::bytes_to_hex(signal);
+        let timestamp = now_unix();
+        let epoch = timestamp / 10;
+        let proof = proof::generate_for_test(&[7u8; 32], signal, epoch, &id);
+        roots::set_window_for_test(&registry, vec![proof.root()], timestamp);
+        let mut wire = proof.to_json();
+        wire.as_object_mut().unwrap().remove("external_nullifier");
+        let wire = wire.to_string();
+        let time = timestamp.to_string();
+        let wrong = validate_proof_impl(&registry, &"aa".repeat(32), &signal_hex, &time, &wire).unwrap();
+        assert_eq!(wrong["verdict"], "invalid");
+        let wrong = validate_proof_impl(&registry, &scope, "00", &time, &wire).unwrap();
+        assert_eq!(wrong["verdict"], "invalid");
+        let valid = validate_proof_impl(&registry, &scope, &signal_hex, &time, &wire).unwrap();
+        assert_eq!(valid["verdict"], "valid");
+        assert_eq!(valid["external_nullifier"], registry_id::bytes_to_hex(&proof.external_nullifier()));
+        let duplicate = validate_proof_impl(&registry, &scope, &signal_hex, &time, &wire).unwrap();
+        assert_eq!(duplicate["verdict"], "duplicate");
     }
 
     // An epoch-less proof (the decomposed spec shape may omit "epoch") is
