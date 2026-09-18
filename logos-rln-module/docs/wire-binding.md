@@ -201,6 +201,11 @@ extras:
   bytes trusted, decoded fields ignored). A decomposed proof is rebuilt and
   re-serialized, so both shapes land in the identical verified
   representation. `epoch` may cross as the 32-byte LE hex or the u64 index.
+- A decomposed Mix proof may omit `external_nullifier`: the module derives it
+  from the scope and timestamp, then verifies the proof against that binding.
+  The response includes the derived `external_nullifier` for Mix coordination.
+  This preserves Mix's existing proof wire format without putting Poseidon
+  computation in the consumer. A wrong scope or signal still fails validation.
 - Frozen byte-exact vectors (identity derivation, external nullifier, signal
   hash, public values, layout): `rust-lib/src/proof.rs`,
   `proof::tests::frozen_interop_vectors`.
