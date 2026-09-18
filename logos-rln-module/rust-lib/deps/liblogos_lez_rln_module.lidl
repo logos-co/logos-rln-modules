@@ -27,12 +27,15 @@ module liblogos_lez_rln_module {
   ; or {"clock_timestamp":N,"grace_period_duration":N,
   ; "grace_period_start_timestamp":N,"leaf_index":N,"rate_limit":N,
   ; "registered":true,"state":"active"|"grace_period"|"expired"}.
+  ; clock_timestamp and grace_period_start_timestamp are MILLISECONDS
+  ; (CLOCK_50); grace_period_duration is SECONDS.
   method get_membership(config_account_id: tstr, id_commitment_hex: tstr) -> tstr
 
   ; {"active_duration":N,"current_total_rate_limit":N,
   ;  "grace_period_duration":N,"max_rate_limit":N,"max_total_rate_limit":N,
   ;  "min_rate_limit":N,"price_per_unit":"<decimal>","total_registrations":N}.
-  ; price_per_unit is denominated in NATIVE balance since v4.0.0.
+  ; price_per_unit is denominated in NATIVE balance since v4.0.0;
+  ; active_duration and grace_period_duration are SECONDS.
   method get_registry_bounds(config_account_id: tstr) -> tstr
 
   ; JSON array of proof objects (each with valid_roots from the same tree
