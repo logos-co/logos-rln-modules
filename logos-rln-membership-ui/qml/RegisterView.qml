@@ -107,7 +107,7 @@ LogosScrollView {
             pollTimer.stop()
             if (view.liveState === "active")
                 view.report("Membership ACTIVE at leaf " + r.leaf_index
-                    + ". On this testnet it stays active ~43 min before grace_period/expired.", false)
+                    + ". See the Memberships tab for when it enters grace_period.", false)
             else if (view.liveState === "failed")
                 view.report("Registration FAILED — see the Memberships tab for the failure reason "
                     + "and whether it is retryable.", true)
