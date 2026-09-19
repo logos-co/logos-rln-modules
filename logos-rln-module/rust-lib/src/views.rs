@@ -252,9 +252,12 @@ impl RegistryParametersView {
 
 /// `validate_proof`'s reply — mirrors the `.lidl` `VerificationResult` record.
 /// `recovered_secret` is present only for the `"rate_limit_violation"`
-/// verdict.
+/// verdict; `external_nullifier` only when the request omitted it and the
+/// module derived it, on every verdict that path can reach.
 #[derive(Serialize)]
 pub(crate) struct VerdictReply {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_nullifier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recovered_secret: Option<String>,
     verdict: String,
@@ -262,14 +265,26 @@ pub(crate) struct VerdictReply {
 
 impl VerdictReply {
     pub(crate) fn verdict(verdict: &str) -> Self {
-        VerdictReply { recovered_secret: None, verdict: verdict.to_string() }
+        VerdictReply {
+            external_nullifier: None,
+            recovered_secret: None,
+            verdict: verdict.to_string(),
+        }
     }
 
     pub(crate) fn rate_limit_violation(recovered_secret: String) -> Self {
         VerdictReply {
+            external_nullifier: None,
             recovered_secret: Some(recovered_secret),
             verdict: "rate_limit_violation".to_string(),
         }
+    }
+
+    /// Echo the external nullifier the module derived for a request that did
+    /// not transmit one — the value Mix keys its own coordination on.
+    pub(crate) fn derived_external_nullifier(mut self, hex: String) -> Self {
+        self.external_nullifier = Some(hex);
+        self
     }
 }
 

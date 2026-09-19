@@ -116,8 +116,11 @@ module liblogos_rln_module {
     ? price_per_unit: any
   }
   ; validate_proof's reply. recovered_secret is present only for the
-  ; "rate_limit_violation" verdict.
+  ; "rate_limit_violation" verdict. external_nullifier is present only when
+  ; the request omitted one and the module derived it (the Mix shape), on
+  ; every verdict that path reaches.
   type VerificationResult {
+    ? external_nullifier: tstr
     ? recovered_secret: tstr
     verdict: tstr
   }
@@ -261,7 +264,10 @@ module liblogos_rln_module {
   ; decomposed RateLimitProof struct — "proof" as the bare 128-byte Groth16
   ; hex plus root/external_nullifier/share_x/share_y/nullifier — the shape
   ; generate_proof's reply carries and a consumer reassembles from its own
-  ; network message.
+  ; network message. The decomposed shape MAY omit "external_nullifier":
+  ; Mix's wire format (LIP-144) has no field for it, so the module derives it
+  ; from the scope and the timestamp and returns it on the reply. Only that
+  ; shape is completed this way — the canonical blob carries its own values.
   ; In both, "epoch" may be the u64 index (generate_proof's reply) or
   ; epoch[32] LE hex, and when carried it must EQUAL the timestamp's epoch.
   ; Checks, in order: the timestamp's epoch is within the current epoch
@@ -270,13 +276,18 @@ module liblogos_rln_module {
   ; poseidon(hash_to_field_le(epoch[32]), hash_to_field_le(rln_identifier)) —
   ; epoch[32] = the timestamp's epoch index as 32-byte LE (logos-delivery's
   ; toEpoch) — (application + epoch binding), then zk-validity + signal +
-  ; root-in-window. Returns a verdict object {"verdict":str}: "valid"
+  ; root-in-window. When the module derived the external nullifier the
+  ; comparison is vacuous and the same binding is enforced one step later, by
+  ; zk-validity: the value is a Groth16 public input. A cold root window
+  ; therefore answers not_ready for a wrong-epoch proof of that shape where a
+  ; transmitted nullifier would have answered "invalid". Returns a verdict object {"verdict":str}: "valid"
   ; (first valid proof for its nullifier), "invalid" (any failed check — not an
   ; error), "duplicate" (nullifier already seen under the same share_x — a
   ; retransmission), or "rate_limit_violation" (nullifier reused under a
-  ; different share_x — a double-signal). Only "rate_limit_violation" adds a
-  ; field: "recovered_secret" (hex), the offender's own identity secret
-  ; reconstructed from the two colliding shares. The verdict comes from an
+  ; different share_x — a double-signal). "rate_limit_violation" adds
+  ; "recovered_secret" (hex), the offender's own identity secret reconstructed
+  ; from the two colliding shares; a request whose external nullifier the
+  ; module derived gets "external_nullifier" (hex) back on any of the four. The verdict comes from an
   ; in-module nullifier log (per epoch, retained max_epoch_gap epochs,
   ; in-memory) — double-signal detection is the Module's job, not the
   ; consumer's. not_ready while the root window is cold/stale; invalid_argument

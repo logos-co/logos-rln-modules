@@ -1369,6 +1369,15 @@ fn fresh_epoch_for(registry: &str, timestamp: &str) -> Result<(u64, u64, u64, u6
 /// external nullifier equals the one recomputed from that epoch + the
 /// scope's rln_identifier. Any failure is a verdict-`invalid` condition,
 /// never an error.
+///
+/// The external-nullifier comparison is vacuous for a request that did not
+/// transmit one (the Mix shape): the caller supplies the epoch, the module
+/// derives the value, and it matches itself by construction. Nothing is lost
+/// — the derived value is a Groth16 public input, so `proof::verify` rejects
+/// a proof built for another epoch or application just the same. What does
+/// change is WHERE: that proof now reads `invalid` after the root-window
+/// check rather than before it, so a cold window answers `not_ready` where
+/// a transmitted nullifier would have answered `invalid` outright.
 fn epoch_binding_holds(
     carried: Option<u64>,
     bound: &[u8; 32],
@@ -1396,6 +1405,13 @@ fn epoch_binding_holds(
 /// hash_to_field_le(rln_identifier))` (epoch[32] = the index as 32-byte LE)
 /// — a stale, epoch-shifted, or cross-application proof is
 /// `verdict:invalid`.
+///
+/// A DECOMPOSED proof may omit `external_nullifier`: Mix's wire format
+/// (LIP-144) has no field for it, so the module derives it from the scope
+/// and the timestamp, verifies against that binding, and echoes the value
+/// back on the reply for Mix's own coordination. See [`epoch_binding_holds`]
+/// for what that moves. The canonical-blob shape is never completed this
+/// way — its public values come out of the bytes.
 ///
 /// The reply is a verdict, not a bool. A validated proof is judged against
 /// the in-memory nullifier log (retention = `max_epoch_gap` epochs): fresh
@@ -1425,18 +1441,24 @@ fn validate_proof_impl(
         .ok_or_else(|| ApiError::new(ErrorKind::InvalidArgument, "signal must be hex"))?;
     let mut proof_value: serde_json::Value = serde_json::from_str(proof_json)
         .map_err(|e| ApiError::new(ErrorKind::InvalidArgument, &format!("proof_json: {e}")))?;
-    // Mix omits this derivable public input on the network. Reconstruct it
-    // from the trusted request scope; cryptographic verification still binds
-    // the received proof to this application and epoch.
-    let derive_external_nullifier = proof_value.get("root").is_some()
-        && proof_value.get("external_nullifier").is_none();
-    if derive_external_nullifier {
-        proof_value["external_nullifier"] = serde_json::Value::String(
-            registry_id::bytes_to_hex(&proof::expected_external_nullifier(
-                expected_epoch, &rln_identifier,
-            )),
-        );
+    // Mix omits this derivable public input on the network (LIP-144's
+    // RateLimitProof has no field for it). Reconstruct it from the trusted
+    // request scope and echo it back on every verdict below — Mix keys its
+    // own coordination on the value. Only the decomposed shape can be
+    // completed this way; the canonical blob carries its own public values.
+    let derived = (proof::RateLimitProof::is_decomposed(&proof_value)
+        && proof_value.get("external_nullifier").is_none())
+    .then(|| proof::expected_external_nullifier(expected_epoch, &rln_identifier));
+    if let Some(external_nullifier) = derived {
+        proof_value["external_nullifier"] =
+            serde_json::Value::String(registry_id::bytes_to_hex(&external_nullifier));
     }
+    let verdict = |view: views::VerdictReply| {
+        ok_json(match derived {
+            Some(en) => view.derived_external_nullifier(registry_id::bytes_to_hex(&en)),
+            None => view,
+        })
+    };
     let rlp = proof::RateLimitProof::from_json(&proof_value).map_err(proof_error)?;
 
     // Application + epoch binding first — pure local computation, so a stale
@@ -1445,7 +1467,7 @@ fn validate_proof_impl(
     let bound = rlp.external_nullifier();
     if !epoch_binding_holds(rlp.epoch(), &bound, &rln_identifier, expected_epoch, now_epoch, gap)
     {
-        return ok_json(views::VerdictReply::verdict("invalid"));
+        return verdict(views::VerdictReply::verdict("invalid"));
     }
 
     // Root window BEFORE any log touch: a cold/stale window is NOT_READY, never
@@ -1459,11 +1481,11 @@ fn validate_proof_impl(
     // roots::nudge shorten it.
     if !window.contains(&rlp.root()) {
         roots::nudge();
-        return ok_json(views::VerdictReply::verdict("invalid"));
+        return verdict(views::VerdictReply::verdict("invalid"));
     }
     if !proof::verify(&rlp, &signal, &window).map_err(proof_error)? {
         // Invalid proofs are NOT logged — only a validated nullifier counts.
-        return ok_json(views::VerdictReply::verdict("invalid"));
+        return verdict(views::VerdictReply::verdict("invalid"));
     }
 
     // The retention floor stays wall-clock-derived: a caller-chosen
@@ -1487,13 +1509,7 @@ fn validate_proof_impl(
             views::VerdictReply::rate_limit_violation(recovered_secret)
         }
     };
-    let mut reply = ok_json(view)?;
-    if derive_external_nullifier {
-        reply["external_nullifier"] = serde_json::Value::String(
-            registry_id::bytes_to_hex(&bound),
-        );
-    }
-    Ok(reply)
+    verdict(view)
 }
 
 /// Spec get_epoch_quota(scope, timestamp): the epoch of the supplied
@@ -2311,15 +2327,63 @@ mod tests {
         wire.as_object_mut().unwrap().remove("external_nullifier");
         let wire = wire.to_string();
         let time = timestamp.to_string();
-        let wrong = validate_proof_impl(&registry, &"aa".repeat(32), &signal_hex, &time, &wire).unwrap();
-        assert_eq!(wrong["verdict"], "invalid");
-        let wrong = validate_proof_impl(&registry, &scope, "00", &time, &wire).unwrap();
-        assert_eq!(wrong["verdict"], "invalid");
+        let expected_en = registry_id::bytes_to_hex(&proof.external_nullifier());
+
+        // Deriving the value costs neither binding: a foreign application and
+        // a tampered signal both still read `invalid` — the derived nullifier
+        // is a Groth16 public input, not a trusted field. The echo rides
+        // along on those verdicts too, so a consumer reads one shape.
+        let foreign =
+            validate_proof_impl(&registry, &"aa".repeat(32), &signal_hex, &time, &wire).unwrap();
+        assert_eq!(foreign["verdict"], "invalid");
+        assert!(foreign["external_nullifier"].is_string());
+        let tampered = validate_proof_impl(&registry, &scope, "00", &time, &wire).unwrap();
+        assert_eq!(tampered["verdict"], "invalid");
+
         let valid = validate_proof_impl(&registry, &scope, &signal_hex, &time, &wire).unwrap();
         assert_eq!(valid["verdict"], "valid");
-        assert_eq!(valid["external_nullifier"], registry_id::bytes_to_hex(&proof.external_nullifier()));
+        assert_eq!(valid["external_nullifier"], expected_en);
         let duplicate = validate_proof_impl(&registry, &scope, &signal_hex, &time, &wire).unwrap();
         assert_eq!(duplicate["verdict"], "duplicate");
+        assert_eq!(duplicate["external_nullifier"], expected_en);
+
+        // A transmitted nullifier is left alone: no derivation, no echo.
+        let transmitted = proof.to_json().to_string();
+        let plain =
+            validate_proof_impl(&registry, &scope, &signal_hex, &time, &transmitted).unwrap();
+        assert_eq!(plain["verdict"], "duplicate");
+        assert!(plain.get("external_nullifier").is_none());
+    }
+
+    // The gate is the 128-byte proof, not the presence of `root`. A canonical
+    // blob carries its own public values, so stripping the decoded
+    // `external_nullifier` off its JSON changes nothing — same verdict, and
+    // no echo, because the module derived nothing.
+    #[test]
+    fn validate_proof_impl_never_derives_for_the_canonical_blob() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        nullifier_log::reset_for_test();
+        start_impl(r#"{"epoch_size_sec": 10, "max_epoch_gap": 3}"#).unwrap();
+        let registry = format!("logos:local:{}", "ad".repeat(32));
+        let id = [4u8; 32];
+        let scope = registry_id::bytes_to_hex(&id);
+        let signal = b"canonical packet";
+        let signal_hex = registry_id::bytes_to_hex(signal);
+        let timestamp = now_unix();
+        let proof = proof::generate_for_test(&[3u8; 32], signal, timestamp / 10, &id);
+        roots::set_window_for_test(&registry, vec![proof.root()], timestamp);
+        let mut wire = proof.to_json();
+        {
+            let o = wire.as_object_mut().unwrap();
+            o.insert("proof".into(), proof.canonical_hex().into());
+            o.remove("external_nullifier");
+        }
+        assert!(!proof::RateLimitProof::is_decomposed(&wire));
+        let wire = wire.to_string();
+        let time = timestamp.to_string();
+        let valid = validate_proof_impl(&registry, &scope, &signal_hex, &time, &wire).unwrap();
+        assert_eq!(valid["verdict"], "valid");
+        assert!(valid.get("external_nullifier").is_none());
     }
 
     // An epoch-less proof (the decomposed spec shape may omit "epoch") is
