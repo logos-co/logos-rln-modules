@@ -466,7 +466,7 @@ pub fn decode_membership(account_data: &[u8]) -> Result<MembershipState, RlnErro
 
 /// Extract the timestamp from fetched CLOCK_50 account data (borsh
 /// `ClockAccountData { block_id: u64, timestamp: u64 }` — LE u64 at 8..16).
-pub fn decode_clock_timestamp(account_data: &[u8]) -> Result<u64, RlnError> {
+pub fn decode_clock_timestamp_ms(account_data: &[u8]) -> Result<u64, RlnError> {
     if account_data.len() < 16 {
         return Err(RlnError::DataTooShort);
     }
@@ -475,21 +475,24 @@ pub fn decode_clock_timestamp(account_data: &[u8]) -> Result<u64, RlnError> {
     ))
 }
 
-/// Registry-visible lifecycle state of a membership at chain time `now`.
-/// Registration sets `grace_period_start = now + active_duration`, so before
-/// grace_start the membership is active; the guest's own boundary helpers
-/// classify the remaining phases (the leaf stays in the tree through
+/// Registry-visible lifecycle state of a membership at chain time `now_ms`.
+/// Registration sets `grace_period_start_ms = now_ms + active_duration`, so
+/// before grace_start the membership is active; the guest's own boundary
+/// helpers classify the remaining phases (the leaf stays in the tree through
 /// grace_period AND expired — expired only means permissionlessly erasable).
+/// The conversion below must match the guest's or this module reports a
+/// lifecycle the chain does not enforce.
 ///
 /// Wire contract: the returned "active"/"grace_period"/"expired" strings are
 /// consumed verbatim by the membership module's store ST_ACTIVE / ST_GRACE /
 /// ST_EXPIRED consts (logos-rln-module). The two crates are
 /// deliberately decoupled — no shared type — and the contract is pinned by
 /// that crate's `membership_state_wire_strings` test.
-pub fn membership_status(grace_start: u64, grace_duration: u32, now: u64) -> &'static str {
-    if rln_layouts::is_expired(grace_start, grace_duration, now) {
+pub fn membership_status(grace_start_ms: u64, grace_duration_sec: u32, now_ms: u64) -> &'static str {
+    let grace_ms = rln_layouts::secs_to_millis(grace_duration_sec);
+    if rln_layouts::is_expired(grace_start_ms, grace_ms, now_ms) {
         "expired"
-    } else if rln_layouts::is_in_grace_period(grace_start, grace_duration, now) {
+    } else if rln_layouts::is_in_grace_period(grace_start_ms, grace_ms, now_ms) {
         "grace_period"
     } else {
         "active"
@@ -512,8 +515,8 @@ mod tests {
             total_registrations: 12_345,
             max_total_rate_limit: 1_000_000,
             current_total_rate_limit: 4_242,
-            active_duration_for_new_memberships: 100,
-            grace_period_duration_for_new_memberships: 10,
+            active_duration_for_new_memberships_sec: 100,
+            grace_period_duration_for_new_memberships_sec: 10,
         };
         borsh::to_vec(&cfg).unwrap()
     }
@@ -601,18 +604,33 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&9u64.to_le_bytes());
         data.extend_from_slice(&1_234_567u64.to_le_bytes());
-        assert_eq!(decode_clock_timestamp(&data), Ok(1_234_567));
-        assert_eq!(decode_clock_timestamp(&data[..15]), Err(RlnError::DataTooShort));
+        assert_eq!(decode_clock_timestamp_ms(&data), Ok(1_234_567));
+        assert_eq!(decode_clock_timestamp_ms(&data[..15]), Err(RlnError::DataTooShort));
     }
 
     // Boundary semantics come from the guest helpers: grace starts AT
-    // grace_start (inclusive) and expiry AT grace_start + duration (inclusive).
+    // grace_start_ms (inclusive) and expiry AT grace_start_ms + duration
+    // (inclusive), so 50 s of grace runs to grace_start_ms + 50_000.
     #[test]
     fn membership_status_boundaries() {
         assert_eq!(membership_status(1_000, 50, 999), "active");
         assert_eq!(membership_status(1_000, 50, 1_000), "grace_period");
-        assert_eq!(membership_status(1_000, 50, 1_049), "grace_period");
-        assert_eq!(membership_status(1_000, 50, 1_050), "expired");
+        assert_eq!(membership_status(1_000, 50, 50_999), "grace_period");
+        assert_eq!(membership_status(1_000, 50, 51_000), "expired");
+    }
+
+    /// The regression at the scale it was reported: a 30-day membership must
+    /// still be active an hour in.
+    #[test]
+    fn a_thirty_day_membership_is_active_an_hour_in() {
+        const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
+        let registered_ms = 1_700_000_000_000u64;
+        let start_ms = registered_ms + 30 * DAY_MS;
+        let grace_sec = 7 * 24 * 60 * 60;
+
+        assert_eq!(membership_status(start_ms, grace_sec, registered_ms + 3_600_000), "active");
+        assert_eq!(membership_status(start_ms, grace_sec, registered_ms + 31 * DAY_MS), "grace_period");
+        assert_eq!(membership_status(start_ms, grace_sec, registered_ms + 38 * DAY_MS), "expired");
     }
 
     /// A `tree_main` account long enough for `build_merkle_proof`'s guards,

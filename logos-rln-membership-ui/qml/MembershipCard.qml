@@ -93,6 +93,18 @@ Item {
             card.refreshing = false
     }
 
+    // `clock_timestamp` and `grace_period_start_timestamp` are CLOCK_50
+    // milliseconds; `grace_period_duration` is seconds. Renders a millisecond
+    // remainder as the coarsest unit that still reads as a number.
+    function humanizeMs(ms) {
+        var mins = Math.max(0, Math.round(ms / 60000))
+        if (mins < 60)
+            return mins + "m"
+        if (mins < 24 * 60)
+            return Math.round(mins / 60) + "h"
+        return Math.round(mins / (24 * 60)) + "d"
+    }
+
     function pollLive() {
         if (commitment === "") { card.refreshing = false; return }
         var cfg = M.registryConfigHex(registryId)
@@ -117,10 +129,10 @@ Item {
                 var graceLen = r.grace_period_duration
                 if (clock !== undefined && graceStart !== undefined) {
                     if (card.liveState === "active")
-                        card.timeContext = "expires in ~" + Math.max(0, Math.round((graceStart - clock) / 60)) + "m"
+                        card.timeContext = "expires in ~" + card.humanizeMs(graceStart - clock)
                     else if (card.liveState === "grace_period" && graceLen !== undefined)
                         card.timeContext = "grace ends in ~"
-                            + Math.max(0, Math.round((graceStart + graceLen - clock) / 60)) + "m"
+                            + card.humanizeMs(graceStart + graceLen * 1000 - clock)
                 }
             }
             card.readDone()

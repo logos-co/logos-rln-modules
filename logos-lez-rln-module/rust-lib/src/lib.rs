@@ -863,7 +863,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             eprintln!("get_membership: failed to fetch clock account");
             return String::new();
         };
-        let now = match native::decode_clock_timestamp(&clock_data) {
+        let now_ms = match native::decode_clock_timestamp_ms(&clock_data) {
             Ok(ts) => ts,
             Err(e) => {
                 eprintln!("get_membership: clock decode error: {e}");
@@ -872,16 +872,16 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         };
 
         serde_json::json!({
-            "clock_timestamp": now,
-            "grace_period_duration": membership.grace_period_duration,
-            "grace_period_start_timestamp": membership.grace_period_start_timestamp,
+            "clock_timestamp": now_ms,
+            "grace_period_duration": membership.grace_period_duration_sec,
+            "grace_period_start_timestamp": membership.grace_period_start_timestamp_ms,
             "leaf_index": membership.leaf_index as i64,
             "rate_limit": membership.rate_limit as i64,
             "registered": true,
             "state": native::membership_status(
-                membership.grace_period_start_timestamp,
-                membership.grace_period_duration,
-                now,
+                membership.grace_period_start_timestamp_ms,
+                membership.grace_period_duration_sec,
+                now_ms,
             ),
         })
         .to_string()

@@ -321,7 +321,7 @@ fn testnet_clock_account_decodes_to_live_chain_time() {
     let Some(dep) = testnet() else { return };
     let (data, _) = get_account(&dep.sequencer, &rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES)
         .expect("CLOCK_50 system account");
-    let chain_ms = native::decode_clock_timestamp(&data).unwrap();
+    let chain_ms = native::decode_clock_timestamp_ms(&data).unwrap();
     let wall_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -434,10 +434,10 @@ fn testnet_membership_read_absent_or_decodes_with_live_state() {
             let (clock_data, _) =
                 get_account(&dep.sequencer, &rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES)
                     .expect("CLOCK_50");
-            let now = native::decode_clock_timestamp(&clock_data).unwrap();
+            let now = native::decode_clock_timestamp_ms(&clock_data).unwrap();
             let state = native::membership_status(
-                membership.grace_period_start_timestamp,
-                membership.grace_period_duration,
+                membership.grace_period_start_timestamp_ms,
+                membership.grace_period_duration_sec,
                 now,
             );
             eprintln!(
