@@ -20,9 +20,11 @@
     # on macOS, a Metal toolchain stub and an unsandboxed build; the LEZ flake
     # supplies all of that and a module flake cannot.
     #
-    # Registration needs a configurable gas limit and a fee cap sized for it.
+    # Must match the root flake's pin: two LEZ builds in one process is the
+    # bug this comment exists to prevent. Registration needs a configurable
+    # gas limit and a fee cap sized for it.
     logos-execution-zone.url =
-      "github:richard-ramos/logos-execution-zone?rev=6752be252e441717ab934013cce101379ea4966b";
+      "github:adklempner/logos-execution-zone?rev=2fe8c5ce51c4018b31e8e144350357185db9cc48";
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:

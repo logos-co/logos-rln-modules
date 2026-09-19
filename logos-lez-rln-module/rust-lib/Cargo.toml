@@ -1,6 +1,6 @@
 [package]
 name    = "lez_rln_module"
-version = "4.0.2"
+version = "4.0.3"
 edition = "2021"
 # u64::is_multiple_of (clippy's manual_is_multiple_of fix) stabilized in 1.87;
 # the builder pins 1.94.0 (metadata.json nix.rust.toolchain).
