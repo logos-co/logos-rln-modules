@@ -335,10 +335,10 @@
       },
       "locked": {
         "dir": "logos-lez-rln-module",
-        "lastModified": 1789787426,
-        "narHash": "sha256-r1YsSXx4Z6Kv53iGZu3NrO1AjmDbLBH50a/qAUQ83cg=",
+        "lastModified": 1789787455,
+        "narHash": "sha256-VJd0fjmW+oYwcAiVNiG9fw3ecNJI0O28tMDNYvT6YmI=",
         "ref": "feat/mix-wire-binding",
-        "rev": "a023101c1a1b7499dc0b0bc769dade7258e3e6e7",
+        "rev": "212128336ccf6fd2ec51dce014ede96cff77d201",
         "revCount": 65,
         "type": "git",
         "url": "https://github.com/logos-co/logos-rln-modules"
