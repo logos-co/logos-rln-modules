@@ -19,7 +19,7 @@
     # registration needs about nine million. Nothing on the path from a module
     # into the wallet carries a gas argument, so config is the only way to
     # raise it. Drop this the moment it lands upstream.
-    logos-execution-zone.url = "github:adklempner/logos-execution-zone?rev=efad8720feb6ba581190ab8776ae93e605bae6e1";
+    logos-execution-zone.url = "github:adklempner/logos-execution-zone?rev=2fe8c5ce51c4018b31e8e144350357185db9cc48";
 
     logos-wallet-module = {
       url = "github:logos-blockchain/logos-execution-zone-module?rev=0ea57f8a1c57539d6ee0961a9cd27b064685b9e8";

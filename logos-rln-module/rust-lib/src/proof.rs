@@ -193,6 +193,18 @@ impl RateLimitProof {
     /// 32-byte LE hex): absent leaves the proof epoch-less, present decodes
     /// via [`epoch_from_bytes`] and rejects a malformed or non-canonical
     /// value outright — a bad epoch is never silently dropped.
+    /// Whether `value` is the DECOMPOSED shape — `proof` a bare 128-byte
+    /// Groth16 proof, the public values in their own fields. The exact
+    /// discriminator [`Self::from_json`] branches on, so a caller can decide
+    /// whether a missing public value is supplyable before parsing.
+    pub(crate) fn is_decomposed(value: &serde_json::Value) -> bool {
+        value
+            .get("proof")
+            .and_then(|v| v.as_str())
+            .and_then(hex_to_vec)
+            .is_some_and(|bytes| bytes.len() == GROTH16_LEN)
+    }
+
     pub(crate) fn from_json(value: &serde_json::Value) -> Result<Self, ProofError> {
         let proof_hex = value
             .get("proof")

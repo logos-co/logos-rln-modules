@@ -79,7 +79,7 @@ switch on `class`, log `kind`.
 | `register(scope, options)` | `register_membership(registry_id, rln_identifier_hex, options_json)` | tstr | public Membership view (below), `"state":"pending"` on a fresh submit; `options_json` is the RegistryOptions ARRAY (below), the common `rate_limit` key defaulted when absent |
 | `get_membership_state(scope)` | `get_membership_state(registry_id, rln_identifier_hex)` | tstr | `{"state":…}` + `membership_hash`/`leaf_index`/`rate_limit` when known |
 | `generate_proof(scope, signal, timestamp)` | `generate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp)` | result | RateLimitProof (below) + `"message_id"`, `"epoch_index"`, `"membership_hash"`; epoch derives from `timestamp` (Unix s), must be within now ± `max_epoch_gap`. Fails `permanent` (kind `permanent`) for an epoch below the membership's persisted allocation floor (backwards clock / widened `max_epoch_gap`) or an `epoch_size_sec` its allocations are not bound to — re-register to recover |
-| `validate_proof(scope, signal, timestamp, proof)` | `validate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp, proof_json)` | result | `{"verdict":str}` (see the verdict table); `rate_limit_violation` also carries `"recovered_secret":hex`. `timestamp` is the value stamped on the message under validation: the proof's epoch must EQUAL its epoch and be within now ± `max_epoch_gap`, else `"invalid"` |
+| `validate_proof(scope, signal, timestamp, proof)` | `validate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp, proof_json)` | result | `{"verdict":str}` (see the verdict table); `rate_limit_violation` also carries `"recovered_secret":hex`, and a request whose `external_nullifier` the module derived carries `"external_nullifier":hex` back on any verdict. `timestamp` is the value stamped on the message under validation: the proof's epoch must EQUAL its epoch and be within now ± `max_epoch_gap`, else `"invalid"` |
 | `get_epoch_quota(scope, timestamp)` | `get_epoch_quota(registry_id, rln_identifier_hex, timestamp)` | result | `{"epoch_index":N,"rate_limit":N,"remaining":N}` — one observation of `timestamp`'s epoch, purely local; `epoch_index` is a NUMBER (`floor(timestamp/epoch_size)`, what a QuotaProvider's `epochIndex` consumes); no usable membership → `rate_limit`/`remaining` both 0 (the wall-clock-fallback cue — never an exhausted budget); a timestamp whose epoch is outside now ± `max_epoch_gap`, below the membership's persisted allocation floor, or denominated in an `epoch_size_sec` its allocations aren't bound to fails `permanent` — the same refusals `generate_proof` would answer (spec: test a timestamp before committing to it), so `{rate_limit>0, remaining:0}` always means spendable-next-epoch |
 | registry parameters read (optional ext.) | `get_registry_parameters(registry_id, rln_identifier_hex)` | result | `{"epoch_size_sec","max_rate_limit","min_rate_limit","max_total_rate_limit","price_per_unit"}` |
 | select (multiple-membership ext.) | `select_membership(registry_id, rln_identifier_hex, selector_json)` | tstr | public Membership view |
@@ -201,6 +201,15 @@ extras:
   bytes trusted, decoded fields ignored). A decomposed proof is rebuilt and
   re-serialized, so both shapes land in the identical verified
   representation. `epoch` may cross as the 32-byte LE hex or the u64 index.
+- A DECOMPOSED proof may omit `external_nullifier`: Mix's wire format
+  (LIP-144) has no field for it, so the module derives it from the scope and
+  timestamp, verifies the proof against that binding, and returns the derived
+  `external_nullifier` on the reply for Mix's own coordination — on every
+  verdict, not only `valid`. This preserves Mix's proof wire format without
+  putting Poseidon computation in the consumer. A wrong scope or signal still
+  fails validation. The discriminator is the 128-byte `proof`, not the
+  presence of `root`: the canonical-blob shape is never completed this way,
+  because its public values come out of the bytes.
 - Frozen byte-exact vectors (identity derivation, external nullifier, signal
   hash, public values, layout): `rust-lib/src/proof.rs`,
   `proof::tests::frozen_interop_vectors`.
@@ -226,7 +235,11 @@ extras:
 - `validate_proof` enforces application binding + epoch agreement + freshness:
   the expected epoch derives from the supplied message `timestamp`; the
   proof's carried epoch, when present, must equal it; the proof's external
-  nullifier must match the scope's expected value recomputed from it; and it
+  nullifier must match the scope's expected value recomputed from it (for a
+  DERIVED nullifier that comparison is vacuous — the binding is enforced one
+  step later by zk-validity, since the value is a Groth16 public input, so a
+  cold root window answers `not_ready` there where a transmitted nullifier
+  answers `"invalid"`); and it
   must fall within the current epoch ± `max_epoch_gap`. Anything else is
   `{"verdict":"invalid"}`. Consumers implement no epoch math of their own —
   they relay the message's timestamp on both `generate_proof` and
