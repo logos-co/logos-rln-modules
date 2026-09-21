@@ -394,17 +394,17 @@
       },
       "locked": {
         "dir": "logos-lez-rln-module",
-        "lastModified": 1789176294,
-        "narHash": "sha256-JiVzu/tmInuTvOrBVQjXC18tJ7rHV0fFuoqik8A9Sng=",
-        "ref": "feat/lez-module-owns-wallet",
-        "rev": "b02b5666bc48bd59eb005e5447d90325e3ae98c2",
-        "revCount": 84,
+        "lastModified": 1790021674,
+        "narHash": "sha256-Ez5OuH1w3ro+FGMpeDGi/dHUSOgmLzm9hvJ1E3eAHm4=",
+        "ref": "main",
+        "rev": "9583801fae795b6d5fd5bfe8d4f407d14d859b9f",
+        "revCount": 62,
         "type": "git",
         "url": "https://github.com/logos-co/logos-rln-modules"
       },
       "original": {
         "dir": "logos-lez-rln-module",
-        "ref": "feat/lez-module-owns-wallet",
+        "ref": "main",
         "type": "git",
         "url": "https://github.com/logos-co/logos-rln-modules"
       }
