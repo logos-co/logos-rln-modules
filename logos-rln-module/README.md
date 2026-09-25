@@ -239,3 +239,7 @@ live chain, plus the R2/R4 architecture diagnostics — lives in
 `register` scenario. `./run.sh register --target local` there boots a local
 sequencer and runs it with zero external infra; `--target testnet` drives
 the deployed registry.
+
+`get_registry_parameters` returns the effective `epoch_size_sec` and
+`max_epoch_gap` for the requested registry, including per-registry overrides.
+Consumers can check both before accepting traffic.

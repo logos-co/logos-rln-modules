@@ -222,12 +222,14 @@ impl StopReply {
 
 /// `get_registry_parameters`'s reply — mirrors the `.lidl`
 /// `RegistryParameters` record. `epoch_size_sec` is always present (the
-/// `start()`-configured value); the registry-declared bounds appear only
+/// `start()`-configured value). `max_epoch_gap` uses the same registry override
+/// resolution as proof validation; the registry-declared bounds appear only
 /// when `get_registry_bounds` carried them. `price_per_unit` passes through
 /// opaquely (documented upstream as a decimal string).
 #[derive(Serialize)]
 pub(crate) struct RegistryParametersView {
     epoch_size_sec: u64,
+    max_epoch_gap: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_rate_limit: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -239,9 +241,10 @@ pub(crate) struct RegistryParametersView {
 }
 
 impl RegistryParametersView {
-    pub(crate) fn from_bounds(epoch_size_sec: u64, bounds: &serde_json::Value) -> Self {
+    pub(crate) fn from_bounds(epoch_size_sec: u64, max_epoch_gap: u64, bounds: &serde_json::Value) -> Self {
         RegistryParametersView {
             epoch_size_sec,
+            max_epoch_gap,
             max_rate_limit: bounds.get("max_rate_limit").and_then(|v| v.as_u64()),
             max_total_rate_limit: bounds.get("max_total_rate_limit").and_then(|v| v.as_u64()),
             min_rate_limit: bounds.get("min_rate_limit").and_then(|v| v.as_u64()),
@@ -299,5 +302,18 @@ pub(crate) struct ErrorBody {
 impl ErrorBody {
     pub(crate) fn new(class: &'static str, kind: &'static str, message: String) -> Self {
         ErrorBody { class, kind, message }
+    }
+}
+
+#[cfg(test)]
+mod registry_parameters_tests {
+    use super::*;
+
+    #[test]
+    fn registry_parameters_include_epoch_window_without_registry_bounds() {
+        let view = RegistryParametersView::from_bounds(10, 3, &serde_json::json!({}));
+        assert_eq!(serde_json::to_value(view).unwrap(), serde_json::json!({
+            "epoch_size_sec": 10, "max_epoch_gap": 3
+        }));
     }
 }

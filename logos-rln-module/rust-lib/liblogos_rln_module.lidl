@@ -102,7 +102,7 @@ module liblogos_rln_module {
     rate_limit: int
     remaining: int
   }
-  ; get_registry_parameters' reply. epoch_size_sec is always present,
+  ; get_registry_parameters' reply. epoch_size_sec and max_epoch_gap are always present,
   ; resolved for THIS registry (its start() override when one was
   ; configured, else the module default); the registry-declared bounds are
   ; present only when the registry read returned them. price_per_unit is
@@ -110,6 +110,7 @@ module liblogos_rln_module {
   ; this contract makes no assumption about its shape).
   type RegistryParameters {
     epoch_size_sec: int
+    max_epoch_gap: int
     ? max_rate_limit: int
     ? max_total_rate_limit: int
     ? min_rate_limit: int
@@ -318,7 +319,7 @@ module liblogos_rln_module {
 
   ; Registry parameters read (spec's optional extension): the
   ; registry-declared parameters that bound registration, plus the module's
-  ; configured epoch length — {"epoch_size_sec","max_rate_limit",
+  ; configured epoch window — {"epoch_size_sec","max_epoch_gap","max_rate_limit",
   ; "min_rate_limit","max_total_rate_limit","price_per_unit"}. Performs one
   ; registry read (bounds); the per-scope budget lives in get_epoch_quota.
   method get_registry_parameters(registry_id: tstr, rln_identifier_hex: tstr) -> result
