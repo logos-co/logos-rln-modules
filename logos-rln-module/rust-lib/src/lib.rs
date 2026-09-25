@@ -1538,8 +1538,8 @@ fn get_registry_parameters_impl(
     let prov = provider_of(&registry)?;
 
     let bounds = prov.get_registry_bounds(&registry)?;
-    let (epoch_size_sec, _) = epoch_params_for(&registry.canonical)?;
-    let view = views::RegistryParametersView::from_bounds(epoch_size_sec, &bounds);
+    let (epoch_size_sec, max_epoch_gap) = epoch_params_for(&registry.canonical)?;
+    let view = views::RegistryParametersView::from_bounds(epoch_size_sec, max_epoch_gap, &bounds);
     ok_json(view)
 }
 
