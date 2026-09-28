@@ -31,8 +31,9 @@
 
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::base58;
 use crate::rln_core::bytes_to_hex;
@@ -265,8 +266,10 @@ mod handle {
 use handle::Handle;
 
 pub(crate) enum Readiness {
-    /// Bring-up has not finished: still opening, importing or syncing.
-    Pending,
+    /// Bring-up has not finished: still opening, importing or syncing. The
+    /// string says what it is waiting on, for a human reading `wallet_status`;
+    /// empty until bring-up has something more specific to report.
+    Pending(String),
     /// Open and caught up to the head it last observed.
     Ready,
     /// Bring-up gave up; the string is the reason, already logged.
@@ -287,7 +290,7 @@ struct State {
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
-    readiness: Readiness::Pending,
+    readiness: Readiness::Pending(String::new()),
     payer_hex: String::new(),
     wallet: None,
 });
@@ -330,18 +333,42 @@ pub(crate) fn spawn_bring_up(persistence_path: &str) {
             PathBuf::from(persistence_path).join("wallet-home")
         }
     };
+    // One bring-up per process, ever. It retries an unreachable sequencer
+    // indefinitely, so a second call would leave two loops opening the same
+    // home against each other rather than the one wasted attempt it used to
+    // cost.
+    if BRINGUP_STARTED.swap(true, Ordering::SeqCst) {
+        eprintln!("lez-rln wallet: bring-up already running, ignoring the repeat");
+        return;
+    }
     std::thread::Builder::new()
         .name("lez-rln-wallet".to_owned())
         .spawn(move || bring_up(&home))
         .map(|_| ())
-        .unwrap_or_else(|e| fail(&format!("cannot spawn the wallet bring-up thread: {e}")));
+        .unwrap_or_else(|e| {
+            BRINGUP_STARTED.store(false, Ordering::SeqCst);
+            fail(&format!("cannot spawn the wallet bring-up thread: {e}"));
+        });
 }
+
+/// Guards `spawn_bring_up` against a second entry; see there.
+static BRINGUP_STARTED: AtomicBool = AtomicBool::new(false);
 
 fn fail(reason: &str) {
     eprintln!("lez-rln wallet: {reason}");
     let mut state = lock(&STATE);
     state.readiness = Readiness::Failed(reason.to_owned());
     SETTLED.notify_all();
+}
+
+/// Say what bring-up is waiting on, without settling it.
+///
+/// Deliberately does not notify `SETTLED`: nothing has settled, and waking
+/// every waiting handler to tell it to keep waiting would only spin them
+/// against `READY_WAIT`.
+fn pending(detail: &str) {
+    let mut state = lock(&STATE);
+    state.readiness = Readiness::Pending(detail.to_owned());
 }
 
 fn bring_up(home: &Path) {
@@ -374,13 +401,7 @@ fn bring_up(home: &Path) {
         }
     }
 
-    let handle = match open_or_create(&config_path, &storage_path, &statistics_path) {
-        Ok(h) => h,
-        Err(e) => {
-            fail(&e);
-            return;
-        }
-    };
+    let handle = open_with_retry(&config_path, &storage_path, &statistics_path);
 
     if let Err(e) = import_payer_key(&handle) {
         fail(&e);
@@ -408,6 +429,100 @@ fn bring_up(home: &Path) {
     state.readiness = Readiness::Ready;
     SETTLED.notify_all();
     eprintln!("lez-rln wallet: ready ({})", home.display());
+}
+
+/// Open the wallet, retrying for as long as it takes.
+///
+/// Opening a wallet is a chain read: `wallet_ffi_open` builds the sequencer
+/// client, which calibrates every configured endpoint and then drops any it has
+/// no statistics for — so on a fresh home an unreachable sequencer leaves the
+/// leader list empty and the open fails outright. That is the ordinary shape of
+/// a node started while the chain is down, and it used to be terminal: one
+/// failure latched `Failed`, nothing re-armed it, and the node never registered
+/// again however healthy the chain became. A node that gives up is a node that
+/// is still broken an hour after the outage ended.
+///
+/// So there is no attempt limit and no deadline, for the same reason
+/// `logos-rln-module`'s funding wait has none: nothing this module can do makes
+/// the sequencer answer sooner, and a deadline only converts a recoverable
+/// outage into a permanent one. The wallet stays `pending` throughout, which is
+/// precisely the answer that tells a consumer to come back — `failed` is
+/// reserved for the causes where waiting cannot help, and an unreachable
+/// sequencer is not one of them.
+///
+/// The FFI reports a failed open as a null handle and nothing more, so a
+/// corrupt storage file is indistinguishable here from an unreachable chain and
+/// is retried the same way. That is the right trade: the node is equally
+/// unusable under either cause, so the only cost is the word `wallet_status`
+/// prints, while the benefit is that the common cause now heals itself. The
+/// detail string carries the real error either way, and `LATCH_AFTER` makes a
+/// persistent failure say so in as many words.
+fn open_with_retry(config: &Path, storage: &Path, statistics: &Path) -> Handle {
+    /// Past this much continuous failure, keep retrying but stop implying the
+    /// wait is routine: something needs looking at.
+    const LATCH_AFTER: Duration = Duration::from_secs(600);
+
+    let start = Instant::now();
+    let mut attempt = 0_u64;
+    loop {
+        attempt += 1;
+        match open_or_create(config, storage, statistics) {
+            Ok(h) => {
+                if attempt > 1 {
+                    eprintln!(
+                        "lez-rln wallet: opened on attempt {attempt} after {}s",
+                        start.elapsed().as_secs()
+                    );
+                }
+                return h;
+            }
+            Err(e) => {
+                let waited = start.elapsed();
+                let detail = if waited >= LATCH_AFTER {
+                    format!(
+                        "cannot open the wallet after {}s and {attempt} attempts — is the \
+                         sequencer reachable? last error: {e}",
+                        waited.as_secs()
+                    )
+                } else {
+                    format!("opening the wallet: {e}")
+                };
+                // Loud on the first failure and then once per escalation, not
+                // once per attempt: at the 5s cadence a long outage would
+                // otherwise bury every other line in the node's log.
+                if attempt == 1 || waited >= LATCH_AFTER {
+                    eprintln!("lez-rln wallet: {detail}");
+                }
+                pending(&detail);
+                sleep_in_slices(open_retry_interval(waited));
+            }
+        }
+    }
+}
+
+/// Read often at first, then rarely — the cadence `logos-rln-module`'s funding
+/// wait already settled on: 5s for the first minute, 30s to ten minutes, then
+/// every five.
+fn open_retry_interval(waited: Duration) -> Duration {
+    if waited < Duration::from_secs(60) {
+        Duration::from_secs(5)
+    } else if waited < Duration::from_secs(600) {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(300)
+    }
+}
+
+/// Sleep in short slices so a five-minute backoff does not keep the process
+/// alive for five minutes past a shutdown.
+fn sleep_in_slices(total: Duration) {
+    const SLICE: Duration = Duration::from_secs(5);
+    let mut left = total;
+    while left > Duration::ZERO {
+        let step = if left < SLICE { left } else { SLICE };
+        std::thread::sleep(step);
+        left -= step;
+    }
 }
 
 #[allow(unsafe_code)]
@@ -586,7 +701,7 @@ fn wallet(who: &str) -> Option<Arc<RwLock<Handle>>> {
                 eprintln!("{who}: wallet unavailable: {reason}");
                 return None;
             }
-            Readiness::Pending => {
+            Readiness::Pending(_) => {
                 let (guard, timeout) = SETTLED
                     .wait_timeout(state, READY_WAIT)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -811,7 +926,10 @@ pub(crate) fn status_json() -> String {
     // human reading a log.
     let (name, detail) = match &state.readiness {
         Readiness::Ready => ("ready", String::new()),
-        Readiness::Pending => ("pending", "opening the wallet".to_owned()),
+        Readiness::Pending(detail) if detail.is_empty() => {
+            ("pending", "opening the wallet".to_owned())
+        }
+        Readiness::Pending(detail) => ("pending", detail.clone()),
         Readiness::Failed(reason) => ("failed", reason.clone()),
     };
     // `payer` is local configuration, never a chain read: this method is what
@@ -955,6 +1073,39 @@ mod tests {
         let s = status_json();
         assert!(s.contains(r#""state":"pending""#), "got {s}");
         assert!(s.contains(r#""ready":false"#), "got {s}");
+    }
+
+    /// An unreachable sequencer must read as `pending`, never `failed`: the
+    /// state is what a consumer branches on to decide whether to keep waiting,
+    /// and `logos-rln-module`'s provisioning pass abandons a registry for the
+    /// life of the process on `failed`.
+    #[test]
+    fn a_failed_open_stays_pending_and_says_why() {
+        pending("opening the wallet: open /nope/storage.json returned no handle");
+        let s = status_json();
+        assert!(s.contains(r#""state":"pending""#), "got {s}");
+        assert!(s.contains(r#""ready":false"#), "got {s}");
+        assert!(s.contains("returned no handle"), "detail is lost: {s}");
+        // Leave the shared state as the other tests expect to find it.
+        pending("");
+    }
+
+    /// The cadence matters more than the numbers: a retry that stayed at 5s
+    /// would hammer a dead endpoint for as long as the outage lasts.
+    #[test]
+    fn the_open_retry_backs_off_but_never_stops() {
+        assert_eq!(
+            open_retry_interval(Duration::from_secs(0)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            open_retry_interval(Duration::from_secs(120)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            open_retry_interval(Duration::from_secs(3600)),
+            Duration::from_secs(300)
+        );
     }
 
     #[test]

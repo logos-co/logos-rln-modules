@@ -43,13 +43,9 @@ use crate::{
 /// yet know which applications will use it.
 const REGISTRY_WIDE: &str = "";
 
-/// How long to keep waiting for the wallet.
-///
-/// A wallet that never opens is a local fault — a bad home, a locked keystore,
-/// an unreachable sequencer — and none of it gets better by waiting longer, so
-/// this one keeps a deadline. Funding is the opposite and has none; see the
-/// funding wait in `provision_one`.
-const WALLET_WAIT: Duration = Duration::from_secs(300);
+/// Past this much waiting on the wallet, say so in the recorded detail. Not a
+/// deadline — see the wallet wait in `provision_one` for why there isn't one.
+const WALLET_WAIT_NOTICE: Duration = Duration::from_secs(300);
 
 /// Poll interval, and the granularity at which both waits notice they should
 /// stop.
@@ -83,7 +79,7 @@ fn superseded(mine: u64) -> bool {
 /// has to bridge or buy the balance first. Poll tightly for the first minute so
 /// the common case is not held up, then relax: a wait measured in hours should
 /// cost a read every five minutes, not 720 an hour.
-fn funding_read_interval(waited: Duration) -> Duration {
+fn read_interval(waited: Duration) -> Duration {
     if waited < Duration::from_secs(60) {
         TICK
     } else if waited < Duration::from_secs(600) {
@@ -218,10 +214,24 @@ fn provision_one(
 
     let prov = provider_of(registry)?;
 
-    // 1. The wallet. `failed` is terminal — the sibling brings its wallet up
-    //    once and never retries — so waiting on it would be waiting forever.
+    // 1. The wallet.
+    //
+    // This wait has NO deadline either, for the same reason the funding wait
+    // below has none. The commonest cause of a wallet that is not ready yet is
+    // an unreachable sequencer — opening one is a chain read — and that is an
+    // outage, not a verdict: the sibling now retries the open for as long as it
+    // takes and stays `pending` while it does. A deadline here could only stop
+    // watching, and stopping is permanent, because `run` records Refused and
+    // `ensure::run` is entered from `start()` and nowhere else. That is exactly
+    // how a node that booted during an outage used to stay dead for the rest of
+    // the process's life, long after the chain came back.
+    //
+    // `failed` stays terminal: the sibling reserves it for the causes where
+    // waiting cannot help — no wallet home, no sequencer configured, a payer key
+    // it cannot import — and reports an unreachable chain as `pending`.
     record(&registry.canonical, Step::WaitingForWallet, "");
-    let deadline = Instant::now() + WALLET_WAIT;
+    let began = Instant::now();
+    let mut noticed = false;
     loop {
         if superseded(mine) {
             return Ok(());
@@ -238,16 +248,39 @@ fn provision_one(
                         &format!("the registry module's wallet failed to come up: {detail}"),
                     ));
                 }
+                Some("pending") => {
+                    // Surface the sibling's own reason once the wait stops
+                    // looking routine, so `get_membership_state` can say what
+                    // is holding the node up rather than only that it waits.
+                    let waited = began.elapsed();
+                    if waited >= WALLET_WAIT_NOTICE && !noticed {
+                        noticed = true;
+                        let detail = status.get("detail").and_then(|x| x.as_str()).unwrap_or("");
+                        eprintln!(
+                            "provision {}: still waiting for the wallet after {}s: {detail}",
+                            registry.canonical,
+                            waited.as_secs()
+                        );
+                        record(
+                            &registry.canonical,
+                            Step::WaitingForWallet,
+                            &format!("{}s: {detail}", waited.as_secs()),
+                        );
+                    }
+                }
                 _ => {}
             }
         }
-        if Instant::now() >= deadline {
-            return Err(ApiError::new(
-                ErrorKind::ProviderFailure,
-                "the registry module's wallet never became ready",
-            ));
+        // Sleeps at TICK granularity whatever the interval, so `stop()`'s grace
+        // join is never held open — the same discipline as the funding wait.
+        let waited = began.elapsed();
+        let due = waited + read_interval(waited);
+        while began.elapsed() < due {
+            if superseded(mine) {
+                return Ok(());
+            }
+            std::thread::sleep(TICK);
         }
-        std::thread::sleep(TICK);
     }
 
     // 2. The price. Read before the funding wait so the log can name the
@@ -323,7 +356,7 @@ fn provision_one(
                 // account, and it must not look like one.
                 Err(e) => eprintln!("provision {}: balance read failed: {}", registry.canonical, e.message),
             }
-            due = waited + funding_read_interval(waited);
+            due = waited + read_interval(waited);
         }
         std::thread::sleep(TICK);
         waited = waited.saturating_add(TICK);
@@ -438,7 +471,7 @@ mod tests {
         let probes = [0, 5, 59, 60, 120, 599, 600, 3600, 86_400];
         let mut previous = Duration::ZERO;
         for secs in probes {
-            let interval = funding_read_interval(Duration::from_secs(secs));
+            let interval = read_interval(Duration::from_secs(secs));
             // Never zero: a zero interval turns the TICK loop into a read every
             // five seconds forever, which is the cost the backoff exists to
             // avoid once a wait is measured in hours.
@@ -457,10 +490,10 @@ mod tests {
         // The first minute stays tight so an operator's script — which
         // transfers as soon as this module publishes the account — is not held
         // up by a backoff meant for human latency.
-        assert_eq!(funding_read_interval(Duration::ZERO), TICK);
+        assert_eq!(read_interval(Duration::ZERO), TICK);
         // And a day in, it is reading twelve times an hour, not 720.
         assert_eq!(
-            funding_read_interval(Duration::from_secs(86_400)),
+            read_interval(Duration::from_secs(86_400)),
             Duration::from_secs(300)
         );
     }
