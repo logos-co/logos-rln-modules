@@ -201,7 +201,14 @@ fn rpc(sequencer: &str, method: &str, params: serde_json::Value) -> serde_json::
 
 /// `(data, program_owner)` — `None` when the account is absent (the
 /// sequencer answers with empty data, exactly the module's
-/// FetchOutcome::Absent semantics). program_owner arrives as 8 LE u32 words.
+/// FetchOutcome::Absent semantics).
+///
+/// `program_owner` arrives base58-encoded, the same spelling account ids take
+/// everywhere else on this wire. It used to be 8 little-endian u32 words, and
+/// reading it that way is what these tests did until the sequencer changed
+/// shape — `as_array()` on a string, which failed five tests deep inside this
+/// one helper. Nothing in the module itself noticed: production reads accounts
+/// through `wallet_ffi`, never through this raw JSON.
 fn get_account(sequencer: &str, id: &[u8; 32]) -> Option<(Vec<u8>, [u8; 32])> {
     let result = rpc(sequencer, "getAccount", serde_json::json!([b58_encode(id)]));
     let data: Vec<u8> = result["data"]
@@ -213,13 +220,11 @@ fn get_account(sequencer: &str, id: &[u8; 32]) -> Option<(Vec<u8>, [u8; 32])> {
     if data.is_empty() {
         return None;
     }
-    let words = result["program_owner"].as_array().expect("owner words");
-    assert_eq!(words.len(), 8, "program_owner is 8 u32 words");
-    let mut owner = [0u8; 32];
-    for (i, word) in words.iter().enumerate() {
-        let w = word.as_u64().expect("owner word") as u32;
-        owner[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
-    }
+    let owner = b58_decode32(
+        result["program_owner"]
+            .as_str()
+            .expect("program_owner is a base58 string"),
+    );
     Some((data, owner))
 }
 
