@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 
 
 mod base58;
+mod networks;
 mod rln_core;
 mod wallet;
 use rln_core as native;
@@ -287,6 +288,10 @@ fn resolve_config_context(config_account_id: &str, who: &str) -> Option<RlnConfi
         eprintln!("{who}: failed to resolve config account");
         return None;
     }
+    if let Some(reason) = network_conflict(wallet::bound_network().as_deref(), &config_hex) {
+        eprintln!("{who}: {reason}");
+        return None;
+    }
     let mut owner_bytes = Vec::new();
     let Some(config_data) = fetch_account_data(&config_hex, Some(&mut owner_bytes)) else {
         eprintln!("{who}: failed to fetch config account");
@@ -318,6 +323,24 @@ fn resolve_config_context(config_account_id: &str, who: &str) -> Option<RlnConfi
     Some(RlnConfigContext {
         config_data,
         program_owner,
+    })
+}
+
+/// Why a config account must not be read through this wallet, if it must not.
+///
+/// A home bound to one network cannot serve a registry the table places on
+/// another: the account either does not exist there or, worse, is someone
+/// else's. Only a recorded binding is checked — an operator-configured home
+/// has no network name to compare — and only a config the table knows, since
+/// an unlisted registry may well live on the bound chain.
+fn network_conflict(bound: Option<&str>, config_hex: &str) -> Option<String> {
+    let bound = bound?;
+    let listed = networks::network_of_config(config_hex)?;
+    (listed.reference != bound).then(|| {
+        format!(
+            "config account {config_hex} is on network {}, but this wallet is bound to {bound}",
+            listed.reference
+        )
     })
 }
 
@@ -663,6 +686,12 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         wallet::status_json()
     }
 
+    /// Bind the wallet to the network a consumer's registry id names, or say
+    /// whether it already is. Never touches the chain.
+    fn use_network(&self, reference: String) -> String {
+        wallet::use_network(&reference)
+    }
+
     fn on_context_ready(&self, ctx: &RustModuleContext) {
         // Bring-up runs on its own thread: this hook fires on the host's Qt
         // main thread, and opening a wallet calibrates sequencers and then
@@ -998,6 +1027,18 @@ mod tests {
         assert!(current_str.contains("\"root\":\"bb"));
         let expected_tail = format!("\"valid_roots\":[\"{}\"]}}]", "ee".repeat(32));
         assert!(current_str.ends_with(&expected_tail));
+    }
+
+    #[test]
+    fn a_listed_config_on_another_network_is_refused() {
+        let devnet_config = "9d6c0f59718f05ecb3f6ae58259821bfff6594e20866d6cd2a214c53e4ec0511";
+        assert!(network_conflict(Some("devnet"), devnet_config).is_none());
+        let reason = network_conflict(Some("testnet"), devnet_config).expect("conflict");
+        assert!(reason.contains("on network devnet") && reason.contains("bound to testnet"));
+        // Operator-configured (no recorded binding): never checked.
+        assert!(network_conflict(None, devnet_config).is_none());
+        // Not in the table: it may well live on the bound chain.
+        assert!(network_conflict(Some("testnet"), &"ab".repeat(32)).is_none());
     }
 
     #[test]
