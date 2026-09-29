@@ -13,13 +13,14 @@
 
     logos-core.url = "github:logos-co/logos-cpp-sdk/25c88f4d48fa95ea4437194bcf60bd8d0cf84a74";
 
-    # v0.2.5-rc2 plus one commit: the wallet takes its execution gas limit from
-    # config instead of a 2,000,000 constant. Gas is cycles in v0.2.5, so that
-    # constant is a ceiling on how expensive a program a module may call, and a
+    # v0.2.5-rc3 plus two commits (adklempner/logos-execution-zone
+    # feat/wallet-gas-limit-rc3): the wallet takes its execution gas limit from
+    # config instead of a 2,000,000 constant, and scales its fee cap with it.
+    # Gas is cycles in v0.2.5, so that constant is a ceiling on how expensive a program a module may call, and a
     # registration needs about nine million. Nothing on the path from a module
     # into the wallet carries a gas argument, so config is the only way to
     # raise it. Drop this the moment it lands upstream.
-    logos-execution-zone.url = "github:adklempner/logos-execution-zone?rev=efad8720feb6ba581190ab8776ae93e605bae6e1";
+    logos-execution-zone.url = "github:adklempner/logos-execution-zone?rev=2fe8c5ce51c4018b31e8e144350357185db9cc48";
 
     logos-wallet-module = {
       url = "github:logos-blockchain/logos-execution-zone-module?rev=0ea57f8a1c57539d6ee0961a9cd27b064685b9e8";

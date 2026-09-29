@@ -24,7 +24,7 @@
     # config only on this fork, and a registration needs five times the stock
     # default.
     logos-execution-zone.url =
-      "github:adklempner/logos-execution-zone?rev=8e2b119ea4e18faee58c4c469943cb1beaab742a";
+      "github:adklempner/logos-execution-zone?rev=2fe8c5ce51c4018b31e8e144350357185db9cc48";
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:
