@@ -14,6 +14,10 @@ use sha2::{Digest, Sha256};
 #[derive(Clone)]
 pub(crate) struct CanonicalRegistryId {
     pub(crate) namespace: String,
+    /// The CAIP-2 chain reference (lowercased for `logos`). For a `logos` id
+    /// it names the network the registry lives on, which is how the lez
+    /// wallet learns which chain to talk to (`provider::ensure_network`).
+    pub(crate) reference: String,
     pub(crate) account: String,
     /// The canonical textual form — the only form ever compared, stored, or
     /// hashed.
@@ -87,6 +91,7 @@ pub(crate) fn parse(raw: &str) -> Result<CanonicalRegistryId, String> {
     Ok(CanonicalRegistryId {
         namespace: namespace.to_string(),
         canonical: format!("{namespace}:{reference}:{account}"),
+        reference,
         account,
     })
 }
@@ -162,8 +167,12 @@ mod tests {
     fn logos_reference_pins_to_lowercase_foreign_preserved() {
         let id = parse(&format!("logos:TestNet-1:{}", "ab".repeat(32))).unwrap();
         assert_eq!(id.canonical, format!("logos:testnet-1:{}", "ab".repeat(32)));
+        assert_eq!(id.reference, "testnet-1");
         let id = parse("eip155:59144:0xB9cd878C90E49F797B4431fBF4fb333108CB90e6").unwrap();
         assert!(id.canonical.starts_with("eip155:59144:0xB9cd"));
+        assert_eq!(id.reference, "59144");
+        let id = parse("eip155:Foo:0xB9cd").unwrap();
+        assert_eq!(id.reference, "Foo", "a foreign reference keeps its case");
     }
 
     #[test]

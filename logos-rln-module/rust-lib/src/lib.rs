@@ -1184,7 +1184,17 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
         .get("rate_limit")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(DEFAULT_RATE_LIMIT);
+    let selection_order = tracked.clone();
     worker::start(move || {
+        // First, before anything reaches the registry module: the first
+        // `logos` registry id is what binds its wallet to a network when
+        // nothing else configured one, and that must be the first one
+        // configured, not whichever the warm-up happens to reach first.
+        if let Err(payload) =
+            std::panic::catch_unwind(|| provider::select_networks(&selection_order))
+        {
+            eprintln!("membership start: network selection panicked: {payload:?}");
+        }
         if warm_roots {
             if let Err(payload) = std::panic::catch_unwind(roots::refresh_all) {
                 eprintln!("membership start: root warm-up panicked: {payload:?}");
