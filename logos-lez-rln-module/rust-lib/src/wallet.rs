@@ -766,6 +766,34 @@ pub(crate) fn bound_network() -> Option<String> {
     }
 }
 
+/// The sequencer the wallet's home is configured with; `None` until a network
+/// is selected, or when the config names none. Read from the file rather than
+/// the wallet, so it answers while bring-up is still opening the wallet.
+pub(crate) fn sequencer_addr() -> Option<String> {
+    let home = match &lock(&SELECTION).selection {
+        Selection::Bound { home, .. } => home.clone(),
+        _ => return None,
+    };
+    let path = home.join(CONFIG_FILE);
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| eprintln!("lez-rln wallet: read {}: {e}", path.display()))
+        .ok()?;
+    sequencer_of_config(&raw)
+}
+
+/// `sequencers[0].sequencer_addr`, else the flat `sequencer_addr` — the two
+/// shapes `wallet_config_json` writes, since an adopted home may carry either.
+fn sequencer_of_config(raw: &str) -> Option<String> {
+    let config: serde_json::Value = serde_json::from_str(raw).ok()?;
+    config
+        .pointer("/sequencers/0/sequencer_addr")
+        .or_else(|| config.get("sequencer_addr"))
+        .and_then(|s| s.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 // ------------------------------------------------------------------ bring-up
 
 /// Resolve the wallet home and decide what it needs. Called from
@@ -1794,6 +1822,18 @@ mod tests {
         let (reply, _) = select_network(&mut sel, "devnet");
         assert!(!reply.accepted && !reply.retry);
         assert!(reply.detail.contains("no home"));
+    }
+
+    #[test]
+    fn the_sequencer_is_read_from_either_config_shape() {
+        let seq = devnet_sequencer();
+        assert_eq!(sequencer_of_config(&wallet_config_json(&seq)), Some(seq.clone()));
+        // A flat-only config (the rc6-era shape) still names it.
+        let flat = serde_json::json!({ "sequencer_addr": seq }).to_string();
+        assert_eq!(sequencer_of_config(&flat), Some(seq));
+        assert_eq!(sequencer_of_config(r#"{"sequencers":[]}"#), None);
+        assert_eq!(sequencer_of_config(r#"{"sequencer_addr":" "}"#), None);
+        assert_eq!(sequencer_of_config("not json"), None);
     }
 
     #[test]

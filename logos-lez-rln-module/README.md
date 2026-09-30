@@ -18,7 +18,7 @@ v2.0.0 dropped the C++-era frozen wire surface: `generate_identity`,
 
 - `metadata.json` — module manifest: `codegen.rust` drives logos-module-builder
   (lidl scaffold + Qt cdylib glue). No module dependencies since 3.0.0.
-- `rust-lib/liblogos_lez_rln_module.lidl` — the module contract (10 methods,
+- `rust-lib/liblogos_lez_rln_module.lidl` — the module contract (9 methods,
   no events).
 - `rust-lib/src/wallet.rs` — the wallet this module owns: bring-up, the home it
   adopts or provisions (and for which network), and the three chain operations
@@ -27,6 +27,9 @@ v2.0.0 dropped the C++-era frozen wire surface: `generate_identity`,
   known networks (CAIP-2 reference → sequencer + registries), embedded at
   compile time. Add one from an e2e descriptor with
   `tools/add-network.sh <reference> <deployment.json>`.
+- `rust-lib/src/fee_state.rs` — `get_fee_state` (since 4.2.0): the
+  sequencer's `getFeeState` quote, read over a std-only HTTP/1.0 POST from the
+  sequencer the wallet's config names (plain http only; https answers `""`).
 - `rust-lib/src/lib.rs` — the provider implementation (the handlers).
 - `rust-lib/src/rln_core.rs` — the RLN core (tree/proof/register/funding logic),
   depending only on the shared `rln-layouts` crate.

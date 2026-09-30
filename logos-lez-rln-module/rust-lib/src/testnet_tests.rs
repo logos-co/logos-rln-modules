@@ -453,6 +453,30 @@ fn testnet_membership_read_absent_or_decodes_with_live_state() {
     }
 }
 
+/// get_fee_state's own transport (not curl) against a live sequencer: the
+/// devnet from the built-in table, or `LEZ_RLN_TESTNET_FEE_SEQUENCER`. Needs no
+/// deployment record, so it gates on LEZ_RLN_TESTNET_TESTS alone.
+#[test]
+fn testnet_fee_state_is_a_live_quote() {
+    if std::env::var("LEZ_RLN_TESTNET_TESTS").ok().as_deref() != Some("1") {
+        eprintln!("testnet test skipped: set LEZ_RLN_TESTNET_TESTS=1 to run against the live registry");
+        return;
+    }
+    let sequencer = std::env::var("LEZ_RLN_TESTNET_FEE_SEQUENCER").unwrap_or_else(|_| {
+        crate::networks::network("devnet").expect("devnet is in the table").sequencer.clone()
+    });
+    let raw = crate::fee_state::fetch(&sequencer)
+        .unwrap_or_else(|e| panic!("getFeeState against {sequencer}: {e}"));
+    let quote: serde_json::Value = serde_json::from_str(&raw).expect("the quote is JSON");
+    let field = |key: &str| {
+        quote.get(key).and_then(|v| v.as_u64()).unwrap_or_else(|| panic!("{key} missing: {raw}"))
+    };
+    assert!(field("next_base_fee_exec_ceiling") >= field("next_base_fee_exec_floor"));
+    assert!(field("next_base_fee_stor_ceiling") >= field("next_base_fee_stor_floor"));
+    assert!(field("height") > 0, "{raw}");
+    eprintln!("{sequencer}: {raw}");
+}
+
 // Offline self-checks for the helpers this file leans on (always run).
 #[test]
 fn base58_roundtrip_matches_known_vector() {
