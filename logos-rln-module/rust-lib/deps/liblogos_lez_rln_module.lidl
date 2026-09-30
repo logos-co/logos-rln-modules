@@ -7,7 +7,7 @@
 ; for per-call timeouts, like the sibling's wallet path) but the client
 ; documents the consumed wire.
 module liblogos_lez_rln_module {
-  version "4.1.0"
+  version "4.2.0"
 
   ; All replies are compact JSON strings; "" is the error value.
 
@@ -79,4 +79,15 @@ module liblogos_lez_rln_module {
   ; otherwise the answer is final. An operator-configured home accepts any
   ; reference unchecked (source "operator"). See provider::ensure_network.
   method use_network(reference: tstr) -> tstr
+
+  ; Since v4.2.0. The head fee market of the sequencer that module's wallet is
+  ; configured with — getFeeState's result passed through:
+  ; {"base_fee_exec":N,"base_fee_stor":N,"height":N,"max_gas_exec":N,
+  ;  "max_gas_stor":N,"next_base_fee_exec_ceiling":N,
+  ;  "next_base_fee_exec_floor":N,"next_base_fee_stor_ceiling":N,
+  ;  "next_base_fee_stor_floor":N}; "" before a network is selected, against an
+  ; https sequencer, and on any transport error. What a registration's fee
+  ; reserve is sized from (ensure::fee_reserve); an older sibling without the
+  ; method, or "", falls back to the wallet's fixed max_fee.
+  method get_fee_state() -> tstr
 }

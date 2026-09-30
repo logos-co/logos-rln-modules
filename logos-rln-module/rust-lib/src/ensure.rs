@@ -89,18 +89,73 @@ fn read_interval(waited: Duration) -> Duration {
     }
 }
 
-/// The fee a transaction reserves, over and above the registry's price.
+/// The execution gas limit the sibling's wallet declares for a registration:
+/// `GAS_LIMIT` in logos-lez-rln-module/rust-lib/src/wallet.rs, written into
+/// every home it provisions. A registration costs ~9.1M cycles, so the stock
+/// 2,000,000 default cannot be what an adopted home declares either.
+const DECLARED_GAS_LIMIT: u128 = 10_000_000;
+
+/// The serialized-size allowance the wallet sizes its `max_fee` against
+/// (`ASSUMED_DATA_BYTES` in the LEZ wallet). A Register tx is a few hundred
+/// bytes, so this over-reserves storage gas — by ~1% of the whole reserve.
+const ASSUMED_DATA_BYTES: u128 = 100_000;
+
+/// Headroom over the quoted ceiling for the base fee rising between the
+/// balance check and the block the Register tx lands in.
 ///
-/// The sibling declares `gas_limit = 10_000_000` and the wallet sizes its
-/// reservation as `(gas_limit + ASSUMED_DATA_BYTES) * ASSUMED_BASE_FEE`. That
-/// is ~646M against a registration price near 1M — the fee dominates the price
-/// by two to three orders of magnitude, so "can afford the price" is the wrong
-/// question and an account sized only for the price cannot transact at all.
+/// The quote's `next_*_ceiling` already bounds the NEXT block (a full one
+/// raises the base fee by at most one step, 8 -> 9 on devnet). But the check
+/// can be a read interval old by submission, and the wallet waits up to 15
+/// blocks for inclusion, so a congested stretch can outrun one step. x2 is six
+/// more full-block steps of +12.5% (1.125^6 ~ 2.03); devnet registrations
+/// measured 7.4e7-8.3e7 spent against 9.09e7 x2 reserved. Over-reserving
+/// costs nothing but a larger funding target — the reserve is refunded down
+/// to the actual fee — while under-reserving fails the Register on chain.
+const BASE_FEE_HEADROOM: u128 = 2;
+
+/// The reserve when no fee quote can be had — an older sibling without
+/// `get_fee_state`, an https sequencer, a transport error or an unparsable
+/// reply: the wallet's own declared cap, `(gas_limit + ASSUMED_DATA_BYTES) x
+/// ASSUMED_BASE_FEE (64)`, ~646M. It is what every release before 0.10.0
+/// waited for, so an older sibling keeps working exactly as it did.
+const FALLBACK_FEE_RESERVE: u128 = (DECLARED_GAS_LIMIT + ASSUMED_DATA_BYTES) * 64;
+
+/// Where a reserve came from, so the log can say when it changes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReserveBasis {
+    /// Computed from the chain's quote at this height.
+    Quote(u64),
+    Fallback,
+}
+
+/// The fee a Register tx reserves, over and above the registry's price.
 ///
-/// Duplicated rather than read: `wallet_ffi` exports no accessor for it. It is
-/// an over-estimate by design — the reserve is refunded down to the actual fee
-/// — so waiting for it is conservative, never optimistic.
-const FEE_RESERVE: u128 = (10_000_000 + 100_000) * 64;
+/// A tx's `max_fee` is only a cap: the chain checks `max_fee >= reserve` and
+/// then debits `gas_limit x base_fee_exec + data_bytes x base_fee_stor + tip`
+/// at the including block's fee state, refunded down to the actual fee. So
+/// the payer has to hold that reserve, not the cap — ~182M at devnet's base
+/// fee 8 (ceiling 9) against the cap's 646M. The fee still dominates a price
+/// near 1M, so "can afford the price" remains the wrong question.
+fn fee_reserve_from(quote: &serde_json::Value) -> Option<u128> {
+    let ceiling = |key: &str| quote.get(key).and_then(serde_json::Value::as_u64).map(u128::from);
+    let exec = ceiling("next_base_fee_exec_ceiling")?;
+    let stor = ceiling("next_base_fee_stor_ceiling")?;
+    Some(
+        DECLARED_GAS_LIMIT
+            .saturating_mul(exec)
+            .saturating_add(ASSUMED_DATA_BYTES.saturating_mul(stor))
+            .saturating_mul(BASE_FEE_HEADROOM),
+    )
+}
+
+/// The reserve from the sibling's live quote, or `FALLBACK_FEE_RESERVE`.
+fn fee_reserve(quote: Result<serde_json::Value, ApiError>) -> (u128, ReserveBasis) {
+    let computed = quote.ok().and_then(|q| {
+        let height = q.get("height").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        fee_reserve_from(&q).map(|r| (r, ReserveBasis::Quote(height)))
+    });
+    computed.unwrap_or((FALLBACK_FEE_RESERVE, ReserveBasis::Fallback))
+}
 
 /// What the task is waiting on, for `get_membership_state` to surface.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -283,10 +338,12 @@ fn provision_one(
         }
     }
 
-    // 2. The price. Read before the funding wait so the log can name the
-    //    number being waited for.
+    // 2. The price and the fee reserve. Read before the funding wait so the
+    //    log can name the number being waited for.
     let price = registration_price(prov, registry, rate_limit)?;
-    let required = price.saturating_add(FEE_RESERVE);
+    let (mut reserve, mut basis) = fee_reserve(prov.fee_state());
+    log_basis(&registry.canonical, reserve, basis);
+    let mut required = price.saturating_add(reserve);
 
     // 3. Funding. Nothing this module can do brings it about — no program
     //    mints native balance — so this waits rather than acts, and says
@@ -299,7 +356,7 @@ fn provision_one(
     record(
         &registry.canonical,
         Step::AwaitingFunding,
-        &format!("{payer} needs {required} native ({price} price + {FEE_RESERVE} fee reserve)"),
+        &format!("{payer} needs {required} native ({price} price + {reserve} fee reserve)"),
     );
     // This wait has NO deadline, and that is the point of it.
     //
@@ -319,26 +376,37 @@ fn provision_one(
     // five minutes would hold shutdown open for five minutes.
     let mut waited = Duration::ZERO;
     let mut due = Duration::ZERO;
-    let mut announced: Option<u128> = None;
+    let mut announced: Option<(u128, u128)> = None;
     loop {
         if superseded(mine) {
             return Ok(());
         }
         if waited >= due {
+            // The base fee moves while a wait runs for hours, so the reserve
+            // is re-quoted with every balance read but the first, which the
+            // quote above just served.
+            if waited > Duration::ZERO {
+                let (r, b) = fee_reserve(prov.fee_state());
+                if std::mem::discriminant(&b) != std::mem::discriminant(&basis) {
+                    log_basis(&registry.canonical, r, b);
+                }
+                (reserve, basis) = (r, b);
+                required = price.saturating_add(reserve);
+            }
             match prov.payer_balance() {
                 Ok(balance) if balance >= required => break,
                 Ok(balance) => {
-                    // Announce only when the number MOVES. A wait of hours then
+                    // Announce only when a number MOVES. A wait of hours then
                     // costs a handful of lines rather than one per read, and a
                     // partial transfer — the case where somebody sent the price
                     // and not the fee reserve — still shows up.
-                    if announced != Some(balance) {
+                    if announced != Some((balance, required)) {
                         eprintln!(
                             "provision {}: waiting for {payer} to hold {required} native \
-                             ({price} price + {FEE_RESERVE} fee reserve); it holds {balance}",
+                             ({price} price + {reserve} fee reserve); it holds {balance}",
                             registry.canonical
                         );
-                        announced = Some(balance);
+                        announced = Some((balance, required));
                     }
                     // Refresh the detail too: get_membership_state is the only
                     // channel that can tell a user their node is waiting on an
@@ -348,7 +416,7 @@ fn provision_one(
                         Step::AwaitingFunding,
                         &format!(
                             "{payer} needs {required} native \
-                             ({price} price + {FEE_RESERVE} fee reserve); it holds {balance}"
+                             ({price} price + {reserve} fee reserve); it holds {balance}"
                         ),
                     );
                 }
@@ -389,6 +457,19 @@ fn provision_one(
             Ok(())
         }
         Err(e) => Err(e),
+    }
+}
+
+fn log_basis(registry: &str, reserve: u128, basis: ReserveBasis) {
+    match basis {
+        ReserveBasis::Quote(height) => eprintln!(
+            "provision {registry}: fee reserve {reserve} from the chain's fee quote at height \
+             {height}"
+        ),
+        ReserveBasis::Fallback => eprintln!(
+            "provision {registry}: no fee quote from the registry module; reserving the fixed \
+             {reserve}"
+        ),
     }
 }
 
@@ -498,31 +579,90 @@ mod tests {
         );
     }
 
+    /// A devnet `getFeeState` quote (base fee 8, next-block ceiling 9).
+    fn devnet_quote() -> serde_json::Value {
+        serde_json::json!({
+            "height": 15082, "base_fee_exec": 8, "base_fee_stor": 8,
+            "next_base_fee_exec_floor": 8, "next_base_fee_exec_ceiling": 9,
+            "next_base_fee_stor_floor": 8, "next_base_fee_stor_ceiling": 9,
+            "max_gas_exec": 10_000_000, "max_gas_stor": 1_000_000,
+        })
+    }
+
+    /// The reserve is the chain's own formula at the quoted ceiling, times the
+    /// headroom — not the wallet's cap, which is 3.5x more at this base fee.
+    #[test]
+    fn the_reserve_is_sized_from_the_quoted_ceiling() {
+        let (reserve, basis) = fee_reserve(Ok(devnet_quote()));
+        assert_eq!(basis, ReserveBasis::Quote(15082));
+        // (10M gas x 9 + 100k bytes x 9) x 2.
+        assert_eq!(reserve, 181_800_000);
+        assert!(reserve < FALLBACK_FEE_RESERVE);
+    }
+
+    /// The headroom is applied once, to the whole reserve, and a rise in the
+    /// quoted ceiling moves the reserve in step.
+    #[test]
+    fn the_headroom_multiplies_the_quoted_reserve() {
+        let unmargined = DECLARED_GAS_LIMIT * 9 + ASSUMED_DATA_BYTES * 9;
+        assert_eq!(fee_reserve_from(&devnet_quote()), Some(unmargined * BASE_FEE_HEADROOM));
+        let mut dearer = devnet_quote();
+        dearer["next_base_fee_exec_ceiling"] = 18.into();
+        dearer["next_base_fee_stor_ceiling"] = 18.into();
+        assert_eq!(fee_reserve_from(&dearer), Some(unmargined * 2 * BASE_FEE_HEADROOM));
+    }
+
+    /// No quote — an older sibling without get_fee_state, "", a transport
+    /// error, a reply that is not a quote — is the pre-0.10.0 behaviour
+    /// exactly: the wallet's fixed 646.4M cap.
+    #[test]
+    fn no_quote_falls_back_to_the_fixed_reserve() {
+        assert_eq!(FALLBACK_FEE_RESERVE, 646_400_000);
+        let fallback = (FALLBACK_FEE_RESERVE, ReserveBasis::Fallback);
+        let failure = ApiError::new(ErrorKind::ProviderFailure, "get_fee_state failed");
+        assert_eq!(fee_reserve(Err(failure)), fallback);
+        assert_eq!(fee_reserve(Ok(serde_json::json!("garbage"))), fallback);
+        assert_eq!(fee_reserve(Ok(serde_json::json!({}))), fallback);
+        let mut partial = devnet_quote();
+        partial.as_object_mut().unwrap().remove("next_base_fee_stor_ceiling");
+        assert_eq!(fee_reserve(Ok(partial)), fallback);
+        let mut stringly = devnet_quote();
+        stringly["next_base_fee_exec_ceiling"] = "9".into();
+        assert_eq!(fee_reserve(Ok(stringly)), fallback);
+    }
+
     /// The gate this module exists to get right. The fee reserve dominates the
-    /// price by two to three orders of magnitude, so an account sized for the
-    /// price alone cannot transact — and the failure it would hit is a bare
-    /// "Incorrect fee" from the sequencer, naming neither number.
+    /// price by two orders of magnitude or more, whichever way it is sized, so
+    /// an account sized for the price alone cannot transact — and the failure
+    /// it would hit is a bare "Incorrect fee" from the sequencer, naming
+    /// neither number.
     #[test]
     fn affordability_counts_the_fee_reserve_not_just_the_price() {
         let price = 100u128 * 10_000; // rate 100 at the deployed price
-        assert!(
-            FEE_RESERVE > price * 100,
-            "if the reserve ever stops dwarfing the price, revisit this gate: \
-             reserve {FEE_RESERVE}, price {price}"
-        );
-        let required = price.saturating_add(FEE_RESERVE);
-        assert!(required > price, "the requirement must exceed the price alone");
-        // An account holding exactly the price is the case that used to pass a
-        // naive check and then fail on chain.
-        assert!(price < required);
+        let (quoted, _) = fee_reserve(Ok(devnet_quote()));
+        for reserve in [quoted, FALLBACK_FEE_RESERVE] {
+            assert!(
+                reserve > price * 100,
+                "if the reserve ever stops dwarfing the price, revisit this gate: \
+                 reserve {reserve}, price {price}"
+            );
+            // An account holding exactly the price is the case that used to
+            // pass a naive check and then fail on chain.
+            assert!(price < price.saturating_add(reserve));
+        }
     }
 
-    /// The requirement must not wrap on an absurd registry price; an
+    /// Neither an absurd quote nor an absurd registry price may wrap; an
     /// unaffordable number is a correct answer, a wrapped small one is not.
     #[test]
-    fn a_saturating_price_stays_unaffordable() {
-        let required = u128::MAX.saturating_add(FEE_RESERVE);
-        assert_eq!(required, u128::MAX);
+    fn a_saturating_price_or_quote_stays_unaffordable() {
+        let mut absurd = devnet_quote();
+        absurd["next_base_fee_exec_ceiling"] = u64::MAX.into();
+        absurd["next_base_fee_stor_ceiling"] = u64::MAX.into();
+        let (reserve, _) = fee_reserve(Ok(absurd));
+        assert!(reserve > FALLBACK_FEE_RESERVE);
+        assert_eq!(u128::MAX.saturating_add(reserve), u128::MAX);
+        assert_eq!(u128::MAX.saturating_add(FALLBACK_FEE_RESERVE), u128::MAX);
     }
 
     /// Progress is per registry, and absent until something records it —
