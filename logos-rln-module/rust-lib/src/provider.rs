@@ -28,6 +28,7 @@
 //! a Qt-affine client on the Qt main thread whoever calls it, so a worker
 //! that finds no client may create one lazily.
 
+use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -182,6 +183,139 @@ fn dispatch_recorded(
             Ok(())
         }
         None => Ok(()),
+    }
+}
+
+// ----------------------------------------------------------- network gate
+
+/// What the sibling said about serving a network, per CAIP-2 reference. Only
+/// definitive answers are kept: an accepted network stays accepted and a
+/// refused one stays refused for the life of the process (the sibling never
+/// re-points a wallet home), while a "not yet" is asked again next time.
+static NETWORK_GATE: std::sync::LazyLock<Mutex<HashMap<String, Result<(), String>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A `use_network` reply, decoded.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Gate {
+    Accepted,
+    /// Final; the sibling's reason.
+    Refused(String),
+    /// Not answerable yet (its wallet home is not resolved), or a reply that
+    /// did not say — ask again.
+    Retry,
+}
+
+/// Decode a `use_network` reply. Anything that is not an explicit answer —
+/// "", garbage, a reply missing `accepted` — is `Retry`, never `Refused`: a
+/// refusal is remembered for the life of the process, and must not be
+/// inferred from a reply that never made one.
+pub(crate) fn interpret_use_network(raw: &str) -> Gate {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Gate::Retry;
+    };
+    match v.get("accepted").and_then(serde_json::Value::as_bool) {
+        Some(true) => Gate::Accepted,
+        Some(false) if v.get("retry").and_then(serde_json::Value::as_bool) == Some(false) => {
+            Gate::Refused(
+                v.get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("refused")
+                    .to_owned(),
+            )
+        }
+        _ => Gate::Retry,
+    }
+}
+
+/// Keep a definitive answer; drop a `Retry`.
+fn remember(gate: &mut HashMap<String, Result<(), String>>, reference: &str, answer: &Gate) {
+    match answer {
+        Gate::Accepted => {
+            gate.insert(reference.to_owned(), Ok(()));
+        }
+        Gate::Refused(detail) => {
+            gate.insert(reference.to_owned(), Err(detail.clone()));
+        }
+        Gate::Retry => {}
+    }
+}
+
+fn network_refused(registry: &CanonicalRegistryId, detail: &str) -> ApiError {
+    ApiError::new(
+        ErrorKind::UnknownRegistry,
+        &format!(
+            "{}: {TARGET_MODULE} will not serve network '{}': {detail}",
+            registry.canonical, registry.reference
+        ),
+    )
+}
+
+/// Make sure the sibling's wallet serves the network this registry's id
+/// names — binding an unconfigured wallet to it, the first time one is asked.
+/// A refusal is `unknown_registry`; a wallet home the sibling has not resolved
+/// yet is `not_ready`; a sibling that does not answer is `provider_failure`
+/// (and is asked again next time).
+pub(crate) fn ensure_network(registry: &CanonicalRegistryId) -> Result<(), ApiError> {
+    if let Some(known) = lock(&NETWORK_GATE).get(&registry.reference) {
+        return known.clone().map_err(|d| network_refused(registry, &d));
+    }
+    let client = lez_client();
+    let raw = await_reply("use_network", READ_TIMEOUT, |done| {
+        client.use_network_async_with_timeout(&registry.reference, READ_TIMEOUT, done)
+    })?;
+    let answer = interpret_use_network(&raw);
+    remember(&mut lock(&NETWORK_GATE), &registry.reference, &answer);
+    match answer {
+        Gate::Accepted => Ok(()),
+        Gate::Refused(detail) => {
+            let err = network_refused(registry, &detail);
+            eprintln!("membership provider: {}", err.message);
+            Err(err)
+        }
+        Gate::Retry => Err(ApiError::new(
+            ErrorKind::NotReady,
+            &format!(
+                "{TARGET_MODULE} cannot select network '{}' yet (its wallet home is not resolved)",
+                registry.reference
+            ),
+        )),
+    }
+}
+
+/// The registries whose network `select_networks` asks about: the first of
+/// each distinct `logos` reference, in configuration order.
+fn networks_in_order(tracked: &[String]) -> Vec<CanonicalRegistryId> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for raw in tracked {
+        let Ok(registry) = crate::registry_id::parse(raw) else {
+            continue;
+        };
+        if registry.namespace != "logos" || seen.contains(&registry.reference) {
+            continue;
+        }
+        seen.push(registry.reference.clone());
+        out.push(registry);
+    }
+    out
+}
+
+/// Put the configured networks to the sibling in configuration order, so the
+/// FIRST registry id binds an unconfigured wallet — deterministically, rather
+/// than whichever registry the root refresher or provisioning happens to
+/// reach first. A registry on a different network is then refused and says
+/// so through `get_membership_state`; nothing here fails `start()`. A network
+/// the sibling cannot answer for yet is asked again by the next provider call.
+pub(crate) fn select_networks(tracked: &[String]) {
+    for registry in networks_in_order(tracked) {
+        match ensure_network(&registry) {
+            Ok(()) => eprintln!("membership start: network '{}' selected", registry.reference),
+            Err(e) => eprintln!(
+                "membership start: network '{}': {}",
+                registry.reference, e.message
+            ),
+        }
     }
 }
 
@@ -408,6 +542,7 @@ impl RegistryProvider for LezRlnProvider {
         registry: &CanonicalRegistryId,
         id_commitment_hex: &str,
     ) -> Result<ProviderMembership, ApiError> {
+        ensure_network(registry)?;
         let client = lez_client();
         let raw = read_reply(
             "get_membership",
@@ -466,6 +601,9 @@ impl RegistryProvider for LezRlnProvider {
             ApiError::new(ErrorKind::InvalidArgument, "rate_limit exceeds the wire's i64")
         })?;
 
+        // After argument validation, so a malformed call is still the
+        // caller's error whatever the network.
+        ensure_network(registry)?;
         let client = lez_client();
         dispatch_recorded("register_member", on_done, |done| {
             client.register_member_async_with_timeout(
@@ -485,6 +623,7 @@ impl RegistryProvider for LezRlnProvider {
         registry: &CanonicalRegistryId,
         leaf_index: u64,
     ) -> Result<serde_json::Value, ApiError> {
+        ensure_network(registry)?;
         let client = lez_client();
         let indices = format!("[{leaf_index}]");
         let raw = read_reply(
@@ -516,6 +655,7 @@ impl RegistryProvider for LezRlnProvider {
         &self,
         registry: &CanonicalRegistryId,
     ) -> Result<Vec<String>, ApiError> {
+        ensure_network(registry)?;
         let client = lez_client();
         let raw = read_reply(
             "get_valid_roots",
@@ -533,6 +673,7 @@ impl RegistryProvider for LezRlnProvider {
         &self,
         registry: &CanonicalRegistryId,
     ) -> Result<serde_json::Value, ApiError> {
+        ensure_network(registry)?;
         let client = lez_client();
         let raw = read_reply(
             "get_registry_bounds",
@@ -830,6 +971,81 @@ mod tests {
             .register_async(&registry, "{not json", &"11".repeat(32), 300, Box::new(|_| {}))
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument);
+    }
+
+    #[test]
+    fn use_network_replies_decode_to_a_gate() {
+        assert_eq!(
+            interpret_use_network(
+                r#"{"accepted":true,"detail":"","network":"devnet","retry":false,"source":"table"}"#
+            ),
+            Gate::Accepted
+        );
+        assert_eq!(
+            interpret_use_network(
+                r#"{"accepted":false,"detail":"bound to devnet","network":"devnet","retry":false,"source":""}"#
+            ),
+            Gate::Refused("bound to devnet".to_owned())
+        );
+        assert_eq!(
+            interpret_use_network(r#"{"accepted":false,"detail":"","retry":true}"#),
+            Gate::Retry
+        );
+        // Nothing that failed to say "refused" may be read as a refusal.
+        for raw in ["", "garbage", "[]", r#"{"accepted":false}"#, r#"{"retry":false}"#] {
+            assert_eq!(interpret_use_network(raw), Gate::Retry, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn only_definitive_answers_are_remembered() {
+        let mut gate = HashMap::new();
+        remember(&mut gate, "devnet", &Gate::Retry);
+        assert!(gate.is_empty(), "a retry must be asked again");
+        remember(&mut gate, "devnet", &Gate::Accepted);
+        remember(&mut gate, "testnet", &Gate::Refused("bound to devnet".to_owned()));
+        assert_eq!(gate.get("devnet"), Some(&Ok(())));
+        assert_eq!(gate.get("testnet"), Some(&Err("bound to devnet".to_owned())));
+    }
+
+    /// The first registry id binds an unconfigured wallet, so the order the
+    /// networks are put to the sibling is the order `start()` named them.
+    #[test]
+    fn networks_are_selected_in_configuration_order() {
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        let c = "cc".repeat(32);
+        let tracked = vec![
+            format!("logos:testnet:{a}"),
+            format!("eip155:1:0x{a}"),
+            format!("logos:devnet:{b}"),
+            format!("logos:testnet:{c}"),
+            "not a registry id".to_owned(),
+        ];
+        let picked: Vec<String> =
+            networks_in_order(&tracked).into_iter().map(|r| r.canonical).collect();
+        assert_eq!(
+            picked,
+            vec![format!("logos:testnet:{a}"), format!("logos:devnet:{b}")]
+        );
+    }
+
+    #[test]
+    fn a_remembered_refusal_is_unknown_registry() {
+        let registry =
+            registry_id::parse(&format!("logos:gate-refused-test:{}", "ab".repeat(32))).unwrap();
+        lock(&NETWORK_GATE)
+            .insert(registry.reference.clone(), Err("bound to devnet".to_owned()));
+        let err = ensure_network(&registry).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::UnknownRegistry);
+        assert!(err.message.contains("bound to devnet"), "{}", err.message);
+        // And every provider method that takes the registry refuses with it.
+        let provider = provider_for("logos").unwrap();
+        assert_eq!(
+            provider.get_valid_roots(&registry).unwrap_err().kind,
+            ErrorKind::UnknownRegistry
+        );
+        lock(&NETWORK_GATE).remove(&registry.reference);
     }
 
     #[test]

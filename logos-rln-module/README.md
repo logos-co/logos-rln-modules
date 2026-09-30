@@ -93,6 +93,12 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   for delegated registration (`rln_gifter_module.request` driven with the
   module-generated commitment and the caller's auth-vector selection; the
   vector's producer module binds the auth payload to that commitment).
+  Every registry call first passes the network gate (`ensure_network`): the
+  `logos` id's reference goes to the sibling's `use_network` (lez module
+  >= 4.1.0), which binds an unconfigured wallet to that network from its
+  built-in table; `start()` puts the configured networks to it in order
+  (`select_networks`), and a registry on another network is refused
+  `unknown_registry`.
 - `rust-lib/src/poller.rs` — confirmation + lifecycle poller: 15s-tick
   detached thread; pending→active with authoritative leaf/rate re-read, or
   pending→failed past the 300s window; 60s non-terminal state refresh with

@@ -41,7 +41,7 @@
 ; Events are a third channel, pushed over the lp event stream rather than
 ; returned from a call — see the events section below.
 module liblogos_rln_module {
-  version "0.8.0"
+  version "0.9.0"
   description "RLN Membership Management Module"
   category "blockchain"
   depends [liblogos_lez_rln_module]
@@ -413,6 +413,12 @@ module liblogos_rln_module {
   ; explicitly. Reply {"started":true,"epoch_size_sec":N,"max_epoch_gap":N,
   ; "overrides"?:{"<caip10>":{"epoch_size_sec"?:N,"max_epoch_gap"?:N},…},
   ; "registries":[…]} — overrides echoes only entries that set one.
+  ; Since 0.9.0 (needs liblogos_lez_rln_module >= 4.1.0) the reference of the
+  ; `logos` registry ids selects the registry module's wallet network when
+  ; nothing configured one: the first id's reference binds it (via
+  ; use_network, from the built-in table), and a registry on a different
+  ; network is then refused unknown_registry — start() itself does not fail;
+  ; get_membership_state shows the refusal.
   method start(config_json: tstr) -> result
 
   ; Spec stop(). Halt the maintenance tasks for real: sleeping workers wake

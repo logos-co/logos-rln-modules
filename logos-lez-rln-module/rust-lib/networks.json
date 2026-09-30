@@ -1,0 +1,20 @@
+{
+  "format": "lez-rln-networks",
+  "version": 1,
+  "networks": [
+    {
+      "reference": "devnet",
+      "description": "LEZ devnet zone 2 (v0.2.5-rc3); used by logos-rln-e2e --target devnet, no delivery preset",
+      "sequencer": "http://209.38.241.182:3140/",
+      "registries": [
+        {
+          "deployment": "devnet-z2",
+          "config_account": "BbWaV7mqVx3kAk1h8rsjZ3cACzPrT4M2J7RVQSCXrDUU",
+          "tree_id": "166d398596959b1ff0f2aa99d669f6b2db4da88677dd6a60a8a38267ec4400b9",
+          "registration_program_id": "a908a461bf129a507a927fef446262c2428a082f846a78f88a816ba0153dfab1",
+          "merkle_program_id": "a2eda7e5f8fe44b2d119db89ba16dafb1452fe128ed0d526829095fd7018492c"
+        }
+      ]
+    }
+  ]
+}

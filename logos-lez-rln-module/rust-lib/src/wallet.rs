@@ -28,6 +28,13 @@
 //! or by transfer from something already funded. A wallet created here can
 //! sign but never pay, so a funded key has to be handed in —
 //! `LEZ_RLN_PAYER_KEY` — and `LEZ_RLN_PAYER` names which account to declare.
+//!
+//! Which chain a home talks to is decided once, by `plan_home` at
+//! `on_context_ready` or, when nothing configured one, by the first
+//! `use_network` — the membership module calls it with the reference of its
+//! first registry id, looked up in the built-in table (`networks.rs`). The
+//! choice is recorded in the home's `network.json`, and a home is never
+//! re-pointed afterwards.
 
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
@@ -36,6 +43,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::base58;
+use crate::networks;
 use crate::rln_core::bytes_to_hex;
 
 /// An existing wallet home to adopt instead of provisioning one under the
@@ -50,6 +58,26 @@ const HOME_ENV: &str = "LEE_WALLET_HOME_DIR";
 /// testnet, and a module silently talking to the wrong chain is worse than one
 /// that refuses to start.
 const SEQUENCER_ENV: &str = "LEZ_RLN_SEQUENCER";
+
+/// A network from the built-in table (`networks.rs`), by CAIP-2 reference.
+/// Alone it provisions a home pointed at that network's sequencer; beside
+/// `LEZ_RLN_SEQUENCER` it only labels the home, so `use_network` can refuse a
+/// registry on another chain.
+const NETWORK_ENV: &str = "LEZ_RLN_NETWORK";
+
+/// The wallet's own config inside a home. Its presence is what makes a home
+/// "configured": this module never rewrites one.
+const CONFIG_FILE: &str = "wallet_config.json";
+
+/// Which network a home was provisioned for, `{"network":s,"source":s}`,
+/// written beside the config whenever the network is known by name. A home
+/// without one was configured by its operator and is not checked.
+const NETWORK_FILE: &str = "network.json";
+
+/// What `wallet_status` says while nothing has told this module which chain
+/// to use.
+const AWAIT_DETAIL: &str = "no network selected — no wallet_config.json, LEZ_RLN_SEQUENCER \
+     unset; liblogos_rln_module.start selects one from its registry ids";
 
 /// A funded account's private key as 32-byte hex, imported so the wallet can
 /// sign as the fee payer. Not needed when the adopted home already holds a
@@ -316,23 +344,462 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Kick bring-up on its own thread. Called from `on_context_ready`, which runs
-/// on the host's Qt main thread — opening a wallet calibrates sequencers and
-/// then syncs the chain, work the loop must not be holding.
+// ------------------------------------------------------------ network choice
+
+/// Who decided which network a home talks to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// The built-in table, from `LEZ_RLN_NETWORK` or `use_network`.
+    Table,
+    /// `LEZ_RLN_NETWORK` naming the chain `LEZ_RLN_SEQUENCER` points at.
+    Env,
+}
+
+impl Source {
+    fn as_str(self) -> &'static str {
+        match self {
+            Source::Table => "table",
+            Source::Env => "env",
+        }
+    }
+}
+
+/// What a home is known to be pointed at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Binding {
+    /// Configured outside the table — a staged home without a marker, or
+    /// `LEZ_RLN_SEQUENCER` alone. Its network has no name here, so nothing is
+    /// checked against it.
+    Operator,
+    /// Recorded in `network.json`.
+    Recorded { network: String, source: Source },
+}
+
+/// The environment `plan_home` reads, trimmed; empty means unset. A struct
+/// rather than `std::env` so the tests can say what they mean without
+/// mutating the process environment under a parallel test runner.
+pub(crate) struct EnvView {
+    pub(crate) sequencer: String,
+    /// Lowercased: a CAIP-2 `logos` reference is.
+    pub(crate) network: String,
+}
+
+impl EnvView {
+    fn from_env() -> Self {
+        let read = |name: &str| std::env::var(name).unwrap_or_default().trim().to_owned();
+        Self {
+            sequencer: read(SEQUENCER_ENV),
+            network: read(NETWORK_ENV).to_ascii_lowercase(),
+        }
+    }
+}
+
+/// How bring-up should treat a home, decided before anything is written.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Plan {
+    /// The home is configured already: open it as it stands.
+    Adopt(Binding),
+    /// Write a config for `sequencer` (and the marker the binding implies),
+    /// then open.
+    Provision { sequencer: String, binding: Binding },
+    /// Nothing says which chain: wait for `use_network`.
+    AwaitSelection,
+    /// Bring-up cannot start, and waiting will not change that.
+    Failed(String),
+}
+
+/// Decide what a home needs, in precedence order: an existing config (never
+/// rewritten — adopting a home means adopting the chain it already points at,
+/// and re-pointing a wallet that holds registered memberships would strand
+/// them), then `LEZ_RLN_SEQUENCER` (optionally labelled by `LEZ_RLN_NETWORK`),
+/// then `LEZ_RLN_NETWORK` alone through the table, then nothing — which is not
+/// a failure since 4.1.0, because the consumer's registry id can still name
+/// the network.
+pub(crate) fn plan_home(home: &Path, env: &EnvView) -> Plan {
+    if home.join(CONFIG_FILE).exists() {
+        return match read_marker(home) {
+            Ok(binding) => Plan::Adopt(binding.unwrap_or(Binding::Operator)),
+            Err(e) => Plan::Failed(e),
+        };
+    }
+    if !env.sequencer.is_empty() {
+        let binding = if env.network.is_empty() {
+            Binding::Operator
+        } else {
+            Binding::Recorded { network: env.network.clone(), source: Source::Env }
+        };
+        return Plan::Provision { sequencer: env.sequencer.clone(), binding };
+    }
+    if !env.network.is_empty() {
+        return match networks::network(&env.network) {
+            Some(n) => Plan::Provision {
+                sequencer: n.sequencer.clone(),
+                binding: Binding::Recorded { network: n.reference.clone(), source: Source::Table },
+            },
+            None => Plan::Failed(format!(
+                "{NETWORK_ENV}: {}",
+                unknown_network(&env.network)
+            )),
+        };
+    }
+    Plan::AwaitSelection
+}
+
+fn unknown_network(reference: &str) -> String {
+    format!(
+        "unknown network '{reference}' (known: {}); set {SEQUENCER_ENV} or {HOME_ENV}",
+        networks::known_references().join(", ")
+    )
+}
+
+/// The home's `network.json`, if it has one. A marker that exists but does not
+/// parse is an error rather than "no marker": reading it as operator-configured
+/// would silently switch the network check off.
+fn read_marker(home: &Path) -> Result<Option<Binding>, String> {
+    let path = home.join(NETWORK_FILE);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let doc: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
+    let network = doc.get("network").and_then(|v| v.as_str()).unwrap_or_default();
+    let source = match doc.get("source").and_then(|v| v.as_str()) {
+        Some("table") => Source::Table,
+        Some("env") => Source::Env,
+        other => return Err(format!("{}: unknown source {other:?}", path.display())),
+    };
+    if network.is_empty() {
+        return Err(format!("{} names no network", path.display()));
+    }
+    Ok(Some(Binding::Recorded { network: network.to_owned(), source }))
+}
+
+/// Write a home's config and marker. The marker goes first: a crash between
+/// the two leaves a marker with no config, which the next start ignores and
+/// overwrites, whereas the other order would leave a config that reads as
+/// operator-configured and so is never checked. Each file is written to a
+/// sibling and renamed into place, so neither is ever seen half-written.
+fn provision_home(home: &Path, sequencer: &str, binding: &Binding) -> Result<(), String> {
+    std::fs::create_dir_all(home).map_err(|e| format!("create {}: {e}", home.display()))?;
+    let marker = home.join(NETWORK_FILE);
+    match binding {
+        Binding::Recorded { network, source } => {
+            let doc = serde_json::json!({ "network": network, "source": source.as_str() });
+            write_atomic(&marker, &doc.to_string())?;
+        }
+        // A marker left by an interrupted provisioning must not outlive it and
+        // bind a home the operator has since pointed elsewhere.
+        Binding::Operator => match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("remove {}: {e}", marker.display())),
+        },
+    }
+    write_atomic(&home.join(CONFIG_FILE), &wallet_config_json(sequencer))
+}
+
+fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, contents).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))
+}
+
+/// Where network selection stands.
+enum Selection {
+    /// `on_context_ready` has not run, so the home is not known yet.
+    Unresolved,
+    /// The home is known and unconfigured; bring-up waits for `use_network`.
+    Awaiting(PathBuf),
+    /// Configured; bring-up has been started for it.
+    Bound { home: PathBuf, binding: Binding },
+    /// Bring-up cannot start; the reason, already reported.
+    Failed(String),
+}
+
+struct Selector {
+    selection: Selection,
+    /// `use_network` against an operator-configured home says once that it is
+    /// not checking, not once per registry per restart of the consumer.
+    operator_noted: bool,
+}
+
+/// Serializes network selection: two consumers naming two networks at once
+/// must not both find the home unconfigured.
+///
+/// Lock order: `SELECTION` before `STATE`, never the reverse — `pending` and
+/// `fail` take `STATE` while this is held.
+static SELECTION: Mutex<Selector> = Mutex::new(Selector {
+    selection: Selection::Unresolved,
+    operator_noted: false,
+});
+
+/// What a selection step asks the caller to do once it has decided.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    None,
+    Start(PathBuf),
+    Await,
+    Fail(String),
+}
+
+/// Run an `Action`. Kept apart from the decisions so the tests can make them
+/// without spawning a bring-up thread or touching the shared state.
+fn perform(action: Action) {
+    match action {
+        Action::None => {}
+        Action::Start(home) => start_bring_up(home),
+        Action::Await => pending(AWAIT_DETAIL),
+        Action::Fail(reason) => fail(&reason),
+    }
+}
+
+/// Record a plan's outcome and say what to do about it.
+fn apply_plan(sel: &mut Selector, home: PathBuf, plan: Plan) -> Action {
+    match plan {
+        Plan::Adopt(binding) => {
+            log_binding("adopting", &home, &binding);
+            sel.selection = Selection::Bound { home: home.clone(), binding };
+            Action::Start(home)
+        }
+        Plan::Provision { sequencer, binding } => {
+            if let Err(e) = provision_home(&home, &sequencer, &binding) {
+                sel.selection = Selection::Failed(e.clone());
+                return Action::Fail(e);
+            }
+            log_binding(&format!("provisioned for {sequencer}"), &home, &binding);
+            sel.selection = Selection::Bound { home: home.clone(), binding };
+            Action::Start(home)
+        }
+        Plan::AwaitSelection => {
+            eprintln!("lez-rln wallet: {} — {AWAIT_DETAIL}", home.display());
+            sel.selection = Selection::Awaiting(home);
+            Action::Await
+        }
+        Plan::Failed(reason) => {
+            sel.selection = Selection::Failed(reason.clone());
+            Action::Fail(reason)
+        }
+    }
+}
+
+fn log_binding(what: &str, home: &Path, binding: &Binding) {
+    match binding {
+        Binding::Operator => eprintln!("lez-rln wallet: {what} {} (operator-configured)", home.display()),
+        Binding::Recorded { network, source } => eprintln!(
+            "lez-rln wallet: {what} {} (network {network}, from {})",
+            home.display(),
+            source.as_str()
+        ),
+    }
+}
+
+/// `use_network`'s reply.
+#[derive(Debug, PartialEq, Eq)]
+struct NetworkReply {
+    accepted: bool,
+    detail: String,
+    /// The network the home serves under the requested name: the recorded
+    /// one, the requested one for an operator-configured home, "" if none.
+    network: String,
+    /// Not accepted YET: the home is not known, ask again.
+    retry: bool,
+    /// "table" | "env" | "operator"; "" when nothing is bound.
+    source: &'static str,
+}
+
+impl NetworkReply {
+    fn refused(detail: String, network: &str) -> Self {
+        Self { accepted: false, detail, network: network.to_owned(), retry: false, source: "" }
+    }
+
+    fn to_json(&self) -> String {
+        serde_json::json!({
+            "accepted": self.accepted,
+            "detail": self.detail,
+            "network": self.network,
+            "retry": self.retry,
+            "source": self.source,
+        })
+        .to_string()
+    }
+}
+
+/// Decide a `use_network` request against where selection stands. Writes the
+/// home's files when it binds one; the returned `Action` is what the caller
+/// still has to do.
+fn select_network(sel: &mut Selector, reference: &str) -> (NetworkReply, Action) {
+    let reference = reference.trim().to_ascii_lowercase();
+    let home = match &sel.selection {
+        Selection::Unresolved => {
+            return (
+                NetworkReply {
+                    accepted: false,
+                    detail: "the wallet home is not resolved yet".to_owned(),
+                    network: String::new(),
+                    retry: true,
+                    source: "",
+                },
+                Action::None,
+            )
+        }
+        Selection::Failed(reason) => {
+            return (
+                NetworkReply::refused(format!("the wallet cannot come up: {reason}"), ""),
+                Action::None,
+            )
+        }
+        Selection::Bound { home, binding } => {
+            return (answer_bound(home, binding, &reference, &mut sel.operator_noted), Action::None)
+        }
+        Selection::Awaiting(home) => home.clone(),
+    };
+
+    // Re-checked under the lock: a home someone configured since bring-up
+    // looked is adopted as it stands, never overwritten.
+    if home.join(CONFIG_FILE).exists() {
+        let action = apply_plan(sel, home.clone(), plan_home(&home, &EnvView {
+            sequencer: String::new(),
+            network: String::new(),
+        }));
+        let reply = match &sel.selection {
+            Selection::Bound { home, binding } => {
+                answer_bound(home, binding, &reference, &mut sel.operator_noted)
+            }
+            Selection::Failed(reason) => {
+                NetworkReply::refused(format!("the wallet cannot come up: {reason}"), "")
+            }
+            _ => NetworkReply::refused("the wallet home changed under selection".to_owned(), ""),
+        };
+        return (reply, action);
+    }
+
+    let Some(network) = networks::network(&reference) else {
+        return (NetworkReply::refused(unknown_network(&reference), ""), Action::None);
+    };
+    let binding = Binding::Recorded { network: network.reference.clone(), source: Source::Table };
+    let action = apply_plan(
+        sel,
+        home,
+        Plan::Provision { sequencer: network.sequencer.clone(), binding },
+    );
+    let reply = match &action {
+        Action::Fail(e) => NetworkReply::refused(e.clone(), ""),
+        _ => NetworkReply {
+            accepted: true,
+            detail: String::new(),
+            network: network.reference.clone(),
+            retry: false,
+            source: Source::Table.as_str(),
+        },
+    };
+    (reply, action)
+}
+
+fn answer_bound(
+    home: &Path,
+    binding: &Binding,
+    reference: &str,
+    operator_noted: &mut bool,
+) -> NetworkReply {
+    match binding {
+        Binding::Operator => {
+            if !*operator_noted {
+                *operator_noted = true;
+                eprintln!(
+                    "lez-rln wallet: {} was configured by its operator — network '{reference}' \
+                     is not checked against it",
+                    home.display()
+                );
+            }
+            NetworkReply {
+                accepted: true,
+                detail: "operator-configured home; the network is not checked".to_owned(),
+                network: reference.to_owned(),
+                retry: false,
+                source: "operator",
+            }
+        }
+        Binding::Recorded { network, source } if network == reference => NetworkReply {
+            accepted: true,
+            detail: String::new(),
+            network: network.clone(),
+            retry: false,
+            source: source.as_str(),
+        },
+        Binding::Recorded { network, .. } => NetworkReply::refused(
+            format!(
+                "wallet home {} is bound to network {network}; refusing to re-point it to \
+                 {reference}",
+                home.display()
+            ),
+            network,
+        ),
+    }
+}
+
+/// Bind this module's wallet to the network a consumer's registry id names,
+/// if nothing has bound it yet; otherwise say whether it matches. See
+/// `select_network` and the `.lidl` for the reply.
+pub(crate) fn use_network(reference: &str) -> String {
+    let mut sel = lock(&SELECTION);
+    let (reply, action) = select_network(&mut sel, reference);
+    if !reply.retry {
+        eprintln!(
+            "lez-rln wallet: use_network({reference}) -> accepted={} {}",
+            reply.accepted, reply.detail
+        );
+    }
+    perform(action);
+    reply.to_json()
+}
+
+/// The network the wallet's home is recorded as bound to; `None` while
+/// unbound or operator-configured.
+pub(crate) fn bound_network() -> Option<String> {
+    match &lock(&SELECTION).selection {
+        Selection::Bound { binding: Binding::Recorded { network, .. }, .. } => {
+            Some(network.clone())
+        }
+        _ => None,
+    }
+}
+
+// ------------------------------------------------------------------ bring-up
+
+/// Resolve the wallet home and decide what it needs. Called from
+/// `on_context_ready`, which runs on the host's Qt main thread — so the only
+/// work done here is a few small file writes; opening a wallet calibrates
+/// sequencers and then syncs the chain, and that runs on its own thread.
 pub(crate) fn spawn_bring_up(persistence_path: &str) {
+    let mut sel = lock(&SELECTION);
+    if !matches!(sel.selection, Selection::Unresolved) {
+        eprintln!("lez-rln wallet: bring-up already resolved, ignoring the repeat");
+        return;
+    }
     let home = match std::env::var(HOME_ENV) {
         Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir.trim()),
         _ => {
             if persistence_path.is_empty() {
-                fail(&format!(
+                let reason = format!(
                     "no instance_persistence_path from the host and no {HOME_ENV} — the wallet \
                      has nowhere to live"
-                ));
+                );
+                sel.selection = Selection::Failed(reason.clone());
+                fail(&reason);
                 return;
             }
             PathBuf::from(persistence_path).join("wallet-home")
         }
     };
+    let plan = plan_home(&home, &EnvView::from_env());
+    let action = apply_plan(&mut sel, home, plan);
+    perform(action);
+}
+
+/// Open a configured home on its own thread.
+fn start_bring_up(home: PathBuf) {
     // One bring-up per process, ever. It retries an unreachable sequencer
     // indefinitely, so a second call would leave two loops opening the same
     // home against each other rather than the one wasted attempt it used to
@@ -376,30 +843,10 @@ fn bring_up(home: &Path) {
         fail(&format!("create {}: {e}", home.display()));
         return;
     }
-    let config_path = home.join("wallet_config.json");
+    // The config is in place by now: `plan_home` adopted it or wrote it.
+    let config_path = home.join(CONFIG_FILE);
     let storage_path = home.join("storage.json");
     let statistics_path = home.join("statistics.json");
-
-    // An existing config is authoritative and is never rewritten: adopting a
-    // home means adopting the chain it already points at, and re-pointing a
-    // wallet that holds registered memberships would strand them. Only a home
-    // we provision ourselves needs to be told a sequencer.
-    if !config_path.exists() {
-        let sequencer = std::env::var(SEQUENCER_ENV).unwrap_or_default();
-        let sequencer = sequencer.trim();
-        if sequencer.is_empty() {
-            fail(&format!(
-                "{} has no wallet_config.json and {SEQUENCER_ENV} is unset — this module owns \
-                 its own wallet and needs to be told which sequencer it talks to",
-                home.display()
-            ));
-            return;
-        }
-        if let Err(e) = std::fs::write(&config_path, wallet_config_json(sequencer)) {
-            fail(&format!("write {}: {e}", config_path.display()));
-            return;
-        }
-    }
 
     let handle = open_with_retry(&config_path, &storage_path, &statistics_path);
 
@@ -919,6 +1366,8 @@ pub(crate) fn native_balance(account_hex: &str) -> Option<(String, u128)> {
 /// What the module can say about its wallet without one being open — the read
 /// a consumer uses to tell "still coming up" from "broken".
 pub(crate) fn status_json() -> String {
+    // Read before `STATE` is taken: see SELECTION's lock order.
+    let network = bound_network().unwrap_or_default();
     let state = lock(&STATE);
     // `state` is the field a consumer branches on, because the distinction
     // that matters is not ready-or-not but retry-or-give-up: "pending" means
@@ -936,8 +1385,11 @@ pub(crate) fn status_json() -> String {
     // a consumer polls to tell "coming up" from "broken", so it must not be
     // able to block or fail on a sequencer round trip. What that account can
     // afford is get_native_balance's question.
+    // `network` is the recorded binding, "" while unbound or when the home was
+    // configured by its operator (whose network this module cannot name).
     serde_json::json!({
         "detail": detail,
+        "network": network,
         "payer": state.payer_hex,
         "ready": name == "ready",
         "state": name,
@@ -1119,6 +1571,235 @@ mod tests {
             "",
         );
         assert_eq!(out, "");
+    }
+
+    // ---------------------------------------------------- network selection
+
+    /// A fresh, empty directory per test; removed first so a rerun starts clean.
+    fn temp_home(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("lez-rln-wallet-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn env(sequencer: &str, network: &str) -> EnvView {
+        EnvView { sequencer: sequencer.to_owned(), network: network.to_owned() }
+    }
+
+    fn selector(selection: Selection) -> Selector {
+        Selector { selection, operator_noted: false }
+    }
+
+    fn devnet_sequencer() -> String {
+        networks::network("devnet").unwrap().sequencer.clone()
+    }
+
+    #[test]
+    fn plan_adopts_an_existing_config_whatever_the_env_says() {
+        let home = temp_home("plan-adopt");
+        std::fs::write(home.join(CONFIG_FILE), "{}").unwrap();
+        assert_eq!(
+            plan_home(&home, &env("http://elsewhere/", "devnet")),
+            Plan::Adopt(Binding::Operator)
+        );
+        std::fs::write(home.join(NETWORK_FILE), r#"{"network":"devnet","source":"table"}"#)
+            .unwrap();
+        assert_eq!(
+            plan_home(&home, &env("", "")),
+            Plan::Adopt(Binding::Recorded { network: "devnet".into(), source: Source::Table })
+        );
+        // A marker that does not parse must not read as "operator": that
+        // would switch the network check off without a word.
+        std::fs::write(home.join(NETWORK_FILE), "garbage").unwrap();
+        assert!(matches!(plan_home(&home, &env("", "")), Plan::Failed(_)));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn plan_provisions_from_the_sequencer_labelled_or_not() {
+        let home = temp_home("plan-seq");
+        assert_eq!(
+            plan_home(&home, &env("http://seq/", "")),
+            Plan::Provision { sequencer: "http://seq/".into(), binding: Binding::Operator }
+        );
+        assert_eq!(
+            plan_home(&home, &env("http://seq/", "testnet")),
+            Plan::Provision {
+                sequencer: "http://seq/".into(),
+                binding: Binding::Recorded { network: "testnet".into(), source: Source::Env },
+            }
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn plan_looks_a_bare_network_up_in_the_table() {
+        let home = temp_home("plan-net");
+        assert_eq!(
+            plan_home(&home, &env("", "devnet")),
+            Plan::Provision {
+                sequencer: devnet_sequencer(),
+                binding: Binding::Recorded { network: "devnet".into(), source: Source::Table },
+            }
+        );
+        let Plan::Failed(reason) = plan_home(&home, &env("", "nosuch")) else {
+            panic!("an unknown network must fail");
+        };
+        assert!(reason.contains("unknown network 'nosuch'"), "{reason}");
+        assert!(reason.contains("devnet"), "the refusal lists what is known: {reason}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Nothing configured is a wait, not a failure: the membership module's
+    /// provisioning abandons a registry for good on `failed`, and the registry
+    /// id it is about to send can still name the network.
+    #[test]
+    fn plan_with_nothing_configured_awaits_selection() {
+        let home = temp_home("plan-await");
+        assert_eq!(plan_home(&home, &env("", "")), Plan::AwaitSelection);
+        let mut sel = selector(Selection::Unresolved);
+        assert_eq!(apply_plan(&mut sel, home.clone(), Plan::AwaitSelection), Action::Await);
+        assert!(matches!(sel.selection, Selection::Awaiting(_)));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_sequencer_labelled_with_a_network_writes_the_marker() {
+        let home = temp_home("env-marker");
+        let mut sel = selector(Selection::Unresolved);
+        let plan = plan_home(&home, &env("http://seq/", "devnet"));
+        assert_eq!(apply_plan(&mut sel, home.clone(), plan), Action::Start(home.clone()));
+        assert_eq!(
+            std::fs::read_to_string(home.join(CONFIG_FILE)).unwrap(),
+            wallet_config_json("http://seq/")
+        );
+        assert_eq!(
+            read_marker(&home).unwrap(),
+            Some(Binding::Recorded { network: "devnet".into(), source: Source::Env })
+        );
+        let (reply, _) = select_network(&mut sel, "devnet");
+        assert!(reply.accepted);
+        assert_eq!(reply.source, "env");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn use_network_before_the_home_is_known_asks_to_retry() {
+        let mut sel = selector(Selection::Unresolved);
+        let (reply, action) = select_network(&mut sel, "devnet");
+        assert!(!reply.accepted && reply.retry, "{reply:?}");
+        assert_eq!(action, Action::None);
+        assert!(reply.to_json().contains(r#""retry":true"#));
+    }
+
+    #[test]
+    fn use_network_binds_an_unconfigured_home_from_the_table() {
+        let home = temp_home("select-bind");
+        let mut sel = selector(Selection::Awaiting(home.clone()));
+        let (reply, action) = select_network(&mut sel, " DevNet ");
+        assert_eq!(
+            reply,
+            NetworkReply {
+                accepted: true,
+                detail: String::new(),
+                network: "devnet".into(),
+                retry: false,
+                source: "table",
+            }
+        );
+        assert_eq!(action, Action::Start(home.clone()));
+        assert_eq!(
+            std::fs::read_to_string(home.join(CONFIG_FILE)).unwrap(),
+            wallet_config_json(&devnet_sequencer())
+        );
+        assert_eq!(
+            read_marker(&home).unwrap(),
+            Some(Binding::Recorded { network: "devnet".into(), source: Source::Table })
+        );
+        // Bound now: a repeat is accepted and starts nothing new.
+        let (again, action) = select_network(&mut sel, "devnet");
+        assert!(again.accepted);
+        assert_eq!(action, Action::None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_unknown_network_is_refused_and_writes_nothing() {
+        let home = temp_home("select-unknown");
+        let mut sel = selector(Selection::Awaiting(home.clone()));
+        let (reply, action) = select_network(&mut sel, "nosuch");
+        assert!(!reply.accepted && !reply.retry, "{reply:?}");
+        assert!(reply.detail.contains("unknown network 'nosuch' (known: devnet"), "{}", reply.detail);
+        assert!(reply.detail.contains("LEZ_RLN_SEQUENCER or LEE_WALLET_HOME_DIR"));
+        assert_eq!(action, Action::None);
+        assert!(!home.join(CONFIG_FILE).exists());
+        assert!(!home.join(NETWORK_FILE).exists());
+        assert!(matches!(sel.selection, Selection::Awaiting(_)), "still selectable");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_home_bound_to_devnet_refuses_testnet() {
+        let home = temp_home("select-refuse");
+        let mut sel = selector(Selection::Awaiting(home.clone()));
+        assert!(select_network(&mut sel, "devnet").0.accepted);
+        let (reply, _) = select_network(&mut sel, "testnet");
+        assert!(!reply.accepted && !reply.retry);
+        assert_eq!(reply.network, "devnet");
+        assert!(
+            reply.detail.contains("is bound to network devnet; refusing to re-point it to testnet"),
+            "{}",
+            reply.detail
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_operator_home_accepts_any_network() {
+        let home = temp_home("select-operator");
+        let mut sel = selector(Selection::Bound { home: home.clone(), binding: Binding::Operator });
+        for reference in ["devnet", "testnet", "anything"] {
+            let (reply, action) = select_network(&mut sel, reference);
+            assert!(reply.accepted, "{reference}: {reply:?}");
+            assert_eq!(reply.source, "operator");
+            assert_eq!(reply.network, reference);
+            assert_eq!(action, Action::None);
+        }
+        assert!(sel.operator_noted);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A home configured after bring-up looked (a staged home dropped in) is
+    /// adopted byte for byte; use_network never overwrites a config.
+    #[test]
+    fn an_existing_config_is_left_byte_identical() {
+        let home = temp_home("select-keep");
+        let staged = r#"{"sequencer_addr":"http://staged/","custom":true}"#;
+        std::fs::write(home.join(CONFIG_FILE), staged).unwrap();
+        let mut sel = selector(Selection::Awaiting(home.clone()));
+        let (reply, action) = select_network(&mut sel, "devnet");
+        assert!(reply.accepted);
+        assert_eq!(reply.source, "operator");
+        assert_eq!(action, Action::Start(home.clone()));
+        assert_eq!(std::fs::read_to_string(home.join(CONFIG_FILE)).unwrap(), staged);
+        assert!(!home.join(NETWORK_FILE).exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_failed_home_refuses_without_retry() {
+        let mut sel = selector(Selection::Failed("no home".into()));
+        let (reply, _) = select_network(&mut sel, "devnet");
+        assert!(!reply.accepted && !reply.retry);
+        assert!(reply.detail.contains("no home"));
+    }
+
+    #[test]
+    fn status_carries_the_network_field() {
+        let s = status_json();
+        assert!(s.contains(r#""network":"#), "got {s}");
     }
 
     #[test]

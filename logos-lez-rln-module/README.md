@@ -18,16 +18,45 @@ v2.0.0 dropped the C++-era frozen wire surface: `generate_identity`,
 
 - `metadata.json` — module manifest: `codegen.rust` drives logos-module-builder
   (lidl scaffold + Qt cdylib glue). No module dependencies since 3.0.0.
-- `rust-lib/liblogos_lez_rln_module.lidl` — the module contract (9 methods, no
-  events).
+- `rust-lib/liblogos_lez_rln_module.lidl` — the module contract (10 methods,
+  no events).
 - `rust-lib/src/wallet.rs` — the wallet this module owns: bring-up, the home it
-  adopts or provisions, and the three chain operations it used to make over lp.
+  adopts or provisions (and for which network), and the three chain operations
+  it used to make over lp.
+- `rust-lib/networks.json` + `rust-lib/src/networks.rs` — the built-in table of
+  known networks (CAIP-2 reference → sequencer + registries), embedded at
+  compile time. Add one from an e2e descriptor with
+  `tools/add-network.sh <reference> <deployment.json>`.
 - `rust-lib/src/lib.rs` — the provider implementation (the handlers).
 - `rust-lib/src/rln_core.rs` — the RLN core (tree/proof/register/funding logic),
   depending only on the shared `rln-layouts` crate.
 - `rust-lib/generated/provider_gen.rs` — gitignored scaffold the nix build
   regenerates in-derivation; `nix run .#generate` materialises it for local
   `cargo check`/tests (see "Staged sources").
+
+## Configuration
+
+| Variable | Meaning |
+|---|---|
+| `LEE_WALLET_HOME_DIR` | An existing wallet home to adopt; default `<instance_persistence_path>/wallet-home`. |
+| `LEZ_RLN_SEQUENCER` | Sequencer URL for a home this module provisions. |
+| `LEZ_RLN_NETWORK` | A network from `rust-lib/networks.json`, by reference (e.g. `devnet`). Alone it provisions the home from the table; beside `LEZ_RLN_SEQUENCER` it only labels the home so a registry on another network is refused. |
+| `LEZ_RLN_PAYER` | The account that pays (base58 or hex). |
+| `LEZ_RLN_PAYER_KEY` | A funded account's private key (32-byte hex), imported at bring-up. |
+
+Which chain a home talks to, first match wins:
+
+1. the home's existing `wallet_config.json` — adopted, never rewritten;
+2. `LEZ_RLN_SEQUENCER` (plus `LEZ_RLN_NETWORK` as an optional label);
+3. `LEZ_RLN_NETWORK` alone, looked up in the table;
+4. `use_network(reference)` — `liblogos_rln_module.start` calls it with the
+   reference of its first `logos` registry id. Until then `wallet_status` is
+   `pending` ("no network selected …"), not `failed`.
+
+Cases 2-4 write `network.json` beside the config whenever the network has a
+name; a home bound that way is never re-pointed, and `use_network` refuses any
+other reference. A home without one (staged, or `LEZ_RLN_SEQUENCER` alone) is
+operator-configured and accepts any reference unchecked.
 
 ## Staged sources (not committed)
 

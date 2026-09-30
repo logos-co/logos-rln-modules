@@ -25,8 +25,14 @@
 ; unchanged on purpose: rln_gifter_module calls this method positionally from
 ; out of tree, and dropping a parameter would silently shift id_commitment_hex
 ; into the payer slot.
+; v4.1.0 added use_network and the built-in network table; additive —
+; positional callers (rln_gifter_module) unaffected. A wallet home with no
+; wallet_config.json and no LEZ_RLN_SEQUENCER now waits ("pending") for
+; use_network instead of failing; LEZ_RLN_NETWORK names a table network at
+; start-up. Precedence: an existing home config > LEZ_RLN_SEQUENCER (+ optional
+; LEZ_RLN_NETWORK label) > LEZ_RLN_NETWORK alone > use_network.
 module liblogos_lez_rln_module {
-  version "4.0.0"
+  version "4.1.0"
   description "RLN registry provider (LEZ chain reads + registration/funding txs)"
   category "blockchain"
 
@@ -89,7 +95,10 @@ module liblogos_lez_rln_module {
 
   ; Whether this module's wallet is open and usable, and which account it
   ; pays with:
-  ; {"detail":s,"payer":hex64,"ready":b,"state":"pending"|"ready"|"failed"}.
+  ; {"detail":s,"network":s,"payer":hex64,"ready":b,
+  ;  "state":"pending"|"ready"|"failed"}.
+  ; `network` (since 4.1.0) is the network the home is recorded as bound to,
+  ; "" while unbound or when the home was configured by its operator.
   ; Never fails and never touches the chain — `payer` is read from local
   ; configuration, so it answers before the first sync, and callers poll this
   ; as a liveness probe. Ask get_native_balance what that account can afford.
@@ -97,6 +106,29 @@ module liblogos_lez_rln_module {
   ; retry-or-give-up. "pending" is bring-up still in flight (open + first
   ; sync) and worth waiting on; "failed" will not resolve by waiting, and
   ; `detail` says why. Every chain-facing method answers "" until "ready".
+  ; Since 4.1.0 an unconfigured home is "pending" with the detail "no network
+  ; selected — no wallet_config.json, LEZ_RLN_SEQUENCER unset;
+  ; liblogos_rln_module.start selects one from its registry ids" until
+  ; use_network binds it.
   method wallet_status() -> tstr
+
+  ; Select the network this module's wallet talks to by the CAIP-2 reference
+  ; of a `logos` registry id (lowercased), or check it against the one already
+  ; chosen. Never touches the chain.
+  ; {"accepted":b,"detail":s,"network":s,"retry":b,
+  ;  "source":"table"|"env"|"operator"|""}.
+  ; - home not resolved yet (on_context_ready pending): accepted:false,
+  ;   retry:true — ask again.
+  ; - home unconfigured: a reference in the built-in table writes
+  ;   wallet_config.json + network.json, starts bring-up, and is accepted
+  ;   (source "table"); an unknown one is refused, listing the known ones.
+  ; - home bound to a recorded network: accepted for that reference, refused
+  ;   for any other (a home is never re-pointed).
+  ; - home configured by its operator (no network.json): accepted for any
+  ;   reference, source "operator" — the network is not checked.
+  ; Refusals are final (retry:false); `network` is the bound network on
+  ; refusal, the accepted one otherwise. Chain-facing methods also refuse a
+  ; config account the table places on a network other than the bound one.
+  method use_network(reference: tstr) -> tstr
 
 }
