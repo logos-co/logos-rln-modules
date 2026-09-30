@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 
 
 mod base58;
+mod fee_state;
 mod networks;
 mod rln_core;
 mod wallet;
@@ -690,6 +691,13 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
     /// whether it already is. Never touches the chain.
     fn use_network(&self, reference: String) -> String {
         wallet::use_network(&reference)
+    }
+
+    /// The head fee market of the wallet's sequencer, so a caller can size
+    /// what a registration's fee will hold back. Needs the network, not the
+    /// wallet: it answers during bring-up.
+    fn get_fee_state(&self) -> String {
+        fee_state::get_fee_state()
     }
 
     fn on_context_ready(&self, ctx: &RustModuleContext) {

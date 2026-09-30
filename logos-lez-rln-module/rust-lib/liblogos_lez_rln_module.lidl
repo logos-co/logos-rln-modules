@@ -31,8 +31,12 @@
 ; use_network instead of failing; LEZ_RLN_NETWORK names a table network at
 ; start-up. Precedence: an existing home config > LEZ_RLN_SEQUENCER (+ optional
 ; LEZ_RLN_NETWORK label) > LEZ_RLN_NETWORK alone > use_network.
+; v4.2.0 added get_fee_state; additive — positional callers unaffected. It is
+; what a caller sizes a registration's fee reserve from: the wallet's
+; declared max_fee is only a cap, and what the chain actually holds back is
+; gas_limit x base fee at the block the tx lands in.
 module liblogos_lez_rln_module {
-  version "4.1.0"
+  version "4.2.0"
   description "RLN registry provider (LEZ chain reads + registration/funding txs)"
   category "blockchain"
 
@@ -130,5 +134,19 @@ module liblogos_lez_rln_module {
   ; refusal, the accepted one otherwise. Chain-facing methods also refuse a
   ; config account the table places on a network other than the bound one.
   method use_network(reference: tstr) -> tstr
+
+  ; Since 4.2.0. The head fee market of the sequencer this module's wallet is
+  ; configured with, read from that sequencer's JSON-RPC getFeeState: its
+  ; `result` object passed through, e.g. {"base_fee_exec":8,
+  ; "base_fee_stor":8,"height":N,"max_gas_exec":10000000,
+  ; "max_gas_stor":1000000,"next_base_fee_exec_ceiling":9,
+  ; "next_base_fee_exec_floor":8,"next_base_fee_stor_ceiling":9,
+  ; "next_base_fee_stor_floor":8}. The next_* pair bounds the base fee of the
+  ; next block (floor: an empty block, ceiling: a full one).
+  ; "" until a network is selected, and on any transport or parse error. Needs
+  ; the wallet's network, not the wallet: it answers during bring-up. Only
+  ; plain-http sequencers are read (the crate carries no TLS stack); an
+  ; https one answers "". Bounded by a 5s connect + 10s read timeout.
+  method get_fee_state() -> tstr
 
 }

@@ -44,6 +44,10 @@ const TARGET_MODULE: &str = "liblogos_lez_rln_module";
 const READ_TIMEOUT: Duration = Duration::from_secs(70);
 /// The sibling's register_member submits with a 180s tx timeout.
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(190);
+/// The sibling bounds its getFeeState round trip at 5s connect + 10s I/O.
+/// Shorter than READ_TIMEOUT because the funding wait asks on every balance
+/// read, and a stalled quote only means falling back to the fixed reserve.
+const FEE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The protocol owns timeout enforcement; this margin only guards the channel
 /// wait against a callback that never fires.
 const REPLY_MARGIN: Duration = Duration::from_secs(10);
@@ -427,6 +431,12 @@ pub(crate) trait RegistryProvider: Send + Sync {
     /// an unreachable sequencer as a permanently broke account and stop
     /// waiting.
     fn payer_balance(&self) -> Result<u128, ApiError>;
+
+    /// The chain's head fee market, as the raw quote object: what a
+    /// registration's fee reserve is sized from. An error means no quote — an
+    /// older chain-access module without the method included — and the
+    /// caller falls back to a fixed reserve.
+    fn fee_state(&self) -> Result<serde_json::Value, ApiError>;
 }
 
 /// Turn a sibling `get_valid_roots` reply into roots at the prover's circuit
@@ -724,6 +734,19 @@ impl RegistryProvider for LezRlnProvider {
                 ApiError::new(ErrorKind::ProviderFailure, "balance reply has no decimal balance")
             })
     }
+
+    fn fee_state(&self) -> Result<serde_json::Value, ApiError> {
+        let client = lez_client();
+        let raw = read_reply(
+            "get_fee_state",
+            await_reply("get_fee_state", FEE_STATE_TIMEOUT, |done| {
+                client.get_fee_state_async_with_timeout(FEE_STATE_TIMEOUT, done)
+            }),
+        )?;
+        serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
+            ApiError::new(ErrorKind::ProviderFailure, &format!("fee state parse: {e}"))
+        })
+    }
 }
 
 // ------------------------------------------------------- test-time transport
@@ -903,6 +926,7 @@ mod tests {
         assert!(provider.get_membership(&registry, &"11".repeat(32)).is_err());
         assert!(provider.get_merkle_proof(&registry, 0).is_err());
         assert!(provider.get_valid_roots(&registry).is_err());
+        assert!(provider.fee_state().is_err());
         // Fire-and-record: a submission the SDK cannot dispatch (no client)
         // is a synchronous provider_failure, and the callback is NOT also
         // invoked — the record's owner handles the failure exactly once.

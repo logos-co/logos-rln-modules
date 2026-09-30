@@ -41,7 +41,7 @@
 ; Events are a third channel, pushed over the lp event stream rather than
 ; returned from a call — see the events section below.
 module liblogos_rln_module {
-  version "0.9.0"
+  version "0.10.0"
   description "RLN Membership Management Module"
   category "blockchain"
   depends [liblogos_lez_rln_module]
@@ -419,6 +419,12 @@ module liblogos_rln_module {
   ; use_network, from the built-in table), and a registry on a different
   ; network is then refused unknown_registry — start() itself does not fail;
   ; get_membership_state shows the refusal.
+  ; Since 0.10.0 a membership start() provisions waits for its payer to hold
+  ; the price plus a fee reserve sized from the chain's live fee quote
+  ; (liblogos_lez_rln_module >= 4.2.0 get_fee_state): (10M gas x the next
+  ; block's exec base-fee ceiling + 100k bytes x its storage ceiling) x 2 —
+  ; ~182M at base fee 8 — instead of the wallet's fixed 646.4M cap. An older
+  ; registry module, or no quote, keeps the 646.4M reserve.
   method start(config_json: tstr) -> result
 
   ; Spec stop(). Halt the maintenance tasks for real: sleeping workers wake
