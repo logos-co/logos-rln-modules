@@ -211,10 +211,28 @@ mod tests {
             Some("devnet")
         );
         assert!(network_of_config(&"ab".repeat(32)).is_none());
-        assert!(network("testnet").is_none());
+        assert!(network("mainnet").is_none());
         assert!(
             network("Devnet").is_none(),
             "lookups are exact; callers lowercase"
         );
+    }
+
+    #[test]
+    fn testnet_is_pinned() {
+        let testnet = network("testnet").expect("testnet");
+        assert_eq!(testnet.sequencer, "http://209.38.241.182:3240/");
+        let config = "841312e989c77e3f6f58a5d880a8e25b950b8b5ffba2f39748fa44622c20c893";
+        assert_eq!(
+            network_of_config(config).map(|n| n.reference.as_str()),
+            Some("testnet")
+        );
+        let registry = &testnet.registries[0];
+        assert_eq!(registry.deployment, "testnet-z1");
+        assert_eq!(
+            registry.tree_id,
+            "63c6b92f831ba82d65c1aa0d4dd6f7a2510b848d7afcfda326f662710b1696d5"
+        );
+        assert_eq!(known_references(), ["devnet", "testnet"]);
     }
 }
