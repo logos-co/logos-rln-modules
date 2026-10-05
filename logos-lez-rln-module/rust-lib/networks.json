@@ -18,21 +18,7 @@
     },
     {
       "reference": "testnet",
-      "description": "LEZ testnet zone (LEZ classic, v0.2.5-rc3-compatible) on the Logos blockchain testnet; registry used by the logos-delivery-module logos.test preset",
-      "sequencer": "http://209.38.241.182:3240/",
-      "registries": [
-        {
-          "deployment": "testnet-z1",
-          "config_account": "9tZgjoUVHHWuE9D1cgQSXbYu2gm6uN9baTSERtTa9Str",
-          "tree_id": "63c6b92f831ba82d65c1aa0d4dd6f7a2510b848d7afcfda326f662710b1696d5",
-          "registration_program_id": "a908a461bf129a507a927fef446262c2428a082f846a78f88a816ba0153dfab1",
-          "merkle_program_id": "a2eda7e5f8fe44b2d119db89ba16dafb1452fe128ed0d526829095fd7018492c"
-        }
-      ]
-    },
-    {
-      "reference": "testnet-v03",
-      "description": "LEZ v0.3.0 testnet zone (https://testnet.lez.logos.co) on the Logos blockchain testnet; used by logos-rln-e2e --target testnet-v03, no delivery preset",
+      "description": "LEZ testnet zone (v0.3.0, https://testnet.lez.logos.co) on the Logos blockchain testnet; registry used by the logos-delivery-module logos.test preset",
       "sequencer": "https://testnet.lez.logos.co/",
       "registries": [
         {
