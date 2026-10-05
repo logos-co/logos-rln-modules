@@ -128,28 +128,28 @@ mod ffi {
         pub data: [u8; 16],
     }
 
+    /// One program's shard on an account (LEZ v0.3.0 accounts are sharded by
+    /// owning program; the native balance is the native token program's).
     #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    pub struct ProgramId {
-        pub data: [u32; 8],
+    pub struct Shard {
+        pub program: Bytes32,
+        pub data: *const u8,
+        pub data_len: usize,
     }
 
     #[repr(C)]
     pub struct Account {
-        pub program_owner: Bytes32,
-        pub balance: U128,
-        pub data: *const u8,
-        pub data_len: usize,
+        /// This account's shards, ordered by program address.
+        pub shards: *const Shard,
+        pub shards_len: usize,
         pub nonce: U128,
     }
 
     impl Default for Account {
         fn default() -> Self {
             Self {
-                program_owner: Bytes32::default(),
-                balance: U128::default(),
-                data: std::ptr::null(),
-                data_len: 0,
+                shards: std::ptr::null(),
+                shards_len: 0,
                 nonce: U128::default(),
             }
         }
@@ -165,12 +165,14 @@ mod ffi {
         pub kind: i32,
         pub account_id: Bytes32,
         pub key_path: *mut c_char,
+        pub authority: Bytes32,
+        pub seed: Bytes32,
         pub authorization_secret_key: Bytes32,
         pub nullifier_secret_key: Bytes32,
         pub nullifier_public_key: Bytes32,
         pub viewing_public_key: *const u8,
         pub viewing_public_key_len: usize,
-        pub identifier: U128,
+        pub identifier: Bytes32,
     }
 
     impl AccountIdentity {
@@ -179,14 +181,23 @@ mod ffi {
                 kind: if signs { KIND_PUBLIC } else { KIND_PUBLIC_NO_SIGN },
                 account_id: Bytes32 { data: account_id },
                 key_path: std::ptr::null_mut(),
+                authority: Bytes32::default(),
+                seed: Bytes32::default(),
                 authorization_secret_key: Bytes32::default(),
                 nullifier_secret_key: Bytes32::default(),
                 nullifier_public_key: Bytes32::default(),
                 viewing_public_key: std::ptr::null(),
                 viewing_public_key_len: 0,
-                identifier: U128::default(),
+                identifier: Bytes32::default(),
             }
         }
+    }
+
+    /// An account identity with the program shard a transaction selects on it.
+    #[repr(C)]
+    pub struct AccountMention {
+        pub identity: AccountIdentity,
+        pub program_account_id: Bytes32,
     }
 
     #[repr(C)]
@@ -257,11 +268,11 @@ mod ffi {
 
         pub fn wallet_ffi_send_generic_public_transaction(
             handle: *mut WalletHandle,
-            account_identities: *const AccountIdentity,
-            account_identities_size: usize,
+            account_mentions: *const AccountMention,
+            account_mentions_size: usize,
             instruction_data: *const u8,
             instruction_data_size: usize,
-            program_id: ProgramId,
+            program_account_id: Bytes32,
             payer: *const Bytes32,
             out_result: *mut TransactionResult,
         ) -> i32;
@@ -1205,9 +1216,10 @@ pub(crate) fn account_id_from_base58(id: &str) -> String {
     }
 }
 
-/// Public account state as the JSON `{program_owner, balance, nonce, data}`
-/// (all hex) that `lez_core` returned, so the parsing above is unchanged.
-/// Empty string on failure.
+/// Public account state as the JSON `{nonce, shards: {<program hex>: <data
+/// hex>}}`. LEZ v0.3.0 shards an account's data by owning program; the native
+/// balance is the shard of the native token program (`[0; 32]`), a 16-byte LE
+/// u128. Empty string on failure.
 #[allow(unsafe_code)]
 pub(crate) fn get_account_public(account_id_hex: &str) -> String {
     let Some(bytes) = crate::hex_to_bytes32(account_id_hex) else {
@@ -1228,18 +1240,29 @@ pub(crate) fn get_account_public(account_id_hex: &str) -> String {
         eprintln!("get_account_public({account_id_hex}): code {rc}");
         return String::new();
     }
-    // SAFETY: on success the library hands back a pointer it owns, valid for
-    // `data_len` bytes until `wallet_ffi_free_account_data`.
-    let data = if account.data.is_null() || account.data_len == 0 {
-        Vec::new()
+    // SAFETY: on success the library hands back a shard array it owns, valid
+    // for `shards_len` entries, each pointing at `data_len` bytes, until
+    // `wallet_ffi_free_account_data`.
+    let shards: &[ffi::Shard] = if account.shards.is_null() || account.shards_len == 0 {
+        &[]
     } else {
-        unsafe { std::slice::from_raw_parts(account.data, account.data_len) }.to_vec()
+        unsafe { std::slice::from_raw_parts(account.shards, account.shards_len) }
     };
+    let mut map = serde_json::Map::new();
+    for shard in shards {
+        let data: &[u8] = if shard.data.is_null() || shard.data_len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(shard.data, shard.data_len) }
+        };
+        map.insert(
+            bytes_to_hex(&shard.program.data),
+            serde_json::Value::String(bytes_to_hex(data)),
+        );
+    }
     let out = serde_json::json!({
-        "program_owner": bytes_to_hex(&account.program_owner.data),
-        "balance": u128::from_le_bytes(account.balance.data).to_string(),
         "nonce": u128::from_le_bytes(account.nonce.data).to_string(),
-        "data": bytes_to_hex(&data),
+        "shards": map,
     })
     .to_string();
     // SAFETY: the struct the call just filled, freed exactly once.
@@ -1247,40 +1270,50 @@ pub(crate) fn get_account_public(account_id_hex: &str) -> String {
     out
 }
 
+/// One account a transaction mentions: the account, whether it signs, and the
+/// program whose shard of it the transaction selects (`[0; 32]` hex for the
+/// native balance).
+pub(crate) struct Mention {
+    pub(crate) account_hex: String,
+    pub(crate) signs: bool,
+    pub(crate) shard_program_hex: String,
+}
+
 /// Submit a generic public transaction, answering the JSON
 /// `{success, tx_hash, error}` shape the module already parses.
+///
+/// `program_hex` is the program's header account id: on LEZ v0.3.0 a program
+/// lives at a keyed account its deployer created, not at a hash of its code.
 #[allow(unsafe_code)]
 pub(crate) fn send_generic_public_transaction(
-    account_ids: &[String],
-    signing_requirements: &[bool],
+    mentions: &[Mention],
     instruction: &[u8],
-    program_id_hex: &str,
+    program_hex: &str,
     payer_account_id_hex: &str,
 ) -> String {
-    if account_ids.len() != signing_requirements.len() {
-        eprintln!("send_generic_public_transaction: account/signing arrays differ in length");
-        return String::new();
-    }
-    let mut identities = Vec::with_capacity(account_ids.len());
-    for (id_hex, signs) in account_ids.iter().zip(signing_requirements) {
-        let Some(bytes) = crate::hex_to_bytes32(id_hex) else {
-            eprintln!("send_generic_public_transaction: {id_hex} is not 32-byte hex");
+    let mut ffi_mentions = Vec::with_capacity(mentions.len());
+    for m in mentions {
+        let Some(account) = crate::hex_to_bytes32(&m.account_hex) else {
+            eprintln!("send_generic_public_transaction: {} is not 32-byte hex", m.account_hex);
             return String::new();
         };
-        identities.push(ffi::AccountIdentity::public(bytes, *signs));
+        let Some(shard) = crate::hex_to_bytes32(&m.shard_program_hex) else {
+            eprintln!(
+                "send_generic_public_transaction: shard program {} is not 32-byte hex",
+                m.shard_program_hex
+            );
+            return String::new();
+        };
+        ffi_mentions.push(ffi::AccountMention {
+            identity: ffi::AccountIdentity::public(account, m.signs),
+            program_account_id: ffi::Bytes32 { data: shard },
+        });
     }
-    let Some(program) = crate::hex_to_bytes32(program_id_hex) else {
-        eprintln!(
-            "send_generic_public_transaction: program id {program_id_hex} is not 32-byte hex"
-        );
+    let Some(program) = crate::hex_to_bytes32(program_hex) else {
+        eprintln!("send_generic_public_transaction: program {program_hex} is not 32-byte hex");
         return String::new();
     };
-    // A ProgramId is eight u32 words, each little-endian, and an AccountId is
-    // their concatenation (lee program/mod.rs) — so this is the inverse.
-    let mut program_id = ffi::ProgramId::default();
-    for (word, chunk) in program_id.data.iter_mut().zip(program.chunks_exact(4)) {
-        *word = u32::from_le_bytes(chunk.try_into().unwrap_or([0; 4]));
-    }
+    let program_account_id = ffi::Bytes32 { data: program };
 
     // Empty means self-pay, matching the lez_core contract.
     let payer = if payer_account_id_hex.trim().is_empty() {
@@ -1304,18 +1337,18 @@ pub(crate) fn send_generic_public_transaction(
     };
     let guard = wallet.read().unwrap_or_else(|p| p.into_inner());
     let mut result = ffi::TransactionResult::default();
-    // SAFETY: a live handle; identities, instruction and payer all outlive the
+    // SAFETY: a live handle; mentions, instruction and payer all outlive the
     // call; the out struct is ours.
     let rc = unsafe {
         // One submission at a time; see SEND_LOCK.
         let _serialized = lock(&SEND_LOCK);
         ffi::wallet_ffi_send_generic_public_transaction(
             guard.0,
-            identities.as_ptr(),
-            identities.len(),
+            ffi_mentions.as_ptr(),
+            ffi_mentions.len(),
             instruction.as_ptr(),
             instruction.len(),
-            program_id,
+            program_account_id,
             payer_ptr,
             &raw mut result,
         )
@@ -1505,11 +1538,11 @@ mod wallet_ffi_test_transport {
     #[allow(clippy::too_many_arguments)]
     pub extern "C" fn wallet_ffi_send_generic_public_transaction(
         _h: *mut ffi::WalletHandle,
-        _ai: *const ffi::AccountIdentity,
-        _ais: usize,
+        _am: *const ffi::AccountMention,
+        _ams: usize,
         _i: *const u8,
         _is: usize,
-        _p: ffi::ProgramId,
+        _p: ffi::Bytes32,
         _payer: *const ffi::Bytes32,
         _o: *mut ffi::TransactionResult,
     ) -> i32 {
@@ -1588,12 +1621,19 @@ mod tests {
         );
     }
 
+    fn mention(account_hex: &str, shard_program_hex: &str) -> Mention {
+        Mention {
+            account_hex: account_hex.to_string(),
+            signs: true,
+            shard_program_hex: shard_program_hex.to_string(),
+        }
+    }
+
     #[test]
-    fn mismatched_account_and_signing_arrays_are_refused_before_any_call() {
+    fn a_malformed_shard_program_is_refused_before_any_call() {
         // Returns before touching the wallet, so it holds with none open.
         let out = send_generic_public_transaction(
-            &["ab".repeat(32)],
-            &[true, false],
+            &[mention(&"ab".repeat(32), "not-hex")],
             &[1, 2, 3],
             &"cd".repeat(32),
             "",
@@ -1845,8 +1885,7 @@ mod tests {
     #[test]
     fn a_malformed_program_id_is_refused_before_any_call() {
         let out = send_generic_public_transaction(
-            &["ab".repeat(32)],
-            &[true],
+            &[mention(&"ab".repeat(32), &"00".repeat(32))],
             &[1, 2, 3],
             "not-hex",
             "",

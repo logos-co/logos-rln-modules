@@ -199,38 +199,71 @@ fn rpc(sequencer: &str, method: &str, params: serde_json::Value) -> serde_json::
     doc.get("result").cloned().expect("JSON-RPC result")
 }
 
-/// `(data, program_owner)` — `None` when the account is absent (the
-/// sequencer answers with empty data, exactly the module's
-/// FetchOutcome::Absent semantics).
-///
-/// `program_owner` arrives base58-encoded, the same spelling account ids take
-/// everywhere else on this wire. It used to be 8 little-endian u32 words, and
-/// reading it that way is what these tests did until the sequencer changed
-/// shape — `as_array()` on a string, which failed five tests deep inside this
-/// one helper. Nothing in the module itself noticed: production reads accounts
-/// through `wallet_ffi`, never through this raw JSON.
-fn get_account(sequencer: &str, id: &[u8; 32]) -> Option<(Vec<u8>, [u8; 32])> {
+/// An account's shards as `(program, data)` — empty when the account is
+/// absent. LEZ v0.3.0 answers `getAccount` with
+/// `{"nonce", "data": {"shards": {"<base58 program>": [bytes…]}}}`: an
+/// account's data is sharded by owning program, and the native balance is the
+/// shard of the native token program (`[0; 32]`).
+fn get_shards(sequencer: &str, id: &[u8; 32]) -> Vec<([u8; 32], Vec<u8>)> {
     let result = rpc(sequencer, "getAccount", serde_json::json!([b58_encode(id)]));
-    let data: Vec<u8> = result["data"]
-        .as_array()
-        .expect("data byte array")
+    let Some(shards) = result["data"]["shards"].as_object() else {
+        return Vec::new();
+    };
+    shards
         .iter()
-        .map(|v| v.as_u64().expect("byte") as u8)
-        .collect();
-    if data.is_empty() {
-        return None;
-    }
-    let owner = b58_decode32(
-        result["program_owner"]
-            .as_str()
-            .expect("program_owner is a base58 string"),
-    );
-    Some((data, owner))
+        .map(|(program, bytes)| {
+            let data: Vec<u8> = bytes
+                .as_array()
+                .expect("shard byte array")
+                .iter()
+                .map(|v| v.as_u64().expect("byte") as u8)
+                .collect();
+            (b58_decode32(program), data)
+        })
+        .collect()
 }
 
+/// One program's shard of an account; `None` when absent or empty (the
+/// module's FetchOutcome::Absent).
+fn get_shard(sequencer: &str, id: &[u8; 32], program: &[u8; 32]) -> Option<Vec<u8>> {
+    get_shards(sequencer, id)
+        .into_iter()
+        .find(|(p, data)| p == program && !data.is_empty())
+        .map(|(_, data)| data)
+}
+
+/// The config shard and the program that owns it — the registration program,
+/// whose id on v0.3.0 is the deployer's header account, discoverable only as
+/// the config's shard key.
 fn fetch_config(dep: &Deployment) -> (Vec<u8>, [u8; 32]) {
-    get_account(&dep.sequencer, &dep.config_account)
-        .expect("deployed config account must exist and be populated")
+    let mut program_shards: Vec<_> = get_shards(&dep.sequencer, &dep.config_account)
+        .into_iter()
+        .filter(|(p, data)| *p != [0u8; 32] && !data.is_empty())
+        .collect();
+    assert_eq!(program_shards.len(), 1, "the config holds exactly one program shard");
+    let (program, data) = program_shards.remove(0);
+    (data, program)
+}
+
+fn merkle_program(config_data: &[u8]) -> [u8; 32] {
+    native::config_field_32(config_data, native::CONFIG_OFFSET_MERKLE_PROGRAM_ID)
+}
+
+fn fetch_tree(dep: &Deployment, config_data: &[u8], registration: &[u8; 32]) -> ([u8; 32], Vec<u8>) {
+    let main = native::tree_main_account_id(config_data, registration).unwrap();
+    let data = get_shard(&dep.sequencer, &main, &merkle_program(config_data))
+        .expect("derived tree-main PDA must hold the merkle program's shard");
+    (main, data)
+}
+
+fn chain_now_ms(dep: &Deployment) -> u64 {
+    let data = get_shard(
+        &dep.sequencer,
+        &rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES,
+        &rln_layouts::clock_program_account_id(),
+    )
+    .expect("CLOCK_50's clock-program shard");
+    native::decode_clock_timestamp_ms(&data).unwrap()
 }
 
 // --------------------------------------------------------------------- tests
@@ -256,10 +289,9 @@ fn testnet_config_account_matches_deployment_and_bounds_decode() {
     assert_eq!(
         bytes_to_hex(&owner),
         dep.registration_program_id_hex,
-        "config account's program owner is the registration program"
+        "the config's shard is the registration program's"
     );
-    // merkle_program_id is the first ConfigState field (offset 0).
-    assert_eq!(bytes_to_hex(&native::config_field_32(&data, 0)), dep.merkle_program_id_hex);
+    assert_eq!(bytes_to_hex(&merkle_program(&data)), dep.merkle_program_id_hex);
     assert_eq!(
         bytes_to_hex(&native::config_field_32(&data, native::CONFIG_OFFSET_TREE_ID)),
         dep.tree_id_hex
@@ -282,25 +314,14 @@ fn testnet_config_account_matches_deployment_and_bounds_decode() {
 }
 
 // The full account-derivation loop against the DEPLOYED program: the tree
-// main PDA derived from (program_owner, tree_id) must exist on chain, and
-// register_plan must re-derive the very config account the deployment
-// record names (proving PDA seeds + hashing match the on-chain program's).
+// main PDA derived from (registration program, tree_id) must hold the merkle
+// program's shard, and register_plan must re-derive the very config account
+// the deployment record names (proving PDA seeds + hashing match the chain).
 #[test]
 fn testnet_register_plan_derives_the_deployed_accounts() {
     let Some(dep) = testnet() else { return };
     let (config_data, owner) = fetch_config(&dep);
-
-    let proofs_plan = native::merkle_proofs_plan(&config_data, &owner, &[]).unwrap();
-    let (tree_main_data, tree_owner) = get_account(&dep.sequencer, &proofs_plan.main_account_id)
-        .expect("derived tree-main PDA must exist on chain");
-    // The tree PDA is DERIVED under the registration program but the
-    // account is OWNED by the merkle program (ConfigState offset 0) —
-    // verified against the live deployment.
-    assert_eq!(
-        tree_owner,
-        native::config_field_32(&config_data, 0),
-        "tree main owned by the config's merkle program"
-    );
+    let (main, tree_main_data) = fetch_tree(&dep, &config_data, &owner);
 
     let plan =
         native::register_plan(&config_data, &tree_main_data, &owner, &[0x11; 32]).unwrap();
@@ -308,8 +329,8 @@ fn testnet_register_plan_derives_the_deployed_accounts() {
         plan.config_account_id, dep.config_account,
         "config PDA re-derivation must round-trip to the deployed account"
     );
-    assert_eq!(plan.tree_main_account_id, proofs_plan.main_account_id);
-    assert_eq!(plan.clock_account_id, rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES);
+    assert_eq!(plan.tree_main_account_id, main);
+    assert_eq!(bytes_to_hex(&plan.merkle_program_id), dep.merkle_program_id_hex);
     assert!(
         plan.next_leaf_index < (1u64 << rln_layouts::TREE_DEPTH),
         "leaf index inside TREE_DEPTH"
@@ -324,9 +345,7 @@ fn testnet_register_plan_derives_the_deployed_accounts() {
 #[test]
 fn testnet_clock_account_decodes_to_live_chain_time() {
     let Some(dep) = testnet() else { return };
-    let (data, _) = get_account(&dep.sequencer, &rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES)
-        .expect("CLOCK_50 system account");
-    let chain_ms = native::decode_clock_timestamp_ms(&data).unwrap();
+    let chain_ms = chain_now_ms(&dep);
     let wall_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -343,9 +362,7 @@ fn testnet_clock_account_decodes_to_live_chain_time() {
 fn testnet_valid_roots_come_from_the_live_tree() {
     let Some(dep) = testnet() else { return };
     let (config_data, owner) = fetch_config(&dep);
-    let plan = native::merkle_proofs_plan(&config_data, &owner, &[]).unwrap();
-    let (tree_main_data, _) =
-        get_account(&dep.sequencer, &plan.main_account_id).expect("tree main");
+    let (_, tree_main_data) = fetch_tree(&dep, &config_data, &owner);
 
     let roots = native::get_valid_roots(&tree_main_data).unwrap();
     assert!(!roots.is_empty());
@@ -355,29 +372,19 @@ fn testnet_valid_roots_come_from_the_live_tree() {
 }
 
 // Full cryptographic round-trip against DEPLOYED tree data: build a proof
-// for a live leaf from the fetched main + subtree accounts, then recompute
-// the root from (leaf, path) with poseidon and demand it equals both the
-// proof's root and a member of the live valid-root window. Works on an
-// empty tree too (leaf 0 against cached defaults).
+// for a live leaf from the fetched merkle shard, then recompute the root from
+// (leaf, path) with poseidon and demand it equals both the proof's root and a
+// member of the live valid-root window. Works on an empty tree too (leaf 0
+// against cached defaults).
 #[test]
 fn testnet_merkle_proof_recomputes_the_live_root() {
     let Some(dep) = testnet() else { return };
     let (config_data, owner) = fetch_config(&dep);
-    let plan0 = native::merkle_proofs_plan(&config_data, &owner, &[]).unwrap();
-    let (tree_main_data, _) =
-        get_account(&dep.sequencer, &plan0.main_account_id).expect("tree main");
+    let (_, tree_main_data) = fetch_tree(&dep, &config_data, &owner);
 
     let next = rln_layouts::TreeMainLayout::parse(&tree_main_data).next_index();
     let leaf_index = next.saturating_sub(1);
-    let plan = native::merkle_proofs_plan(&config_data, &owner, &[leaf_index]).unwrap();
-    // An absent subtree account (tree still empty) reads as an empty slice,
-    // exactly the module's tri-state Absent handling.
-    let subtree_data = get_account(&dep.sequencer, &plan.subtree_account_ids[0])
-        .map(|(data, _)| data)
-        .unwrap_or_default();
-    let subtrees = [(plan.subtree_ids[0], subtree_data.as_slice())];
-
-    let proofs = native::merkle_proofs_exec(&tree_main_data, &subtrees, &[leaf_index]).unwrap();
+    let proofs = native::merkle_proofs_exec(&tree_main_data, &[leaf_index]).unwrap();
     assert_eq!(proofs.len(), 1);
     let proof = &proofs[0];
     assert_eq!(proof.leaf_index, leaf_index);
@@ -417,37 +424,33 @@ fn testnet_merkle_proof_recomputes_the_live_root() {
 fn testnet_membership_read_absent_or_decodes_with_live_state() {
     let Some(dep) = testnet() else { return };
     let (config_data, owner) = fetch_config(&dep);
-    let plan0 = native::merkle_proofs_plan(&config_data, &owner, &[]).unwrap();
-    let (tree_main_data, _) =
-        get_account(&dep.sequencer, &plan0.main_account_id).expect("tree main");
+    let (_, tree_main_data) = fetch_tree(&dep, &config_data, &owner);
 
     let identity_keys = IdentityKeys::generate_seeded::<PoseidonHash, ChaCha20Rng>(&[0x5A; 32]);
     let id_commitment = fr_to_bytes_le(&identity_keys.id_commitment());
     let plan =
         native::register_plan(&config_data, &tree_main_data, &owner, &id_commitment).unwrap();
 
-    match get_account(&dep.sequencer, &plan.membership_account_id) {
+    match get_shard(&dep.sequencer, &plan.membership_account_id, &owner) {
         None => eprintln!(
             "live membership: {} absent (never registered / erased)",
             bytes_to_hex(&plan.membership_account_id)
         ),
-        Some((data, _)) => {
+        Some(data) => {
             let membership = native::decode_membership(&data).unwrap();
             assert_eq!(membership.id_commitment, id_commitment);
             assert!(membership.rate_limit >= native::MIN_RATE_LIMIT);
             assert!(membership.rate_limit <= native::MAX_RATE_LIMIT);
-            let (clock_data, _) =
-                get_account(&dep.sequencer, &rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES)
-                    .expect("CLOCK_50");
-            let now = native::decode_clock_timestamp_ms(&clock_data).unwrap();
             let state = native::membership_status(
                 membership.grace_period_start_timestamp_ms,
                 membership.grace_period_duration_sec,
-                now,
+                chain_now_ms(&dep),
             );
+            let leaf = native::registration_leaf(&membership.id_commitment, membership.rate_limit)
+                .and_then(|leaf| native::find_leaf_index(&tree_main_data, &leaf));
             eprintln!(
-                "live membership: leaf {} rate {} state {state}",
-                membership.leaf_index, membership.rate_limit
+                "live membership: leaf {leaf:?} rate {} state {state}",
+                membership.rate_limit
             );
         }
     }

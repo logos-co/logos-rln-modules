@@ -37,7 +37,7 @@
 ; gas_limit x base fee at the block the tx lands in.
 ; v4.2.1 adds the testnet network (testnet-z1) to the built-in table; data only.
 module liblogos_lez_rln_module {
-  version "4.2.1"
+  version "5.0.0"
   description "RLN registry provider (LEZ chain reads + registration/funding txs)"
   category "blockchain"
 

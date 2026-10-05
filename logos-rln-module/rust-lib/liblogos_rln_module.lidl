@@ -41,7 +41,7 @@
 ; Events are a third channel, pushed over the lp event stream rather than
 ; returned from a call — see the events section below.
 module liblogos_rln_module {
-  version "0.10.0"
+  version "0.11.0"
   description "RLN Membership Management Module"
   category "blockchain"
   depends [liblogos_lez_rln_module]
