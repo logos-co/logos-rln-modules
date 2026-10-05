@@ -198,89 +198,86 @@ fn resolve_account_id(id: &str) -> String {
     wallet::account_id_from_base58(id)
 }
 
-/// Tri-state fetch: Present / legitimately Absent (empty data) / Error
-/// (RPC failure, malformed JSON or hex). Logs nothing.
+/// The native token program's id: the shard key of an account's native
+/// balance (LEZ v0.3.0 `NATIVE_TOKEN_PROGRAM_ID`).
+const NATIVE_TOKEN_PROGRAM: [u8; 32] = [0; 32];
+
+/// Tri-state fetch: Present / legitimately Absent (no such shard, or an empty
+/// one) / Error (RPC failure, malformed JSON or hex). Logs nothing.
 enum FetchOutcome {
     Present(Vec<u8>),
     Absent,
     Error,
 }
 
-fn fetch_account_data_tri_state(account_id_hex: &str) -> FetchOutcome {
+/// Every shard of an account as `(program, data)`, or `None` when the read
+/// failed. An account that does not exist reads as no shards.
+///
+/// LEZ v0.3.0 shards an account's data by owning program, so "the account's
+/// data" is no longer one thing: callers name the program whose shard they
+/// mean.
+fn fetch_shards(account_id_hex: &str) -> Option<Vec<([u8; 32], Vec<u8>)>> {
     let json = wallet::get_account_public(account_id_hex);
     if json.is_empty() {
-        return FetchOutcome::Error;
+        return None;
     }
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&json) else {
+    let doc = serde_json::from_str::<serde_json::Value>(&json).ok()?;
+    let shards = doc.as_object()?.get("shards")?.as_object()?;
+    let mut out = Vec::with_capacity(shards.len());
+    for (program_hex, data) in shards {
+        let program = hex_to_bytes32(program_hex)?;
+        let data = hex_to_bytes(data.as_str()?, None)?;
+        out.push((program, data));
+    }
+    Some(out)
+}
+
+fn fetch_shard_tri_state(account_id_hex: &str, program: &[u8; 32]) -> FetchOutcome {
+    let Some(shards) = fetch_shards(account_id_hex) else {
         return FetchOutcome::Error;
     };
-    let Some(obj) = doc.as_object() else {
-        return FetchOutcome::Error;
-    };
-    let data_hex = obj.get("data").and_then(|v| v.as_str()).unwrap_or("");
-    if data_hex.is_empty() {
-        return FetchOutcome::Absent;
-    }
-    match hex_to_bytes(data_hex, None) {
-        Some(bytes) => FetchOutcome::Present(bytes),
-        None => FetchOutcome::Error,
+    match shards.into_iter().find(|(p, _)| p == program) {
+        Some((_, data)) if !data.is_empty() => FetchOutcome::Present(data),
+        _ => FetchOutcome::Absent,
     }
 }
 
-/// Some(data) only for a populated, well-formed account; logs nothing. Used
-/// where "not yet present" is an expected state — today only
-/// register_member's idempotency pre-check.
-fn fetch_account_data_quiet(account_id_hex: &str) -> Option<Vec<u8>> {
-    match fetch_account_data_tri_state(account_id_hex) {
+/// Some(data) only for a populated shard; logs nothing. Used where "not yet
+/// present" is an expected state — today only register_member's idempotency
+/// pre-check.
+fn fetch_shard_quiet(account_id_hex: &str, program: &[u8; 32]) -> Option<Vec<u8>> {
+    match fetch_shard_tri_state(account_id_hex, program) {
         FetchOutcome::Present(data) => Some(data),
         _ => None,
     }
 }
 
-/// Loud fetch: logs each failure mode. Optionally extracts and validates the
-/// 32-byte program_owner; an empty owner field is tolerated and leaves
-/// `owner_out` empty.
-fn fetch_account_data(account_id_hex: &str, owner_out: Option<&mut Vec<u8>>) -> Option<Vec<u8>> {
-    let json = wallet::get_account_public(account_id_hex);
-    if json.is_empty() {
-        eprintln!("fetch_account_data failed: empty response for {account_id_hex}");
-        return None;
-    }
-    let parsed = serde_json::from_str::<serde_json::Value>(&json).ok();
-    let Some(obj) = parsed.as_ref().and_then(|v| v.as_object()) else {
-        let head: String = json.chars().take(200).collect();
-        eprintln!("fetch_account_data failed: not a JSON object for {account_id_hex} got: {head}");
-        return None;
-    };
-    let data_hex = obj.get("data").and_then(|v| v.as_str()).unwrap_or("");
-    if data_hex.is_empty() {
-        eprintln!("fetch_account_data failed: empty data for {account_id_hex}");
-        return None;
-    }
-    if let Some(owner_out) = owner_out {
-        let owner_hex = obj
-            .get("program_owner")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if !owner_hex.is_empty() {
-            match hex_to_bytes(owner_hex, Some(32)) {
-                Some(owner) => *owner_out = owner,
-                None => {
-                    let head: String = owner_hex.chars().take(80).collect();
-                    eprintln!("fetch_account_data: malformed program_owner hex: {head}");
-                    return None;
-                }
-            }
+/// Loud fetch of one program's shard: logs each failure mode.
+fn fetch_shard(account_id_hex: &str, program: &[u8; 32], who: &str) -> Option<Vec<u8>> {
+    match fetch_shard_tri_state(account_id_hex, program) {
+        FetchOutcome::Present(data) => Some(data),
+        FetchOutcome::Absent => {
+            eprintln!(
+                "{who}: {account_id_hex} has no shard of program {}",
+                bytes_to_hex(program)
+            );
+            None
+        }
+        FetchOutcome::Error => {
+            eprintln!("{who}: reading {account_id_hex} failed");
+            None
         }
     }
-    hex_to_bytes(data_hex, None)
 }
 
-/// The resolved config account (64-hex + raw data) and its 32-byte program
-/// owner — the inputs every on-chain entry point needs.
+/// The resolved config and the two program ids every on-chain entry point
+/// needs: the registration program (the config's owner, and the program every
+/// PDA hangs off) and the merkle program (whose shard of `tree_main` holds the
+/// tree, and which `Register` claims).
 struct RlnConfigContext {
     config_data: Vec<u8>,
-    program_owner: [u8; 32],
+    registration_program: [u8; 32],
+    merkle_program: [u8; 32],
 }
 
 fn resolve_config_context(config_account_id: &str, who: &str) -> Option<RlnConfigContext> {
@@ -293,37 +290,46 @@ fn resolve_config_context(config_account_id: &str, who: &str) -> Option<RlnConfi
         eprintln!("{who}: {reason}");
         return None;
     }
-    let mut owner_bytes = Vec::new();
-    let Some(config_data) = fetch_account_data(&config_hex, Some(&mut owner_bytes)) else {
+    let Some(shards) = fetch_shards(&config_hex) else {
         eprintln!("{who}: failed to fetch config account");
         return None;
     };
-    if owner_bytes.len() != 32 {
-        eprintln!("{who}: invalid program_owner size {}", owner_bytes.len());
+    // On LEZ v0.3.0 a program's id is the header account its deployer created,
+    // not derivable from anything a registry id carries. The config is the
+    // registration program's PDA and holds exactly one program shard — that
+    // program's — so its shard key IS the registration program id. A native
+    // balance shard (someone sent it tokens) is not a program and is skipped.
+    let mut program_shards = shards
+        .into_iter()
+        .filter(|(p, data)| *p != NATIVE_TOKEN_PROGRAM && !data.is_empty());
+    let Some((registration_program, config_data)) = program_shards.next() else {
+        eprintln!("{who}: config account {config_hex} holds no program shard — not deployed here");
+        return None;
+    };
+    if program_shards.next().is_some() {
+        eprintln!("{who}: config account {config_hex} holds more than one program shard");
         return None;
     }
     // The one place a config account is admitted, and so the one place its
     // generation is checked. Every field below is read by byte offset and
     // ConfigState carries no version discriminator, so a config from another
     // program generation does not fail to decode — it decodes to a plausible
-    // wrong treasury and a plausible wrong price. Length is the only signal
-    // there is, and it has to be exact: the previous floor (240, admitting
-    // both a 240- and a 296-byte layout) was written when fields were only
-    // ever appended, which is no longer true.
+    // wrong treasury and a plausible wrong price. Length is the only signal.
     if config_data.len() != native::CONFIG_STATE_SIZE {
         eprintln!(
-            "{who}: config account is {} bytes, expected {} — this is a config \
+            "{who}: config shard is {} bytes, expected {} — this is a config \
              from a different program generation, not a short read",
             config_data.len(),
             native::CONFIG_STATE_SIZE,
         );
         return None;
     }
-    let mut program_owner = [0u8; 32];
-    program_owner.copy_from_slice(&owner_bytes);
+    let merkle_program =
+        native::config_field_32(&config_data, native::CONFIG_OFFSET_MERKLE_PROGRAM_ID);
     Some(RlnConfigContext {
         config_data,
-        program_owner,
+        registration_program,
+        merkle_program,
     })
 }
 
@@ -396,19 +402,13 @@ fn fee_payer_hex() -> String {
 /// failed, already logged.
 fn send_generic_tx(
     who: &str,
-    account_ids: Vec<String>,
-    signing_reqs: Vec<bool>,
+    mentions: Vec<wallet::Mention>,
     instruction: Vec<u8>,
-    program_id_hex: String,
+    program_hex: String,
     payer_hex: String,
 ) -> Option<String> {
-    let send_result = wallet::send_generic_public_transaction(
-        &account_ids,
-        &signing_reqs,
-        &instruction,
-        &program_id_hex,
-        &payer_hex,
-    );
+    let send_result =
+        wallet::send_generic_public_transaction(&mentions, &instruction, &program_hex, &payer_hex);
     if send_result.is_empty() {
         eprintln!("{who}: transaction failed");
         return None;
@@ -421,23 +421,18 @@ fn derive_register_plan(
     id_commitment: &[u8; 32],
     who: &str,
 ) -> Option<RlnRegisterPlan> {
-    let accounts_plan =
-        match native::merkle_proofs_plan(&ctx.config_data, &ctx.program_owner, &[]) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("{who}: derive tree main failed: {e}");
-                return None;
-            }
-        };
-    let tree_main_hex = bytes_to_hex(&accounts_plan.main_account_id);
-    let Some(tree_main_data) = fetch_account_data(&tree_main_hex, None) else {
-        eprintln!("{who}: fetch tree main failed");
-        return None;
+    let tree_main_hex = match native::tree_main_account_id(&ctx.config_data, &ctx.registration_program) {
+        Ok(id) => bytes_to_hex(&id),
+        Err(e) => {
+            eprintln!("{who}: derive tree main failed: {e}");
+            return None;
+        }
     };
+    let tree_main_data = fetch_shard(&tree_main_hex, &ctx.merkle_program, who)?;
     match native::register_plan(
         &ctx.config_data,
         &tree_main_data,
-        &ctx.program_owner,
+        &ctx.registration_program,
         id_commitment,
     ) {
         Ok(plan) => Some(plan),
@@ -446,6 +441,57 @@ fn derive_register_plan(
             None
         }
     }
+}
+
+/// CLOCK_50's timestamp, from the clock program's shard of the clock account —
+/// the chain time the registry judges lifecycles by and `Register` claims.
+fn chain_now_ms(who: &str) -> Option<u64> {
+    let clock_hex = bytes_to_hex(&rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES);
+    let data = fetch_shard(&clock_hex, &rln_layouts::clock_program_account_id(), who)?;
+    match native::decode_clock_timestamp_ms(&data) {
+        Ok(ts) => Some(ts),
+        Err(e) => {
+            eprintln!("{who}: clock decode error: {e}");
+            None
+        }
+    }
+}
+
+/// The leaf index of a membership that exists, from the tree.
+///
+/// On LEZ v0.3.0 the merkle program assigns the slot as the registration
+/// applies and the membership record does not keep it, so the index is found
+/// by looking the member's leaf up in the tree. `None` (logged) when the tree
+/// cannot be read or does not hold the leaf — never a guess.
+fn membership_leaf_index(
+    ctx: &RlnConfigContext,
+    membership: &rln_layouts::MembershipState,
+    who: &str,
+) -> Option<u64> {
+    let tree = fetch_tree_shard(ctx, who)?;
+    let Some(leaf) = native::registration_leaf(&membership.id_commitment, membership.rate_limit)
+    else {
+        eprintln!("{who}: the membership's id_commitment is not a field element");
+        return None;
+    };
+    let found = native::find_leaf_index(&tree, &leaf);
+    if found.is_none() {
+        eprintln!("{who}: the tree holds no leaf for this membership");
+    }
+    found
+}
+
+/// The tree's merkle shard — one read, so the roots and every proof built from
+/// it come from the same tree state.
+fn fetch_tree_shard(ctx: &RlnConfigContext, who: &str) -> Option<Vec<u8>> {
+    let main = match native::tree_main_account_id(&ctx.config_data, &ctx.registration_program) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("{who}: derive tree main failed: {e}");
+            return None;
+        }
+    };
+    fetch_shard(&bytes_to_hex(&main), &ctx.merkle_program, who)
 }
 
 fn roots_to_json_array(roots: &[[u8; 32]]) -> serde_json::Value {
@@ -476,6 +522,166 @@ fn proofs_with_roots_json(proofs: &[native::ProofJson], roots_array: &serde_json
     serde_json::Value::Array(augmented).to_string()
 }
 
+/// The `tx_hash` of a send reply (`{success, tx_hash, error}`), or "".
+fn tx_hash_of(send_result: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(send_result)
+        .ok()
+        .and_then(|v| v.get("tx_hash").and_then(|h| h.as_str()).map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// Build and send one `Register` with claims read from the chain now.
+/// `None` = not submitted, already logged.
+fn submit_register(
+    ctx: &RlnConfigContext,
+    plan: &RlnRegisterPlan,
+    id_commitment: &[u8; 32],
+    rate_limit: u64,
+    payer_hex: &str,
+    who: &str,
+) -> Option<String> {
+    // now_ms is a claim the guest asserts against the clock shard, so it is
+    // read last, just before sending.
+    let now_ms = chain_now_ms(who)?;
+    let instruction = match native::register_build_instruction(plan, id_commitment, rate_limit, now_ms) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("{who}: register_build_instruction failed: {e}");
+            return None;
+        }
+    };
+    // Account order and shard per account must match the guest's Register
+    // (lez-rln methods/guest registration.rs), which asserts both:
+    //   config      registration shard
+    //   tree_main   merkle shard (PDA of the registration program)
+    //   payer       native balance, signs
+    //   treasury    native balance
+    //   clock       CLOCK_50, clock program shard
+    //   membership  registration shard (created)
+    let registration_hex = bytes_to_hex(&ctx.registration_program);
+    let native_hex = bytes_to_hex(&NATIVE_TOKEN_PROGRAM);
+    let mention = |account: &[u8; 32], signs: bool, shard: &str| wallet::Mention {
+        account_hex: bytes_to_hex(account),
+        signs,
+        shard_program_hex: shard.to_string(),
+    };
+    let Some(payer_bytes) = hex_to_bytes32(payer_hex) else {
+        eprintln!("{who}: payer {payer_hex} is not 32-byte hex");
+        return None;
+    };
+    let mentions = vec![
+        mention(&plan.config_account_id, false, &registration_hex),
+        mention(&plan.tree_main_account_id, false, &bytes_to_hex(&ctx.merkle_program)),
+        mention(&payer_bytes, true, &native_hex),
+        mention(&plan.treasury_account_id, false, &native_hex),
+        mention(
+            &rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES,
+            false,
+            &bytes_to_hex(&rln_layouts::clock_program_account_id()),
+        ),
+        mention(&plan.membership_account_id, false, &registration_hex),
+    ];
+    send_generic_tx(who, mentions, instruction, registration_hex, fee_payer_hex())
+}
+
+/// How often the watcher looks at the chain, and how many times a reverted
+/// registration is re-sent before the watcher gives up and frees the slot for
+/// a later caller.
+const REG_WATCH_INTERVAL: Duration = Duration::from_secs(2);
+const REG_MAX_RESUBMITS: u32 = 5;
+
+struct RegisterWatch {
+    config_account_id: String,
+    payer_hex: String,
+    id_commitment: [u8; 32],
+    rate_limit: u64,
+    reg_key: String,
+    tx_hash: String,
+}
+
+/// Follow a submitted registration until its membership appears, re-sending it
+/// with fresh claims if it reverted.
+///
+/// On LEZ v0.3.0 a registration whose claims no longer hold (its clock claim
+/// outside the registry's tolerance, a price or duration changed under it) is
+/// still included in a block — charged, with no effect, and nothing sent back
+/// to the submitter. So the fate is read from the chain: the membership
+/// appearing is success; the transaction in a block without it is a revert,
+/// re-planned and re-sent. A transaction the sequencer still holds (deferred on
+/// the block gas cap, which fits one registration per block) is left alone:
+/// re-sending it would race the original, and the loser pays a full
+/// registration's gas for nothing.
+fn spawn_register_watch(w: RegisterWatch) {
+    let spawned = std::thread::Builder::new()
+        .name("lez-rln-register-watch".into())
+        .spawn(move || register_watch(w));
+    if let Err(e) = spawned {
+        eprintln!("register_member: could not start the confirmation watcher: {e}");
+    }
+}
+
+fn register_watch(mut w: RegisterWatch) {
+    const WHO: &str = "register_member(watch)";
+    let deadline = Instant::now() + REG_IN_FLIGHT_TTL;
+    let mut resubmits = 0u32;
+    while Instant::now() < deadline {
+        std::thread::sleep(REG_WATCH_INTERVAL);
+        let Some(ctx) = resolve_config_context(&w.config_account_id, WHO) else {
+            continue;
+        };
+        let Some(plan) = derive_register_plan(&ctx, &w.id_commitment, WHO) else {
+            continue;
+        };
+        let membership_hex = bytes_to_hex(&plan.membership_account_id);
+        let landed = || {
+            fetch_shard_quiet(&membership_hex, &ctx.registration_program)
+                .and_then(|data| native::decode_membership(&data).ok())
+        };
+        if let Some(m) = landed() {
+            match membership_leaf_index(&ctx, &m, WHO) {
+                Some(leaf) => eprintln!("{WHO}: registered at leaf {leaf}"),
+                None => eprintln!("{WHO}: registered"),
+            }
+            return;
+        }
+        if fee_state::tx_included(&w.tx_hash) != Some(true) {
+            continue;
+        }
+        // Included: re-read once, in case it applied between the two reads.
+        if landed().is_some() {
+            continue;
+        }
+        if resubmits >= REG_MAX_RESUBMITS {
+            eprintln!(
+                "{WHO}: membership still absent after {REG_MAX_RESUBMITS} re-sends — giving up; \
+                 a later register_member call starts afresh"
+            );
+            reg_in_flight(|m| m.remove(&w.reg_key));
+            return;
+        }
+        eprintln!(
+            "{WHO}: tx {} is in a block but registered nothing — it reverted; re-sending with \
+             fresh claims",
+            w.tx_hash
+        );
+        resubmits += 1;
+        let Some(send_result) =
+            submit_register(&ctx, &plan, &w.id_commitment, w.rate_limit, &w.payer_hex, WHO)
+        else {
+            continue;
+        };
+        w.tx_hash = tx_hash_of(&send_result);
+        let reply = serde_json::json!({
+            "leaf_index": plan.next_leaf_index as i64,
+            "tx_result": send_result,
+            "pending": true,
+        })
+        .to_string();
+        reg_in_flight(|m| m.insert(w.reg_key.clone(), (reply, Instant::now())));
+    }
+    eprintln!("{WHO}: no membership within {}s", REG_IN_FLIGHT_TTL.as_secs());
+}
+
 // ------------------------------------------------------------- method bodies
 
 fn get_valid_roots_impl(rln_account_id_hex: &str) -> String {
@@ -483,18 +689,7 @@ fn get_valid_roots_impl(rln_account_id_hex: &str) -> String {
         return String::new();
     };
 
-    // Derive tree main account via merkle_proofs_plan (no leaves needed).
-    let plan = match native::merkle_proofs_plan(&ctx.config_data, &ctx.program_owner, &[]) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("get_valid_roots: merkle_proofs_plan failed: {e}");
-            return String::new();
-        }
-    };
-
-    let main_hex = bytes_to_hex(&plan.main_account_id);
-    let Some(main_data) = fetch_account_data(&main_hex, None) else {
-        eprintln!("get_valid_roots: failed to fetch tree main account {main_hex}");
+    let Some(main_data) = fetch_tree_shard(&ctx, "get_valid_roots") else {
         return String::new();
     };
 
@@ -550,111 +745,28 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
         return String::new();
     };
 
-    let plan = match native::merkle_proofs_plan(&ctx.config_data, &ctx.program_owner, &leaf_indices)
-    {
+    // The whole tree is one shard of one account, so a single read is a
+    // consistent snapshot: the roots and every proof come from the same state.
+    let Some(main_data) = fetch_tree_shard(&ctx, "get_merkle_proofs") else {
+        return String::new();
+    };
+    let roots = match native::get_valid_roots(&main_data) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("get_merkle_proofs: valid_roots failed: {e}");
+            return String::new();
+        }
+    };
+    let proofs = match native::merkle_proofs_exec(&main_data, &leaf_indices) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("get_merkle_proofs: merkle_proofs_plan failed: {e}");
+            eprintln!("get_merkle_proofs: merkle_proofs_exec failed: {e}");
             return String::new();
         }
     };
 
-    // Stable-snapshot loop: the wallet's reads aren't snapshot-bound, so the
-    // subtree reads are bracketed by two main-account fetches; equal
-    // valid_roots windows prove no mutation occurred and the (main, subtree)
-    // pair is consistent.
-    const MAX_SNAPSHOT_ATTEMPTS: usize = 5;
-    let main_hex = bytes_to_hex(&plan.main_account_id);
-    let subtree_count = plan.subtree_count as usize;
-
-    let mut proofs: Vec<native::ProofJson> = Vec::new();
-    let mut stable_roots: Vec<[u8; 32]> = Vec::new();
-    let mut consistent = false;
-
-    for attempt in 0..MAX_SNAPSHOT_ATTEMPTS {
-        // Snapshot A — opens the read window.
-        let Some(main_data) = fetch_account_data(&main_hex, None) else {
-            eprintln!("get_merkle_proofs: failed to fetch main account {main_hex}");
-            return String::new();
-        };
-        let roots_a = match native::get_valid_roots(&main_data) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("get_merkle_proofs: valid_roots(A) failed: {e}");
-                return String::new();
-            }
-        };
-
-        // Subtree fetches are tri-state: Absent (not yet initialized) is
-        // legitimate; Error routes into the snapshot retry instead of
-        // silently substituting "empty" for an existing subtree.
-        let mut subtrees: Vec<(u32, Vec<u8>)> = Vec::with_capacity(subtree_count);
-        let mut subtree_fetch_errored = false;
-        for i in 0..subtree_count {
-            let subtree_hex = bytes_to_hex(&plan.subtree_account_ids[i]);
-            match fetch_account_data_tri_state(&subtree_hex) {
-                FetchOutcome::Present(data) => subtrees.push((plan.subtree_ids[i], data)),
-                FetchOutcome::Absent => subtrees.push((plan.subtree_ids[i], Vec::new())),
-                FetchOutcome::Error => {
-                    eprintln!(
-                        "get_merkle_proofs: subtree fetch errored {subtree_hex} (attempt {attempt}) — retrying snapshot"
-                    );
-                    subtree_fetch_errored = true;
-                    break;
-                }
-            }
-        }
-        if subtree_fetch_errored {
-            continue;
-        }
-
-        // Snapshot B — closes the read window.
-        let Some(main_data_b) = fetch_account_data(&main_hex, None) else {
-            eprintln!("get_merkle_proofs: refetch main account failed (attempt {attempt})");
-            continue;
-        };
-        let roots_b = match native::get_valid_roots(&main_data_b) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("get_merkle_proofs: valid_roots(B) failed: {e}");
-                return String::new();
-            }
-        };
-        if roots_a != roots_b {
-            eprintln!(
-                "get_merkle_proofs: tree advanced during subtree reads; retrying for a consistent snapshot (attempt {attempt})"
-            );
-            continue;
-        }
-
-        // Stable window: build proofs from snapshot A's main data.
-        let subtree_refs: Vec<(u32, &[u8])> = subtrees
-            .iter()
-            .map(|(id, data)| (*id, data.as_slice()))
-            .collect();
-        proofs = match native::merkle_proofs_exec(&main_data, &subtree_refs, &leaf_indices) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("get_merkle_proofs: merkle_proofs_exec failed: {e}");
-                return String::new();
-            }
-        };
-        stable_roots = roots_b;
-        consistent = true;
-        break;
-    }
-
-    if !consistent {
-        // Never ship an internally-inconsistent proof (the poller keeps its
-        // previous consistent cachedProof instead).
-        eprintln!(
-            "get_merkle_proofs: no consistent tree snapshot after {MAX_SNAPSHOT_ATTEMPTS} attempts"
-        );
-        return String::new();
-    }
-
     // Inject valid_roots into each proof object so a single RPC returns both.
-    proofs_with_roots_json(&proofs, &roots_to_json_array(&stable_roots))
+    proofs_with_roots_json(&proofs, &roots_to_json_array(&roots))
 }
 
 // -------------------------------------------------------------------- module
@@ -758,15 +870,15 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         // via Claim::Pda, so a resubmit always fails.
         // decode_membership carries its own length guard (DataTooShort), so
         // a short or absent account simply fails to decode.
-        if let Some(membership) = fetch_account_data_quiet(&membership_pda_hex)
+        if let Some(membership) = fetch_shard_quiet(&membership_pda_hex, &ctx.registration_program)
             .and_then(|existing| native::decode_membership(&existing).ok())
         {
-            eprintln!(
-                "register_member: membership already exists at leaf {} — skipping resubmit",
-                membership.leaf_index
-            );
+            let Some(leaf) = membership_leaf_index(&ctx, &membership, "register_member") else {
+                return String::new();
+            };
+            eprintln!("register_member: membership already exists at leaf {leaf} — skipping resubmit");
             return serde_json::json!({
-                "leaf_index": membership.leaf_index as i64,
+                "leaf_index": leaf as i64,
                 "already_registered": true,
             })
             .to_string();
@@ -794,45 +906,9 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             return reply;
         }
 
-        let instruction = match native::register_build_instruction(
-            &plan.tree_id,
-            &id_commitment,
-            rate_limit as u64,
-            plan.subtree_id,
-        ) {
-            Ok(words) => words,
-            Err(e) => {
-                eprintln!("register_member: register_build_instruction failed: {e}");
-                reg_in_flight(|m| m.remove(&reg_key));
-                return String::new();
-            }
-        };
-        // Account order must match methods/guest/src/program.rs::register:
-        //   config, tree_main, user_holding (signer), treasury, bottom_subtree,
-        //   clock_account, membership (init).
-        let account_ids: Vec<String> = vec![
-            bytes_to_hex(&plan.config_account_id),
-            bytes_to_hex(&plan.tree_main_account_id),
-            payer_hex.clone(),
-            bytes_to_hex(&plan.treasury_account_id),
-            bytes_to_hex(&plan.subtree_account_id),
-            bytes_to_hex(&plan.clock_account_id),
-            bytes_to_hex(&plan.membership_account_id),
-        ];
-        // Only the user-holding (payer) account signs; the rest are read/PDA/init.
-        let signing_reqs: Vec<bool> = account_ids
-            .iter()
-            .map(|a| *a == payer_hex)
-            .collect();
-
-        let Some(send_result) = send_generic_tx(
-            "register_member",
-            account_ids,
-            signing_reqs,
-            instruction,
-            bytes_to_hex(&ctx.program_owner),
-            fee_payer_hex(),
-        ) else {
+        let Some(send_result) =
+            submit_register(&ctx, &plan, &id_commitment, rate_limit as u64, &payer_hex, "register_member")
+        else {
             reg_in_flight(|m| m.remove(&reg_key));
             return String::new();
         };
@@ -847,7 +923,15 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             "pending": true,
         })
         .to_string();
-        reg_in_flight(|m| m.insert(reg_key, (reply.clone(), Instant::now())));
+        reg_in_flight(|m| m.insert(reg_key.clone(), (reply.clone(), Instant::now())));
+        spawn_register_watch(RegisterWatch {
+            config_account_id,
+            payer_hex,
+            id_commitment,
+            rate_limit: rate_limit as u64,
+            reg_key,
+            tx_hash: tx_hash_of(&send_result),
+        });
         reply
     }
 
@@ -874,7 +958,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         // destructively. "" maps to provider_failure, which the poller leaves
         // the record untouched for — the intended safe path.
         let membership_pda_hex = bytes_to_hex(&plan.membership_account_id);
-        let data = match fetch_account_data_tri_state(&membership_pda_hex) {
+        let data = match fetch_shard_tri_state(&membership_pda_hex, &ctx.registration_program) {
             FetchOutcome::Present(data) => data,
             FetchOutcome::Absent => {
                 return serde_json::json!({ "registered": false }).to_string();
@@ -895,24 +979,20 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         // Lifecycle state MUST come from chain time; the sequencer refreshes
         // CLOCK_50 every 50 blocks and the guest judges extend/erase against
         // it, so a local clock would disagree with the registry's view.
-        let Some(clock_data) = fetch_account_data(&bytes_to_hex(&plan.clock_account_id), None)
-        else {
-            eprintln!("get_membership: failed to fetch clock account");
+        let Some(now_ms) = chain_now_ms("get_membership") else {
             return String::new();
         };
-        let now_ms = match native::decode_clock_timestamp_ms(&clock_data) {
-            Ok(ts) => ts,
-            Err(e) => {
-                eprintln!("get_membership: clock decode error: {e}");
-                return String::new();
-            }
+        // A membership that exists has a leaf; failing to find it is a read
+        // problem, reported as one ("") rather than as a membership without one.
+        let Some(leaf_index) = membership_leaf_index(&ctx, &membership, "get_membership") else {
+            return String::new();
         };
 
         serde_json::json!({
             "clock_timestamp": now_ms,
             "grace_period_duration": membership.grace_period_duration_sec,
             "grace_period_start_timestamp": membership.grace_period_start_timestamp_ms,
-            "leaf_index": membership.leaf_index as i64,
+            "leaf_index": leaf_index as i64,
             "rate_limit": membership.rate_limit as i64,
             "registered": true,
             "state": native::membership_status(

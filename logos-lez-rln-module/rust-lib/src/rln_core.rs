@@ -3,18 +3,15 @@
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use rln_layouts::{
-    combine_seeds, label_seed, u32_seed,
+    combine_seeds, label_seed,
     MembershipState, TreeMainLayout, ROOT_HISTORY_SIZE,
-    OFFSET_CACHED_NODES, OFFSET_DEPTH, OFFSET_ROOT, OFFSET_TOP_TREE_DATA,
-    TOP_DEPTH, TREE_DEPTH, SUBTREE_LEAVES,
+    OFFSET_CACHED_NODES, OFFSET_DEPTH, OFFSET_ROOT, OFFSET_TREE_DATA, TREE_DEPTH,
     read_sparse_node,
 };
 use serde::Serialize;
 use sha2::{Sha256, Digest};
 
 pub use rln_layouts::{MAX_RATE_LIMIT, MIN_RATE_LIMIT};
-
-pub const MAX_SUBTREES_PER_CALL: usize = 64;
 
 /// A single merkle proof.
 pub struct RlnMerkleProof {
@@ -26,29 +23,33 @@ pub struct RlnMerkleProof {
     pub path_indices: [u8; TREE_DEPTH],
 }
 
-/// The accounts a merkle-proofs call must fetch.
-pub struct MerkleProofsPlan {
-    pub main_account_id: [u8; 32],
-    pub subtree_account_ids: [[u8; 32]; MAX_SUBTREES_PER_CALL],
-    pub subtree_ids: [u32; MAX_SUBTREES_PER_CALL],
-    pub subtree_count: u32,
-}
-
-/// Derived account IDs for a registration transaction.
+/// Derived account IDs, and the values the `Register` instruction claims,
+/// for a registration transaction.
+///
+/// LEZ v0.3.0 runs a program's plan phase without account data, so every value
+/// the guest used to read for itself is now a claim the host makes and the
+/// guest asserts in apply. They are read from the chain just before sending;
+/// a claim that went stale in between is refused, not misapplied.
 pub struct RlnRegisterPlan {
     pub config_account_id: [u8; 32],
     pub tree_main_account_id: [u8; 32],
     pub treasury_account_id: [u8; 32],
-    pub subtree_account_id: [u8; 32],
-    pub clock_account_id: [u8; 32],
-    /// Membership PDA from (program_owner, tree_id, id_commitment).
-    /// Required by the `Register` instruction's `init`-marked membership account.
+    /// Membership PDA from (registration program, tree_id, id_commitment).
     pub membership_account_id: [u8; 32],
     /// The config's tree_id (`CONFIG_OFFSET_TREE_ID`), carried so callers
     /// building the `Register` instruction never re-slice raw config bytes.
     pub tree_id: [u8; 32],
-    pub subtree_id: u32,
+    /// Claim: the merkle program's header account id, from the config.
+    pub merkle_program_id: [u8; 32],
+    /// The tree's `next_index` at planning time: where this registration
+    /// lands if nothing else does first. An estimate only — the tree assigns
+    /// the slot itself when the registration applies.
     pub next_leaf_index: u64,
+    /// Claim: the config's price per rate-limit unit.
+    pub price_per_unit: u128,
+    /// Claims: the config's durations, snapshotted into the membership.
+    pub active_duration_sec: u32,
+    pub grace_period_duration_sec: u32,
 }
 
 /// `rln_layouts::ConfigState` field offsets (borsh: fixed-width fields in
@@ -65,6 +66,7 @@ pub struct RlnRegisterPlan {
 /// offsets does not fail, it yields a plausible wrong treasury and a plausible
 /// wrong price. The length is the only signal, which is why callers assert
 /// `CONFIG_STATE_SIZE` exactly rather than a floor.
+pub const CONFIG_OFFSET_MERKLE_PROGRAM_ID: usize = 0;
 pub const CONFIG_OFFSET_TREE_ID: usize = 32;
 pub const CONFIG_OFFSET_PRICE_PER_UNIT: usize = 64;
 pub const CONFIG_OFFSET_TREASURY_ACCOUNT_ID: usize = 80;
@@ -112,8 +114,9 @@ pub fn config_field_u128(config_data: &[u8], offset: usize) -> u128 {
     )
 }
 
-/// Borsh size of the on-chain `MembershipState` (8+8+32+8+4+4 bytes).
-pub const MEMBERSHIP_STATE_SIZE: usize = 64;
+/// Borsh size of the on-chain `MembershipState`, from the shared crate so a
+/// layout change there reaches this decoder's length guard.
+pub const MEMBERSHIP_STATE_SIZE: usize = rln_layouts::state::MEMBERSHIP_STATE_SIZE;
 
 /// Errors surfaced by the RLN core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,20 +200,26 @@ pub fn get_valid_roots(data: &[u8]) -> Result<Vec<[u8; 32]>, RlnError> {
     Ok(roots)
 }
 
-/// Build a merkle proof for a single leaf given pre-fetched main + subtree data.
-pub fn build_merkle_proof(
-    main_data: &[u8],
-    subtree_data: &[u8],
-    leaf_index: u64,
-) -> Result<RlnMerkleProof, RlnError> {
-    let min_main_len = OFFSET_CACHED_NODES + (TREE_DEPTH + 1) * 32;
-    if main_data.len() < min_main_len {
+/// Build a merkle proof for a single leaf from the tree's merkle shard.
+///
+/// LEZ v0.3.0 keeps the whole tree in one shard of `tree_main`: the header,
+/// then each level's default hash (root level first) at
+/// `OFFSET_CACHED_NODES`, then one sparse node map from `OFFSET_TREE_DATA`.
+/// There are no subtree accounts any more, so a proof is a read of one
+/// account — which also makes it a consistent snapshot by construction.
+pub fn build_merkle_proof(main_data: &[u8], leaf_index: u64) -> Result<RlnMerkleProof, RlnError> {
+    if main_data.len() < OFFSET_TREE_DATA {
         return Err(RlnError::DataTooShort);
     }
 
     let depth = main_data[OFFSET_DEPTH] as usize;
     if depth == 0 || depth > TREE_DEPTH {
         return Err(RlnError::DataTooShort);
+    }
+    // Every offset past the header is a function of TREE_DEPTH; a shard
+    // written at another depth would be misread rather than rejected.
+    if depth != TREE_DEPTH {
+        return Err(RlnError::InvalidConfig);
     }
 
     let max_leaves = 1u64 << depth;
@@ -221,27 +230,14 @@ pub fn build_merkle_proof(
     let root: [u8; 32] = main_data[OFFSET_ROOT..OFFSET_ROOT + 32].try_into().unwrap();
 
     let cached_defaults: Vec<[u8; 32]> = (0..=depth)
-        .map(|i| {
-            let start = OFFSET_CACHED_NODES + i * 32;
+        .map(|level| {
+            let start = OFFSET_CACHED_NODES + level * 32;
             main_data[start..start + 32].try_into().unwrap()
         })
         .collect();
-
-    let top_tree_data = if main_data.len() > OFFSET_TOP_TREE_DATA {
-        &main_data[OFFSET_TOP_TREE_DATA..]
-    } else {
-        &[]
-    };
-
+    let tree_data = &main_data[OFFSET_TREE_DATA..];
     let fetch_node = |level: usize, node_index: u64| -> [u8; 32] {
-        if level <= TOP_DEPTH {
-            read_sparse_node(top_tree_data, level, node_index as usize, &cached_defaults[level])
-        } else {
-            let bottom_level = level - TOP_DEPTH;
-            let nodes_per_subtree = 1usize << bottom_level;
-            let local_index = node_index as usize % nodes_per_subtree;
-            read_sparse_node(subtree_data, bottom_level, local_index, &cached_defaults[level])
-        }
+        read_sparse_node(tree_data, level, node_index as usize, &cached_defaults[level])
     };
 
     let leaf = fetch_node(depth, leaf_index);
@@ -252,16 +248,8 @@ pub fn build_merkle_proof(
 
     for i in 0..depth {
         let level = depth - i;
-        let is_right = (current_index % 2) as u8;
-        path_indices[i] = is_right;
-
-        let sibling_index = if current_index.is_multiple_of(2) {
-            current_index + 1
-        } else {
-            current_index - 1
-        };
-
-        path_elements[i] = fetch_node(level, sibling_index);
+        path_indices[i] = (current_index % 2) as u8;
+        path_elements[i] = fetch_node(level, current_index ^ 1);
         current_index /= 2;
     }
 
@@ -275,52 +263,20 @@ pub fn build_merkle_proof(
     })
 }
 
-/// Phase 1: compute which accounts a merkle-proofs call must fetch.
-///
-/// `program_owner`: 32-byte registration program ID. Tree main and subtree
-/// accounts are PDAs of this program, NOT the merkle program.
-pub fn merkle_proofs_plan(
+/// The tree's main account: a PDA of the REGISTRATION program, whose merkle
+/// shard (keyed by the merkle program) holds the tree.
+pub fn tree_main_account_id(
     config_data: &[u8],
-    program_owner: &[u8; 32],
-    leaf_indices: &[u64],
-) -> Result<MerkleProofsPlan, RlnError> {
+    registration_program: &[u8; 32],
+) -> Result<[u8; 32], RlnError> {
     if config_data.len() != CONFIG_STATE_SIZE {
         return Err(RlnError::InvalidConfig);
     }
-
     let tree_id: &[u8; 32] = &config_field_32(config_data, CONFIG_OFFSET_TREE_ID);
-    let main_account_id =
-        derive_pda(program_owner, &combine_seeds(&[&label_seed("main"), tree_id]));
-
-    let mut unique_ids: Vec<u32> = leaf_indices
-        .iter()
-        .map(|&idx| {
-            u32::try_from(idx / SUBTREE_LEAVES as u64).map_err(|_| RlnError::InvalidLeafIndex)
-        })
-        .collect::<Result<_, _>>()?;
-    unique_ids.sort_unstable();
-    unique_ids.dedup();
-
-    if unique_ids.len() > MAX_SUBTREES_PER_CALL {
-        return Err(RlnError::InvalidLeafIndex);
-    }
-
-    let mut plan = MerkleProofsPlan {
-        main_account_id,
-        subtree_account_ids: [[0u8; 32]; MAX_SUBTREES_PER_CALL],
-        subtree_ids: [0u32; MAX_SUBTREES_PER_CALL],
-        subtree_count: unique_ids.len() as u32,
-    };
-
-    for (i, &subtree_id) in unique_ids.iter().enumerate() {
-        plan.subtree_account_ids[i] = derive_pda(
-            program_owner,
-            &combine_seeds(&[&label_seed("subtree"), tree_id, &u32_seed(subtree_id)]),
-        );
-        plan.subtree_ids[i] = subtree_id;
-    }
-
-    Ok(plan)
+    Ok(derive_pda(
+        registration_program,
+        &combine_seeds(&[&label_seed("main"), tree_id]),
+    ))
 }
 
 /// One wire proof object. Serialized by the caller via `serde_json::Value`
@@ -348,33 +304,12 @@ pub(crate) fn bytes_to_hex(data: &[u8]) -> String {
     out
 }
 
-/// Phase 2: build all proofs from fetched account data, as typed proof
+/// Build all proofs from one read of the tree's merkle shard, as typed proof
 /// objects (the caller serializes them together with `valid_roots`).
-pub fn merkle_proofs_exec(
-    main_data: &[u8],
-    subtrees: &[(u32, &[u8])],
-    leaf_indices: &[u64],
-) -> Result<Vec<ProofJson>, RlnError> {
+pub fn merkle_proofs_exec(main_data: &[u8], leaf_indices: &[u64]) -> Result<Vec<ProofJson>, RlnError> {
     let mut proofs = Vec::with_capacity(leaf_indices.len());
-
     for &leaf_index in leaf_indices {
-        let subtree_id = u32::try_from(leaf_index / SUBTREE_LEAVES as u64)
-            .map_err(|_| RlnError::InvalidLeafIndex)?;
-
-        // A PRESENT entry that is empty is the legitimate Absent case (the
-        // subtree account is not initialized yet). A MISSING entry means the
-        // caller's plan and this call disagree — substituting empty there
-        // would prove against default nodes and mint a wrong-but-plausible
-        // proof, which is exactly what the caller's tri-state fetch refuses
-        // to do.
-        let subtree_data: &[u8] = subtrees
-            .iter()
-            .find(|(id, _)| *id == subtree_id)
-            .map(|(_, data)| *data)
-            .ok_or(RlnError::InvalidLeafIndex)?;
-
-        let proof = build_merkle_proof(main_data, subtree_data, leaf_index)?;
-
+        let proof = build_merkle_proof(main_data, leaf_index)?;
         let depth = proof.depth as usize;
         proofs.push(ProofJson {
             leaf: bytes_to_hex(&proof.leaf),
@@ -388,15 +323,15 @@ pub fn merkle_proofs_exec(
             path_indices: proof.path_indices[..depth].to_vec(),
         });
     }
-
     Ok(proofs)
 }
 
-/// Plan a registration transaction by deriving all required account IDs.
+/// Plan a registration transaction: derive its accounts and read every claim
+/// the guest asserts from the config and the tree's merkle shard.
 pub fn register_plan(
     config_data: &[u8],
     tree_main_data: &[u8],
-    program_owner: &[u8; 32],
+    registration_program: &[u8; 32],
     id_commitment: &[u8; 32],
 ) -> Result<RlnRegisterPlan, RlnError> {
     if config_data.len() != CONFIG_STATE_SIZE {
@@ -410,19 +345,11 @@ pub fn register_plan(
     let tree_id: &[u8; 32] = &config_field_32(config_data, CONFIG_OFFSET_TREE_ID);
 
     let config_account_id =
-        derive_pda(program_owner, &combine_seeds(&[&label_seed("config"), tree_id]));
+        derive_pda(registration_program, &combine_seeds(&[&label_seed("config"), tree_id]));
     let tree_main_account_id =
-        derive_pda(program_owner, &combine_seeds(&[&label_seed("main"), tree_id]));
-
-    let next_leaf_index = tree_main.next_index();
-    let subtree_id = (next_leaf_index / SUBTREE_LEAVES as u64) as u32;
-    let subtree_account_id = derive_pda(
-        program_owner,
-        &combine_seeds(&[&label_seed("subtree"), tree_id, &u32_seed(subtree_id)]),
-    );
-
+        derive_pda(registration_program, &combine_seeds(&[&label_seed("main"), tree_id]));
     let membership_account_id = derive_pda(
-        program_owner,
+        registration_program,
         &combine_seeds(&[&label_seed("membership"), tree_id, id_commitment]),
     );
 
@@ -430,29 +357,68 @@ pub fn register_plan(
         config_account_id,
         tree_main_account_id,
         treasury_account_id: config_field_32(config_data, CONFIG_OFFSET_TREASURY_ACCOUNT_ID),
-        subtree_account_id,
-        clock_account_id: rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES,
         membership_account_id,
         tree_id: *tree_id,
-        subtree_id,
-        next_leaf_index,
+        merkle_program_id: config_field_32(config_data, CONFIG_OFFSET_MERKLE_PROGRAM_ID),
+        next_leaf_index: tree_main.next_index(),
+        price_per_unit: config_field_u128(config_data, CONFIG_OFFSET_PRICE_PER_UNIT),
+        active_duration_sec: config_field_u32(config_data, CONFIG_OFFSET_ACTIVE_DURATION),
+        grace_period_duration_sec: config_field_u32(config_data, CONFIG_OFFSET_GRACE_DURATION),
     })
 }
 
-/// Build the `Instruction::Register` payload as borsh bytes.
+/// Build the `Instruction::Register` payload as borsh bytes. `now_ms` is the
+/// CLOCK_50 timestamp read just before sending — a claim, like the plan's.
 pub fn register_build_instruction(
-    tree_id: &[u8; 32],
+    plan: &RlnRegisterPlan,
     id_commitment: &[u8; 32],
     rate_limit: u64,
-    subtree_id: u32,
+    now_ms: u64,
 ) -> Result<Vec<u8>, RlnError> {
     let instruction = rln_layouts::Instruction::Register {
-        tree_id: *tree_id,
+        tree_id: plan.tree_id,
         id_commitment: *id_commitment,
         rate_limit,
-        subtree_id,
+        merkle_program_id: plan.merkle_program_id,
+        now_ms,
+        price_per_unit: plan.price_per_unit,
+        active_duration_sec: plan.active_duration_sec,
+        grace_period_duration_sec: plan.grace_period_duration_sec,
     };
     serialize_instruction(&instruction)
+}
+
+/// A membership's leaf: `rate_commitment = poseidon(id_commitment, rate_limit)`,
+/// little-endian — the value the merkle program inserts. `None` when the
+/// commitment is not a canonical BN254 field element.
+pub fn registration_leaf(id_commitment: &[u8; 32], rate_limit: u64) -> Option<[u8; 32]> {
+    use rln::prelude::{CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, PoseidonHash};
+    let id = Fr::deserialize_compressed(id_commitment.as_slice()).ok()?;
+    let leaf = Hasher::<PoseidonHash>::hash_pair(id, Fr::from(rate_limit));
+    let mut out = [0u8; 32];
+    leaf.serialize_compressed(out.as_mut_slice()).ok()?;
+    Some(out)
+}
+
+/// Where `leaf` sits in the tree, newest slot first, below `next_index`.
+///
+/// On LEZ v0.3.0 the merkle program assigns the slot when a registration
+/// applies and the membership record no longer carries it, so the tree is
+/// the only place the index lives. Mirrors lez-rln's
+/// `merkle_tree::find_leaf_index`.
+pub fn find_leaf_index(main_data: &[u8], leaf: &[u8; 32]) -> Option<u64> {
+    if main_data.len() < OFFSET_TREE_DATA || main_data[OFFSET_DEPTH] as usize != TREE_DEPTH {
+        return None;
+    }
+    let next = TreeMainLayout::parse(main_data).next_index().min(1u64 << TREE_DEPTH);
+    let default: [u8; 32] = main_data
+        [OFFSET_CACHED_NODES + TREE_DEPTH * 32..OFFSET_CACHED_NODES + (TREE_DEPTH + 1) * 32]
+        .try_into()
+        .ok()?;
+    let nodes = &main_data[OFFSET_TREE_DATA..];
+    (0..next)
+        .rev()
+        .find(|&i| read_sparse_node(nodes, TREE_DEPTH, i as usize, &default) == *leaf)
 }
 
 /// Decode a fetched membership PDA's account data.
@@ -574,7 +540,7 @@ mod tests {
             stale.resize(stale_len, 0);
             assert!(
                 matches!(
-                    merkle_proofs_plan(&stale, &owner, &[0]),
+                    tree_main_account_id(&stale, &owner),
                     Err(RlnError::InvalidConfig)
                 ),
                 "a {stale_len}-byte config must be refused, not decoded"
@@ -592,7 +558,7 @@ mod tests {
         // right size gets past it. (What it does next is the other tests'
         // business; only "not InvalidConfig" is claimed here.)
         assert!(!matches!(
-            merkle_proofs_plan(&good, &owner, &[0]),
+            tree_main_account_id(&good, &owner),
             Err(RlnError::InvalidConfig)
         ));
     }
@@ -633,108 +599,184 @@ mod tests {
         assert_eq!(membership_status(start_ms, grace_sec, registered_ms + 38 * DAY_MS), "expired");
     }
 
-    /// A `tree_main` account long enough for `build_merkle_proof`'s guards,
-    /// declaring the full tree depth.
-    fn make_tree_main() -> Vec<u8> {
-        let mut main = vec![0u8; OFFSET_CACHED_NODES + (TREE_DEPTH + 1) * 32];
-        main[OFFSET_DEPTH] = TREE_DEPTH as u8;
-        main
+    /// An initialized, empty tree shard: header at depth TREE_DEPTH, each
+    /// level's default at its own value, and an empty sparse map.
+    fn make_tree_shard(next_index: u64) -> Vec<u8> {
+        let mut shard = vec![0u8; OFFSET_TREE_DATA + 2];
+        shard[OFFSET_DEPTH] = TREE_DEPTH as u8;
+        shard[1..9].copy_from_slice(&next_index.to_le_bytes());
+        for level in 0..=TREE_DEPTH {
+            let at = OFFSET_CACHED_NODES + level * 32;
+            shard[at..at + 32].copy_from_slice(&[level as u8 + 1; 32]);
+        }
+        shard
     }
 
-    // A subtree the caller never supplied is a plan/exec disagreement, not
-    // the legitimate "not initialized yet" case. Substituting empty there
-    // would build a proof over default nodes — plausible, and wrong.
-    #[test]
-    fn exec_refuses_a_leaf_whose_subtree_was_not_supplied() {
-        let main = make_tree_main();
-        let Err(err) = merkle_proofs_exec(&main, &[], &[0]) else {
-            panic!("a leaf whose subtree was not supplied must not prove");
-        };
-        assert!(matches!(err, RlnError::InvalidLeafIndex), "got: {err}");
+    /// Put one node into a shard's sparse map (entries stay sorted, which
+    /// `read_sparse_node`'s binary search needs).
+    fn set_node(shard: &mut Vec<u8>, level: usize, index: usize, hash: [u8; 32]) {
+        let mut entries: Vec<(u16, [u8; 32])> = Vec::new();
+        let map = &shard[OFFSET_TREE_DATA..];
+        let count = u16::from_le_bytes([map[0], map[1]]) as usize;
+        for i in 0..count {
+            let at = 2 + i * 34;
+            let off = u16::from_le_bytes([map[at], map[at + 1]]);
+            entries.push((off, map[at + 2..at + 34].try_into().unwrap()));
+        }
+        entries.push((rln_layouts::node_offset(level, index) as u16, hash));
+        entries.sort_by_key(|e| e.0);
+        shard.truncate(OFFSET_TREE_DATA);
+        shard.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (off, h) in entries {
+            shard.extend_from_slice(&off.to_le_bytes());
+            shard.extend_from_slice(&h);
+        }
+    }
 
-        // Present-but-empty stays legitimate: that is FetchOutcome::Absent.
-        assert!(
-            merkle_proofs_exec(&main, &[(0, &[])], &[0]).is_ok(),
-            "an absent (present-but-empty) subtree still proves"
+    // A proof reads every sibling from its own level of the one shard, and an
+    // unset node reads as that level's cached default.
+    #[test]
+    fn a_proof_takes_each_sibling_from_its_own_level() {
+        let mut shard = make_tree_shard(2);
+        set_node(&mut shard, TREE_DEPTH, 0, [0xA0; 32]);
+        set_node(&mut shard, TREE_DEPTH, 1, [0xA1; 32]);
+        set_node(&mut shard, TREE_DEPTH - 1, 1, [0xB1; 32]);
+
+        let p = build_merkle_proof(&shard, 1).unwrap();
+        assert_eq!(p.leaf, [0xA1; 32]);
+        assert_eq!(p.depth as usize, TREE_DEPTH);
+        assert_eq!(p.path_indices[0], 1, "leaf 1 is a right child");
+        assert_eq!(p.path_elements[0], [0xA0; 32], "its sibling is leaf 0");
+        assert_eq!(p.path_elements[1], [0xB1; 32], "level depth-1, index 1");
+        // Unset above that: the level's cached default.
+        let level = TREE_DEPTH - 2;
+        assert_eq!(p.path_elements[2], [level as u8 + 1; 32]);
+    }
+
+    #[test]
+    fn a_proof_refuses_an_uninitialized_or_foreign_depth_shard() {
+        assert_eq!(
+            build_merkle_proof(&vec![0u8; OFFSET_TREE_DATA - 1], 0).err(),
+            Some(RlnError::DataTooShort)
+        );
+        let mut shard = make_tree_shard(0);
+        shard[OFFSET_DEPTH] = (TREE_DEPTH - 1) as u8;
+        assert_eq!(build_merkle_proof(&shard, 0).err(), Some(RlnError::InvalidConfig));
+        let shard = make_tree_shard(0);
+        assert_eq!(
+            build_merkle_proof(&shard, 1u64 << TREE_DEPTH).err(),
+            Some(RlnError::InvalidLeafIndex)
+        );
+    }
+
+    // Every claim the guest asserts comes from the config and the tree shard.
+    #[test]
+    fn register_plan_reads_every_claim() {
+        let config = make_config_state();
+        let program = [0xAA; 32];
+        let plan = register_plan(&config, &make_tree_shard(37), &program, &[0x77; 32]).unwrap();
+        assert_eq!(plan.merkle_program_id, [0x11; 32]);
+        assert_eq!(plan.tree_id, [0x42; 32]);
+        assert_eq!(plan.treasury_account_id, [0x33; 32]);
+        assert_eq!(plan.next_leaf_index, 37);
+        assert_eq!(plan.price_per_unit, 77_000_000_000_000_000_000);
+        assert_eq!(plan.active_duration_sec, 100);
+        assert_eq!(plan.grace_period_duration_sec, 10);
+        let tree_id = [0x42; 32];
+        assert_eq!(
+            plan.membership_account_id,
+            derive_pda(&program, &combine_seeds(&[&label_seed("membership"), &tree_id, &[0x77; 32]]))
+        );
+        assert_eq!(
+            plan.tree_main_account_id,
+            tree_main_account_id(&config, &program).unwrap()
         );
     }
 
     // Pins the Register instruction's byte encoding (borsh: a one-byte variant
-    // discriminant, fixed-width arrays inline, integers little-endian).
-    //
-    // This is consensus wire format shared with the deployed guest, so a change
-    // here is a change the whole chain has to make at once. It used to be
-    // risc0-serde u32 words; LEZ v0.2.5 moved every program's instruction
-    // decoding to borsh.
-    //
-    // The discriminant moved 3 -> 2 when the registry dropped every token:
-    // InitializeCreditToken sat between Initialize and Register and went with
-    // the credit path, so Register slid down. A borsh variant index IS its
-    // declaration order, which is why this assert is spelled as a literal —
-    // deriving it from the enum would track a renumbering silently, and a
-    // module encoding 3 against a guest that now reads 2 does not fail to
-    // decode, it executes a DIFFERENT instruction.
+    // discriminant, fixed-width arrays inline, integers little-endian). This is
+    // consensus wire format shared with the deployed guest: a module encoding
+    // against a guest that reads a different layout does not fail to decode,
+    // it executes a different instruction — hence literals, not derivations.
     #[test]
     fn register_instruction_bytes_pin() {
-        let bytes = register_build_instruction(&[0xAB; 32], &[0xCD; 32], 0x1_0000_0002, 7).unwrap();
-        assert_eq!(bytes.len(), 1 + 32 + 32 + 8 + 4);
+        let mut plan = register_plan(
+            &make_config_state(),
+            &make_tree_shard(0x0102),
+            &[0xAA; 32],
+            &[0xCD; 32],
+        )
+        .unwrap();
+        plan.tree_id = [0xAB; 32];
+        let bytes = register_build_instruction(&plan, &[0xCD; 32], 0x1_0000_0002, 0x0A0B).unwrap();
+        assert_eq!(bytes.len(), 1 + 32 + 32 + 8 + 32 + 8 + 16 + 4 + 4);
         assert_eq!(bytes[0], 2, "Register variant discriminant");
         assert_eq!(&bytes[1..33], &[0xABu8; 32], "tree_id");
         assert_eq!(&bytes[33..65], &[0xCDu8; 32], "id_commitment");
+        assert_eq!(&bytes[65..73], &[2, 0, 0, 0, 1, 0, 0, 0], "rate_limit u64 LE");
+        assert_eq!(&bytes[73..105], &[0x11u8; 32], "merkle_program_id");
+        assert_eq!(&bytes[105..113], &[0x0B, 0x0A, 0, 0, 0, 0, 0, 0], "now_ms u64 LE");
         assert_eq!(
-            &bytes[65..73],
-            &[2, 0, 0, 0, 1, 0, 0, 0],
-            "rate_limit, little-endian u64"
+            &bytes[113..129],
+            &77_000_000_000_000_000_000u128.to_le_bytes(),
+            "price_per_unit u128 LE"
         );
-        assert_eq!(&bytes[73..77], &[7, 0, 0, 0], "subtree_id, little-endian u32");
+        assert_eq!(&bytes[129..133], &[100, 0, 0, 0], "active_duration_sec");
+        assert_eq!(&bytes[133..137], &[10, 0, 0, 0], "grace_period_duration_sec");
     }
 
     // The guest decodes what this encodes, so the two must round-trip.
     #[test]
     fn register_instruction_round_trips_through_borsh() {
-        let bytes = register_build_instruction(&[0xAB; 32], &[0xCD; 32], 0x1_0000_0002, 7).unwrap();
-        let decoded = rln_layouts::Instruction::try_from_slice(&bytes).expect("decodes");
+        let plan = register_plan(&make_config_state(), &make_tree_shard(5), &[0xAA; 32], &[0xCD; 32])
+            .unwrap();
+        let bytes = register_build_instruction(&plan, &[0xCD; 32], 200, 9_999).unwrap();
         let rln_layouts::Instruction::Register {
             tree_id,
             id_commitment,
             rate_limit,
-            subtree_id,
-        } = decoded
+            merkle_program_id,
+            now_ms,
+            price_per_unit,
+            active_duration_sec,
+            grace_period_duration_sec,
+        } = rln_layouts::Instruction::try_from_slice(&bytes).expect("decodes")
         else {
             panic!("expected a Register instruction");
         };
-        assert_eq!(tree_id, [0xAB; 32]);
+        assert_eq!(tree_id, [0x42; 32]);
         assert_eq!(id_commitment, [0xCD; 32]);
-        assert_eq!(rate_limit, 0x1_0000_0002);
-        assert_eq!(subtree_id, 7);
+        assert_eq!(rate_limit, 200);
+        assert_eq!(merkle_program_id, [0x11; 32]);
+        assert_eq!(now_ms, 9_999);
+        assert_eq!(price_per_unit, 77_000_000_000_000_000_000);
+        assert_eq!(active_duration_sec, 100);
+        assert_eq!(grace_period_duration_sec, 10);
     }
 
+    // The tree, not the membership, holds a member's index: found by its
+    // leaf, newest slot first, and only below next_index.
     #[test]
-    fn plan_derives_correct_ids_with_program_owner() {
-        let config_data = make_config_state();
-        let program_owner: [u8; 32] = [0xAA; 32];
-        let tree_id: [u8; 32] = [0x42; 32];
+    fn a_leaf_is_found_by_value_below_next_index() {
+        let mut shard = make_tree_shard(3);
+        set_node(&mut shard, TREE_DEPTH, 0, [0x11; 32]);
+        set_node(&mut shard, TREE_DEPTH, 1, [0x22; 32]);
+        set_node(&mut shard, TREE_DEPTH, 2, [0x11; 32]);
+        set_node(&mut shard, TREE_DEPTH, 3, [0x33; 32]);
+        assert_eq!(find_leaf_index(&shard, &[0x11; 32]), Some(2), "newest first");
+        assert_eq!(find_leaf_index(&shard, &[0x22; 32]), Some(1));
+        assert_eq!(find_leaf_index(&shard, &[0x33; 32]), None, "at next_index, not below it");
+        assert_eq!(find_leaf_index(&shard, &[0x44; 32]), None);
+    }
 
-        let expected_main_id =
-            derive_pda(&program_owner, &combine_seeds(&[&label_seed("main"), &tree_id]));
-
-        // Two leaves in the first subtree and one in the second, wherever the
-        // tree's geometry puts that boundary.
-        let second_subtree_leaf = SUBTREE_LEAVES as u64 + 1;
-        let plan =
-            merkle_proofs_plan(&config_data, &program_owner, &[0, 1, second_subtree_leaf]).unwrap();
-        assert_eq!(expected_main_id, plan.main_account_id);
-        assert_eq!(plan.subtree_count, 2);
-        assert_eq!(plan.subtree_ids[0], 0);
-        assert_eq!(plan.subtree_ids[1], 1);
-        for i in 0..plan.subtree_count as usize {
-            let mut seed = [0u8; 32];
-            seed[..4].copy_from_slice(&plan.subtree_ids[i].to_le_bytes());
-            let expected = derive_pda(
-                &program_owner,
-                &combine_seeds(&[&label_seed("subtree"), &tree_id, &seed]),
-            );
-            assert_eq!(expected, plan.subtree_account_ids[i]);
-        }
+    // The leaf is poseidon(id_commitment, rate_limit): the rate limit is part
+    // of it, so the same identity at another rate is another leaf.
+    #[test]
+    fn the_leaf_binds_the_rate_limit() {
+        let id = [7u8; 32];
+        let a = registration_leaf(&id, 100).expect("canonical commitment");
+        assert_ne!(a, registration_leaf(&id, 200).unwrap());
+        assert_eq!(a, registration_leaf(&id, 100).unwrap());
+        assert!(registration_leaf(&[0xFF; 32], 100).is_none(), "non-canonical field element");
     }
 }

@@ -22,7 +22,7 @@ panic = "abort"
 # rln-layouts is the on-chain borsh wire format, pinned to the logos-lez-rln
 # rev whose deployed programs it must match; bump the rev together with any
 # layout change.
-rln-layouts = { git = "https://github.com/logos-co/logos-lez-rln.git", rev = "387d9c1f6b353fa3d44cd10e459ec7729d9318a7" }
+rln-layouts = { git = "https://github.com/logos-co/logos-lez-rln.git", rev = "e54598d2dc30f68075ab5d37e087b04aa5966242" }
 risc0-zkvm = { version = "3.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
 borsh = { version = "1", default-features = false, features = ["derive"] }
@@ -32,9 +32,14 @@ serde = { version = "1", features = ["derive"] }
 # logos-rust-sdk rev its generator came from.
 logos-rust-sdk = { path = "../logos-rust-sdk-src" }
 serde_json = "1"
-
-# rln (zerokit) is test-only: tests recompute Poseidon tree roots and derive
-# a deterministic throwaway identity. The shipped staticlib does not link it.
-[dev-dependencies]
+# rln (zerokit) for Poseidon: a membership's leaf is
+# rate_commitment = poseidon(id_commitment, rate_limit), and on LEZ v0.3.0 the
+# tree assigns the leaf index, so finding a membership's leaf means hashing
+# its leaf and looking it up in the tree.
 rln = { version = "3.0.0", default-features = false }
+# get_fee_state / tx_included read the sequencer directly (wallet_ffi exposes
+# neither); rustls so an https-only zone (the LEZ 0.3 testnet) can be read.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+
+[dev-dependencies]
 rand_chacha = "0.3"

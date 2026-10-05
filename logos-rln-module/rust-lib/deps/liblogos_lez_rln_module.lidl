@@ -7,7 +7,7 @@
 ; for per-call timeouts, like the sibling's wallet path) but the client
 ; documents the consumed wire.
 module liblogos_lez_rln_module {
-  version "4.2.0"
+  version "5.0.0"
 
   ; All replies are compact JSON strings; "" is the error value.
 

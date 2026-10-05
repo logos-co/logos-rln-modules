@@ -233,6 +233,23 @@ mod tests {
             registry.tree_id,
             "63c6b92f831ba82d65c1aa0d4dd6f7a2510b848d7afcfda326f662710b1696d5"
         );
-        assert_eq!(known_references(), ["devnet", "testnet"]);
+        assert_eq!(known_references(), ["devnet", "testnet", "testnet-v03"]);
+    }
+
+    #[test]
+    fn testnet_v03_is_pinned() {
+        let net = network("testnet-v03").expect("testnet-v03");
+        assert_eq!(net.sequencer, "https://testnet.lez.logos.co/");
+        let config = "5e77e579df942069ef37fcc1ca0a56266e83a710ebc3349fe6171bbfc83c542a";
+        assert_eq!(
+            network_of_config(config).map(|n| n.reference.as_str()),
+            Some("testnet-v03")
+        );
+        let registry = &net.registries[0];
+        assert_eq!(registry.deployment, "testnet-v03-z1");
+        assert_eq!(
+            registry.tree_id,
+            "81dc01d66d8e34fcbf7ad12614e70ae046f816a1e48f9f712a63c81b53a8024a"
+        );
     }
 }

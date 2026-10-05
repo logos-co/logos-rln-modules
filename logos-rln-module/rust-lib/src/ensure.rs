@@ -114,7 +114,8 @@ const ASSUMED_DATA_BYTES: u128 = 100_000;
 const BASE_FEE_HEADROOM: u128 = 2;
 
 /// The reserve when no fee quote can be had — an older sibling without
-/// `get_fee_state`, an https sequencer, a transport error or an unparsable
+/// `get_fee_state` (or one before lez 5.0.0 on an https sequencer: its quote
+/// read spoke plain http only), a transport error or an unparsable
 /// reply: the wallet's own declared cap, `(gas_limit + ASSUMED_DATA_BYTES) x
 /// ASSUMED_BASE_FEE (64)`, ~646M. It is what every release before 0.10.0
 /// waited for, so an older sibling keeps working exactly as it did.
