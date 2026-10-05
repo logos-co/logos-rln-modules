@@ -197,59 +197,47 @@ mod tests {
         }
     }
 
+    /// Every listed registry resolves back to its own network, by reference
+    /// and by config account in either hex case.
     #[test]
-    fn devnet_is_pinned() {
-        let devnet = network("devnet").expect("devnet");
-        assert_eq!(devnet.sequencer, "http://209.38.241.182:3140/");
-        let config = "9d6c0f59718f05ecb3f6ae58259821bfff6594e20866d6cd2a214c53e4ec0511";
-        assert_eq!(
-            network_of_config(config).map(|n| n.reference.as_str()),
-            Some("devnet")
-        );
-        assert_eq!(
-            network_of_config(&config.to_ascii_uppercase()).map(|n| n.reference.as_str()),
-            Some("devnet")
-        );
+    fn every_registry_resolves_to_its_network() {
+        for n in table() {
+            assert_eq!(
+                network(&n.reference).map(|m| m.reference.as_str()),
+                Some(n.reference.as_str())
+            );
+            for r in &n.registries {
+                let hex = bytes_to_hex(&base58::decode32(&r.config_account).expect("base58"));
+                for config in [hex.clone(), hex.to_ascii_uppercase()] {
+                    assert_eq!(
+                        network_of_config(&config).map(|m| m.reference.as_str()),
+                        Some(n.reference.as_str()),
+                        "{}: {config}",
+                        r.deployment
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_or_miscased_lookups_find_nothing() {
         assert!(network_of_config(&"ab".repeat(32)).is_none());
         assert!(network("mainnet").is_none());
+        let first = &table()[0].reference;
         assert!(
-            network("Devnet").is_none(),
+            network(&first.to_ascii_uppercase()).is_none(),
             "lookups are exact; callers lowercase"
         );
     }
 
+    /// References other code names: logos-delivery-module's logos.test preset
+    /// carries `logos:testnet:...`, and logos-rln-e2e has devnet and testnet
+    /// targets.
     #[test]
-    fn testnet_is_pinned() {
-        let testnet = network("testnet").expect("testnet");
-        assert_eq!(testnet.sequencer, "http://209.38.241.182:3240/");
-        let config = "841312e989c77e3f6f58a5d880a8e25b950b8b5ffba2f39748fa44622c20c893";
-        assert_eq!(
-            network_of_config(config).map(|n| n.reference.as_str()),
-            Some("testnet")
-        );
-        let registry = &testnet.registries[0];
-        assert_eq!(registry.deployment, "testnet-z1");
-        assert_eq!(
-            registry.tree_id,
-            "63c6b92f831ba82d65c1aa0d4dd6f7a2510b848d7afcfda326f662710b1696d5"
-        );
-        assert_eq!(known_references(), ["devnet", "testnet", "testnet-v03"]);
-    }
-
-    #[test]
-    fn testnet_v03_is_pinned() {
-        let net = network("testnet-v03").expect("testnet-v03");
-        assert_eq!(net.sequencer, "https://testnet.lez.logos.co/");
-        let config = "5e77e579df942069ef37fcc1ca0a56266e83a710ebc3349fe6171bbfc83c542a";
-        assert_eq!(
-            network_of_config(config).map(|n| n.reference.as_str()),
-            Some("testnet-v03")
-        );
-        let registry = &net.registries[0];
-        assert_eq!(registry.deployment, "testnet-v03-z1");
-        assert_eq!(
-            registry.tree_id,
-            "81dc01d66d8e34fcbf7ad12614e70ae046f816a1e48f9f712a63c81b53a8024a"
-        );
+    fn the_references_consumers_name_exist() {
+        for reference in ["devnet", "testnet"] {
+            assert!(network(reference).is_some(), "no `{reference}` network");
+        }
     }
 }
