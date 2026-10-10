@@ -27,7 +27,8 @@ JSON replies; `scope` = the `registry_id` + `rln_identifier_hex` arg pair):
 |---|---|
 | `start(config)` / `stop()` | `start(config_json)` / `stop()` |
 | `register(scope, options)` | `register(registry_id, rln_identifier_hex, options_json)` — `options_json` is the spec `RegistryOptions` array of `{"key","value"}` string pairs (`rate_limit` rides there; default 100) |
-| `get_membership_state(scope)` | `get_membership_state(registry_id, rln_identifier_hex)` |
+| `get_membership_state(scope)` | `get_membership_state(registry_id, rln_identifier_hex)` — `"unknown"` carries a `provisioning` object (structured funding fields on `awaiting_funding`) while provisioning runs |
+| provisioning, one registry (helper) | `ensure_membership(registry_id, options_json)` — `start()`'s registry-wide provisioning for a ui_qml caller (`start` is a `result` method and nulls through the QML bridge); `options_json` carries only `rate_limit`. See `../docs/intents.md` |
 | `generate_proof(scope, signal, timestamp)` | `generate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp)` |
 | `validate_proof(scope, signal, timestamp, proof)` | `validate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp, proof_json)` |
 | `get_epoch_quota(scope, timestamp)` | `get_epoch_quota(registry_id, rln_identifier_hex, timestamp)` |

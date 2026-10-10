@@ -118,17 +118,56 @@ pub(crate) struct MembershipStateView {
     state: MembershipState,
 }
 
-/// The provisioning task's current step and a human-readable detail.
+/// The provisioning task's current step, a human-readable detail, and — on
+/// `awaiting_funding` only — the numbers behind it as decimal strings (the
+/// same convention as balances on this wire: u128 does not survive JSON
+/// number parsing everywhere). `balance` appears once the first balance read
+/// has happened. Keys stay alphabetical.
 #[derive(Serialize)]
 pub(crate) struct ProvisioningView {
-    step: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    balance: Option<String>,
     #[serde(skip_serializing_if = "str::is_empty")]
     detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fee_reserve: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required: Option<String>,
+    step: &'static str,
 }
 
 impl ProvisioningView {
     pub(crate) fn new(step: &'static str, detail: String) -> Self {
-        ProvisioningView { step, detail }
+        ProvisioningView {
+            balance: None,
+            detail,
+            fee_reserve: None,
+            payer: None,
+            price: None,
+            required: None,
+            step,
+        }
+    }
+
+    /// Attach the funding snapshot's fields.
+    pub(crate) fn with_funding(
+        mut self,
+        payer: &str,
+        required: u128,
+        price: u128,
+        fee_reserve: u128,
+        balance: Option<u128>,
+    ) -> Self {
+        self.payer = Some(payer.to_string());
+        self.required = Some(required.to_string());
+        self.price = Some(price.to_string());
+        self.fee_reserve = Some(fee_reserve.to_string());
+        self.balance = balance.map(|b| b.to_string());
+        self
     }
 }
 
@@ -315,6 +354,46 @@ pub(crate) struct ErrorBody {
 impl ErrorBody {
     pub(crate) fn new(class: &'static str, kind: &'static str, message: String) -> Self {
         ErrorBody { class, kind, message }
+    }
+}
+
+#[cfg(test)]
+mod provisioning_view_tests {
+    use super::*;
+
+    /// Pins the wire shape a UI reads: alphabetical keys, u128s as decimal
+    /// strings, the funding fields absent on every step but awaiting_funding,
+    /// and `balance` absent until something read it.
+    #[test]
+    fn provisioning_funding_fields_are_strings_and_optional() {
+        let bare = MembershipStateView::unknown("logos:test:r")
+            .with_provisioning(Some(ProvisioningView::new("waiting_for_wallet", String::new())));
+        assert_eq!(
+            serde_json::to_string(&bare).unwrap(),
+            r#"{"provisioning":{"step":"waiting_for_wallet"},"registry_id":"logos:test:r","state":"unknown"}"#
+        );
+
+        let payer = "ab".repeat(32);
+        let quoted = ProvisioningView::new("awaiting_funding", "needs 183000000".into())
+            .with_funding(&payer, 183_000_000, 1_000_000, 182_000_000, None);
+        assert_eq!(
+            serde_json::to_string(&quoted).unwrap(),
+            format!(
+                r#"{{"detail":"needs 183000000","fee_reserve":"182000000","payer":"{payer}","price":"1000000","required":"183000000","step":"awaiting_funding"}}"#
+            )
+        );
+
+        let read = ProvisioningView::new("awaiting_funding", String::new()).with_funding(
+            &payer,
+            u128::MAX,
+            1,
+            u128::MAX - 1,
+            Some(7),
+        );
+        let json = serde_json::to_value(read).unwrap();
+        assert_eq!(json["balance"], "7");
+        assert_eq!(json["required"], u128::MAX.to_string(), "u128 travels as a string");
+        assert!(json.get("detail").is_none(), "empty detail is omitted");
     }
 }
 

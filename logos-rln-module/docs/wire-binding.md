@@ -77,7 +77,8 @@ switch on `class`, log `kind`.
 | `start(config)` | `start(config_json)` | result | `{"started":true,"epoch_size_sec":N,"max_epoch_gap":N,"registries":[…]}` + `"overrides":{registry:{…}}` when any registries entry set per-registry values. config: `{"epoch_size_sec":N (required default), "max_epoch_gap"?:N, "registries"?:[caip10 \| {"registry_id","epoch_size_sec"?,"max_epoch_gap"?}]}` — spec: epoch size and max gap are per-REGISTRY configuration; an object entry overrides the defaults for that registry |
 | `stop()` | `stop()` | result | `{"stopped":true}` |
 | `register(scope, options)` | `register_membership(registry_id, rln_identifier_hex, options_json)` | tstr | public Membership view (below), `"state":"pending"` on a fresh submit; `options_json` is the RegistryOptions ARRAY (below), the common `rate_limit` key defaulted when absent |
-| `get_membership_state(scope)` | `get_membership_state(registry_id, rln_identifier_hex)` | tstr | `{"state":…}` + `membership_hash`/`leaf_index`/`rate_limit` when known |
+| `get_membership_state(scope)` | `get_membership_state(registry_id, rln_identifier_hex)` | tstr | `{"state":…}` + `membership_hash`/`leaf_index`/`rate_limit` when known; `"unknown"` + `"provisioning":{…}` (below) while provisioning works on the registry |
+| provisioning, one registry (helper) | `ensure_membership(registry_id, options_json)` | tstr | the registry's one live membership as a MembershipState view (from the local cache; any scope counts), else `{"state":"unknown","provisioning":{…}}` after spawning the same pass `start()` runs — registry-wide scope, `options_json` carries only `rate_limit`; gifter keys are `invalid_argument` (a gift is `register_membership`'s). Exists because `start()` is a `result` method (unreachable from QML) and the scope-taking methods refuse the empty scope |
 | `generate_proof(scope, signal, timestamp)` | `generate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp)` | result | RateLimitProof (below) + `"message_id"`, `"epoch_index"`, `"membership_hash"`; epoch derives from `timestamp` (Unix s), must be within now ± `max_epoch_gap`. Fails `permanent` (kind `permanent`) for an epoch below the membership's persisted allocation floor (backwards clock / widened `max_epoch_gap`) or an `epoch_size_sec` its allocations are not bound to — re-register to recover |
 | `validate_proof(scope, signal, timestamp, proof)` | `validate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp, proof_json)` | result | `{"verdict":str}` (see the verdict table); a cryptographically valid decomposed proof that omitted `external_nullifier` also carries the reconstructed value, and `rate_limit_violation` carries `"recovered_secret":hex`. `timestamp` is the value stamped on the message under validation: the proof's epoch must EQUAL its epoch and be within now ± `max_epoch_gap`, else `"invalid"` |
 | `get_epoch_quota(scope, timestamp)` | `get_epoch_quota(registry_id, rln_identifier_hex, timestamp)` | result | `{"epoch_index":N,"rate_limit":N,"remaining":N}` — one observation of `timestamp`'s epoch, purely local; `epoch_index` is a NUMBER (`floor(timestamp/epoch_size)`, what a QuotaProvider's `epochIndex` consumes); no usable membership → `rate_limit`/`remaining` both 0 (the wall-clock-fallback cue — never an exhausted budget); a timestamp whose epoch is outside now ± `max_epoch_gap`, below the membership's persisted allocation floor, or denominated in an `epoch_size_sec` its allocations aren't bound to fails `permanent` — the same refusals `generate_proof` would answer (spec: test a timestamp before committing to it), so `{rate_limit>0, remaining:0}` always means spendable-next-epoch |
@@ -91,6 +92,17 @@ The public **Membership view** (spec `Membership` + status):
 secret ever appears. A `"failed"` state carries `"failed_reason":str` and
 `"retryable":bool` (spec: a failed submission SHALL report whether it is
 retryable).
+
+The **provisioning object** on an `"unknown"` state (`start()` and
+`ensure_membership` both drive it):
+`{"step":"waiting_for_wallet"|"awaiting_funding"|"registering"|"done"|"refused",
+"detail":str}` — `detail` is a human sentence, omitted when empty. On
+`awaiting_funding` only, the numbers behind the sentence travel as fields,
+decimal strings like every balance on this wire: `"payer"` (hex64 account to
+fund), `"required"` (price + fee reserve), `"price"`, `"fee_reserve"`, and
+`"balance"` once the first balance read happened. A UI renders "send
+`required` to `payer`" — or hands that pair to a wallet app — from the
+fields, never by parsing `detail`. A `done`/`refused` step carries no numbers.
 
 **Scope semantics.** `register` is idempotent **per scope** (spec): the scope's
 live membership short-circuits; a different application registering on the
