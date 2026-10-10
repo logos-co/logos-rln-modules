@@ -41,7 +41,7 @@
 ; Events are a third channel, pushed over the lp event stream rather than
 ; returned from a call — see the events section below.
 module liblogos_rln_module {
-  version "0.11.0"
+  version "0.12.0"
   description "RLN Membership Management Module"
   category "blockchain"
   depends [liblogos_lez_rln_module]
@@ -184,6 +184,38 @@ module liblogos_rln_module {
   ; again for the same scope.
   method register_membership(registry_id: tstr, rln_identifier_hex: tstr, options_json: tstr) -> tstr
 
+  ; ensure_membership(registry): start()'s automatic provisioning for ONE
+  ; registry, reachable from a ui_qml app. start() answers over the result
+  ; channel (nulls through the QML bridge) and every scope-taking method
+  ; refuses the empty scope, so a UI had no way to ask for the REGISTRY-WIDE
+  ; membership provisioning registers — the one that backs every application
+  ; on the registry. Answers from the LOCAL records: one live
+  ; (pending|active|grace_period) membership of ANY scope on the registry is
+  ; returned as the MembershipState view straight from the cache (the live
+  ; registry overlay is get_membership_state's, which the caller polls next
+  ; anyway); two or more → ambiguous_selection; none → a provisioning pass is
+  ; spawned — select the registry's network, wait for the wallet, quote
+  ; price + fee reserve, wait for the payer to hold it, register — and the
+  ; reply is {"registry_id":…,"state":"unknown","provisioning":{…}} with the
+  ; pass's first step. From there the caller polls get_membership_state (any
+  ; scope on the registry) and watches membership_state_changed. A pass
+  ; already running for the registry is reported, never duplicated; a later
+  ; start() naming the registry supersedes it (one pass per process, exactly
+  ; as between two start() calls). options_json: RegistryOptions array
+  ; carrying only "rate_limit" (decimal string; default 100) — any other key
+  ; (delegated, gifter_*, auth_*) is invalid_argument, because a gift is a
+  ; scoped registration and belongs to register_membership. internal when
+  ; the host provided no persistence path.
+  ; The provisioning object, on get_membership_state and here: {"step":
+  ; "waiting_for_wallet"|"awaiting_funding"|"registering"|"done"|"refused",
+  ; "detail":<human sentence, omitted when empty>} and, on awaiting_funding
+  ; only, the numbers behind the sentence as decimal strings: "payer" (hex64
+  ; account to fund), "required" (price + fee reserve), "price",
+  ; "fee_reserve", and "balance" once the first balance read happened. A UI
+  ; renders "send <required> to <payer>" — or hands the pair to a wallet
+  ; app — from the fields, never from the sentence.
+  method ensure_membership(registry_id: tstr, options_json: tstr) -> tstr
+
   ; Spec get_membership_state(scope). Resolves the membership BACKING the
   ; scope: records registered under this rln_identifier (or carrying none —
   ; legacy) first; with no usable match, any of the registry's records. The
@@ -195,7 +227,11 @@ module liblogos_rln_module {
   ; "erased"|"unknown"} plus membership_hash / leaf_index / rate_limit when
   ; known. (erased_awaits_withdrawal and slashed complete the spec
   ; vocabulary; the logos registry does not expose those removal causes, so
-  ; this module never emits them today.)
+  ; this module never emits them today.) "unknown" carries "provisioning"
+  ; while start()/ensure_membership provisioning works on the registry —
+  ; the object ensure_membership documents, structured funding fields
+  ; included — so a caller can tell "never given a membership" from "three
+  ; minutes into acquiring one, waiting for <payer> to hold <required>".
   method get_membership_state(registry_id: tstr, rln_identifier_hex: tstr) -> tstr
 
   ; Spec get_memberships(): all locally managed memberships for the

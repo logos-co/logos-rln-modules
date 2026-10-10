@@ -13,6 +13,9 @@ applications, backed by the on-chain RLN registry deployed from
   verification. Talks to the registry only through the lez-rln module's wire.
 - **`logos-rln-membership-ui/`** — the membership UI (QML) driving the two
   modules from Logos Basecamp.
+- **`docs/intents.md`** — the `rln.*` Basecamp intent vocabulary: how an app
+  that needs an RLN membership asks for one without naming a provider, and
+  the module surface a provider needs.
 
 ## Prerequisites
 

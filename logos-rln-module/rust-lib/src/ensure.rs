@@ -188,6 +188,19 @@ impl Step {
 /// must not stop the others.
 pub(crate) fn run(registries: Vec<String>, rate_limit: u64) {
     let mine = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+    run_as(registries, rate_limit, mine)
+}
+
+/// `run` for one registry asked for OUTSIDE `start()` — `ensure_membership`
+/// from a UI. It adopts the ticket in force instead of taking a new one, so
+/// it supersedes nothing: a `start()` pass parked on another registry's
+/// funding keeps waiting. The next `start()` ends it like any other pass, and
+/// `is_running` keeps two from working the same registry at once.
+pub(crate) fn run_alongside(registry: String, rate_limit: u64) {
+    run_as(vec![registry], rate_limit, EPOCH.load(Ordering::SeqCst))
+}
+
+fn run_as(registries: Vec<String>, rate_limit: u64, mine: u64) {
     for raw in registries {
         if superseded(mine) {
             return;
@@ -199,6 +212,7 @@ pub(crate) fn run(registries: Vec<String>, rate_limit: u64) {
                 continue;
             }
         };
+        let _active = ActivePass::enter(&registry.canonical);
         // Read per registry rather than captured once: this runs detached and
         // the store can be republished under it (on_context_ready re-opening
         // it), so a handle taken at spawn time could outlive its store.
@@ -209,35 +223,46 @@ pub(crate) fn run(registries: Vec<String>, rate_limit: u64) {
     }
 }
 
+/// Does this node already have a membership on this registry — ANY
+/// membership, whatever scope it was registered under?
+///
+/// Deliberately not `scope_matches(r, REGISTRY_WIDE)`, which is true only of
+/// a record carrying an empty identifier. Under that test a node that had
+/// registered explicitly for one application looked unprovisioned and got a
+/// SECOND membership: a second registration, a second slice of the registry's
+/// rate-limit budget, no new capability — and, because the extra insert moves
+/// the tree root, an invalidated proof for anything already in flight.
+/// Observed exactly that: a scenario registered, called start() to warm its
+/// root window, and validate_proof then rejected a proof it had just
+/// generated.
+///
+/// The question provisioning exists to answer is "can this node prove
+/// against this registry", and any live record answers it yes. Asked on
+/// entry AND again on every balance read and before the registration itself:
+/// the funding wait runs for hours, and a membership registered by hand
+/// (`register_membership` from a UI) while it waits is the same second
+/// registration arriving later.
+pub(crate) fn live_membership_present(registry: &registry_id::CanonicalRegistryId) -> bool {
+    crate::sealed_store::store::current()
+        .map(|s| {
+            records_for_registry(&s, registry)
+                .iter()
+                .any(|r| !r.quarantined && r.cache.state.is_live())
+        })
+        .unwrap_or(false)
+}
+
 fn provision_one(
     registry: &registry_id::CanonicalRegistryId,
     rate_limit: u64,
     mine: u64,
 ) -> Result<(), ApiError> {
-    // Does this node already have a membership on this registry — ANY
-    // membership, whatever scope it was registered under?
-    //
-    // Deliberately not `scope_matches(r, REGISTRY_WIDE)`, which is true only
-    // of a record carrying an empty identifier. Under that test a node that
-    // had registered explicitly for one application looked unprovisioned and
-    // got a SECOND membership: a second registration, a second slice of the
-    // registry's rate-limit budget, no new capability — and, because the extra
-    // insert moves the tree root, an invalidated proof for anything already in
-    // flight. Observed exactly that: a scenario registered, called start() to
-    // warm its root window, and validate_proof then rejected a proof it had
-    // just generated.
-    //
-    // The question provisioning exists to answer is "can this node prove
-    // against this registry", and any live record answers it yes.
+    if live_membership_present(registry) {
+        record(&registry.canonical, Step::Done, "membership already present");
+        return Ok(());
+    }
     if let Some(s) = crate::sealed_store::store::current() {
         let records = records_for_registry(&s, registry);
-        let live = records
-            .iter()
-            .any(|r| !r.quarantined && r.cache.state.is_live());
-        if live {
-            record(&registry.canonical, Step::Done, "membership already present");
-            return Ok(());
-        }
         // A quarantined record is NOT an absent one, and this is the case
         // where the difference has teeth.
         //
@@ -354,10 +379,10 @@ fn provision_one(
         .ok()
         .and_then(|s| s.get("payer").and_then(|p| p.as_str()).map(str::to_owned))
         .unwrap_or_default();
-    record(
+    record_funding(
         &registry.canonical,
-        Step::AwaitingFunding,
         &format!("{payer} needs {required} native ({price} price + {reserve} fee reserve)"),
+        Funding { payer: payer.clone(), required, price, fee_reserve: reserve, balance: None },
     );
     // This wait has NO deadline, and that is the point of it.
     //
@@ -383,6 +408,13 @@ fn provision_one(
             return Ok(());
         }
         if waited >= due {
+            // A membership that arrived by another route — register_membership
+            // from a UI, a gift — ends the wait: funding one more would be the
+            // second registration the entry check exists to prevent.
+            if live_membership_present(registry) {
+                record(&registry.canonical, Step::Done, "membership already present");
+                return Ok(());
+            }
             // The base fee moves while a wait runs for hours, so the reserve
             // is re-quoted with every balance read but the first, which the
             // quote above just served.
@@ -409,16 +441,22 @@ fn provision_one(
                         );
                         announced = Some((balance, required));
                     }
-                    // Refresh the detail too: get_membership_state is the only
-                    // channel that can tell a user their node is waiting on an
-                    // account, and how far off it is.
-                    record(
+                    // Refresh the snapshot too: get_membership_state is the
+                    // only channel that can tell a user their node is waiting
+                    // on an account, and how far off it is.
+                    record_funding(
                         &registry.canonical,
-                        Step::AwaitingFunding,
                         &format!(
                             "{payer} needs {required} native \
                              ({price} price + {reserve} fee reserve); it holds {balance}"
                         ),
+                        Funding {
+                            payer: payer.clone(),
+                            required,
+                            price,
+                            fee_reserve: reserve,
+                            balance: Some(balance),
+                        },
                     );
                 }
                 // NOT treated as zero: an unreachable sequencer is not a broke
@@ -433,7 +471,12 @@ fn provision_one(
 
     // 4. Register. The same entry point the wire method uses, so the
     //    idempotency, the in-flight guard and the confirmation poller all
-    //    come along; a live record short-circuits and this is a no-op.
+    //    come along. `register_scoped`'s own short-circuit only sees records
+    //    of ITS scope, so the any-scope check runs once more here.
+    if live_membership_present(registry) {
+        record(&registry.canonical, Step::Done, "membership already present");
+        return Ok(());
+    }
     record(&registry.canonical, Step::Registering, "");
     let options = format!(r#"[{{"key":"rate_limit","value":"{rate_limit}"}}]"#);
     let store = crate::sealed_store::store::current_or_uninit();
@@ -496,16 +539,56 @@ fn registration_price(
 // Progress, readable through get_membership_state
 // ---------------------------------------------------------------------------
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-static PROGRESS: Mutex<Option<HashMap<String, (Step, String)>>> = Mutex::new(None);
+/// The numbers behind an `awaiting_funding` step, as fields rather than only
+/// as the sentence `detail` renders them: a UI that wants to show "send
+/// `required` to `payer`" — or hand that pair to a wallet app — must not have
+/// to parse prose. `balance` is absent until the first balance read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Funding {
+    pub(crate) payer: String,
+    pub(crate) required: u128,
+    pub(crate) price: u128,
+    pub(crate) fee_reserve: u128,
+    pub(crate) balance: Option<u128>,
+}
 
-fn record(registry: &str, step: Step, detail: &str) {
+/// What the provisioning task last reported for a registry.
+#[derive(Clone, Debug)]
+pub(crate) struct Progress {
+    pub(crate) step: Step,
+    pub(crate) detail: String,
+    /// Only ever set with `Step::AwaitingFunding`.
+    pub(crate) funding: Option<Funding>,
+}
+
+static PROGRESS: Mutex<Option<HashMap<String, Progress>>> = Mutex::new(None);
+
+fn record_progress(registry: &str, progress: Progress) {
     let mut guard = crate::lock(&PROGRESS);
     guard
         .get_or_insert_with(HashMap::new)
-        .insert(registry.to_owned(), (step, detail.to_owned()));
+        .insert(registry.to_owned(), progress);
+}
+
+fn record(registry: &str, step: Step, detail: &str) {
+    record_progress(registry, Progress { step, detail: detail.to_owned(), funding: None });
+}
+
+fn record_funding(registry: &str, detail: &str, funding: Funding) {
+    record_progress(
+        registry,
+        Progress { step: Step::AwaitingFunding, detail: detail.to_owned(), funding: Some(funding) },
+    );
+}
+
+/// Note that a pass has been asked for, before its thread has recorded
+/// anything, so the reply that spawned it already shows a step instead of
+/// nothing. The pass overwrites this with its first real step.
+pub(crate) fn mark_requested(registry: &str) {
+    record(registry, Step::WaitingForWallet, "");
 }
 
 /// What provisioning is doing for `registry`, if anything.
@@ -513,10 +596,50 @@ fn record(registry: &str, step: Step, detail: &str) {
 /// Surfaced on `get_membership_state`'s `unknown` reply, which is otherwise
 /// the same answer for "this node was never given a membership" and "this
 /// node is three minutes into acquiring one".
-pub(crate) fn progress(registry: &str) -> Option<(Step, String)> {
+pub(crate) fn progress(registry: &str) -> Option<Progress> {
     crate::lock(&PROGRESS)
         .as_ref()
         .and_then(|m| m.get(registry).cloned())
+}
+
+// ---------------------------------------------------------------------------
+// Which registries have a pass in flight right now
+// ---------------------------------------------------------------------------
+//
+// Distinct from PROGRESS on purpose: a superseded or finished pass leaves its
+// last step behind for `get_membership_state` to show, so "awaiting_funding"
+// in PROGRESS does not mean anyone is still watching the balance. A caller
+// that wants to START a pass (ensure_membership) needs the live answer.
+
+static ACTIVE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// RAII marker for a registry's pass; dropped on every exit path of `run`'s
+/// per-registry body, including a panic unwinding through it.
+pub(crate) struct ActivePass(String);
+
+impl ActivePass {
+    pub(crate) fn enter(registry: &str) -> Self {
+        crate::lock(&ACTIVE)
+            .get_or_insert_with(HashSet::new)
+            .insert(registry.to_owned());
+        ActivePass(registry.to_owned())
+    }
+}
+
+impl Drop for ActivePass {
+    fn drop(&mut self) {
+        if let Some(set) = crate::lock(&ACTIVE).as_mut() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+/// Whether a provisioning pass is currently working on `registry`.
+pub(crate) fn is_running(registry: &str) -> bool {
+    crate::lock(&ACTIVE)
+        .as_ref()
+        .map(|set| set.contains(registry))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -677,17 +800,65 @@ mod tests {
         record(a, Step::AwaitingFunding, "needs 646400000");
         record(b, Step::Done, "submitted");
 
-        let (step, detail) = progress(a).expect("a has progress");
-        assert_eq!(step, Step::AwaitingFunding);
-        assert_eq!(step.as_str(), "awaiting_funding");
-        assert!(detail.contains("646400000"));
+        let p = progress(a).expect("a has progress");
+        assert_eq!(p.step, Step::AwaitingFunding);
+        assert_eq!(p.step.as_str(), "awaiting_funding");
+        assert!(p.detail.contains("646400000"));
+        assert!(p.funding.is_none(), "a plain record carries no snapshot");
 
-        let (step, _) = progress(b).expect("b has progress");
-        assert_eq!(step, Step::Done);
+        assert_eq!(progress(b).expect("b has progress").step, Step::Done);
 
         // Later steps replace earlier ones rather than accumulating.
         record(a, Step::Done, "submitted");
-        assert_eq!(progress(a).expect("a still has progress").0, Step::Done);
+        assert_eq!(progress(a).expect("a still has progress").step, Step::Done);
+    }
+
+    /// The funding step carries its numbers as fields, and a later step
+    /// drops them: a `done` reply must not keep advertising an amount to
+    /// send.
+    #[test]
+    fn the_funding_snapshot_is_structured_and_does_not_outlive_its_step() {
+        let r = "logos:test:funding-snapshot";
+        let first = Funding {
+            payer: "ab".repeat(32),
+            required: 1_000_000 + 182_000_000,
+            price: 1_000_000,
+            fee_reserve: 182_000_000,
+            balance: None,
+        };
+        record_funding(r, "ab… needs 183000000 native", first.clone());
+        let p = progress(r).expect("recorded");
+        assert_eq!(p.step, Step::AwaitingFunding);
+        assert_eq!(p.funding.as_ref(), Some(&first));
+
+        // A balance read refreshes the snapshot in place.
+        let read = Funding { balance: Some(1_000_000), ..first.clone() };
+        record_funding(r, "…; it holds 1000000", read.clone());
+        assert_eq!(progress(r).expect("refreshed").funding, Some(read));
+
+        record(r, Step::Registering, "");
+        let p = progress(r).expect("moved on");
+        assert_eq!(p.step, Step::Registering);
+        assert!(p.funding.is_none(), "a non-funding step must not carry the snapshot");
+    }
+
+    /// `is_running` answers for the pass itself, not for what it last wrote:
+    /// a finished pass leaves its step in PROGRESS for readers but must not
+    /// look live to a caller deciding whether to start another.
+    #[test]
+    fn a_pass_is_running_only_while_its_marker_lives() {
+        let r = "logos:test:active-marker";
+        assert!(!is_running(r));
+        {
+            let _pass = ActivePass::enter(r);
+            assert!(is_running(r));
+            record(r, Step::AwaitingFunding, "parked");
+        }
+        assert!(!is_running(r), "dropping the marker ends the pass");
+        assert_eq!(
+            progress(r).expect("the last step stays readable").step,
+            Step::AwaitingFunding
+        );
     }
 
     /// An empty rln_identifier is the registry-wide scope, and

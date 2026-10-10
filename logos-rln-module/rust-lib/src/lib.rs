@@ -306,8 +306,13 @@ fn parse_scope(
 
 /// The provisioning task's progress for a registry, shaped for the reply.
 fn provisioning_view(registry: &str) -> Option<views::ProvisioningView> {
-    ensure::progress(registry)
-        .map(|(step, detail)| views::ProvisioningView::new(step.as_str(), detail))
+    ensure::progress(registry).map(|p| {
+        let view = views::ProvisioningView::new(p.step.as_str(), p.detail);
+        match p.funding {
+            Some(f) => view.with_funding(&f.payer, f.required, f.price, f.fee_reserve, f.balance),
+            None => view,
+        }
+    })
 }
 
 /// Whether a record backs a scope: registered under the same rln_identifier,
@@ -978,6 +983,86 @@ fn select_membership_impl(
         .cloned()
         .ok_or_else(|| ApiError::internal("selected record vanished"))?;
     Ok(public_membership_json(&hash, &record, false, false, false))
+}
+
+/// ensure_membership(registry): `start()`'s provisioning for one registry,
+/// reachable from a ui_qml app. `start()` answers over the `result` channel,
+/// which nulls through the QML bridge, and every scope-taking method refuses
+/// the empty (registry-wide) scope that provisioning registers — so a UI that
+/// wants "a membership that backs every app on this registry" had no way to
+/// ask for one. This is that way and nothing more: the pass it spawns is the
+/// one `start()` runs, ended by the next `start()` like any pass — and, unlike
+/// a `start()` pass, ending none itself (`ensure::run_alongside`).
+///
+/// Answers from the local records on purpose. The question is "is this
+/// registry provisioned", which any live record answers; the registry read
+/// that overlays a stale cache belongs to `get_membership_state`, which the
+/// caller polls next anyway, and this call stays clear of a 70 s provider
+/// deadline.
+fn ensure_membership_impl(
+    store: Result<Arc<Store>, ApiError>,
+    registry_id_raw: &str,
+    options_json: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let registry = parse_registry(registry_id_raw)?;
+    let (rate_limit, rest) = parse_registry_options(options_json)?;
+    // Refused rather than ignored: a caller passing gifter options here
+    // expects a gift, and silently funding a registration instead would spend
+    // the payer's balance on the opposite of what was asked.
+    if let Some(key) = rest.as_object().and_then(|o| o.keys().next()) {
+        return Err(ApiError::new(
+            ErrorKind::InvalidArgument,
+            &format!(
+                "ensure_membership takes only rate_limit; '{key}' selects a scoped \
+                 registration, which is register_membership's"
+            ),
+        ));
+    }
+    let store = store?;
+    let records = records_for_registry(&store, &registry);
+    let live: Vec<&MembershipRecord> = records
+        .iter()
+        .filter(|r| !r.quarantined && r.cache.state.is_live())
+        .collect();
+    match live.as_slice() {
+        [] => {}
+        [record] => {
+            // A pending record has no leaf yet; 0 is what get_membership_state
+            // reports for it too, until the registry read fills it in.
+            return ok_json(views::MembershipStateView::resolved(
+                &record.hash,
+                &registry.canonical,
+                record.cache.state,
+                record.cache.leaf_index.unwrap_or(0),
+                record.cache.rate_limit.unwrap_or(0),
+            ));
+        }
+        _ => {
+            return Err(ApiError::new(
+                ErrorKind::AmbiguousSelection,
+                "multiple live memberships on this registry; use get_memberships / select_membership",
+            ))
+        }
+    }
+    if !ensure::is_running(&registry.canonical) {
+        // Recorded before the spawn so this very reply already shows a step,
+        // and a second call racing the thread's first record sees one too.
+        ensure::mark_requested(&registry.canonical);
+        let canonical = registry.canonical.clone();
+        std::thread::Builder::new()
+            .name("rln-ensure".to_owned())
+            .spawn(move || {
+                // The order start() keeps: the registry's network binds the
+                // sibling's wallet before anything reads through it.
+                provider::select_networks(std::slice::from_ref(&canonical));
+                ensure::run_alongside(canonical, rate_limit);
+            })
+            .map_err(|e| ApiError::internal(&format!("cannot spawn provisioning: {e}")))?;
+    }
+    ok_json(
+        views::MembershipStateView::unknown(&registry.canonical)
+            .with_provisioning(provisioning_view(&registry.canonical)),
+    )
 }
 
 fn get_memberships_impl(
@@ -1702,6 +1787,10 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
         options_json: String,
     ) -> String {
         reply(register_impl(self.store(), &registry_id, &rln_identifier_hex, &options_json))
+    }
+
+    fn ensure_membership(&self, registry_id: String, options_json: String) -> String {
+        reply(ensure_membership_impl(self.store(), &registry_id, &options_json))
     }
 
     fn get_membership_state(
@@ -2611,6 +2700,120 @@ mod tests {
             RegisterClaim::take(&canonical.canonical, &rln_id_hex).is_ok(),
             "a read must leave no claim behind"
         );
+    }
+
+    // ensure_membership is the registry-wide twin of start()'s provisioning
+    // and the one path a ui_qml app has to it. What it refuses is anything
+    // that would turn it into a scoped — or gifted — registration in
+    // disguise, and it refuses before the store is touched.
+    #[test]
+    fn ensure_membership_validates_before_touching_the_store() {
+        let registry = format!("logos:local:{}", "e1".repeat(32));
+        let canonical = parse_registry(&registry).unwrap().canonical;
+
+        let err = ensure_membership_impl(no_store(), "", "").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidArgument, "got: {}", err.message);
+
+        let err =
+            ensure_membership_impl(no_store(), &registry, &opts_arr(&[("delegated", "true")]))
+                .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidArgument, "got: {}", err.message);
+        assert!(err.message.contains("register_membership"), "got: {}", err.message);
+
+        let err = ensure_membership_impl(no_store(), &registry, &opts_arr(&[("rate_limit", "0")]))
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidArgument, "got: {}", err.message);
+
+        // Valid input and no store is the store's own error — and no pass
+        // was started on the way to it.
+        let err = ensure_membership_impl(no_store(), &registry, "").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Internal, "got: {}", err.message);
+        assert!(!ensure::is_running(&canonical));
+        assert!(ensure::progress(&canonical).is_none(), "nothing may be recorded for it");
+    }
+
+    // A live membership of ANY scope answers "provisioned": the reply is that
+    // record, from the cache, and nothing is spawned. Registering a second
+    // one is the failure the entry check in ensure.rs exists to prevent.
+    #[test]
+    fn ensure_membership_reports_a_live_membership_of_any_scope_without_spawning() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-ensure-live-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (imp, store) = imp_with_store(dir.clone());
+        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+
+        let registry = format!("logos:local:{}", "e2".repeat(32));
+        let canonical = parse_registry(&registry).unwrap().canonical;
+        // Registered under an application scope, not registry-wide.
+        let scoped_rln_id = "ef".repeat(32);
+        let (commitment_hex, secret_hex) = proof::generate_identity().expect("test identity");
+        let commitment =
+            registry_id::hex_to_bytes32(&commitment_hex).expect("generated commitment is 32 bytes");
+        let hash = registry_id::membership_hash(&registry, &commitment);
+        seed_membership(
+            &store,
+            &hash,
+            &registry,
+            &commitment_hex,
+            &scoped_rln_id,
+            &secret_hex,
+            MembershipState::Active,
+            7,
+            300,
+        );
+
+        let out = ensure_membership_impl(imp.store(), &registry, "").unwrap();
+        assert_eq!(out["state"], serde_json::json!("active"), "got: {out}");
+        assert_eq!(out["membership_hash"], serde_json::json!(hash), "got: {out}");
+        assert_eq!(out["leaf_index"], serde_json::json!(7), "got: {out}");
+        assert_eq!(out["rate_limit"], serde_json::json!(300), "got: {out}");
+        assert!(out.get("provisioning").is_none(), "a provisioned registry has no pass: {out}");
+        assert!(!ensure::is_running(&canonical));
+        assert!(ensure::progress(&canonical).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // No live record: exactly one pass per registry. While one is alive a
+    // repeat call reports and does not spawn — observable because the spawn
+    // path records a first step before the thread exists, and the held pass
+    // below has recorded nothing.
+    #[test]
+    fn ensure_membership_spawns_one_pass_and_reports_its_step() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-ensure-spawn-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (imp, _store) = imp_with_store(dir.clone());
+
+        // A pass somebody else is already running for this registry.
+        let busy = format!("logos:local:{}", "e3".repeat(32));
+        let busy_canonical = parse_registry(&busy).unwrap().canonical;
+        {
+            let _held = ensure::ActivePass::enter(&busy_canonical);
+            let out = ensure_membership_impl(imp.store(), &busy, "").unwrap();
+            assert_eq!(out["state"], serde_json::json!("unknown"), "got: {out}");
+            assert!(
+                out.get("provisioning").is_none(),
+                "a running pass is reported as it stands, not re-marked: {out}"
+            );
+            assert!(ensure::progress(&busy_canonical).is_none());
+        }
+
+        // Nobody is: the call starts one and the reply already shows a step.
+        let fresh = format!("logos:local:{}", "e4".repeat(32));
+        let fresh_canonical = parse_registry(&fresh).unwrap().canonical;
+        let out = ensure_membership_impl(imp.store(), &fresh, &opts_arr(&[("rate_limit", "250")]))
+            .unwrap();
+        assert_eq!(out["state"], serde_json::json!("unknown"), "got: {out}");
+        assert_eq!(out["registry_id"], serde_json::json!(fresh_canonical), "got: {out}");
+        assert!(
+            out["provisioning"]["step"].is_string(),
+            "the spawning reply carries the pass's first step: {out}"
+        );
+        assert!(ensure::progress(&fresh_canonical).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The readiness gate runs before input validation, so start() first,
