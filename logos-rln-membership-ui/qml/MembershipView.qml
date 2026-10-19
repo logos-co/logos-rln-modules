@@ -50,6 +50,10 @@ Item {
         // may celebrate, and only if it is the completion landing.
         var wasCompletion = completionRefresh
         completionRefresh = false
+        // The count this view last showed: a completion celebrates only the
+        // 0 -> 1 transition, never an idempotent re-run that found the
+        // membership already there.
+        var prevCount = rows.length
         flow.callRetry(M.RLN_MODULE, "get_memberships", [registryId], function (r) {
             view.refreshing = false
             if (r.error) {
@@ -69,7 +73,7 @@ Item {
             list.sort(function (a, b) { return M.stateRank(a.state) - M.stateRank(b.state) })
             view.rows = list
             if (wasCompletion)
-                view.celebrate = list.length === 1
+                view.celebrate = prevCount === 0 && list.length === 1
         }, 8000)
     }
 

@@ -1,5 +1,7 @@
-// Segmented Syncing→Claiming→Registering bar driven by the flow's phase
-// properties, with a stage caption above it and an inline Retry on a failed
+// The funded-path work screen (step 2 in "funded" mode): a segmented
+// Preparing→Registering bar driven by the flow's phase properties, the
+// module's provisioning caption above it, the "send <required> to <payer>"
+// block while the module waits for funds, and an inline Retry on a failed
 // segment. OnboardingView hands off the instant registration completes, so
 // this view only ever paints the in-progress and error states.
 import QtQuick
@@ -13,42 +15,14 @@ ColumnLayout {
 
     required property OnboardingFlow flow
 
-    readonly property string currentError:
-        flow.walletPhase === "error" ? flow.walletError
-        : flow.syncPhase === "error" ? flow.syncError
-        : flow.fundPhase === "error" ? flow.fundError
-        : flow.regPhase === "error" ? flow.regError : ""
+    readonly property string currentError: flow.regPhase === "error" ? flow.regError : ""
+    readonly property var prov: flow.provisioning || ({})
+    readonly property bool awaitingFunding: flow.provisioningStep === "awaiting_funding"
 
-    // Resume-aware kick-off: the guards cover already-done phases; the
-    // Connections chain live transitions.
+    // Resume-aware kick-off: the guard covers an already-done registration.
     function entered() {
-        if (flow.walletPhase === "done")
-            flow.startSync()
-        else
-            flow.startWallet()
-        if (flow.syncPhase === "done" && flow.fundPhase !== "done")
-            flow.startFunding()
-        if (flow.fundPhase === "done" && flow.regPhase !== "done")
+        if (flow.regPhase !== "done")
             flow.startRegistration()
-    }
-
-    function retryErroredSegment() {
-        if (flow.walletPhase === "error") { flow.startWallet(); return }
-        if (flow.syncPhase === "error") { flow.startSync(); return }
-        if (flow.fundPhase === "error") { flow.restartFunding(); return }
-        if (flow.regPhase === "error") { flow.retryRegistration(); return }
-    }
-
-    Connections {
-        target: step.flow
-        function onSyncPhaseChanged() {
-            if (step.flow.syncPhase === "done")
-                step.flow.startFunding()
-        }
-        function onFundPhaseChanged() {
-            if (step.flow.fundPhase === "done")
-                step.flow.startRegistration()
-        }
     }
 
     spacing: M.sc(Theme.spacing.medium)
@@ -59,7 +33,7 @@ ColumnLayout {
         horizontalAlignment: Text.AlignHCenter
         font.pixelSize: M.sc(Theme.typography.titleText)
         font.weight: Theme.typography.weightBold
-        text: "Setting everything up…"
+        text: step.awaitingFunding ? "Fund your account" : "Setting everything up…"
     }
     LogosText {
         Layout.fillWidth: true
@@ -67,7 +41,10 @@ ColumnLayout {
         horizontalAlignment: Text.AlignHCenter
         font.pixelSize: M.sc(Theme.typography.primaryText)
         color: Theme.palette.textSecondary
-        text: "This takes a few minutes — hang tight."
+        text: step.awaitingFunding
+              ? "Registration costs a small native balance. Send it to the account below "
+                + "and this screen continues on its own."
+              : "This takes a few minutes — hang tight."
     }
 
     // Hidden during an error — the bar's own error row carries the message.
@@ -82,15 +59,90 @@ ColumnLayout {
         text: progressRow.stageLabel
     }
 
-    // Intra-sync progress lives inside segment 1's fill (which advances with
-    // the chunked sync); there is no separate sync bar.
     MembershipRow {
         id: progressRow
         Layout.fillWidth: true
         rowKind: "progress"
         flow: step.flow
         commitment: step.flow.commitment
-        onRetryRequested: step.retryErroredSegment()
+        onRetryRequested: step.flow.retryRegistration()
+    }
+
+    // The module's own sentence for the step (e.g. why it is waiting), as
+    // fine print under the bar.
+    LogosText {
+        visible: step.currentError === "" && !!step.prov.detail && !step.awaitingFunding
+        Layout.fillWidth: true
+        wrapMode: Text.Wrap
+        horizontalAlignment: Text.AlignHCenter
+        color: Theme.palette.textTertiary
+        font.pixelSize: M.sc(Theme.typography.secondaryText)
+        text: String(step.prov.detail || "")
+    }
+
+    // awaiting_funding: the numbers behind the sentence, rendered from the
+    // structured fields (never parsed out of `detail`).
+    ColumnLayout {
+        objectName: "fundingBlock"
+        visible: step.awaitingFunding && step.currentError === ""
+        Layout.fillWidth: true
+        spacing: M.sc(Theme.spacing.small)
+
+        LogosText {
+            Layout.fillWidth: true
+            wrapMode: Text.Wrap
+            font.pixelSize: M.sc(Theme.typography.secondaryText)
+            color: Theme.palette.textSecondary
+            text: "Send at least"
+        }
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: M.sc(Theme.spacing.small)
+            LogosText {
+                objectName: "fundingRequired"
+                Layout.fillWidth: true
+                font.pixelSize: M.sc(Theme.typography.subtitleText)
+                font.weight: Theme.typography.weightBold
+                text: String(step.prov.required || "—") + " native"
+            }
+            CopyButton { payload: String(step.prov.required || "") }
+        }
+        LogosText {
+            Layout.fillWidth: true
+            wrapMode: Text.Wrap
+            font.pixelSize: M.sc(Theme.typography.secondaryText)
+            color: Theme.palette.textTertiary
+            text: "(price " + String(step.prov.price || "—") + " + fee reserve "
+                  + String(step.prov.fee_reserve || "—") + ")"
+        }
+        LogosText {
+            Layout.fillWidth: true
+            wrapMode: Text.Wrap
+            font.pixelSize: M.sc(Theme.typography.secondaryText)
+            color: Theme.palette.textSecondary
+            text: "to this account"
+        }
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: M.sc(Theme.spacing.small)
+            LogosText {
+                objectName: "fundingPayer"
+                Layout.fillWidth: true
+                elide: Text.ElideMiddle
+                font.pixelSize: M.sc(Theme.typography.secondaryText)
+                font.family: "monospace"
+                text: String(step.prov.payer || "—")
+            }
+            CopyButton { payload: String(step.prov.payer || "") }
+        }
+        LogosText {
+            visible: step.prov.balance !== undefined
+            Layout.fillWidth: true
+            wrapMode: Text.Wrap
+            font.pixelSize: M.sc(Theme.typography.secondaryText)
+            color: Theme.palette.textTertiary
+            text: "Balance so far: " + String(step.prov.balance)
+        }
     }
 
     LogosText {
@@ -101,25 +153,6 @@ ColumnLayout {
         color: Theme.palette.textTertiary
         font.pixelSize: M.sc(Theme.typography.secondaryText)
         text: step.currentError
-    }
-
-    // Registration may have failed for lack of funds: offer a fresh claim.
-    // LogosButton has no font hook, so text stays "" and a scaled overlay
-    // LogosText paints the label; the plain Text passes clicks through.
-    LogosButton {
-        visible: step.flow.regPhase === "error"
-        Layout.alignment: Qt.AlignHCenter
-        implicitWidth: M.sc(160)
-        implicitHeight: M.sc(34)
-        text: ""
-        onClicked: step.flow.restartFunding()
-        LogosText {
-            anchors.centerIn: parent
-            text: "Get more tokens"
-            font.pixelSize: M.sc(Theme.typography.secondaryText)
-            font.weight: Theme.typography.weightMedium
-            color: Theme.palette.text
-        }
     }
 
     LogosText {

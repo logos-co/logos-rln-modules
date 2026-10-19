@@ -1,8 +1,9 @@
 // Register flow: unlock keystore -> register_membership (the membership
 // module generates the credential) -> poll get_membership_state until the
-// pending window settles. The funding holding account is either typed in or
-// auto-filled by the Wallet tab's faucet claim (AdvancedView.qml wires
-// WalletView.onFunded to fundingAccount).
+// pending window settles. Funded registrations are paid by the registry
+// module's own payer (Payer tab); the allocator section instead delegates
+// to a membership allocator with the chosen auth vector — the same options
+// the wizard builds (M.delegatedOptions).
 import QtQuick
 import QtQuick.Layouts
 import Logos.Theme
@@ -14,10 +15,6 @@ LogosScrollView {
 
     required property var bridge
     required property string registryId
-
-    // Written by AdvancedView.qml's WalletView.onFunded, when the Wallet tab
-    // confirms a funded holding.
-    property alias fundingAccount: fundingField.text
 
     // Keystore session (unlock holds the password module-side; lock drops it).
     property bool unlocked: false
@@ -73,11 +70,14 @@ LogosScrollView {
 
     function doRegister() {
         // The credential is generated inside the module; the caller supplies
-        // only the scope (registry_id + rln_identifier) and, for the logos
-        // namespace, the paying account.
-        var options = M.registryOptions(rateSpin.value, {
-            funding_holding_account_id: fundingField.text.trim()
-        })
+        // only the scope (registry_id + rln_identifier) and the options.
+        // mirrors OnboardingFlow.registerDelegated — both build through
+        // M.delegatedOptions.
+        var options = delegatedToggle.checked
+            ? M.delegatedOptions(rateSpin.value, {
+                  peerId: peerIdField.text, multiaddr: multiaddrField.text,
+                  authType: vectorPicker.authType, authArgs: authArgsField.text })
+            : M.registryOptions(rateSpin.value, {})
         busy = true
         liveState = ""
         M.call(bridge, M.RLN_MODULE, "register_membership",
@@ -268,14 +268,56 @@ LogosScrollView {
                         }
                     }
 
-                    LogosText {
-                        text: "Funding account"
-                        color: Theme.palette.textSecondary
+                }
+
+                LogosText {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    font.pixelSize: Theme.typography.secondaryText
+                    color: Theme.palette.textTertiary
+                    text: "A funded registration is paid by the registry module's own account "
+                        + "(see the Payer tab). Or delegate it to an allocator:"
+                }
+
+                LogosCheckbox {
+                    id: delegatedToggle
+                    objectName: "delegatedToggle"
+                    text: "Delegate to an allocator"
+                }
+
+                ColumnLayout {
+                    visible: delegatedToggle.checked
+                    Layout.fillWidth: true
+                    spacing: Theme.spacing.small
+
+                    LogosTextField {
+                        id: peerIdField
+                        objectName: "advancedGifterPeerIdField"
+                        Layout.fillWidth: true
+                        placeholderText: "Allocator peer id (16Uiu2HAm…)"
                     }
                     LogosTextField {
-                        id: fundingField
+                        id: multiaddrField
+                        objectName: "advancedGifterMultiaddrField"
                         Layout.fillWidth: true
-                        placeholderText: "Funded holding account (hex or base58) — or claim one on the Wallet tab"
+                        placeholderText: "Allocator address (/ip4/…/tcp/…)"
+                    }
+                    AuthVectorPicker {
+                        id: vectorPicker
+                        Layout.fillWidth: true
+                    }
+                    LogosText {
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        font.pixelSize: Theme.typography.secondaryText
+                        color: Theme.palette.textTertiary
+                        text: M.authVector(vectorPicker.authType).hint
+                    }
+                    LogosTextField {
+                        id: authArgsField
+                        visible: vectorPicker.authType !== "none"
+                        Layout.fillWidth: true
+                        placeholderText: "Producer arguments (JSON, optional)"
                     }
                 }
 
@@ -286,8 +328,9 @@ LogosScrollView {
                         implicitWidth: 180
                         implicitHeight: 40
                         text: "Register membership"
-                        enabled: !view.busy && view.unlocked
-                                 && fundingField.text.trim() !== "" && view.registryId !== ""
+                        enabled: !view.busy && view.unlocked && view.registryId !== ""
+                                 && (!delegatedToggle.checked
+                                     || (peerIdField.text.trim() !== "" && multiaddrField.text.trim() !== ""))
                         onClicked: view.doRegister()
                     }
                     LogosSpinner {

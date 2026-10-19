@@ -1,4 +1,4 @@
-// The expert three-tab UI (Register / Memberships / Wallet), shown as the
+// The expert three-tab UI (Register / Memberships / Payer), shown as the
 // "Advanced" mode behind the onboarding wizard and status card. The registry
 // field is Advanced-only; edits propagate up to Main through registryEdited,
 // and Main re-probes on exit.
@@ -65,7 +65,7 @@ Item {
             Layout.fillWidth: true
             LogosTabButton { text: "Register" }
             LogosTabButton { text: "Memberships" }
-            LogosTabButton { text: "Wallet" }
+            LogosTabButton { text: "Payer" }
         }
 
         StackLayout {
@@ -82,12 +82,9 @@ Item {
                 bridge: view.bridge
                 registryId: registryField.text.trim()
             }
-            WalletView {
+            PayerView {
                 bridge: view.bridge
                 registryId: registryField.text.trim()
-                onFunded: function (holdingHex) {
-                    registerView.fundingAccount = holdingHex
-                }
             }
         }
     }

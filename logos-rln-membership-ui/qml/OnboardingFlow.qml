@@ -1,66 +1,48 @@
 // Non-visual onboarding controller. The wizard runs the keystore password
-// first (its step's Next fires checkPassword), then wallet -> sync -> faucet
-// claim -> registration; the phase letters below are ids, not the sequence.
-// Sequential idempotent phases with observable progress. Each phase
-// duplicates an Advanced view's logic and
-// carries a "mirrors <view>.<fn> — keep in sync" cross-reference. An Item
-// (not QtObject) so it can own the poll Timers.
+// first (its step's Next fires checkPassword), then ONE of two registration
+// paths, both ending in the shared confirmation poll (pollRegistration):
+//
+//   funded     ensure_membership: the membership module provisions the
+//              registry-wide membership itself — selects the network, waits
+//              for its payer to hold price + fee reserve (the UI shows "send
+//              <required> to <payer>" from the structured provisioning
+//              object), registers — and this flow only polls.
+//   allocator  one delegated register_membership: the module mints the
+//              identity, asks the configured producer module for an auth
+//              payload bound to it, dials the allocator over libp2p, and the
+//              allocator pays. This flow brings the libp2p node up and gates
+//              on what the chosen auth vector needs (card present, eth
+//              address known).
+//
+// Sequential idempotent phases with observable progress. The expert
+// RegisterView duplicates the register call; both build their options
+// through membership.js (registryOptions / delegatedOptions). An Item (not
+// QtObject) so it can own the poll Timers.
 import QtQuick
 import "membership.js" as M
 
 Item {
     id: flow
+    objectName: "flowController"
     visible: false
 
     required property var bridge
     required property string registryId
 
-    // Single password for both stores (wallet storage + keystore); frozen by
-    // the password step once walletCreated — create_new consumed it.
+    // The keystore password (manual entry, or the auto-unlock secret).
     property string password: ""
     property int rateLimit: M.RATE_LIMIT_DEFAULT
+    // The allocator path asks for the registry minimum: rln_gifter_module
+    // clamps every request to its serve-time maxRateLimit (default 100)
+    // WITHOUT saying so, and the membership module then flags the granted
+    // rate as rate_limit_mismatch against what was asked. An allocator
+    // configured for more can be matched from the expert Register tab.
+    property int delegatedRateLimit: M.RATE_LIMIT_MIN
     property string priorNotice: ""
 
     // Set by Main from the startup probe (any local membership records ->
     // true); the password step frames itself as creation vs entry from it.
     property bool hasExistingAccount: false
-
-    // Phase A — wallet (provision + open/create).
-    property string walletPhase: "idle"
-    property string walletError: ""
-    // Captured from create_new. The WIZARD never renders it — only the
-    // Advanced Wallet tab shows a mnemonic, and only for a wallet it created
-    // there. Kept for a future recovery/export surface (and reset by the
-    // flow tests).
-    property string mnemonic: ""
-    property bool walletCreated: false
-
-    // Phase B — sync (auto-chained after A).
-    property string syncPhase: "idle"
-    property string syncError: ""
-    property int syncTarget: 0
-    // The wallet's block when this sync began — the progress bar's origin.
-    property int syncStart: 0
-    property int lastSynced: -1
-    // Total sync_to_block calls this run (hard global bound).
-    property int syncAttempts: 0
-    property bool syncToppedUp: false
-    // Sync throughput varies wildly: ~110–180 blocks/s when first measured
-    // (2026-08-04), but ~8–10 blocks/s for the v0.2.2 wallet against the
-    // hosted testnet (2026-08-14). 250-block chunks keep one chunk near ~30s
-    // even at the slow end, so the bar still ticks and the probe loop can
-    // tell "slow" from "stuck".
-    readonly property int syncChunk: 250
-    // The wallet module serves NO reads while a sync_to_block runs: a slow
-    // chunk outlives the bridge reply, and progress probes queue behind it —
-    // both come back bridge_failure while the wallet keeps syncing
-    // underneath. So the chunk reply is advisory; probeChunk re-checks every
-    // syncProbeMs and declares failure only after syncProbePatienceMs with
-    // NO block progress (any advance resets the patience). Test-tunable.
-    property int syncProbeMs: 3000
-    property int syncProbePatienceMs: 180000
-    property int syncChunkTarget: 0
-    property double syncProbeDeadline: 0
 
     // Phase C — keystore password check (fired by the password step's Next).
     property string unlockPhase: "idle"
@@ -68,8 +50,8 @@ Item {
 
     // Phase C′ — OS-keychain auto-unlock, fired by Main when routing into
     // onboarding. "done": unlockPhase is done and flow.password carries the
-    // keychain secret (it feeds create_new too). "fallback": the password
-    // screen runs manually; autoUnlockKind carries the error kind.
+    // keychain secret. "fallback": the password screen runs manually;
+    // autoUnlockKind carries the error kind.
     property string autoUnlockPhase: "idle"
     property string autoUnlockKind: ""
     // Set true by OnboardingView once the flow leaves Welcome; fences a late
@@ -77,14 +59,11 @@ Item {
     // restart().
     property bool started: false
 
-    // Test-tunable poll cadences. claimPollBudget x claimPollMs bounds the
-    // claim timeout (36 x 5s = 180s in production).
-    property int claimPollMs: 5000
-    property int claimPollBudget: 36
+    // Test-tunable poll cadence for the confirmation poll.
     property int statePollMs: 10000
 
     // Backoff and budget for callRetry's auto-retry of TRANSIENT failures;
-    // test-tunable. claim/create_new are never auto-retried.
+    // test-tunable.
     property int transientRetryMs: 1500
     property int transientRetryMax: 4
 
@@ -94,44 +73,52 @@ Item {
     // subscription for the same (module, event) pair.
     property bool eventsArmed: false
 
-    // Phase D — faucet claim into a fresh holding.
-    property string fundPhase: "idle"
-    property string fundError: ""
-    property string pricePerUnit: ""
-    property int claimAmount: 0
-    property string holdingHex: ""
-    property int claimPolls: 0
+    // The network the lez module's wallet is bound to (wallet_status), ""
+    // until read or unbound. Main adopts the matching built-in registry
+    // through registryDetected.
+    property string network: ""
 
-    // Phase E — registration + confirmation poll. register_membership
-    // generates the identity credential in-module; this flow only sees the
-    // public commitment from its reply.
+    // Phase E — registration + confirmation poll. Both paths land here.
+    // regPhase: idle | running | done | error. regState mirrors the last
+    // get_membership_state (unknown while the module provisions).
     property string regPhase: "idle"
     property string regError: ""
     property string regState: ""
     property string commitment: ""
     property bool rateLimitMismatch: false
+    // The module's provisioning object while a funded pass runs (see
+    // M.provisioningLabel): {} outside one.
+    property var provisioning: ({})
+    readonly property string provisioningStep: provisioning && provisioning.step ? String(provisioning.step) : ""
+    // "unknown" with no pass in flight is bounded: after unknownPollBudget
+    // polls the flow fails instead of spinning forever.
+    property int unknownPolls: 0
+    property int unknownPollBudget: 12
 
-    // ---- Gifter path (alternative to Phases A/B/D) -------------------------
-    // "gifter" replaces wallet-provision + sync + faucet with one delegated
-    // register_membership call: the membership module generates the identity, the
-    // capture module produces an attestation bound to its commitment, and
-    // the gifter node pays for the registration. The Phase E poll tail
-    // handles confirmation. Set on Welcome; reset by resetForNewRegistration.
-    property string registrationMode: "wallet"
+    // ---- Allocator path --------------------------------------------------
+    // "allocator" replaces ensure_membership with one delegated
+    // register_membership call. Set on Welcome; reset by
+    // resetForNewRegistration.
+    property string registrationMode: "funded"
     // gifterPhase: idle | running | done | error. gifterStage is the running
-    // sub-step (wallet -> node -> capture) for the progress caption.
+    // sub-step (node -> capture | address) for the progress caption.
     property string gifterPhase: "idle"
     property string gifterStage: ""
     property string gifterError: ""
-    property string gifterPeerId: M.GIFTER_PEER_ID_DEFAULT
-    property string gifterMultiaddr: M.GIFTER_MULTIADDR_DEFAULT
-    // createNode + start run once per session; retries and later gifted
-    // memberships reuse the node.
+    // The allocator's identity: what its operator published (allocator.json
+    // / the serve output). No default — the peer id is the trust anchor.
+    property string gifterPeerId: ""
+    property string gifterMultiaddr: ""
+    // The auth vector (M.AUTH_VECTORS id) and its optional producer args
+    // (a JSON string, forwarded verbatim as auth_args).
+    property string authType: "none"
+    property string authArgs: ""
+    // eth-allowlist: this device's address (eth_sign_module.address), shown
+    // so the allocator's operator can allowlist it before the request.
+    property string ethAddress: ""
+    // createNode + start run once per session; retries and later
+    // registrations reuse the node.
     property bool libp2pNodeReady: false
-    // The gifter pays for registration, but the client still needs an OPEN
-    // wallet for on-chain reads ("Null wallet handle" otherwise).
-    // Provisioned + opened once, unfunded, unsynced.
-    property bool gifterWalletReady: false
     // Card-presence gate before the delegated register: gating keeps the
     // module's background capture + dial + register chain inside its 300s
     // pending confirmation window.
@@ -144,6 +131,8 @@ Item {
 
     // Fired by finish() when the user leaves the completed wizard.
     signal completed(string commitment)
+    // The lez module's wallet is bound to a network with a known registry.
+    signal registryDetected(string registryId)
 
     function finish() {
         completed(commitment)
@@ -171,207 +160,43 @@ Item {
         }, timeoutMs)
     }
 
-    // Reset for a NEW registration after a completed run: funding,
-    // registration, and sync go back to idle so the re-run runs fresh
-    // (registering against a stale sync head drops the claim into the 180s
-    // timeout); the wallet phase stays done.
+    // wallet_status never touches the chain and answers before the first
+    // sync: its `network` (since lez 4.1.0) names the registry table entry
+    // to prefill. "" (unbound, operator-configured, or an error) keeps the
+    // default. Main fires this after a SUCCESSFUL startup probe only: with
+    // no backend loaded every bridge request blocks for its full timeout,
+    // and a second one at startup would hold the host's event loop long
+    // enough to miss the test harness's inspector window.
+    function detectNetwork() {
+        M.call(bridge, M.LEZ_RLN_MODULE, "wallet_status", [], function (r) {
+            if (r.error || !r.network)
+                return
+            flow.network = String(r.network)
+            var id = M.registryIdFor(flow.network)
+            if (id !== "")
+                flow.registryDetected(id)
+        }, 8000)
+    }
+
+    // Reset for a NEW registration after a completed run: registration goes
+    // back to idle so the re-run runs fresh. The libp2p node, if up, stays up.
     function resetForNewRegistration() {
-        if (syncPhase !== "running") {
-            syncPhase = "idle"
-            syncError = ""
-            syncStart = 0
-            lastSynced = -1
-            syncTarget = 0
-        }
-        if (fundPhase !== "running") {
-            fundPhase = "idle"
-            fundError = ""
-        }
         if (regPhase !== "running") {
             regPhase = "idle"
             regError = ""
             regState = ""
             commitment = ""
             rateLimitMismatch = false
+            provisioning = {}
+            unknownPolls = 0
         }
-        // A re-run re-offers the Welcome choice; the libp2p node, if up,
-        // stays up.
-        registrationMode = "wallet"
+        // A re-run re-offers the Welcome choice.
+        registrationMode = "funded"
         if (gifterPhase !== "running") {
             gifterPhase = "idle"
             gifterStage = ""
             gifterError = ""
         }
-    }
-
-    // ---- Phase A: wallet ---------------------------------------------------
-    // mirrors WalletView.doProvision — keep in sync
-    function startWallet() {
-        if (walletPhase === "running" || walletPhase === "done")
-            return
-        walletPhase = "running"
-        walletError = ""
-        callRetry(M.RLN_MODULE, "provision_wallet_home",
-               [JSON.stringify({ sequencer_addr: M.TESTNET_SEQUENCER_ADDR })], function (r) {
-            if (r.error) { flow.walletPhase = "error"; flow.walletError = M.errorText(r.error); return }
-            if (r.storage_exists === true)
-                flow.openWallet(String(r.config_path || ""), String(r.storage_path || ""))
-            else
-                flow.createWallet(String(r.config_path || ""), String(r.storage_path || ""))
-        })
-    }
-
-    // mirrors WalletView.doOpen — keep in sync. A daemon-lifetime wallet from
-    // a previous run reports open != 0; a working chain-head read proves it
-    // is still usable.
-    function openWallet(configPath, storagePath) {
-        callRetry(M.WALLET_MODULE, "open",
-               [configPath, storagePath, M.statsPathFor(storagePath)], function (r) {
-            if (!r.error && r.value === 0) {
-                flow.walletPhase = "done"
-                flow.startSync()
-                return
-            }
-            callRetry(M.WALLET_MODULE, "get_current_block_height", [], function (r2) {
-                if (!r2.error && r2.value > 0) {
-                    flow.walletPhase = "done"
-                    flow.startSync()
-                } else {
-                    flow.walletPhase = "error"
-                    flow.walletError = r.error ? M.errorText(r.error)
-                        : "open returned status " + r.value + " and the wallet answers no "
-                          + "chain-head probe — wrong files, or the wallet module is wedged."
-                }
-            })
-        })
-    }
-
-    // mirrors WalletView.doCreateFresh — keep in sync
-    function createWallet(configPath, storagePath) {
-        M.call(bridge, M.WALLET_MODULE, "create_new",
-               [configPath, storagePath, M.statsPathFor(storagePath), password], function (r) {
-            if (r.error) {
-                // create_new returns "" (-> empty_reply) when a DIFFERENT
-                // wallet is already open in the daemon; that wallet is
-                // usable, so recover by opening it.
-                if (r.error.kind === "empty_reply") { flow.openWallet(configPath, storagePath); return }
-                flow.walletPhase = "error"; flow.walletError = M.errorText(r.error); return
-            }
-            var words = r.value !== undefined ? String(r.value) : ""
-            if (words === "") {
-                flow.openWallet(configPath, storagePath)
-                return
-            }
-            flow.mnemonic = words
-            flow.walletCreated = true
-            M.call(bridge, M.WALLET_MODULE, "save", [], function (r2) {
-                flow.walletPhase = "done"
-                flow.startSync()
-            })
-        })
-    }
-
-    // ---- Phase B: sync -----------------------------------------------------
-    // mirrors WalletView.startSync — keep in sync; execution is chunked here
-    // (see syncChunkStep).
-    function startSync() {
-        if (syncPhase === "running" || syncPhase === "done")
-            return
-        syncAttempts = 0
-        syncChunkTarget = 0
-        syncToppedUp = false
-        syncPhase = "running"
-        syncError = ""
-        callRetry(M.WALLET_MODULE, "get_current_block_height", [], function (r) {
-            if (r.error || !(r.value > 0)) {
-                flow.syncPhase = "error"
-                flow.syncError = "Cannot discover the chain head (get_current_block_height "
-                    + "returned " + (r.error ? "an error" : r.value) + ") — is the sequencer reachable?"
-                return
-            }
-            flow.syncTarget = r.value
-            callRetry(M.WALLET_MODULE, "get_last_synced_block", [], function (r2) {
-                var last = (!r2.error && r2.value !== undefined) ? r2.value : 0
-                flow.syncStart = last
-                flow.lastSynced = last
-                if (last >= flow.syncTarget) {
-                    flow.syncPhase = "done"
-                    return
-                }
-                flow.syncChunkStep()
-            })
-        })
-    }
-
-    // Deliberately diverges from WalletView.runSyncAttempt: the wallet module
-    // serves NO reads while a sync call is in flight (concurrent
-    // get_last_synced_block starves; clients disconnecting mid-call can even
-    // crash the module host), so sync runs as strictly serial chunks and
-    // each chunk completion is the progress tick.
-    function syncChunkStep() {
-        syncAttempts += 1
-        if (syncAttempts > 200) {
-            flow.syncPhase = "error"
-            flow.syncError = "Sync did not complete (attempt budget exhausted, synced "
-                + flow.lastSynced + " / " + flow.syncTarget + "). Transactions from an "
-                + "unsynced wallet are accepted but never apply — retry before claiming "
-                + "or registering."
-            return
-        }
-        flow.syncChunkTarget = Math.min(lastSynced + syncChunk, syncTarget)
-        flow.syncProbeDeadline = Date.now() + syncProbePatienceMs
-        M.call(bridge, M.WALLET_MODULE, "sync_to_block", [flow.syncChunkTarget], function (r) {
-            // The reply is advisory — see the syncProbeMs comment. Success and
-            // bridge_failure alike fall through to the probe loop.
-            flow.probeChunk()
-        }, 0)
-    }
-
-    function probeChunk() {
-        M.call(bridge, M.WALLET_MODULE, "get_last_synced_block", [], function (r2) {
-            var last = (!r2.error && r2.value !== undefined) ? r2.value : -1
-            if (last > flow.lastSynced) {
-                flow.lastSynced = last
-                flow.syncProbeDeadline = Date.now() + flow.syncProbePatienceMs
-            }
-            if (last >= flow.syncChunkTarget) {
-                if (last >= flow.syncTarget)
-                    flow.syncTopUp()
-                else
-                    flow.syncChunkStep()
-            } else if (Date.now() < flow.syncProbeDeadline) {
-                // Still inside the patience window: the chunk is (probably)
-                // grinding server-side. Re-probe after a pause — each probe
-                // already self-paces by its own bridge timeout when queued.
-                syncProbeTimer.restart()
-            } else {
-                flow.syncPhase = "error"
-                flow.syncError = "Sync did not complete (no progress for "
-                    + Math.round(flow.syncProbePatienceMs / 1000) + "s, last status "
-                    + (r2.error ? r2.error.kind : last) + ", synced " + last + " / "
-                    + flow.syncTarget + "). Transactions from an unsynced wallet are "
-                    + "accepted but never apply — retry before claiming or registering."
-            }
-        })
-    }
-
-    // The head can advance while a long sync runs; one top-up pass re-syncs
-    // the difference. One pass suffices — register tolerates being a few
-    // blocks behind the live head.
-    function syncTopUp() {
-        if (syncToppedUp) {
-            syncPhase = "done"
-            return
-        }
-        syncToppedUp = true
-        M.call(bridge, M.WALLET_MODULE, "get_current_block_height", [], function (r) {
-            if (!r.error && r.value > flow.syncTarget) {
-                flow.syncTarget = r.value
-                flow.syncChunkStep()
-            } else {
-                flow.syncPhase = "done"
-            }
-        })
     }
 
     // ---- Phase C: keystore password ---------------------------------------
@@ -414,8 +239,7 @@ Item {
         if (started)
             return
         if (unlockPhase === "done") {
-            // A manual unlock already happened, possibly with a password
-            // create_new consumed — never clobber it.
+            // A manual unlock already happened — never clobber it.
             autoUnlockPhase = "done"
             return
         }
@@ -434,119 +258,12 @@ Item {
         })
     }
 
-    // ---- Phase D: faucet claim ---------------------------------------------
-    // mirrors WalletView.startClaim — keep in sync. Always claims into a
-    // FRESH holding: no wire method lists holdings, so a relaunch mid-claim
-    // orphans the previous claim's tokens.
-    function startFunding() {
-        if (fundPhase === "running" || fundPhase === "done")
-            return
-        var cfg = M.registryConfigHex(registryId)
-        if (cfg === "") {
-            fundPhase = "error"
-            fundError = "Registry id is not logos:<ref>:<64-hex> — cannot derive the config account."
-            return
-        }
-        fundPhase = "running"
-        fundError = ""
-        holdingHex = ""
-        claimPolls = 0
-        callRetry(M.LEZ_RLN_MODULE, "get_registry_bounds", [cfg], function (r) {
-            if (r.error || r.price_per_unit === undefined) {
-                flow.fundPhase = "error"
-                flow.fundError = r.error ? M.errorText(r.error)
-                                         : "get_registry_bounds returned no price_per_unit"
-                return
-            }
-            flow.pricePerUnit = String(r.price_per_unit)
-            flow.claimAmount = M.suggestedClaimAmount(flow.rateLimit, flow.pricePerUnit)
-            if (!(flow.claimAmount > 0)) {
-                // A non-numeric price would make a 0-token claim that is
-                // accepted and silently never funds — surface it instead.
-                flow.fundPhase = "error"
-                flow.fundError = "Couldn't determine the registration price (got \""
-                    + flow.pricePerUnit + "\")."
-                return
-            }
-            flow.deriveHolding(cfg, 0)
-        })
-    }
-
-    // A failed registration may have consumed the holding, so a revisit can
-    // explicitly claim again.
-    function restartFunding() {
-        if (fundPhase === "running")
-            return
-        fundPhase = "idle"
-        startFunding()
-    }
-
-    // mirrors WalletView.deriveHolding — keep in sync. The shared seed wallet
-    // replays the same account sequence deterministically, so derive until
-    // get_token_balance reports exists:false.
-    function deriveHolding(cfg, tries) {
-        if (tries >= 15) {
-            fundPhase = "error"
-            fundError = "No unused holding account after 15 derivations."
-            return
-        }
-        callRetry(M.WALLET_MODULE, "create_account_public", [], function (r) {
-            if (r.error || r.value === undefined) {
-                flow.fundPhase = "error"
-                flow.fundError = "create_account_public failed"
-                    + (r.error ? ": " + M.errorText(r.error) : "")
-                return
-            }
-            var acc = String(r.value)
-            callRetry(M.LEZ_RLN_MODULE, "get_token_balance", [acc], function (rb) {
-                if (rb.error) { flow.fundPhase = "error"; flow.fundError = M.errorText(rb.error); return }
-                if (rb.exists === false) {
-                    flow.holdingHex = acc
-                    flow.submitClaim(cfg, acc)
-                } else {
-                    flow.deriveHolding(cfg, tries + 1)
-                }
-            })
-        })
-    }
-
-    // mirrors WalletView.submitClaim — keep in sync
-    function submitClaim(cfg, acc) {
-        M.call(bridge, M.LEZ_RLN_MODULE, "claim_tokens", [cfg, acc, claimAmount], function (r) {
-            if (r.error) { flow.fundPhase = "error"; flow.fundError = M.errorText(r.error); return }
-            flow.claimPolls = 0
-            claimTimer.start()
-        })
-    }
-
-    // mirrors WalletView.pollClaim — keep in sync. An over-faucet claim is
-    // accepted and silently never funds — hence the hard claimPollBudget x
-    // claimPollMs timeout (180s in production).
-    function pollClaim() {
-        claimPolls += 1
-        M.call(bridge, M.LEZ_RLN_MODULE, "get_token_balance", [holdingHex], function (r) {
-            if (!r.error) {
-                var bal = parseInt(r.balance !== undefined ? r.balance : "0", 10)
-                if (r.exists === true && bal >= flow.claimAmount) {
-                    claimTimer.stop()
-                    flow.fundPhase = "done"
-                    return
-                }
-            }
-            if (flow.claimPolls >= flow.claimPollBudget) {
-                claimTimer.stop()
-                flow.fundPhase = "error"
-                flow.fundError = "Claim submitted but never funded within 180s — the faucet may "
-                    + "be exhausted or the wallet unsynced (transactions from an unsynced "
-                    + "wallet are silently dropped)."
-            }
-        })
-    }
-
-    // ---- Phase E: registration ----------------------------------------------
-    // mirrors RegisterView.doRegister — keep in sync. register_membership
-    // (the 0.7.0 wire's spelling of the spec's register) generates the
-    // identity credential in-module.
+    // ---- Phase E (funded): ensure_membership + confirmation poll ------------
+    // ensure_membership answers from the local records: a live membership of
+    // any scope on the registry comes back as its state view; none spawns the
+    // module's own provisioning pass and answers {"state":"unknown",
+    // "provisioning":{…}}. Either way the shared poll drives regPhase to
+    // completion; the provisioning object is re-read on every poll.
     function startRegistration() {
         if (regPhase === "running" || regPhase === "done")
             return
@@ -554,33 +271,39 @@ Item {
         regError = ""
         regState = ""
         rateLimitMismatch = false
-        flow.submitRegistration()
+        provisioning = {}
+        unknownPolls = 0
+        callRetry(M.RLN_MODULE, "ensure_membership",
+               [registryId, M.registryOptions(rateLimit, {})], function (r) {
+            if (r.error) { flow.regPhase = "error"; flow.regError = M.errorText(r.error); return }
+            flow.commitment = (r.credential && r.credential.identity_commitment) || ""
+            flow.regState = r.state || "unknown"
+            flow.rateLimitMismatch = r.rate_limit_mismatch === true
+            if (r.provisioning)
+                flow.provisioning = r.provisioning
+            if (flow.regState === "active" || flow.regState === "grace_period") {
+                flow.regPhase = "done"
+                return
+            }
+            regTimer.start()
+        })
     }
 
     function retryRegistration() {
         if (regPhase === "running")
             return
         regPhase = "idle"
-        startRegistration()
-    }
-
-    function submitRegistration() {
-        // Wallet path only — the gifter path submits via registerDelegated().
-        var options = M.registryOptions(rateLimit, { funding_holding_account_id: holdingHex })
-        callRetry(M.RLN_MODULE, "register_membership",
-               [registryId, M.DEFAULT_RLN_ID, options], function (r) {
-            if (r.error) { flow.regPhase = "error"; flow.regError = M.errorText(r.error); return }
-            flow.commitment = (r.credential && r.credential.identity_commitment) || ""
-            flow.regState = r.state || "pending"
-            flow.rateLimitMismatch = r.rate_limit_mismatch === true
-            regTimer.start()
-        })
+        if (registrationMode === "allocator")
+            retryGifter()
+        else
+            startRegistration()
     }
 
     // mirrors RegisterView.pollState — keep in sync. The module bounds the
-    // pending window at 300s, so this poll always terminates. A TRANSIENT
-    // error is tolerated by continuing — the next tick re-reads; only a
-    // non-transient error stops and fails.
+    // pending window at 300s, so this poll always terminates once a record
+    // exists; "unknown" is bounded by unknownPollBudget once no provisioning
+    // pass is reported. A TRANSIENT error is tolerated by continuing — the
+    // next tick re-reads; only a non-transient error stops and fails.
     function pollRegistration() {
         M.call(bridge, M.RLN_MODULE, "get_membership_state",
                [registryId, M.DEFAULT_RLN_ID], function (r) {
@@ -590,43 +313,78 @@ Item {
                 regTimer.stop()
                 flow.regPhase = "error"
                 flow.regError = M.errorText(r.error)
+                flow.settleGifter()
                 return
             }
             flow.regState = r.state || "unknown"
-            if (flow.regState === "pending")
+            if (r.provisioning)
+                flow.provisioning = r.provisioning
+            if (flow.regState === "pending") {
+                flow.unknownPolls = 0
                 return
+            }
+            if (flow.regState === "unknown") {
+                var step = flow.provisioningStep
+                if (step === "refused") {
+                    regTimer.stop()
+                    flow.regPhase = "error"
+                    flow.regError = "Registration refused"
+                        + (flow.provisioning.detail ? ": " + String(flow.provisioning.detail) : "")
+                    flow.settleGifter()
+                    return
+                }
+                // A pass in flight: keep polling. Past "done" (or with no
+                // pass at all) the record must appear within the budget.
+                if (r.provisioning && step !== "done")
+                    return
+                flow.unknownPolls += 1
+                if (flow.unknownPolls < flow.unknownPollBudget)
+                    return
+                regTimer.stop()
+                flow.regPhase = "error"
+                flow.regError = "The module reports no membership and no provisioning in "
+                    + "progress for this registry."
+                flow.settleGifter()
+                return
+            }
             regTimer.stop()
             if (flow.regState === "active" || flow.regState === "grace_period") {
                 flow.regPhase = "done"
             } else if (flow.regState === "failed") {
                 flow.fetchFailureReason()
+                return
             } else {
                 flow.regPhase = "error"
                 flow.regError = "Registration settled in state \"" + flow.regState + "\"."
             }
-            // The gifter path settles with the registration itself.
-            if (flow.registrationMode === "gifter" && flow.gifterPhase === "running") {
-                flow.gifterStage = ""
-                if (flow.regPhase === "done")
-                    flow.gifterPhase = "done"
-                else
-                    flow.gifterPhase = "error"
-            }
+            flow.settleGifter()
         })
+    }
+
+    // The allocator path settles with the registration itself.
+    function settleGifter() {
+        if (registrationMode === "allocator" && gifterPhase === "running") {
+            gifterStage = ""
+            gifterPhase = regPhase === "done" ? "done" : "error"
+        }
     }
 
     // The merged-state view carries no reason; the memberships row does
     // (failed_reason, plus retryable — spec: a failed submission SHALL
     // report whether it is retryable; never present without the reason).
+    // The funded path may not know its commitment (ensure_membership's pass
+    // registers in the background), so the newest failed row stands in.
     function fetchFailureReason() {
         callRetry(M.RLN_MODULE, "get_memberships", [registryId], function (r) {
             var reason = ""
             var retryable
             if (!r.error) {
                 var rows = r.memberships || []
-                for (var i = 0; i < rows.length; i++) {
+                for (var i = rows.length - 1; i >= 0; i--) {
                     var full = rows[i].credential ? rows[i].credential.identity_commitment : ""
-                    if (full === flow.commitment && rows[i].failed_reason) {
+                    var mine = flow.commitment !== "" ? full === flow.commitment
+                                                      : rows[i].state === "failed"
+                    if (mine && rows[i].failed_reason) {
                         reason = String(rows[i].failed_reason)
                         retryable = rows[i].retryable
                         break
@@ -637,67 +395,37 @@ Item {
             flow.regError = "Registration FAILED" + (reason !== "" ? ": " + reason : "")
                 + (retryable === false
                    ? " — the module reports this failure is not retryable as-is: fix the "
-                     + "cause (funding, registry, gifter) before trying again."
-                   : " — Try again re-registers with a fresh identity; if funds ran short, "
-                     + "get more tokens first.")
+                     + "cause (funding, registry, allocator) before trying again."
+                   : " — Try again re-registers with a fresh identity.")
+            flow.settleGifter()
         })
     }
 
-    // ---- Gifter path ---------------------------------------------------------
-    // Bring up the transport, gate on card presence, then hand the whole
-    // delegated flow to the membership module with one register_membership
-    // call; the Phase E poll tail drives regPhase to completion.
+    // ---- Allocator path ------------------------------------------------------
+    // Bring up the transport, satisfy the chosen vector's gate, then hand the
+    // whole delegated flow to the membership module with one
+    // register_membership call; the shared poll tail drives regPhase.
     function startGifter() {
         if (gifterPhase === "running" || gifterPhase === "done")
             return
-        // Keycard grants are clamped server-side to RATE_LIMIT_MIN; asking
-        // for anything else makes the reply warn spuriously about the
-        // granted rate differing from the requested one.
-        rateLimit = M.RATE_LIMIT_MIN
         gifterPhase = "running"
         gifterError = ""
-        gifterStage = "wallet"
-        ensureGifterWallet(function (wErr) {
-        if (wErr) { flow.failGifter(wErr); return }
-        flow.gifterStage = "node"
-        flow.ensureLibp2pNode(function (nodeErr) {
+        gifterStage = "node"
+        ensureLibp2pNode(function (nodeErr) {
             if (nodeErr) { flow.failGifter(nodeErr); return }
-            flow.gifterStage = "capture"
-            flow.cardWaitPolls = 0
-            flow.pollCardThenRegister()
-        })
-        })
-    }
-
-    // Open a wallet for the client's on-chain reads only — no sync, no
-    // faucet. get_membership and the idempotent register need it or they hit
-    // "Null wallet handle".
-    function ensureGifterWallet(cb) {
-        if (gifterWalletReady) { cb(""); return }
-        flow.callRetry(M.RLN_MODULE, "provision_wallet_home",
-               [JSON.stringify({ sequencer_addr: M.TESTNET_SEQUENCER_ADDR })], function (r) {
-            if (r.error) { cb("Couldn't set up the wallet: " + M.errorText(r.error)); return }
-            var configPath = String(r.config_path || "")
-            var storagePath = String(r.storage_path || "")
-            if (r.storage_exists === true) {
-                flow.callRetry(M.WALLET_MODULE, "open",
-                       [configPath, storagePath, M.statsPathFor(storagePath)], function (ro) {
-                    // A non-zero open on an already-open daemon wallet is fine for
-                    // reads; proceed either way.
-                    flow.gifterWalletReady = true
-                    cb("")
+            var gate = M.authVector(flow.authType).gate
+            if (gate === "card") {
+                flow.gifterStage = "capture"
+                flow.cardWaitPolls = 0
+                flow.pollCardThenRegister()
+            } else if (gate === "address") {
+                flow.gifterStage = "address"
+                flow.fetchEthAddress(function (err) {
+                    if (err) { flow.failGifter(err); return }
+                    flow.registerDelegated()
                 })
             } else {
-                M.call(bridge, M.WALLET_MODULE, "create_new",
-                       [configPath, storagePath, M.statsPathFor(storagePath), flow.password], function (rc) {
-                    if (rc.error && rc.error.kind !== "empty_reply") {
-                        cb("Couldn't create the wallet: " + M.errorText(rc.error)); return
-                    }
-                    M.call(bridge, M.WALLET_MODULE, "save", [], function () {
-                        flow.gifterWalletReady = true
-                        cb("")
-                    })
-                })
+                flow.registerDelegated()
             }
         })
     }
@@ -729,7 +457,7 @@ Item {
     }
 
     // A plain libp2p node (createNode + start, no RLN/mix context) suffices
-    // to dial the gifter. The FIRST libp2p_call can race libp2p_module's
+    // to dial the allocator. The FIRST libp2p_call can race libp2p_module's
     // token registration ("auth token not recognized"/"Invalid response");
     // createNodeAttempt retries those.
     function ensureLibp2pNode(cb) {
@@ -784,23 +512,36 @@ Item {
         })
     }
 
+    // eth-allowlist: read (and on first use mint) this device's signing
+    // address from the producer module, so the user can hand it to the
+    // allocator's operator before registering. cb(errorText) is optional.
+    function fetchEthAddress(cb) {
+        M.call(bridge, M.ETH_SIGN_MODULE, "address", [], function (r) {
+            if (r.error || !r.address) {
+                var msg = r.error ? M.errorText(r.error) : "eth_sign_module returned no address"
+                if (cb) cb("Couldn't read this device's Ethereum address: " + msg)
+                return
+            }
+            flow.ethAddress = String(r.address)
+            if (cb) cb("")
+        })
+    }
+
     // The one delegated call: register_membership generates the identity
     // in-module and returns the pending membership immediately; the module
-    // then captures, dials, and registers in the background. Confirmation
-    // comes through the shared Phase E poll.
+    // then asks the producer, dials, and registers in the background.
+    // Confirmation comes through the shared poll.
     function registerDelegated() {
         regPhase = "running"
         regError = ""
         regState = ""
         rateLimitMismatch = false
-        var options = M.registryOptions(rateLimit, {
-            delegated: "true",
-            gifter_peer_id: gifterPeerId.trim(),
-            gifter_multiaddr: gifterMultiaddr.trim(),
-            // The capture module (an rln_auth_vector producer) supplies the
-            // attestation bound to the module-generated commitment.
-            auth_type: "keycard-attestation",
-            auth_provider: M.CAPTURE_MODULE
+        provisioning = {}
+        var options = M.delegatedOptions(delegatedRateLimit, {
+            peerId: gifterPeerId,
+            multiaddr: gifterMultiaddr,
+            authType: authType,
+            authArgs: authArgs
         })
         callRetry(M.RLN_MODULE, "register_membership",
                [registryId, M.DEFAULT_RLN_ID, options], function (r) {
@@ -818,25 +559,12 @@ Item {
     }
 
     Timer {
-        id: syncProbeTimer
-        interval: flow.syncProbeMs
-        repeat: false
-        onTriggered: flow.probeChunk()
-    }
-
-    Timer {
-        id: claimTimer
-        interval: flow.claimPollMs
-        repeat: true
-        onTriggered: flow.pollClaim()
-    }
-
-    Timer {
         id: regTimer
         // Events only tighten latency, never replace the poll: armed widens
-        // the interval to a 60s slow-poll safety net; unarmed keeps the
-        // statePollMs cadence (and its test-tunability).
-        interval: flow.eventsArmed ? 60000 : flow.statePollMs
+        // the interval to a 60s slow-poll safety net — except while the
+        // module's provisioning pass runs, whose captions and funding
+        // numbers come from this poll alone.
+        interval: (flow.eventsArmed && flow.provisioningStep === "") ? 60000 : flow.statePollMs
         repeat: true
         onTriggered: flow.pollRegistration()
     }

@@ -1,17 +1,21 @@
 // Deterministic state-machine tests for the onboarding flow, driven by a
 // scripted mock bridge injected through the inspector's `evaluate` command
 // (framework.mjs doesn't wrap it; the server supports it). No daemon, no
-// faucet: the mock replies with the same parseReply-visible shapes as the
-// real wire (liblogos_rln_module.lidl at wire 0.7.0 — register_membership,
-// the LIP MembershipStatus vocabulary, {class,kind,message} error envelopes —
-// liblogos_lez_rln_module.lidl 2.0.0, plus the wallet module's int64 and
-// raw-string returns). One deliberate simplification: register_membership
-// here always mints a NEW membership, where the real module short-circuits
-// to the scope's live one — the multi-pill list scenarios need the former.
+// chain: the mock replies with the same parseReply-visible shapes as the
+// real wire (liblogos_rln_module.lidl 0.12.0 — ensure_membership with the
+// structured provisioning object, register_membership with the delegated
+// RegistryOptions, the LIP MembershipStatus vocabulary, {class,kind,message}
+// error envelopes — liblogos_lez_rln_module.lidl 5.0.0's wallet_status /
+// get_native_balance, rln_gifter_module.libp2p_call, and the two producer
+// modules' card_status / address). Methods the wire dropped (lez_core, the
+// faucet) answer an ERROR, so a call-site regression fails loudly. One
+// deliberate simplification: register_membership here always mints a NEW
+// membership, where the real module short-circuits to the scope's live one —
+// the multi-pill list scenarios need the former.
 //
 // The seam: Main.qml `bridgeOverride` re-threads the whole tree to the mock;
 // OnboardingView `flowController` exposes the flow's phase properties and
-// methods; test-tunable poll intervals let the claim/register timers fire in
+// methods; test-tunable poll intervals let the register timers fire in
 // milliseconds; Qt.callLater keeps mock dispatch async (no re-entrancy).
 //
 // One app process (mkPluginTest invokes each tests/*.mjs separately) is
@@ -36,6 +40,9 @@ const mode = (app) => evalExpr(app, "root.mode");
 async function callLog(app) {
   return JSON.parse(await evalExpr(app, "JSON.stringify(root.bridgeOverride.callLog)"));
 }
+async function lastRegisterOptions(app) {
+  return JSON.parse(await evalExpr(app, "JSON.stringify(root.bridgeOverride.state.lastRegisterOptions)"));
+}
 
 async function waitFor(app, fn, description, timeout = 8000) {
   await app.waitFor(fn, { timeout, interval: 100, description });
@@ -53,6 +60,10 @@ async function waitMode(app, value, timeout = 8000) {
   }, `mode → ${value}`, timeout);
 }
 
+const DEAD_METHODS = ["claim_tokens", "get_token_balance", "create_holding_account", "open",
+  "create_new", "save", "sync_to_block", "get_last_synced_block", "get_current_block_height",
+  "create_account_public", "provision_wallet_home", "register"];
+
 // ---- the mock ---------------------------------------------------------------
 // Returns a QML-JS expression string that builds the mock and assigns it to
 // root.bridgeOverride. cfg is embedded verbatim.
@@ -61,25 +72,37 @@ function mockExpr(cfg) {
     autoUnlock: cfg.autoUnlock ?? "created",
     autoUnlockKind: cfg.autoUnlockKind ?? "keychain_unavailable",
     memberships: cfg.memberships ?? [],
-    syncHead: cfg.syncHead ?? 1005,
-    syncFail: cfg.syncFail ?? false,
-    claimFunds: cfg.claimFunds ?? true,
     registerState: cfg.registerState ?? "active",
     registerFailReason: cfg.registerFailReason ?? "insufficient funds",
     unlockOk: cfg.unlockOk ?? true,
+    // The network wallet_status reports (prefills the registry via
+    // M.KNOWN_REGISTRIES); "" = unbound.
+    network: cfg.network ?? "testnet",
+    // The funded path's provisioning pass: "pass" walks
+    // waiting_for_wallet -> awaiting_funding -> registering -> (record) ->
+    // done, one step per get_membership_state poll; "refused" stops at
+    // refused. provisioningHold names a step the pass parks at until
+    // state.release is set (so a screen can be asserted mid-pass).
+    provisioning: cfg.provisioning ?? "pass",
+    provisioningHold: cfg.provisioningHold ?? "",
+    // Producer modules.
+    cardPresent: cfg.cardPresent ?? true,
+    ethAddress: cfg.ethAddress ?? "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
     // Map of method -> { kind, times }: return that transient error kind for
     // the first `times` calls of the method, then succeed.
     transientOnce: cfg.transientOnce ?? {},
   });
   return `(function () {
     var cfg = ${c};
-    var st = { synced: 0, acctSeq: 0, claimedAccount: "", failMemberships: false, memberships: cfg.memberships.slice(), transientLeft: {}, force: {}, regSeq: 0 };
+    var st = { failMemberships: false, memberships: cfg.memberships.slice(), transientLeft: {}, force: {}, regSeq: 0,
+               pass: null, release: false, cardPresent: cfg.cardPresent, lastRegisterOptions: null };
     for (var k in cfg.transientOnce) st.transientLeft[k] = cfg.transientOnce[k].times;
     var log = [];
     // First registration keeps the golden "aa" commitment; a second run (the
     // ghost / New-membership path) gets a distinct one so the list holds two
     // separate pills.
     var COMMIT = "aa".repeat(32), COMMIT2 = "dd".repeat(32);
+    var PAYER = "ab".repeat(32);
     // The raw register_member wire reply the module records as MembershipMeta
     // .tx_result and get_memberships echoes back — double-encoded exactly as
     // live (inner tx_result is itself a JSON string). qml/membership.js
@@ -92,17 +115,72 @@ function mockExpr(cfg) {
     function err(kind, message) {
       return { error: { "class": CLASS_OF[kind] || "permanent", kind: kind, message: message } };
     }
+    var DEAD = ${JSON.stringify(DEAD_METHODS)};
     // Scope resolution the way the module does it (lidl get_membership_state):
     // records registered under this rln_identifier, or legacy rows carrying
-    // none, back the scope; the newest such record wins here (the module
-    // would answer ambiguous_selection for several — see the header note).
+    // none, back the scope. One candidate answers; several answer the single
+    // LIVE one, else "ambiguous" (the module's ambiguous_selection).
+    function isLive(m) { return m.state === "pending" || m.state === "active" || m.state === "grace_period"; }
     function findScoped(registryId, rlnId) {
+      var cands = [];
       for (var i = st.memberships.length - 1; i >= 0; i--) {
         var m = st.memberships[i];
         if (m.registry_id !== undefined && m.registry_id !== registryId) continue;
-        if (m.rln_identifier === undefined || m.rln_identifier === rlnId) return m;
+        if (m.rln_identifier === undefined || m.rln_identifier === rlnId) cands.push(m);
+      }
+      if (cands.length <= 1) return cands[0] || null;
+      var live = cands.filter(isLive);
+      return live.length === 1 ? live[0] : "ambiguous";
+    }
+    function liveOnRegistry(registryId) {
+      for (var i = st.memberships.length - 1; i >= 0; i--) {
+        var m = st.memberships[i];
+        if (m.registry_id !== undefined && m.registry_id !== registryId) continue;
+        if (m.state === "pending" || m.state === "active" || m.state === "grace_period") return m;
       }
       return null;
+    }
+    function mint(registryId, rlnId, rate) {
+      // The credential is minted in-module and only its commitment is ever
+      // released. First registration keeps the golden "aa" commitment; a
+      // later one (the ghost / New-membership path) gets a distinct one so
+      // the list holds two separate pills.
+      st.regSeq += 1;
+      var commit = st.regSeq === 1 ? COMMIT : COMMIT2;
+      var view = { credential: { identity_commitment: commit }, leaf_index: 5, membership_hash: "ee".repeat(32), rate_limit: rate, registry_id: registryId, rln_identifier: rlnId, state: "pending", submitted_at: 1700000000 };
+      var row = JSON.parse(JSON.stringify(view));
+      row.tx_result = TXRESULT;
+      st.memberships.push(row);
+      return view;
+    }
+    function parseOptions(raw) {
+      var opts;
+      try { opts = JSON.parse(raw); } catch (e) { return null; }
+      if (!Array.isArray(opts) || opts.some(function (o) { return !o || typeof o.key !== "string" || !o.key || typeof o.value !== "string"; }))
+        return null;
+      return opts;
+    }
+    function optionsRate(opts) {
+      var rate = 0;
+      for (var oi = 0; oi < opts.length; oi++) if (opts[oi].key === "rate_limit") rate = parseInt(opts[oi].value, 10);
+      return rate;
+    }
+    // The provisioning object per step, as the lidl documents it.
+    var STEPS = ["waiting_for_wallet", "awaiting_funding", "registering", "done"];
+    function provisioningView(step) {
+      var p = { step: step, detail: "mock: " + step };
+      if (step === "awaiting_funding") { p.payer = PAYER; p.required = "6000000"; p.price = "5000000"; p.fee_reserve = "1000000"; p.balance = "0"; }
+      return p;
+    }
+    // One poll of a running pass: advance a step unless parked at the hold.
+    function advancePass(registryId) {
+      var p = st.pass;
+      if (cfg.provisioning === "refused") { p.step = "refused"; return provisioningView("refused"); }
+      if (p.step === cfg.provisioningHold && !st.release) return provisioningView(p.step);
+      var i = STEPS.indexOf(p.step);
+      if (p.step === "registering") mint(registryId, p.rlnId, p.rate);
+      if (i < STEPS.length - 1) p.step = STEPS[i + 1];
+      return provisioningView(p.step);
     }
     function reply(method, args) {
       log.push(method);
@@ -114,6 +192,8 @@ function mockExpr(cfg) {
         st.transientLeft[method] -= 1;
         return err(cfg.transientOnce[method].kind, "mock: transient " + method);
       }
+      if (DEAD.indexOf(method) >= 0)
+        return err("internal", "mock: '" + method + "' is not on this wire (lez module 5.0.0 / rln 0.12.0) — call-site regression");
       switch (method) {
         case "get_memberships":
           if (st.failMemberships) return err("provider_failure", "mock: memberships unavailable");
@@ -127,71 +207,79 @@ function mockExpr(cfg) {
           if (!cfg.unlockOk) return err("bad_password", "mock: wrong password");
           return { membership_count: st.memberships.length, unlocked: true };
         case "remember_keystore_password": return { remembered: true };
-        case "provision_wallet_home":
-          return { config_existed: false, config_path: "/mock/wallet-home/wallet_config.json", storage_exists: false, storage_path: "/mock/wallet-home/storage.json" };
-        case "create_new": return "mock recovery phrase shown only once ok";
-        case "open": return 0;
-        case "save": return 0;
-        case "get_current_block_height":
-          if (cfg.syncFail) return err("empty_reply", "mock: no head");
-          return cfg.syncHead;
-        case "get_last_synced_block": return st.synced;
-        case "sync_to_block": st.synced = Math.min(args[0], cfg.syncHead); return 0;
+        case "wallet_status":
+          return { detail: "", network: cfg.network, payer: PAYER, ready: true, state: "ready" };
+        case "get_native_balance": return { balance: "0" };
         case "get_registry_bounds": return { max_rate_limit: 600, min_rate_limit: 100, price_per_unit: "10000", total_registrations: 1 };
-        case "create_account_public":
-          st.acctSeq += 1;
-          return (st.acctSeq.toString(16).padStart(2, "0")).repeat(32).slice(0, 64);
-        case "get_token_balance":
-          // Only the account a claim funded reads back a balance; freshly
-          // derived accounts read exists:false so the derive loop advances.
-          if (cfg.claimFunds && args[0] === st.claimedAccount)
-            return { exists: true, balance: "6000000", definition: "dd".repeat(32) };
-          return { exists: false, balance: "0" };
-        case "claim_tokens": st.claimedAccount = args[1]; return { payment_definition: "dd".repeat(32), pending: true, tx_result: "{}" };
-        case "register":
-          // The pre-0.7.0 spelling. The wire renamed it (register is a C/C++
-          // keyword — generated clients could not carry the spec name), so a
-          // call-site regression fails loudly here.
-          return err("invalid_argument", "mock: no method 'register' on wire 0.7.0 — call register_membership");
+        case "ensure_membership": {
+          // Strict: (registry_id, options_json) with ONLY rate_limit in the
+          // options array — delegated/gifter/auth keys are invalid here.
+          if (args.length !== 2)
+            return err("invalid_argument", "mock: ensure_membership takes 2 args (registry_id, options_json), got " + args.length);
+          var eopts = parseOptions(args[1]);
+          if (!eopts) return err("invalid_argument", "mock: options_json must be a RegistryOptions array of {key,value} string pairs");
+          for (var ei = 0; ei < eopts.length; ei++) if (eopts[ei].key !== "rate_limit")
+            return err("invalid_argument", "mock: ensure_membership accepts only rate_limit, got " + eopts[ei].key);
+          var live = liveOnRegistry(args[0]);
+          if (live) return { registry_id: args[0], state: live.state, membership_hash: live.membership_hash, leaf_index: live.leaf_index, rate_limit: live.rate_limit };
+          st.pass = { step: STEPS[0], rlnId: "00".repeat(32), rate: optionsRate(eopts) || 100 };
+          return { registry_id: args[0], state: "unknown", provisioning: provisioningView(st.pass.step) };
+        }
         case "register_membership": {
           // Deliberately strict so a call-site regression fails here: the
           // scope pair, then the RegistryOptions array with a decimal-string
-          // rate_limit (the module rejects non-string values / non-arrays).
+          // rate_limit (the module rejects non-string values / non-arrays);
+          // a delegated registration must name the allocator, and an
+          // auth_type must come with exactly one of auth_payload/auth_provider.
           if (args.length !== 3)
             return err("invalid_argument", "mock: register_membership takes 3 args (registry_id, rln_identifier_hex, options_json), got " + args.length);
           if (!/^(0x)?[0-9a-f]{64}$/.test(String(args[1])))
             return err("invalid_argument", "mock: rln_identifier_hex must be 32-byte hex, got " + args[1]);
-          var opts;
-          try { opts = JSON.parse(args[2]); } catch (e) { opts = null; }
-          if (!Array.isArray(opts) || opts.some(function (o) { return !o || typeof o.key !== "string" || !o.key || typeof o.value !== "string"; }))
-            return err("invalid_argument", "mock: options_json must be a RegistryOptions array of {key,value} string pairs");
-          var rate = 0;
-          for (var oi = 0; oi < opts.length; oi++) if (opts[oi].key === "rate_limit") rate = parseInt(opts[oi].value, 10);
+          var opts = parseOptions(args[2]);
+          if (!opts) return err("invalid_argument", "mock: options_json must be a RegistryOptions array of {key,value} string pairs");
+          st.lastRegisterOptions = opts;
+          var rate = optionsRate(opts);
           if (!(rate > 0))
             return err("invalid_argument", "mock: rate_limit must be a positive decimal string");
-          // The credential is minted in-module and only its commitment is
-          // ever released. First registration keeps the golden "aa"
-          // commitment; a later one (the ghost / New-membership path) gets a
-          // distinct one so the list holds two separate pills.
-          st.regSeq += 1;
-          var commit = st.regSeq === 1 ? COMMIT : COMMIT2;
-          var view = { credential: { identity_commitment: commit }, leaf_index: 5, membership_hash: "ee".repeat(32), rate_limit: rate, registry_id: args[0], rln_identifier: args[1], state: "pending", submitted_at: 1700000000 };
-          var row = JSON.parse(JSON.stringify(view));
-          row.tx_result = TXRESULT;
-          st.memberships.push(row);
-          return view;
+          var o = {};
+          for (var oj = 0; oj < opts.length; oj++) o[opts[oj].key] = opts[oj].value;
+          if (o.delegated === "true") {
+            if (!o.gifter_peer_id || !o.gifter_multiaddr)
+              return err("invalid_argument", "mock: delegated registration needs gifter_peer_id and gifter_multiaddr");
+            if (o.auth_type && !!o.auth_payload === !!o.auth_provider)
+              return err("invalid_argument", "mock: auth_type needs exactly one of auth_payload / auth_provider");
+            if (!o.auth_type && (o.auth_payload || o.auth_provider))
+              return err("invalid_argument", "mock: auth_payload/auth_provider need an auth_type");
+          }
+          return mint(args[0], args[1], rate);
         }
         case "get_membership_state": {
           if (args.length !== 2)
             return err("invalid_argument", "mock: get_membership_state takes 2 args (registry_id, rln_identifier_hex), got " + args.length);
           var m = findScoped(args[0], args[1]);
-          if (!m) return { registry_id: args[0], state: "unknown" };
-          if (cfg.registerState === "failed") { m.state = "failed"; m.failed_reason = cfg.registerFailReason; m.retryable = true; return { registry_id: args[0], state: "failed" }; }
-          m.state = cfg.registerState;
-          return { leaf_index: m.leaf_index, membership_hash: m.membership_hash, rate_limit: m.rate_limit, registry_id: args[0], state: cfg.registerState };
+          if (m === "ambiguous") return err("ambiguous_selection", "mock: more than one record backs this scope");
+          if (!m) {
+            if (st.pass && st.pass.step !== "done")
+              return { registry_id: args[0], state: "unknown", provisioning: advancePass(args[0]) };
+            return { registry_id: args[0], state: "unknown" };
+          }
+          // Only a fresh submission settles to the scripted outcome; a settled
+          // record keeps its state (the registry overlay never revives a
+          // slashed or erased one).
+          if (m.state === "pending") {
+            if (cfg.registerState === "failed") { m.state = "failed"; m.failed_reason = cfg.registerFailReason; m.retryable = true; return { registry_id: args[0], state: "failed" }; }
+            m.state = cfg.registerState;
+          }
+          if (m.state === "failed") return { registry_id: args[0], state: "failed" };
+          return { leaf_index: m.leaf_index, membership_hash: m.membership_hash, rate_limit: m.rate_limit, registry_id: args[0], state: m.state };
         }
         case "get_membership":
           return { clock_timestamp: 1700003000, grace_period_duration: 600, grace_period_start_timestamp: 1700005580, leaf_index: 5, rate_limit: 300, registered: true, state: cfg.registerState };
+        // rln_gifter_module.libp2p_call relays createNode/start: the raw
+        // {success,value,error} envelope (error:"" on success).
+        case "libp2p_call": return { success: true, value: "", error: "" };
+        case "card_status": return { present: st.cardPresent === true };
+        case "address": return { address: cfg.ethAddress, persisted: true };
         default: return err("internal", "mock: unhandled " + method);
       }
     }
@@ -208,17 +296,18 @@ function mockExpr(cfg) {
 function resetExpr(cfg) {
   return `(function () {
     var f = onboardingView.flowController;
-    f.walletPhase = "idle"; f.walletError = ""; f.mnemonic = ""; f.walletCreated = false;
-    f.syncPhase = "idle"; f.syncError = ""; f.syncStart = 0; f.lastSynced = -1; f.syncTarget = 0; f.syncAttempts = 0; f.syncChunkTarget = 0; f.syncToppedUp = false;
     f.unlockPhase = "idle"; f.unlockError = "";
     f.autoUnlockPhase = "idle"; f.autoUnlockKind = ""; f.started = false;
-    f.fundPhase = "idle"; f.fundError = ""; f.pricePerUnit = ""; f.claimAmount = 0; f.holdingHex = ""; f.claimPolls = 0;
     f.regPhase = "idle"; f.regError = ""; f.regState = ""; f.commitment = ""; f.rateLimitMismatch = false; f.password = "";
-    f.registrationMode = "wallet"; f.gifterPhase = "idle"; f.gifterStage = ""; f.gifterError = "";
-    f.claimPollMs = 20; f.statePollMs = 20; f.claimPollBudget = ${cfg.claimBudget ?? 36};
+    f.provisioning = {}; f.unknownPolls = 0; f.network = "";
+    f.registrationMode = "funded"; f.gifterPhase = "idle"; f.gifterStage = ""; f.gifterError = "";
+    f.gifterPeerId = ""; f.gifterMultiaddr = ""; f.authType = "none"; f.authArgs = ""; f.ethAddress = ""; f.libp2pNodeReady = false;
+    f.rateLimit = ${cfg.rateLimit ?? 300};
+    f.statePollMs = 20; f.unknownPollBudget = ${cfg.unknownPollBudget ?? 12};
     f.transientRetryMs = 15; f.transientRetryMax = 3;
     onboardingView.currentStep = 0; onboardingView.priorNotice = ""; root.preAdvancedMode = ""; root.mode = "probe";
-    membershipView.celebrate = false; membershipView.completionRefresh = false;
+    root.registryEdited = false; root.registryId = M.TESTNET_REGISTRY_ID;
+    membershipView.celebrate = false; membershipView.completionRefresh = false; membershipView.rows = [];
     ${mockExpr(cfg)};
     return true;
   })()`;
@@ -229,12 +318,40 @@ async function setup(app, cfg) {
   await evalExpr(app, "root.probe()");
 }
 
+// Drive the wizard into the allocator step with the given allocator config
+// (auto-unlock skips the password screen), then start it.
+async function startAllocator(app, cfg) {
+  await waitPhase(app, "autoUnlockPhase", "done");
+  // Not app.click: the allocator step's title and the expert view's toggle
+  // share the link's text and the click BFS would match an invisible one.
+  // Drive the link's handler directly.
+  await evalExpr(app, "(function () { onboardingView.flowController.registrationMode = 'allocator'; onboardingView.advance(); return true; })()");
+  await waitFor(app, async () => {
+    if (await evalExpr(app, "onboardingView.currentStep") !== 2) throw new Error("not on step 2");
+  }, "allocator step");
+  if (await phase(app, "registrationMode") !== "allocator") throw new Error("mode not allocator");
+  await evalExpr(app, `(function () { var f = onboardingView.flowController;
+    f.gifterPeerId = ${JSON.stringify(cfg.peerId)}; f.gifterMultiaddr = ${JSON.stringify(cfg.multiaddr)};
+    f.authType = ${JSON.stringify(cfg.authType)}; f.authArgs = ${JSON.stringify(cfg.authArgs ?? "")}; return true; })()`);
+  await evalExpr(app, "onboardingView.flowController.retryGifter()");
+}
+
+const PEER = "16Uiu2HAm8KkYKyhBK5f8ZcSDJP947bxCqVRRbzP8DKDigqePtX2Y";
+const MADDR = "/ip4/203.0.113.7/tcp/9000";
+
+function optionsToObject(opts) {
+  const o = {};
+  for (const { key, value } of opts) o[key] = value;
+  return o;
+}
+
 // ---- scenarios --------------------------------------------------------------
 
-// 1. Golden path: auto-unlock → wallet → chunked sync → fund → register →
-//    active; completion lands on the refreshed list, the first membership
-//    celebrates, and tapping the pill opens detail.
-test("flow: golden path lands the first membership in a celebrating list", async (app) => {
+// 1. Golden funded path: auto-unlock → ensure_membership → the module's
+//    provisioning pass (polled) → pending → active; completion lands on the
+//    refreshed list, the first membership celebrates, and tapping the pill
+//    opens detail. Nothing on the dead wire is ever dialled.
+test("flow: golden funded path lands the first membership in a celebrating list", async (app) => {
   await setup(app, { autoUnlock: "created", registerState: "active" });
   await waitPhase(app, "autoUnlockPhase", "done");
   if (await phase(app, "password") !== "sec-created") throw new Error("secret not adopted as password");
@@ -242,12 +359,14 @@ test("flow: golden path lands the first membership in a celebrating list", async
   if (skipped !== true) throw new Error("password screen not skipped after auto-unlock");
   await app.click("Get started");
   await waitPhase(app, "regPhase", "done", 12000);
-  // The 0.7.0 wire: registration goes through register_membership with the
-  // (registry_id, rln_identifier_hex, options_json) scope; the old spelling
-  // must never be dialled.
   const glog = await callLog(app);
-  if (!glog.includes("register_membership") || glog.includes("register"))
-    throw new Error(`registration did not use register_membership: ${glog.join(",")}`);
+  if (!glog.includes("ensure_membership"))
+    throw new Error(`funded path did not use ensure_membership: ${glog.join(",")}`);
+  if (glog.includes("register_membership"))
+    throw new Error("funded path must not call register_membership itself");
+  const dead = glog.filter((m) => DEAD_METHODS.includes(m));
+  if (dead.length) throw new Error(`dead-wire methods dialled: ${dead.join(",")}`);
+  if (await phase(app, "provisioningStep") !== "done") throw new Error("provisioning did not reach done");
   await waitMode(app, "status");
   if (await evalExpr(app, "membershipView.celebrate") !== true)
     throw new Error("first membership did not celebrate");
@@ -268,6 +387,21 @@ test("flow: golden path lands the first membership in a celebrating list", async
     throw new Error(`tx hash not parsed: ${await evalExpr(app, "detailCard.txHash")}`);
   const shownHash = await evalExpr(app, `M.truncateHex("${txHash}", 10, 8)`);
   await app.expectTexts(["Registration", "Confirmed", shownHash, "Copy"]);
+});
+
+// 1b. awaiting_funding renders "send <required> to <payer>" from the
+//     structured fields, and the flow continues on its own once funded.
+test("flow: awaiting_funding shows the payer and the amount, then continues", async (app) => {
+  await setup(app, { autoUnlock: "created", registerState: "active", provisioningHold: "awaiting_funding" });
+  await waitPhase(app, "autoUnlockPhase", "done");
+  await app.click("Get started");
+  await waitPhase(app, "provisioningStep", "awaiting_funding");
+  await app.expectTexts(["Fund your account", "Send at least", "6000000 native", "ab".repeat(32),
+                         "Waiting for funds…"]);
+  if (await phase(app, "regPhase") !== "running") throw new Error("flow stopped while awaiting funding");
+  await evalExpr(app, "root.bridgeOverride.state.release = true");
+  await waitPhase(app, "regPhase", "done", 12000);
+  await waitMode(app, "status");
 });
 
 // 2. Fallback + remember: auto-unlock errors → password screen → manual unlock
@@ -309,7 +443,8 @@ test("flow: exit-advanced restores mode on a transient error, routes on success"
 });
 
 // 4. Registry poisoning regression: a garbled edit must not reach
-//    root.registryId; a valid CAIP-10 edit is adopted.
+//    root.registryId; a valid CAIP-10 edit is adopted, and pins the registry
+//    against a later network detection.
 test("flow: advanced registry edits reject garbage, accept valid CAIP-10", async (app) => {
   await setup(app, { autoUnlock: "created" });
   await waitMode(app, "onboarding");
@@ -322,41 +457,60 @@ test("flow: advanced registry edits reject garbage, accept valid CAIP-10", async
   await evalExpr(app, "advancedView.registryEdited('not a caip10 id')");
   if (await evalExpr(app, "root.registryId") !== good)
     throw new Error("garbage edit poisoned registryId");
-  if (await evalExpr(app, `M.registryConfigHex(root.registryId) !== ""`) !== true)
-    throw new Error("funding path would be poisoned (registryConfigHex empty)");
   const other = "logos:testnet:" + "ab".repeat(32);
   await evalExpr(app, `advancedView.registryEdited(${JSON.stringify(other)})`);
   if (await evalExpr(app, "root.registryId") !== other)
     throw new Error("valid registry edit not adopted");
+  // An edited registry is never overridden by the wallet's network.
+  await evalExpr(app, "onboardingView.flowController.detectNetwork()");
+  await waitFor(app, async () => {
+    if (await phase(app, "network") !== "testnet") throw new Error("network not read");
+  }, "wallet_status network");
+  if (await evalExpr(app, "root.registryId") !== other)
+    throw new Error("network detection overrode an edited registry");
 });
 
-// 5. New membership via the ghost: a completed run leaves syncPhase done; the
-//    "+ New Membership" ghost resets it so the re-run re-enters sync (else
-//    startSync would early-return) and reaches active.
-test("flow: the New Membership ghost re-runs the flow with a sync reset", async (app) => {
+// 4b. The lez module's bound network selects the registry: a devnet wallet
+//     moves the default (testnet) registry to devnet's; an unknown network
+//     keeps it.
+test("flow: the wallet's network picks the registry from the built-in table", async (app) => {
+  await setup(app, { autoUnlock: "created", network: "devnet" });
+  await waitMode(app, "onboarding");
+  await evalExpr(app, "onboardingView.flowController.detectNetwork()");
+  await waitFor(app, async () => {
+    const id = await evalExpr(app, "root.registryId");
+    const want = await evalExpr(app, "M.KNOWN_REGISTRIES.devnet");
+    if (id !== want) throw new Error(`registry ${id}, want ${want}`);
+  }, "devnet registry adopted");
+  if (await evalExpr(app, "M.registryIdFor('nonet')") !== "") throw new Error("unknown network must map to ''");
+});
+
+// 5. New membership via the ghost: a completed run leaves regPhase done; the
+//    "+ New Membership" ghost resets it so the re-run re-enters
+//    ensure_membership and reaches active.
+test("flow: the New Membership ghost re-runs the flow", async (app) => {
   await setup(app, { autoUnlock: "created", registerState: "active" });
   await waitPhase(app, "autoUnlockPhase", "done");
   await app.click("Get started");
   await waitPhase(app, "regPhase", "done", 12000);
-  if (await phase(app, "syncPhase") !== "done") throw new Error("precondition: syncPhase done after a run");
   await app.expectTexts(["+ New Membership"]);
-  const before = (await callLog(app)).filter((m) => m === "get_current_block_height").length;
+  const before = (await callLog(app)).filter((m) => m === "ensure_membership").length;
   // Not app.click: MembershipView's always-instantiated (invisible) ghost
   // shares the text and the click BFS would match it. Drive the ghost's
   // handler (onNewMembershipRequested → restart) directly.
   await evalExpr(app, "onboardingView.restart()");
-  // Re-entering sync proves syncPhase was reset (a stale "done" would make
-  // startSync early-return and never re-read the head).
   await waitFor(app, async () => {
-    const n = (await callLog(app)).filter((m) => m === "get_current_block_height").length;
-    if (n <= before) throw new Error(`no re-sync: head reads ${n} <= ${before}`);
-  }, "re-sync to begin", 8000);
+    const n = (await callLog(app)).filter((m) => m === "ensure_membership").length;
+    if (n <= before) throw new Error(`no re-run: ensure_membership calls ${n} <= ${before}`);
+  }, "re-run to begin", 8000);
   await waitPhase(app, "regPhase", "done", 12000);
 });
 
-// 5b. A second membership never celebrates: the 0->1 one-shot is not re-armed
-//     for a 1->2 completion; both pills land under "Your Memberships".
-test("flow: a second membership lands in the list without celebrating", async (app) => {
+// 5b. A relaunch into an existing membership never celebrates, and "+ New
+//     Membership" on a registry that already holds a live one is idempotent:
+//     ensure_membership answers the live membership, no provisioning pass
+//     runs, the list keeps its one pill, and nothing celebrates.
+test("flow: a re-run on a registry with a live membership is idempotent", async (app) => {
   const cOld = "cc".repeat(32);
   await setup(app, { autoUnlock: "created", registerState: "active",
     memberships: [{ credential: { identity_commitment: cOld }, membership_hash: "ff".repeat(32), leaf_index: 2, rate_limit: 200, state: "active", submitted_at: 1 }] });
@@ -372,11 +526,14 @@ test("flow: a second membership lands in the list without celebrating", async (a
   await app.click("Get started");
   await waitPhase(app, "regPhase", "done", 12000);
   await waitMode(app, "status");
-  const petNew = await evalExpr(app, `M.petname("${"aa".repeat(32)}")`);
-  if (petNew === petOld) throw new Error("test fixtures collided on a petname");
-  await app.expectTexts(["Your Memberships", petOld, petNew, "+ New Membership"]);
+  const log = await callLog(app);
+  if (!log.includes("ensure_membership")) throw new Error("re-run did not ask ensure_membership");
+  if (await phase(app, "provisioningStep") !== "") throw new Error("a provisioning pass ran despite a live membership");
+  if (await evalExpr(app, "root.bridgeOverride.state.memberships.length") !== 1)
+    throw new Error("a second record was minted on an idempotent re-run");
+  await app.expectTexts(["Your Memberships", petOld, "+ New Membership"]);
   if (await evalExpr(app, "membershipView.celebrate") !== false)
-    throw new Error("a second membership must not celebrate");
+    throw new Error("an idempotent re-run must not celebrate");
 });
 
 // 5d. The LIP vocabulary: a terminal state the logos namespace never emits
@@ -409,23 +566,17 @@ test("flow: LIP terminal and unknown states degrade gracefully", async (app) => 
     throw new Error("vocabulary check wrong");
 });
 
-// 6. Error branches: sync fail, claim timeout, register failed.
-test("flow: sync failure surfaces an error with retry", async (app) => {
-  await setup(app, { autoUnlock: "created", syncFail: true });
+// 6. Error branches: a refused provisioning pass, a failed registration, an
+//    "unknown" that never resolves.
+test("flow: a refused provisioning pass surfaces its detail with retry", async (app) => {
+  await setup(app, { autoUnlock: "created", provisioning: "refused" });
   await waitPhase(app, "autoUnlockPhase", "done");
   await app.click("Get started");
-  await waitPhase(app, "syncPhase", "error", 12000);
+  await waitPhase(app, "regPhase", "error", 12000);
   await app.expectTexts(["Setup failed", "Retry"]);
-});
-
-test("flow: claim timeout names both causes", async (app) => {
-  await setup(app, { autoUnlock: "created", claimFunds: false, claimBudget: 3 });
-  await waitPhase(app, "autoUnlockPhase", "done");
-  await app.click("Get started");
-  await waitPhase(app, "fundPhase", "error", 12000);
-  const err = await phase(app, "fundError");
-  if (!/never funded within 180s/.test(err) || !/unsynced/.test(err))
-    throw new Error(`claim-timeout message missing a cause: ${err}`);
+  const err = await phase(app, "regError");
+  if (!/refused/.test(err) || !/mock: refused/.test(err))
+    throw new Error(`refusal detail missing: ${err}`);
 });
 
 test("flow: register failure shows the reason and try-again", async (app) => {
@@ -438,20 +589,41 @@ test("flow: register failure shows the reason and try-again", async (app) => {
   if (!/insufficient funds/.test(err)) throw new Error(`failed_reason missing: ${err}`);
 });
 
+test("flow: an unknown state with no provisioning pass fails within its budget", async (app) => {
+  // force get_membership_state to never show a record: the mock's pass
+  // completes but a forced state view keeps "unknown" without provisioning.
+  await setup(app, { autoUnlock: "created", unknownPollBudget: 4 });
+  await evalExpr(app, "root.bridgeOverride.state.pass = { step: 'done' }");
+  await evalExpr(app, "root.bridgeOverride.state.force = {}");
+  await waitPhase(app, "autoUnlockPhase", "done");
+  // Make ensure_membership start no pass: pre-mark the pass as done so the
+  // state poll answers a bare "unknown".
+  await evalExpr(app, `(function () {
+    var orig = root.bridgeOverride.callModuleAsync;
+    root.bridgeOverride.callModuleAsync = function (module, method, args, cb, t) {
+      if (method === "ensure_membership") { root.bridgeOverride.callLog.push(method); Qt.callLater(function () { cb(JSON.stringify({ registry_id: args[0], state: "unknown" })); }); return; }
+      if (method === "get_membership_state") { root.bridgeOverride.callLog.push(method); Qt.callLater(function () { cb(JSON.stringify({ registry_id: args[0], state: "unknown" })); }); return; }
+      orig(module, method, args, cb, t);
+    }; return true; })()`);
+  await app.click("Get started");
+  await waitPhase(app, "regPhase", "error", 12000);
+  if (!/no provisioning in progress/.test(await phase(app, "regError")))
+    throw new Error(`unexpected error: ${await phase(app, "regError")}`);
+});
+
 // 7. Auto-retry recovery: transient bridge_failure errors on the first
-//    get_registry_bounds calls self-heal — the flow reaches active without
+//    ensure_membership calls self-heal — the flow reaches active without
 //    surfacing the error.
-test("flow: transient error on a critical read auto-recovers", async (app) => {
+test("flow: transient error on ensure_membership auto-recovers", async (app) => {
   await setup(app, { autoUnlock: "created", registerState: "active",
-    transientOnce: { get_registry_bounds: { kind: "bridge_failure", times: 2 } } });
+    transientOnce: { ensure_membership: { kind: "bridge_failure", times: 2 } } });
   await waitPhase(app, "autoUnlockPhase", "done");
   await app.click("Get started");
   await waitPhase(app, "regPhase", "done", 12000);
-  if (await phase(app, "fundPhase") !== "done") throw new Error("fund phase did not recover");
-  if (await phase(app, "fundError") !== "") throw new Error("transient error leaked to the user");
+  if (await phase(app, "regError") !== "") throw new Error("transient error leaked to the user");
   const log = await callLog(app);
-  const bounds = log.filter((m) => m === "get_registry_bounds").length;
-  if (bounds < 3) throw new Error(`expected retries, saw ${bounds} get_registry_bounds calls`);
+  const n = log.filter((m) => m === "ensure_membership").length;
+  if (n < 3) throw new Error(`expected retries, saw ${n} ensure_membership calls`);
 });
 
 // 8. Non-transient errors are NOT retried and surface immediately: a
@@ -471,7 +643,79 @@ test("flow: non-transient error (bad_password) is not retried", async (app) => {
     throw new Error(`unexpected unlock error: ${await phase(app, "unlockError")}`);
 });
 
-// 9. Petname determinism, evaluated against the real M.petname.
+// 9. Allocator path, eth-allowlist: the libp2p node comes up through the
+//    gifter relay, the device address is read from eth_sign_module, and ONE
+//    register_membership carries exactly the delegated options the lidl
+//    names — auth_provider, never a payload, no funding key.
+test("allocator: eth-allowlist delegates with the producer module as auth_provider", async (app) => {
+  await setup(app, { autoUnlock: "created", registerState: "active" });
+  await startAllocator(app, { peerId: PEER, multiaddr: MADDR, authType: "eth-allowlist" });
+  await waitPhase(app, "regPhase", "done", 12000);
+  if (await phase(app, "gifterPhase") !== "done") throw new Error("gifterPhase did not settle to done");
+  if (await phase(app, "ethAddress") !== "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025")
+    throw new Error("device address not read from eth_sign_module");
+  const log = await callLog(app);
+  for (const m of ["libp2p_call", "address", "register_membership"])
+    if (!log.includes(m)) throw new Error(`${m} not dialled: ${log.join(",")}`);
+  if (log.includes("ensure_membership")) throw new Error("allocator path must not call ensure_membership");
+  if (log.includes("card_status")) throw new Error("eth path must not poll the card");
+  const opts = await lastRegisterOptions(app);
+  // The allocator path asks for the registry minimum (the gifter's default
+  // cap), not the funded path's default rate.
+  const want = [
+    { key: "rate_limit", value: "100" }, { key: "delegated", value: "true" },
+    { key: "gifter_peer_id", value: PEER }, { key: "gifter_multiaddr", value: MADDR },
+    { key: "auth_type", value: "eth-allowlist" }, { key: "auth_provider", value: "eth_sign_module" }];
+  if (JSON.stringify(opts) !== JSON.stringify(want))
+    throw new Error(`delegated options differ:\n got ${JSON.stringify(opts)}\nwant ${JSON.stringify(want)}`);
+  await waitMode(app, "status");
+});
+
+// 9b. Allocator path, keycard: gated on card presence, then the capture
+//     module is the provider; auth_args rides along verbatim.
+test("allocator: keycard waits for the card, then delegates with the capture module", async (app) => {
+  await setup(app, { autoUnlock: "created", registerState: "active", cardPresent: false });
+  await startAllocator(app, { peerId: PEER, multiaddr: MADDR, authType: "keycard-attestation", authArgs: '{"slot":1}' });
+  await waitPhase(app, "gifterStage", "capture");
+  await app.expectTexts(["Hold your Keycard on the reader…"]);
+  if ((await callLog(app)).includes("register_membership")) throw new Error("registered before the card was present");
+  await evalExpr(app, "root.bridgeOverride.state.cardPresent = true");
+  await waitPhase(app, "regPhase", "done", 12000);
+  const o = optionsToObject(await lastRegisterOptions(app));
+  if (o.auth_type !== "keycard-attestation" || o.auth_provider !== "keycard_capture_module")
+    throw new Error(`keycard options wrong: ${JSON.stringify(o)}`);
+  if (o.auth_args !== '{"slot":1}') throw new Error(`auth_args not forwarded: ${JSON.stringify(o)}`);
+  if (!(await callLog(app)).includes("card_status")) throw new Error("card_status never polled");
+});
+
+// 9c. Allocator path, open: no auth keys at all.
+test("allocator: an open allocator gets no auth keys", async (app) => {
+  await setup(app, { autoUnlock: "created", registerState: "active" });
+  await startAllocator(app, { peerId: PEER, multiaddr: MADDR, authType: "none" });
+  await waitPhase(app, "regPhase", "done", 12000);
+  const o = optionsToObject(await lastRegisterOptions(app));
+  if (o.delegated !== "true" || o.gifter_peer_id !== PEER) throw new Error(`open options wrong: ${JSON.stringify(o)}`);
+  for (const k of ["auth_type", "auth_provider", "auth_payload", "auth_args", "funding_holding_account_id"])
+    if (k in o) throw new Error(`unexpected key ${k} in open-allocator options`);
+  const log = await callLog(app);
+  if (log.includes("address") || log.includes("card_status")) throw new Error("open path must not touch a producer");
+});
+
+// 9d. Allocator path, refusal: the module's failed record (e.g. the gifter
+//     refused the credential) surfaces with Try again on the allocator step.
+test("allocator: a failed delegated registration surfaces the reason", async (app) => {
+  await setup(app, { autoUnlock: "created", registerState: "failed", registerFailReason: "gifter refused: credential already used" });
+  await startAllocator(app, { peerId: PEER, multiaddr: MADDR, authType: "eth-allowlist" });
+  await waitPhase(app, "regPhase", "error", 12000);
+  if (await phase(app, "gifterPhase") !== "error") throw new Error("gifterPhase did not settle to error");
+  await app.expectTexts(["Try again"]);
+  // expectTexts matches whole element texts; the reason is part of the
+  // fine-print sentence, so read it from the flow.
+  if (!/credential already used/.test(await phase(app, "regError")))
+    throw new Error(`failed_reason missing: ${await phase(app, "regError")}`);
+});
+
+// 10. Petname determinism, evaluated against the real M.petname.
 test("petname is stable per commitment and varies across commitments", async (app) => {
   const a = "aa".repeat(32), b = "bb".repeat(32);
   const pa1 = await evalExpr(app, `M.petname("${a}")`);
@@ -483,7 +727,7 @@ test("petname is stable per commitment and varies across commitments", async (ap
   if (await evalExpr(app, `M.petname("")`) !== "") throw new Error("empty commitment should yield ''");
 });
 
-// 10. Regression: detail "Refresh status" under a flaky transport must not
+// 11. Regression: detail "Refresh status" under a flaky transport must not
 //     stack overlapping refresh cycles — a burst collapses to one cycle, the
 //     view stays interactive, and the guard releases for a later refresh.
 test("detail refresh is guarded — bursts don't stack retry chains", async (app) => {

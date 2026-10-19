@@ -27,8 +27,10 @@ Rectangle {
                                 : (typeof logos !== "undefined") ? logos : null
 
     // The registry is not a wizard concern: it lives here, starts at the
-    // deployed testnet, and only Advanced can edit it.
+    // deployed testnet, follows the lez module's bound network once known
+    // (onRegistryDetected below), and only Advanced can edit it.
     property string registryId: M.TESTNET_REGISTRY_ID
+    property bool registryEdited: false
 
     property string mode: "probe"
 
@@ -61,6 +63,9 @@ Rectangle {
                 return
             }
             root.preAdvancedMode = ""
+            // The backend answered: ask the lez module which network its
+            // wallet is bound to (→ onRegistryDetected below).
+            onboardingView.flowController.detectNetwork()
             var rows = r.memberships || []
             // Existing local records: the wizard frames the password step as
             // entry, not creation.
@@ -131,6 +136,14 @@ Rectangle {
             registryId: root.registryId
             onCompleted: root.onboardingCompleted()
             onAdvancedRequested: root.enterAdvanced()
+            // Adopt the wallet's network's registry unless the user already
+            // chose one in Advanced; re-probe so routing follows the switch.
+            onRegistryDetected: function (id) {
+                if (root.registryEdited || id === root.registryId)
+                    return
+                root.registryId = id
+                root.probe()
+            }
         }
 
         MembershipView {
@@ -150,8 +163,10 @@ Rectangle {
             // Adopt an edited registry only when it parses as a valid CAIP-10;
             // a cleared or garbled field keeps the last-good value.
             onRegistryEdited: function (registryId) {
-                if (M.registryConfigHex(registryId) !== "")
+                if (M.registryConfigHex(registryId) !== "") {
+                    root.registryEdited = root.registryEdited || registryId !== root.registryId
                     root.registryId = registryId
+                }
             }
             // State may have changed in Advanced (registrations, registry
             // edits) — route by reality, not by where the user came from.

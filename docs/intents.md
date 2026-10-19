@@ -183,7 +183,7 @@ and handles `onIntentRequested(requestId, intent, params, requesterName)`
 with one `logos.respond(requestId, ok, data, error)` per request, all four
 arguments always.
 
-The RLN module surface a provider works from (`liblogos_rln_module` ≥ 0.12.0,
+The RLN module surface a provider works from (`liblogos_rln_module` ≥ 0.13.0,
 `liblogos_lez_rln_module` ≥ 5.0.0), all reachable from QML:
 
 | Need | Call |
@@ -218,7 +218,7 @@ registration.
 | Piece | State |
 |---|---|
 | this vocabulary | v1, published here |
-| `liblogos_rln_module` 0.12.0: structured `provisioning` fields, `ensure_membership`, any-scope stand-down during the funding wait | done on this repo's `main` once merged |
+| `liblogos_rln_module` 0.13.0: structured `provisioning` fields, `ensure_membership`, any-scope stand-down during the funding wait (0.12.0 on `main` is `check_registry`) | done on this repo's `main` once merged |
 | `rln_membership_ui` as provider | not started. The 0.7.x UI predates the wallet-owning registry module (it still drives `lez_core` and a faucet that no longer exists) and must be re-based on `wallet_status` / `get_native_balance` / `provisioning` before it can provide anything |
 | `delivery_module`: a typed reason on `messageError` (or a `membershipRequired` event) | cross-repo ask |
 | `rln_gifter_module`: refuse a registry mismatch at once instead of letting the client wait out the 300 s window | cross-repo ask |

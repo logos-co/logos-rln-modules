@@ -1,12 +1,13 @@
 // The simple-view row element: one full-width, low-height rounded rectangle
 // with an identical footprint (height, width, radiusLarge) across all three
 // kinds, so rows never shift between states:
-//   "progress"   — three Syncing→Claiming→Registering segments, a pure view
-//                  over OnboardingFlow's phase properties. Sync fills by the
-//                  real chunk fraction, claim/register shimmer; the stage
-//                  caption renders ABOVE the bar (StepProgress). A failed
-//                  segment turns the row into a tinted headline with an
-//                  inline Retry at the same fixed height.
+//   "progress"   — two Preparing→Registering segments, a pure view over
+//                  OnboardingFlow's phase properties and the module's
+//                  provisioning object (its step labels the first segment);
+//                  active segments shimmer; the stage caption renders ABOVE
+//                  the bar (StepProgress). A failed segment turns the row
+//                  into a tinted headline with an inline Retry at the same
+//                  fixed height.
 //   "membership" — a clickable pill: petname + rate + state badge →
 //                  membership detail.
 //   "ghost"      — a dashed "+ New Membership" wireframe → start a new one.
@@ -45,35 +46,32 @@ Item {
     readonly property color doneColor: Qt.darker(Theme.palette.primary, 1.4)
 
     // ---- segment state helpers (progress) ----------------------------------
-    // Segment 1 folds wallet provision/open/create into "syncing".
-    function syncSegState() {
-        if (!flow) return "upcoming"
-        if (flow.walletPhase === "error" || flow.syncPhase === "error") return "error"
-        if (flow.syncPhase === "done") return "done"
-        if (flow.walletPhase === "idle") return "upcoming"
-        return "active"
-    }
-    function fundSegState() {
-        if (!flow) return "upcoming"
-        return flow.fundPhase === "error" ? "error"
-             : flow.fundPhase === "done" ? "done"
-             : flow.fundPhase === "running" ? "active" : "upcoming"
+    // Segment 1 is the module's provisioning pass up to the registration
+    // itself (network selection, waiting for funds); segment 2 the
+    // registration + confirmation. With no pass (a live record answered
+    // ensure_membership, or the allocator path) segment 1 completes at once.
+    readonly property bool preparing: !!flow && flow.regPhase !== "idle"
+        && flow.regState !== "pending"
+        && (flow.provisioningStep === "" || flow.provisioningStep === "waiting_for_wallet"
+            || flow.provisioningStep === "awaiting_funding" || flow.provisioningStep === "refused")
+        && flow.regPhase !== "done"
+    function prepSegState() {
+        if (!flow || flow.regPhase === "idle") return "upcoming"
+        if (!preparing) return "done"
+        return flow.regPhase === "error" ? "error" : "active"
     }
     function regSegState() {
-        if (!flow) return "upcoming"
+        if (!flow || flow.regPhase === "idle" || preparing) return "upcoming"
         return flow.regPhase === "error" ? "error"
-             : flow.regPhase === "done" ? "done"
-             : flow.regPhase === "running" ? "active" : "upcoming"
+             : flow.regPhase === "done" ? "done" : "active"
     }
     // The label + retry for the current (active or errored) stage. shortErr
     // is the headline for the error row; the technical reason renders as
     // fine print in StepProgress below the row.
     readonly property var activeSeg: {
         var segs = [
-            { st: syncSegState(), active: "Syncing with Logos Blockchain...", done: "Synced!",
-              shortErr: "Setup failed", retry: "Retry" },
-            { st: fundSegState(), active: "Claiming faucet tokens...", done: "Tokens Received!",
-              shortErr: "Couldn't get tokens", retry: "Retry" },
+            { st: prepSegState(), active: M.provisioningLabel(flow ? flow.provisioning : null),
+              done: "Ready to register", shortErr: "Setup failed", retry: "Retry" },
             { st: regSegState(), active: "Registering membership...", done: "Registered!",
               shortErr: "Registration failed", retry: "Try again" }
         ]
@@ -88,15 +86,10 @@ Item {
     // The current stage's caption, shown by StepProgress above the bar.
     readonly property string stageLabel: activeSeg.st === "done" ? activeSeg.done : activeSeg.active
 
-    // done/error render full, upcoming empty; the active sync segment
-    // (idx 0) fills by the real chunk fraction, claim/register render full.
+    // done/error/active render full (active ones shimmer), upcoming empty.
     function segFill(idx, s) {
-        if (s === "done" || s === "error") return 1.0
-        if (s !== "active") return 0.0
-        if (idx === 0 && flow && flow.syncTarget > flow.syncStart)
-            return Math.max(0.04, Math.min(1.0,
-                (flow.lastSynced - flow.syncStart) / (flow.syncTarget - flow.syncStart)))
-        return 1.0
+        if (s === "done" || s === "error" || s === "active") return 1.0
+        return 0.0
     }
 
     // ---- progress (in-progress): pill-height row of segments ---------------
@@ -110,18 +103,17 @@ Item {
 
             Repeater {
                 model: root.rowKind === "progress"
-                       ? [root.syncSegState(), root.fundSegState(), root.regSegState()] : []
+                       ? [root.prepSegState(), root.regSegState()] : []
 
                 Item {
                     id: seg
                     required property int index
                     required property string modelData
-                    width: (parent.width - 2 * root.segGap) / 3
+                    width: (parent.width - root.segGap) / 2
                     height: parent.height
 
                     readonly property bool segDone: modelData === "done"
-                    readonly property bool segFilling: modelData === "active" && index === 0
-                    readonly property bool segLoading: modelData === "active" && index > 0
+                    readonly property bool segLoading: modelData === "active"
 
                     onModelDataChanged: if (modelData === "done") pop.restart()
 
@@ -132,9 +124,8 @@ Item {
                         color: Theme.colors.getColor(Theme.palette.primary, 0.18)
                     }
 
-                    // Fill: sync grows linearly by the real fraction;
-                    // loading segments hold a translucent base under the
-                    // shimmer; done settles to the deep accent.
+                    // Fill: loading segments hold a translucent base under
+                    // the shimmer; done settles to the deep accent.
                     Rectangle {
                         id: fill
                         height: parent.height

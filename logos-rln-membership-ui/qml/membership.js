@@ -1,24 +1,61 @@
 // Shared plumbing for the RLN membership GUI: logos-bridge reply parsing,
 // error rendering, and small formatting helpers. Wire shapes come from
-// liblogos_rln_module.lidl (wire 0.7.0 — the merged RLN-API LIP: failures
-// are the in-band envelope {"error":{"class":…,"kind":…,"message":…}},
-// membership states are the MembershipStatus vocabulary in MEMBERSHIP_STATES
-// below) and liblogos_lez_rln_module.lidl (2.0.0, ""-on-error convention).
+// liblogos_rln_module.lidl (0.12.0 — register_membership / ensure_membership
+// with the structured `provisioning` object; failures are the in-band
+// envelope {"error":{"class":…,"kind":…,"message":…}}, membership states
+// are the MembershipStatus vocabulary in MEMBERSHIP_STATES below) and
+// liblogos_lez_rln_module.lidl (5.0.0: native asset only, the module owns
+// its wallet and payer; ""-on-error convention).
 .pragma library
 
 var RLN_MODULE = "liblogos_rln_module";
 var LEZ_RLN_MODULE = "liblogos_lez_rln_module";
-var WALLET_MODULE = "lez_core";
-// Gifter path (alternative registration) only — unused by the wallet path:
-// rln_gifter_module runs the gifter protocol and relays libp2p_module calls;
-// keycard_capture_module does the in-process PC/SC Keycard IDENTIFY capture;
-// libp2p_module provides the node the gifter dials through.
+// Allocator path (delegated registration through the RLN Membership
+// Allocation Protocol) only — unused by the funded path: rln_gifter_module
+// runs the protocol and relays libp2p_module calls; libp2p_module provides
+// the node the allocator is dialled through; the producer modules below make
+// the auth payload bound to the module-generated commitment.
 var LIBP2P_MODULE = "libp2p_module";
 var GIFTER_MODULE = "rln_gifter_module";
-var CAPTURE_MODULE = "keycard_capture_module";
+// Producers (rln_auth_vector produce_auth), one per auth vector:
+var CAPTURE_MODULE = "keycard_capture_module";   // keycard-attestation: PC/SC card
+var ETH_SIGN_MODULE = "eth_sign_module";         // eth-allowlist: module-owned eth key
 
-var TESTNET_REGISTRY_ID =
-    "logos:testnet:ffa111d7384f0f78d1b0927d38a5c34b6a7d11508cf327cc210610c43e43a219";
+// The auth vectors this GUI can drive. `id` is the gifter's auth_type
+// verbatim (open vocabulary — an app adds its own row here, with its own
+// producer module), `provider` the producer module register_membership asks
+// for the payload, `gate` what the UI waits for before registering.
+var AUTH_VECTORS = [
+    { id: "none", label: "Open allocator", provider: "", gate: "",
+      hint: "The allocator pays for any commitment it is sent — test setups only." },
+    { id: "keycard-attestation", label: "Keycard", provider: CAPTURE_MODULE, gate: "card",
+      hint: "Tap a genuine Keycard on the reader; the allocator trusts the card issuer." },
+    { id: "eth-allowlist", label: "Ethereum key", provider: ETH_SIGN_MODULE, gate: "address",
+      hint: "This device signs with its own Ethereum key; the allocator must allowlist its address." }
+];
+
+function authVector(id) {
+    for (var i = 0; i < AUTH_VECTORS.length; i++)
+        if (AUTH_VECTORS[i].id === id)
+            return AUTH_VECTORS[i];
+    return AUTH_VECTORS[0];
+}
+
+// The registries liblogos_lez_rln_module's built-in network table knows
+// (logos-lez-rln-module/rust-lib/networks.json: the config account, base58
+// there, as the 64-hex CAIP-10 account segment the rln module requires),
+// keyed by the CAIP-2 reference wallet_status().network reports.
+var KNOWN_REGISTRIES = {
+    testnet: "logos:testnet:fd322d32a46ddf57eece9db8d68e9b722262d1f770760fca63b8cb9e7775b971",   // testnet-v03-z3 (LEZ v0.3.1)
+    devnet: "logos:devnet:9d6c0f59718f05ecb3f6ae58259821bfff6594e20866d6cd2a214c53e4ec0511"
+};
+var TESTNET_REGISTRY_ID = KNOWN_REGISTRIES.testnet;
+
+// The registry for a network reference, "" when the table has none.
+function registryIdFor(network) {
+    var k = String(network || "").toLowerCase();
+    return Object.prototype.hasOwnProperty.call(KNOWN_REGISTRIES, k) ? KNOWN_REGISTRIES[k] : "";
+}
 
 var RATE_LIMIT_MIN = 100;
 var RATE_LIMIT_MAX = 600;
@@ -35,6 +72,49 @@ function registryOptions(rateLimit, extras) {
             arr.push({ key: k, value: String(extras[k]) });
     }
     return JSON.stringify(arr);
+}
+
+// The delegated (allocator) RegistryOptions — the ONE builder both register
+// call sites use (wizard registerDelegated, expert RegisterView.doRegister):
+// delegated:"true" + the allocator's (peer id, multiaddr), and for a non-open
+// vector its auth_type + the producer module as auth_provider (+ auth_args,
+// a JSON string forwarded verbatim to the producer). The membership module
+// mints the commitment inside register_membership and asks the producer for
+// a payload bound to it, so no payload is built here.
+function delegatedOptions(rateLimit, cfg) {
+    var vec = authVector(cfg.authType);
+    var extras = {
+        delegated: "true",
+        gifter_peer_id: String(cfg.peerId || "").trim(),
+        gifter_multiaddr: String(cfg.multiaddr || "").trim()
+    };
+    if (vec.id !== "none") {
+        extras.auth_type = vec.id;
+        extras.auth_provider = vec.provider;
+        var args = String(cfg.authArgs || "").trim();
+        if (args !== "")
+            extras.auth_args = args;
+    }
+    return registryOptions(rateLimit, extras);
+}
+
+// The provisioning object ensure_membership / get_membership_state carry
+// while the module acquires a registry-wide membership itself:
+// {step: waiting_for_wallet | awaiting_funding | registering | done |
+// refused, detail?, and on awaiting_funding payer/required/price/
+// fee_reserve/balance as decimal strings}. Labels per step for the progress
+// caption; the funding block renders the numbers from the fields.
+var PROVISIONING_LABELS = {
+    waiting_for_wallet: "Connecting to the network…",
+    awaiting_funding: "Waiting for funds…",
+    registering: "Registering membership…",
+    done: "Registered!",
+    refused: "Registration refused"
+};
+
+function provisioningLabel(p) {
+    var step = p && p.step ? String(p.step) : "";
+    return PROVISIONING_LABELS[step] || (step !== "" ? step : "Setting up…");
 }
 
 // register_membership / get_membership_state / select_membership take a
@@ -54,24 +134,7 @@ function sc(x) {
     return Math.round(x * UI_SCALE);
 }
 
-var TESTNET_SEQUENCER_ADDR = "https://testnet.lez.logos.co/";
-
-// The wallet's open/create_new take a statistics_path since LEZ v0.2.2
-// (sequencer-latency stats live beside the wallet). Derived from the storage
-// path so it works for provision_wallet_home's layout and hand-entered
-// Advanced paths alike; the file need not pre-exist.
-function statsPathFor(storagePath) {
-    var i = storagePath.lastIndexOf("/");
-    return (i >= 0 ? storagePath.substring(0, i + 1) : "") + "statistics.json";
-}
-
-// StepGifter prefills, both freely editable. Defaults point at a local dev
-// gifter run from the logos-rln-gifter checkout, whose fixed node key keeps
-// this peerId stable across restarts.
-var GIFTER_PEER_ID_DEFAULT = "16Uiu2HAm8KkYKyhBK5f8ZcSDJP947bxCqVRRbzP8DKDigqePtX2Y";
-var GIFTER_MULTIADDR_DEFAULT = "/ip4/127.0.0.1/tcp/9000";
-
-// The app's own libp2p node, brought up only to dial the gifter: a direct
+// The app's own libp2p node, brought up only to dial the allocator: a direct
 // protocol dial to a known peer needs no gossipsub/kad/discovery. A plain
 // object — libp2pCall JSON.stringifies it into createNode's single string arg.
 var LIBP2P_NODE_CONFIG = {
@@ -300,24 +363,12 @@ function parseTxResult(raw) {
 
 // The CAIP-10 registry id's third segment doubles as the registry's config
 // account id (64 hex) — the rln module's resolve_account_id passes 64-hex
-// through verbatim, so claim/bounds calls can use it directly.
+// through verbatim, so lez module reads (bounds, get_membership) use it.
 function registryConfigHex(registryId) {
     var parts = registryId.split(":");
     if (parts.length !== 3) return "";
     var h = parts[2].toLowerCase();
     return /^[0-9a-f]{64}$/.test(h) ? h : "";
-}
-
-// Suggested faucet claim for one registration: rate × price_per_unit × 1.2
-// slack, ceiled to an int (price_per_unit arrives as a decimal string).
-// Returns NaN when the price is non-numeric — the caller must surface that
-// rather than claim 0 tokens (a 0-token claim is accepted and silently
-// dropped into the 180s timeout).
-function suggestedClaimAmount(rate, priceStr) {
-    var price = parseInt(priceStr, 10);
-    if (!(price > 0))
-        return NaN;
-    return Math.ceil(rate * price * 1.2);
 }
 
 // The MembershipStatus wire strings (module docs/wire-binding.md), best

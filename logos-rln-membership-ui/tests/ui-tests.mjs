@@ -32,34 +32,36 @@ test("rln_membership_ui: loads into onboarding with the headline and CTA", async
   );
 });
 
-test("rln_membership_ui: password screen and progress bar exist", async (app) => {
+test("rln_membership_ui: password, progress and allocator screens exist", async (app) => {
   // Text matching sees invisible items — every screen stays instantiated in
-  // the StackLayout. While phases are idle the progress row renders only its
-  // first segment's label ("Syncing…").
-  await app.expectTexts(["Choose a password", "Syncing with Logos Blockchain..."]);
+  // the StackLayout. While phases are idle the progress row renders the
+  // provisioning placeholder; the allocator step shows its three
+  // configuration surfaces (peer id, address, auth vector).
+  await app.expectTexts(["Choose a password", "Setting up…",
+                         "Register through an allocator", "How the allocator checks you:",
+                         // AuthVectorPicker captions carry the selection glyph.
+                         "● Open allocator", "○ Keycard", "○ Ethereum key"]);
 });
 
-test("rln_membership_ui: advanced keeps the legacy register chrome", async (app) => {
+test("rln_membership_ui: advanced keeps the register chrome, plus the allocator toggle", async (app) => {
   await app.click("Advanced setup");
   await app.waitFor(
     async () => {
       await app.expectTexts(["Registry", "Keystore", "Identity", "Registration",
-                             "Register membership"]);
+                             "Register membership", "Delegate to an allocator"]);
     },
     { timeout: 10000, interval: 500, description: "advanced mode to activate" }
   );
 });
 
-test("rln_membership_ui: advanced wallet tab keeps the legacy funding chrome", async (app) => {
-  await app.click("Wallet");
+test("rln_membership_ui: advanced payer tab is read-only payer + price", async (app) => {
+  await app.click("Payer");
   await app.waitFor(
     async () => {
-      await app.expectTexts(["Use basecamp wallet", "Sequencer",
-                             "Advanced: use existing wallet files",
-                             "Open wallet", "Create wallet",
-                             "Sync to head", "Faucet claim", "Claim into fresh holding"]);
+      await app.expectTexts(["Account", "Native balance", "Refresh", "Registry price",
+                             "Price per unit"]);
     },
-    { timeout: 10000, interval: 500, description: "wallet tab to activate" }
+    { timeout: 10000, interval: 500, description: "payer tab to activate" }
   );
 });
 

@@ -1,7 +1,7 @@
 // Step 2 — one password encrypts both the wallet storage and the credential
 // keystore. Copy adapts to Main's probe: creation framing (with confirm) for
 // fresh installs, entry framing when local records exist. The shell gates
-// Continue on unlock_keystore succeeding; fields freeze once walletCreated.
+// Continue on unlock_keystore succeeding; fields freeze once the keystore is unlocked.
 import QtQuick
 import QtQuick.Layouts
 import Logos.Theme
@@ -59,8 +59,8 @@ ColumnLayout {
         implicitHeight: M.sc(40)
         echoMode: TextInput.Password
         placeholderText: "Password"
-        enabled: !step.flow.walletCreated
-        onTextChanged: if (!step.flow.walletCreated) step.flow.password = text
+        enabled: step.flow.unlockPhase !== "done"
+        onTextChanged: if (step.flow.unlockPhase !== "done") step.flow.password = text
     }
     // For an existing account the unlock check is the confirmation.
     LogosTextField {
@@ -70,7 +70,7 @@ ColumnLayout {
         implicitHeight: M.sc(40)
         echoMode: TextInput.Password
         placeholderText: "Confirm password"
-        enabled: !step.flow.walletCreated
+        enabled: step.flow.unlockPhase !== "done"
     }
 
     LogosText {
@@ -84,7 +84,7 @@ ColumnLayout {
     }
 
     LogosText {
-        visible: step.flow.walletCreated
+        visible: step.flow.unlockPhase === "done"
         Layout.fillWidth: true
         horizontalAlignment: Text.AlignHCenter
         color: Theme.palette.textTertiary

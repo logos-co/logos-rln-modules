@@ -24,6 +24,9 @@ Item {
 
     signal completed()
     signal advancedRequested()
+    // The lez module's wallet is bound to a network with a known registry
+    // (OnboardingFlow.detectNetwork); Main decides whether to adopt it.
+    signal registryDetected(string registryId)
 
     property int currentStep: 0
     readonly property var ctaLabels: ["Get started", "Continue"]
@@ -87,6 +90,7 @@ Item {
         bridge: view.bridge
         registryId: view.registryId
         onCompleted: view.completed()
+        onRegistryDetected: function (id) { view.registryDetected(id) }
     }
 
     Connections {
@@ -131,9 +135,20 @@ Item {
             }
         }
 
+        // A StackLayout sizes itself to its TALLEST child, hidden ones
+        // included (and overrides an implicitHeight binding); the allocator
+        // and progress steps are far taller than Welcome, which pushed the
+        // CTA below a 768px viewport. Pin the stack to the step actually
+        // shown through the Layout attached properties the column honours.
         StackLayout {
+            id: stepStack
             Layout.fillWidth: true
             currentIndex: view.currentStep
+            readonly property real shownHeight: view.currentStep === 2 ? workStep.shownHeight
+                                              : (view.stepItem(view.currentStep).implicitHeight || 0)
+            Layout.preferredHeight: shownHeight
+            Layout.minimumHeight: shownHeight
+            Layout.maximumHeight: shownHeight
 
             StepWelcome { id: welcomeStep; flow: flow }
             StepPassword { id: passwordStep; flow: flow }
@@ -142,10 +157,12 @@ Item {
             // shared CTA.
             StackLayout {
                 id: workStep
-                currentIndex: flow.registrationMode === "gifter" ? 1 : 0
+                currentIndex: flow.registrationMode === "allocator" ? 1 : 0
+                readonly property real shownHeight:
+                    (flow.registrationMode === "allocator" ? gifterStep : progressStep).implicitHeight
                 readonly property bool ready: true
                 function entered() {
-                    if (flow.registrationMode === "gifter")
+                    if (flow.registrationMode === "allocator")
                         gifterStep.entered()
                     else
                         progressStep.entered()
@@ -173,21 +190,23 @@ Item {
             onClicked: view.goBack()
         }
 
-        // Alternative path: register via a gifter node + Keycard. Sets the
-        // mode, then advances through the password step (which the gifter
-        // path still needs to persist the grant) to StepGifter.
+        // Alternative path: register through an allocator (the RLN Membership
+        // Allocation Protocol). Sets the mode, then advances through the
+        // password step (the delegated path still persists the credential)
+        // to StepGifter.
         LinkText {
+            objectName: "allocatorPathLink"
             Layout.alignment: Qt.AlignHCenter
             visible: view.currentStep === 0 && welcomeStep.ready
-            text: "Register with a Keycard gift"
+            text: "Register through an allocator"
             onClicked: {
-                flow.registrationMode = "gifter"
+                flow.registrationMode = "allocator"
                 view.advance()
             }
         }
 
         // Reachable only from Welcome: jumping to Advanced mid-flow could
-        // interfere with in-progress wallet/sync/claim/register work.
+        // interfere with an in-progress registration.
         LinkText {
             Layout.alignment: Qt.AlignHCenter
             visible: view.currentStep === 0
