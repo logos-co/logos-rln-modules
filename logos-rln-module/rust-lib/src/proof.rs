@@ -372,9 +372,16 @@ fn external_nullifier(epoch: u64, rln_identifier: &[u8; 32]) -> Fr {
     Hasher::<PoseidonHash>::hash_pair(epoch_fr, rln_identifier_fr)
 }
 
-/// The circuit's signal binding: `x = hash_to_field_le(signal)`. PINNED.
-fn signal_to_x(signal: &[u8]) -> Fr {
-    hash_to_field_le(signal)
+/// The circuit's signal binding: `x = hash_to_field_le(signal)`. PINNED — the
+/// one definition lives in the rln-signal crate so a consumer that pre-hashes
+/// (`generate_proof_prehashed`) computes the identical value.
+pub(crate) use rln_signal::signal_to_x;
+
+/// A pre-hashed signal off the wire (`signal_hash_hex`): the canonical 32-byte
+/// LE encoding of `x`, the reply's `share_x`. Strict — a non-canonical value
+/// (at or above the field modulus) is rejected, never reduced.
+pub(crate) fn x_from_hash_hex(hex: &str) -> Result<Fr, ProofError> {
+    hex_to_fr(hex, "signal_hash")
 }
 
 /// The external nullifier expected for `(epoch, rln_identifier)`, as the
@@ -504,11 +511,12 @@ pub(crate) fn generate_identity() -> Result<(String, String), ProofError> {
     ))
 }
 
-/// Generate an RLN proof that `signal` came from the membership backing
-/// `material`, for `(epoch, rln_identifier)`, spending slot `message_id`.
+/// Generate an RLN proof that the signal bound by `x` (see [`signal_to_x`])
+/// came from the membership backing `material`, for `(epoch, rln_identifier)`,
+/// spending slot `message_id`.
 pub(crate) fn generate(
     material: &WitnessMaterial,
-    signal: &[u8],
+    x: Fr,
     epoch: u64,
     rln_identifier: &[u8; 32],
 ) -> Result<RateLimitProof, ProofError> {
@@ -545,7 +553,7 @@ pub(crate) fn generate(
             path_elements,
             material.path_indices.clone(),
         ))
-        .x(signal_to_x(signal))
+        .x(x)
         .external_nullifier(external_nullifier(epoch, rln_identifier))
         .build()
         .map_err(|e| ProofError::BadInput(format!("witness: {e}")))?;
@@ -558,7 +566,8 @@ pub(crate) fn generate(
     Ok(rlp)
 }
 
-/// Verify an RLN proof for `signal` against a valid-root window. `Ok(true)`
+/// Verify an RLN proof for the signal bound by `x` against a valid-root
+/// window. `Ok(true)`
 /// only if the proof is cryptographically valid, its signal matches, and its
 /// root is one of `valid_roots`. A proof that fails any of those is `Ok(false)`
 /// (an invalid message, not an engine error); only an engine failure is `Err`.
@@ -566,11 +575,10 @@ pub(crate) fn generate(
 /// on the hot path MUST pass a non-empty window.
 pub(crate) fn verify(
     proof: &RateLimitProof,
-    signal: &[u8],
+    x: Fr,
     valid_roots: &[[u8; 32]],
 ) -> Result<bool, ProofError> {
     let rln_proof = proof.to_rln_proof()?;
-    let x = signal_to_x(signal);
     // A non-canonical root entry is skipped, but a non-empty window yielding
     // NO usable root must verify false — never fall through to zerokit's
     // empty-window "skip the root check" semantics.
@@ -637,7 +645,7 @@ pub(crate) fn generate_for_test(
         path_elements_hex: vec!["00".repeat(32); RLN_TREE_DEPTH],
         path_indices: vec![0u8; RLN_TREE_DEPTH],
     };
-    generate(&material, signal, epoch, rln_identifier).expect("test proof")
+    generate(&material, signal_to_x(signal), epoch, rln_identifier).expect("test proof")
 }
 
 #[cfg(test)]
@@ -748,6 +756,26 @@ mod tests {
         assert_eq!(depth_bridge::fold_root(&root, RLN_TREE_DEPTH), root);
     }
 
+    // The pre-hashed wire form round-trips to the same x the raw path hashes
+    // to, and a non-canonical or short encoding is a typed BadInput.
+    #[test]
+    fn prehashed_signal_round_trips_and_rejects_non_canonical() {
+        let x = signal_to_x(b"Hello, RLN!");
+        let hex = bytes_to_hex(&fr_to_bytes32(&x));
+        assert_eq!(x_from_hash_hex(&hex).expect("canonical"), x);
+        assert_eq!(x_from_hash_hex(&format!("0x{hex}")).expect("0x tolerated"), x);
+        assert_eq!(fr_to_bytes32(&x), rln_signal::signal_hash(b"Hello, RLN!"));
+
+        // At or above the modulus: refused, never reduced.
+        assert!(matches!(
+            x_from_hash_hex(&"ff".repeat(32)),
+            Err(ProofError::BadInput(m)) if m.contains("signal_hash")
+        ));
+        // Wrong length / not hex.
+        assert!(matches!(x_from_hash_hex(&"ab".repeat(31)), Err(ProofError::BadInput(_))));
+        assert!(matches!(x_from_hash_hex("zz"), Err(ProofError::BadInput(_))));
+    }
+
     // Frozen interop vectors — the wire contract other implementations must
     // match. Every value below is deterministic; only the Groth16 proof bytes
     // are randomized, so the proof is pinned structurally (layout) while its
@@ -790,7 +818,7 @@ mod tests {
 
         // Public values of a proof over the fixed witness.
         let material = material_from_seed(&[7u8; 32], 100, 0);
-        let j = generate(&material, b"Hello, RLN!", 1231028105, &rln_id)
+        let j = generate(&material, signal_to_x(b"Hello, RLN!"), 1231028105, &rln_id)
             .expect("generate")
             .to_json();
         assert_eq!(
@@ -817,7 +845,7 @@ mod tests {
         // double-signal detection signal), a fresh slot never does.
         let j2 = generate(
             &material_from_seed(&[7u8; 32], 100, 1),
-            b"Hello, RLN!",
+            signal_to_x(b"Hello, RLN!"),
             1231028105,
             &rln_id,
         )
@@ -836,19 +864,19 @@ mod tests {
     fn generate_then_verify_roundtrips() {
         let material = material_from_seed(&[7u8; 32], 100, 0);
         let rln_id = [9u8; 32];
-        let proof = generate(&material, b"hello", 1231028105, &rln_id).expect("generate");
+        let proof = generate(&material, signal_to_x(b"hello"), 1231028105, &rln_id).expect("generate");
         let root = proof.root();
-        assert!(verify(&proof, b"hello", &[root]).expect("verify"));
+        assert!(verify(&proof, signal_to_x(b"hello"), &[root]).expect("verify"));
     }
 
     #[test]
     fn wrong_signal_is_invalid_not_error() {
         let material = material_from_seed(&[7u8; 32], 100, 0);
         let rln_id = [9u8; 32];
-        let proof = generate(&material, b"hello", 1231028105, &rln_id).expect("generate");
+        let proof = generate(&material, signal_to_x(b"hello"), 1231028105, &rln_id).expect("generate");
         let root = proof.root();
         // A different signal must verify false, NOT raise an engine error.
-        assert!(!verify(&proof, b"goodbye", &[root]).expect("verify"));
+        assert!(!verify(&proof, signal_to_x(b"goodbye"), &[root]).expect("verify"));
     }
 
     #[test]
@@ -858,22 +886,22 @@ mod tests {
         // roots. Verifying proof A against only B's root must be false.
         let a = generate(
             &material_from_seed(&[7u8; 32], 100, 0),
-            b"hello",
+            signal_to_x(b"hello"),
             1,
             &rln_id,
         )
         .expect("generate a");
         let b = generate(
             &material_from_seed(&[8u8; 32], 100, 0),
-            b"hello",
+            signal_to_x(b"hello"),
             1,
             &rln_id,
         )
         .expect("generate b");
         assert_ne!(a.root(), b.root());
-        assert!(!verify(&a, b"hello", &[b.root()]).expect("verify"));
+        assert!(!verify(&a, signal_to_x(b"hello"), &[b.root()]).expect("verify"));
         // A window that is present but entirely non-canonical is also invalid.
-        assert!(!verify(&a, b"hello", &[[0xffu8; 32]]).expect("verify non-canonical"));
+        assert!(!verify(&a, signal_to_x(b"hello"), &[[0xffu8; 32]]).expect("verify non-canonical"));
     }
 
     // The spec-struct path: a consumer that reassembles the proof from its
@@ -884,7 +912,7 @@ mod tests {
     fn decomposed_spec_struct_roundtrip_verifies() {
         let material = material_from_seed(&[5u8; 32], 100, 2);
         let rln_id = [6u8; 32];
-        let proof = generate(&material, b"net msg", 77, &rln_id).expect("generate");
+        let proof = generate(&material, signal_to_x(b"net msg"), 77, &rln_id).expect("generate");
         let root = proof.root();
         let j = proof.to_json();
 
@@ -904,7 +932,7 @@ mod tests {
             j["proof"],
             "reconstruction must be byte-identical to the canonical form"
         );
-        assert!(verify(&restored, b"net msg", &[root]).expect("verify"));
+        assert!(verify(&restored, signal_to_x(b"net msg"), &[root]).expect("verify"));
 
         // A tampered public value breaks reconstruction or verification —
         // never a silent pass.
@@ -912,7 +940,7 @@ mod tests {
         bad["share_y"] = serde_json::json!("11".repeat(32));
         match RateLimitProof::from_json(&bad) {
             Err(_) => {}
-            Ok(p) => assert!(!verify(&p, b"net msg", &[root]).expect("verify tampered")),
+            Ok(p) => assert!(!verify(&p, signal_to_x(b"net msg"), &[root]).expect("verify tampered")),
         }
     }
 
@@ -920,7 +948,7 @@ mod tests {
     fn canonical_blob_alone_round_trips() {
         let material = material_from_seed(&[5u8; 32], 100, 2);
         let rln_id = [6u8; 32];
-        let proof = generate(&material, b"net msg", 77, &rln_id).expect("generate");
+        let proof = generate(&material, signal_to_x(b"net msg"), 77, &rln_id).expect("generate");
         let hex = proof.canonical_hex();
         assert_eq!(hex.len(), 289 * 2, "Single-mode canonical blob is 289 bytes");
         assert!(
@@ -931,28 +959,28 @@ mod tests {
         let restored = RateLimitProof::from_json(&serde_json::json!({ "proof": hex }))
             .expect("blob-only from_json");
         assert_eq!(restored.root(), proof.root());
-        assert!(verify(&restored, b"net msg", &[proof.root()]).expect("verify"));
+        assert!(verify(&restored, signal_to_x(b"net msg"), &[proof.root()]).expect("verify"));
     }
 
     #[test]
     fn json_roundtrip_preserves_verification() {
         let material = material_from_seed(&[3u8; 32], 100, 1);
         let rln_id = [4u8; 32];
-        let proof = generate(&material, b"signal", 42, &rln_id).expect("generate");
+        let proof = generate(&material, signal_to_x(b"signal"), 42, &rln_id).expect("generate");
         let root = proof.root();
         let json = proof.to_json();
         let restored = RateLimitProof::from_json(&json).expect("from_json");
         assert_eq!(restored.root(), root);
         assert_eq!(proof.epoch(), Some(42));
         assert_eq!(restored.epoch(), Some(42), "the epoch survives the round trip");
-        assert!(verify(&restored, b"signal", &[root]).expect("verify"));
+        assert!(verify(&restored, signal_to_x(b"signal"), &[root]).expect("verify"));
     }
 
     #[test]
     fn message_id_at_or_above_rate_limit_is_bad_input() {
         // message_id must be < rate_limit; the circuit rejects otherwise.
         let material = material_from_seed(&[1u8; 32], 5, 5);
-        let err = generate(&material, b"x", 1, &[0u8; 32]).unwrap_err();
+        let err = generate(&material, signal_to_x(b"x"), 1, &[0u8; 32]).unwrap_err();
         assert!(matches!(err, ProofError::BadInput(_)));
     }
 
@@ -961,7 +989,7 @@ mod tests {
         let mut material = material_from_seed(&[1u8; 32], 100, 0);
         material.path_elements_hex.truncate(RLN_TREE_DEPTH - 1);
         material.path_indices.truncate(RLN_TREE_DEPTH - 1);
-        let err = generate(&material, b"x", 1, &[0u8; 32]).unwrap_err();
+        let err = generate(&material, signal_to_x(b"x"), 1, &[0u8; 32]).unwrap_err();
         assert!(matches!(err, ProofError::BadInput(_)));
     }
 
@@ -982,7 +1010,7 @@ mod tests {
     fn from_json_accepts_numeric_epoch_from_the_handler_reply() {
         let material = material_from_seed(&[3u8; 32], 100, 1);
         let rln_id = [4u8; 32];
-        let proof = generate(&material, b"signal", 42, &rln_id).expect("generate");
+        let proof = generate(&material, signal_to_x(b"signal"), 42, &rln_id).expect("generate");
 
         let mut wire = proof.to_json();
         wire["epoch"] = serde_json::json!(42u64);

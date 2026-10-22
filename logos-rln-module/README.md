@@ -31,6 +31,7 @@ JSON replies; `scope` = the `registry_id` + `rln_identifier_hex` arg pair):
 | provisioning, one registry (helper) | `ensure_membership(registry_id, options_json)` — `start()`'s registry-wide provisioning for a ui_qml caller (`start` is a `result` method and nulls through the QML bridge); `options_json` carries only `rate_limit`. See `../docs/intents.md` |
 | `generate_proof(scope, signal, timestamp)` | `generate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp)` |
 | `validate_proof(scope, signal, timestamp, proof)` | `validate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp, proof_json)` |
+| pre-hashed signal (wire extension) | `generate_proof_prehashed(registry_id, rln_identifier_hex, signal_hash_hex, timestamp)` / `validate_proof_prehashed(…, signal_hash_hex, timestamp, proof_json)` — `signal_hash_hex` = `hash_to_field_le(signal)` as 32-byte LE hex (the reply's `share_x`), so a consumer ships 32 bytes instead of the payload; computed by [`rust-lib/rln-signal`](rust-lib/rln-signal) or librln's `ffi_hash_to_field_le` |
 | `get_epoch_quota(scope, timestamp)` | `get_epoch_quota(registry_id, rln_identifier_hex, timestamp)` |
 | registry parameters read (optional ext.) | `get_registry_parameters(registry_id, rln_identifier_hex)` |
 | membership state subscriptions (optional ext.) | `event membership_state_changed(registry_id, rln_identifier, membership_hash, state, previous)` — see `docs/wire-binding.md` |
@@ -41,7 +42,8 @@ never registers or unlocks anything. The pinned wire constructions
 (`external_nullifier = poseidon(hash_to_field_le(epoch[32]),
 hash_to_field_le(rln_identifier))`, where `epoch[32]` is the epoch index as
 a 32-byte little-endian integer matching logos-delivery's `toEpoch`;
-`x = hash_to_field_le(signal)`; and the
+`x = hash_to_field_le(signal)`, whose one definition is the
+[`rln-signal`](rust-lib/rln-signal) crate; and the
 zerokit-canonical `RateLimitProof` bytes) are frozen by
 `proof::tests::frozen_interop_vectors`.
 
@@ -55,7 +57,11 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   logos-module-builder (lidl scaffold + typed `liblogos_lez_rln_module` client
   + Qt cdylib glue).
 - `rust-lib/liblogos_rln_module.lidl` — the module contract
-  (17 methods; reply/error conventions documented in the header).
+  (19 methods; reply/error conventions documented in the header).
+- `rust-lib/rln-signal/` — the signal binding `x = hash_to_field_le(signal)`
+  as a standalone crate (own lock, excluded from the rust-lib workspace):
+  the module links it, and a C/Nim consumer links its `staticlib` + header
+  to pre-hash for the `_prehashed` methods. `nix build .#rln-signal`.
 - `rust-lib/deps/liblogos_lez_rln_module.lidl` — hand-maintained dependency
   contract (the consumed subset of the sibling's wire), wired via
   `dependency_overrides`. Same repo: update both files in the same PR.

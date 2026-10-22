@@ -41,7 +41,7 @@
 ; Events are a third channel, pushed over the lp event stream rather than
 ; returned from a call — see the events section below.
 module liblogos_rln_module {
-  version "0.13.0"
+  version "0.14.1"
   description "RLN Membership Management Module"
   category "blockchain"
   depends [liblogos_lez_rln_module]
@@ -329,6 +329,28 @@ module liblogos_rln_module {
   ; activated membership's first proofs) typically validates on the
   ; caller's next retry rather than after a full refresh interval.
   method validate_proof(registry_id: tstr, rln_identifier_hex: tstr, signal_hex: tstr, timestamp: tstr, proof_json: tstr) -> result
+
+  ; generate_proof over a PRE-HASHED signal — a wire extension beyond the
+  ; spec's generate_proof(scope, Bytes signal, …) for consumers that would
+  ; otherwise copy the whole message payload (hex, 2× its size) across the
+  ; module boundary. signal_hash_hex: x = hash_to_field_le(signal) =
+  ; Fr::from_le_bytes_mod_order(keccak256(signal)) as its canonical 32-byte
+  ; little-endian hex — the value the reply's "share_x" carries, computed
+  ; by the rln-signal crate (rust-lib/rln-signal, one C symbol) or zerokit
+  ; librln's ffi_hash_to_field_le + ffi_fr_to_bytes_le. Strictly decoded: a
+  ; value at or above the field modulus is invalid_argument, never
+  ; re-reduced. Everything else — scope, timestamp/epoch, selection,
+  ; message_id allocation, reply shape, errors — is generate_proof's.
+  method generate_proof_prehashed(registry_id: tstr, rln_identifier_hex: tstr, signal_hash_hex: tstr, timestamp: tstr) -> result
+
+  ; validate_proof over a PRE-HASHED signal: signal_hash_hex as in
+  ; generate_proof_prehashed (the verifier hashes the message it holds and
+  ; passes the 32-byte x; a proof whose share_x differs is "invalid").
+  ; Everything else — checks, order, verdicts, the nullifier log, not_ready
+  ; semantics — is validate_proof's. The two validate methods are
+  ; interchangeable over the same proof: either accepts a proof the other
+  ; (or either generate method) produced.
+  method validate_proof_prehashed(registry_id: tstr, rln_identifier_hex: tstr, signal_hash_hex: tstr, timestamp: tstr, proof_json: tstr) -> result
 
   ; Spec get_epoch_quota(scope, timestamp): the epoch of the supplied
   ; timestamp, the scope's membership rate limit, and the budget still

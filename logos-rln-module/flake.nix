@@ -37,9 +37,30 @@
     in
     {
       packages = forAllSystems (system:
-        let m = module.packages.${system};
+        let
+          m = module.packages.${system};
+          pkgs = import nixpkgs { inherit system; };
+          # rln-signal: the signal binding x = hash_to_field_le(signal) as a
+          # standalone staticlib/cdylib + C header, for consumers that
+          # pre-hash (generate_proof_prehashed). Its own workspace root and
+          # lock; the module build reaches it as a path dependency inside
+          # rust-lib/ instead.
+          rlnSignal = pkgs.rustPlatform.buildRustPackage {
+            pname = "rln-signal";
+            version = "0.1.0";
+            src = ./rust-lib/rln-signal;
+            cargoLock.lockFile = ./rust-lib/rln-signal/Cargo.lock;
+            # The zerokit equality oracle (dev-dependency rln) runs under
+            # cargo test in CI; it is not rebuilt here.
+            doCheck = false;
+            postInstall = ''
+              install -Dm644 include/rln_signal.h $out/include/rln_signal.h
+            '';
+          };
         in m // {
           liblogos_rln_module = m.default;
+        } // nixpkgs.lib.optionalAttrs (system != "x86_64-windows") {
+          rln-signal = rlnSignal;
         });
 
       # The builder walks a dependency's config + inputs to bundle the chain.

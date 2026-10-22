@@ -1218,8 +1218,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rln-signal"
+version = "0.1.0"
+dependencies = [
+ "ark-bn254",
+ "ark-ff",
+ "ark-serialize",
+ "tiny-keccak",
+]
+
+[[package]]
 name = "rln_module"
-version = "0.13.0"
+version = "0.14.1"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1229,6 +1239,7 @@ dependencies = [
  "logos-rust-sdk",
  "rand_chacha 0.3.1",
  "rln",
+ "rln-signal",
  "serde",
  "serde_json",
  "sha2",

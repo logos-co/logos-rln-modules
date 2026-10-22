@@ -44,7 +44,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          workspaces: logos-rln-module/rust-lib
+          workspaces: |
+            logos-rln-module/rust-lib
+            logos-rln-module/rust-lib/rln-signal
 
       - name: cargo clippy
         working-directory: logos-rln-module/rust-lib
@@ -54,6 +56,16 @@ jobs:
       - name: cargo test
         working-directory: logos-rln-module/rust-lib
         run: cargo test --locked -- --skip keychain
+
+      # rln-signal is its own workspace root (excluded from rust-lib's), so
+      # the steps above do not reach it.
+      - name: cargo clippy (rln-signal)
+        working-directory: logos-rln-module/rust-lib/rln-signal
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo test (rln-signal)
+        working-directory: logos-rln-module/rust-lib/rln-signal
+        run: cargo test --locked
 
   nix:
     name: nix build (.lgx)

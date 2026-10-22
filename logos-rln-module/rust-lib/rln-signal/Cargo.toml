@@ -1,0 +1,30 @@
+[package]
+name = "rln-signal"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "The RLN signal binding x = hash_to_field_le(signal), as a library and a one-symbol C ABI"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "rln_signal"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+# Standalone root: the parent rust-lib workspace excludes this directory so
+# the crate builds (and is packaged by nix) on its own, with its own lock.
+[workspace]
+
+# Panicking across the FFI boundary is UB.
+[profile.release]
+panic = "abort"
+
+[dependencies]
+tiny-keccak = { version = "2.0.2", features = ["keccak"] }
+ark-bn254 = { version = "0.5.0", default-features = false, features = ["scalar_field"] }
+ark-ff = { version = "0.5.0", default-features = false }
+ark-serialize = { version = "0.5.0", default-features = false }
+
+[dev-dependencies]
+# Equality oracle only: the pinned construction must stay byte-identical to
+# zerokit's hash_to_field_le.
+rln = { version = "3.0.0", default-features = false }

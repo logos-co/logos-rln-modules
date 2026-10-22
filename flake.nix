@@ -72,6 +72,9 @@
           wallet-module = walletModulePackage;
           default = rlnModule.lgx;
         }
+        // lib.optionalAttrs (rlnModule ? rln-signal) {
+          rln-signal = rlnModule.rln-signal;
+        }
       );
 
       apps = forAll (

@@ -1354,6 +1354,44 @@ fn generate_proof_impl(
     signal_hex: &str,
     timestamp: &str,
 ) -> Result<serde_json::Value, ApiError> {
+    generate_proof_with(store, registry_id_raw, rln_identifier_hex, SignalArg::Raw(signal_hex), timestamp)
+}
+
+/// The signal argument of the two generate/validate wire dialects: the raw
+/// message bytes as hex (`signal_hex`, the spec shape — hashed here), or the
+/// consumer-hashed `x` as its canonical 32-byte LE hex (`signal_hash_hex`,
+/// the `_prehashed` methods). Both resolve to the circuit's `x`; the
+/// pre-hashed form is decoded strictly (a non-canonical value is refused,
+/// never reduced), so one `x` has exactly one wire spelling.
+#[derive(Clone, Copy)]
+enum SignalArg<'a> {
+    Raw(&'a str),
+    Prehashed(&'a str),
+}
+
+impl SignalArg<'_> {
+    fn resolve(self) -> Result<rln_signal::Fr, ApiError> {
+        match self {
+            SignalArg::Raw(hex) => registry_id::hex_to_vec(hex)
+                .map(|bytes| proof::signal_to_x(&bytes))
+                .ok_or_else(|| ApiError::new(ErrorKind::InvalidArgument, "signal must be hex")),
+            SignalArg::Prehashed(hex) => proof::x_from_hash_hex(hex).map_err(|_| {
+                ApiError::new(
+                    ErrorKind::InvalidArgument,
+                    "signal_hash must be the 32-byte LE hex of a canonical field element",
+                )
+            }),
+        }
+    }
+}
+
+fn generate_proof_with(
+    store: Result<Arc<Store>, ApiError>,
+    registry_id_raw: &str,
+    rln_identifier_hex: &str,
+    signal: SignalArg<'_>,
+    timestamp: &str,
+) -> Result<serde_json::Value, ApiError> {
     let (registry, rln_identifier, rln_id_hex) =
         parse_scope(registry_id_raw, rln_identifier_hex)?;
     let prov = provider_of(&registry)?;
@@ -1363,8 +1401,7 @@ fn generate_proof_impl(
     // construction, and a stale or future one fails fast instead of minting
     // a proof the verifier would reject as not fresh.
     let (epoch, size, gap, now_epoch) = fresh_epoch_for(&registry.canonical, timestamp)?;
-    let signal = registry_id::hex_to_vec(signal_hex)
-        .ok_or_else(|| ApiError::new(ErrorKind::InvalidArgument, "signal must be hex"))?;
+    let x = signal.resolve()?;
 
     // Keep this registry's root window warm (this node may verify too).
     roots::track(&registry);
@@ -1425,7 +1462,7 @@ fn generate_proof_impl(
         path_indices,
     };
     let rlp =
-        proof::generate(&material, &signal, epoch, &rln_identifier).map_err(proof_error)?;
+        proof::generate(&material, x, epoch, &rln_identifier).map_err(proof_error)?;
 
     let mut out = rlp.to_json();
     if let Some(obj) = out.as_object_mut() {
@@ -1527,6 +1564,16 @@ fn validate_proof_impl(
     timestamp: &str,
     proof_json: &str,
 ) -> Result<serde_json::Value, ApiError> {
+    validate_proof_with(registry_id_raw, rln_identifier_hex, SignalArg::Raw(signal_hex), timestamp, proof_json)
+}
+
+fn validate_proof_with(
+    registry_id_raw: &str,
+    rln_identifier_hex: &str,
+    signal: SignalArg<'_>,
+    timestamp: &str,
+    proof_json: &str,
+) -> Result<serde_json::Value, ApiError> {
     let (registry, rln_identifier, _) = parse_scope(registry_id_raw, rln_identifier_hex)?;
     // Namespace support check only — no registry I/O on the verify path.
     provider_of(&registry)?;
@@ -1534,8 +1581,7 @@ fn validate_proof_impl(
     let (size, gap) = epoch_params_for(&registry.canonical)?;
     let now_epoch = rate_limit::current_epoch(now_unix(), size);
     let expected_epoch = epoch_of_timestamp(timestamp, size)?;
-    let signal = registry_id::hex_to_vec(signal_hex)
-        .ok_or_else(|| ApiError::new(ErrorKind::InvalidArgument, "signal must be hex"))?;
+    let x = signal.resolve()?;
     let mut proof_value: serde_json::Value = serde_json::from_str(proof_json)
         .map_err(|e| ApiError::new(ErrorKind::InvalidArgument, &format!("proof_json: {e}")))?;
     // Mix omits this derivable public input on the network. Reconstruct it
@@ -1574,7 +1620,7 @@ fn validate_proof_impl(
         roots::nudge();
         return ok_json(views::VerdictReply::verdict("invalid"));
     }
-    if !proof::verify(&rlp, &signal, &window).map_err(proof_error)? {
+    if !proof::verify(&rlp, x, &window).map_err(proof_error)? {
         // Invalid proofs are NOT logged — only a validated nullifier counts.
         return ok_json(views::VerdictReply::verdict("invalid"));
     }
@@ -1890,6 +1936,39 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
         ))
     }
 
+    fn generate_proof_prehashed(
+        &self,
+        registry_id: String,
+        rln_identifier_hex: String,
+        signal_hash_hex: String,
+        timestamp: String,
+    ) -> Result<serde_json::Value, String> {
+        reply_result(generate_proof_with(
+            self.store(),
+            &registry_id,
+            &rln_identifier_hex,
+            SignalArg::Prehashed(&signal_hash_hex),
+            &timestamp,
+        ))
+    }
+
+    fn validate_proof_prehashed(
+        &self,
+        registry_id: String,
+        rln_identifier_hex: String,
+        signal_hash_hex: String,
+        timestamp: String,
+        proof_json: String,
+    ) -> Result<serde_json::Value, String> {
+        reply_result(validate_proof_with(
+            &registry_id,
+            &rln_identifier_hex,
+            SignalArg::Prehashed(&signal_hash_hex),
+            &timestamp,
+            &proof_json,
+        ))
+    }
+
     fn get_epoch_quota(
         &self,
         registry_id: String,
@@ -2169,6 +2248,48 @@ mod tests {
         let other = registry_id::bytes_to_hex(b"another-signal");
         let bad = validate_proof_impl(&registry, &rln_id_hex, &other, &ts, &proof_json).unwrap();
         assert_eq!(bad, serde_json::json!({ "verdict": "invalid" }));
+
+        start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
+    }
+
+    // The pre-hashed dialect is interchangeable with the raw one over the same
+    // proof: a verifier may hash the message itself and pass x — the reply's
+    // own share_x — and the two dialects share one nullifier log.
+    #[test]
+    fn validate_proof_prehashed_is_interchangeable_with_raw() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        nullifier_log::reset_for_test();
+        start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
+        let registry = format!("logos:local:{}", "cd".repeat(32));
+        let rln_id = [9u8; 32];
+        let rln_id_hex = registry_id::bytes_to_hex(&rln_id);
+        let signal = b"prehashed-signal";
+        let signal_hex = registry_id::bytes_to_hex(signal);
+        let hash_hex = registry_id::bytes_to_hex(&rln_signal::signal_hash(signal));
+
+        let epoch = rate_limit::current_epoch(now_unix(), epoch_size().unwrap());
+        let ts = (epoch * 600).to_string();
+        let rlp = proof::generate_for_test(&[7u8; 32], signal, epoch, &rln_id);
+        let proof_json = rlp.to_json().to_string();
+        // The reply's share_x IS the pre-hashed wire value.
+        assert_eq!(rlp.to_json()["share_x"].as_str().unwrap(), hash_hex);
+        roots::set_window_for_test(&registry, vec![rlp.root()], now_unix());
+
+        let prehashed = |hex: &str| {
+            validate_proof_with(&registry, &rln_id_hex, SignalArg::Prehashed(hex), &ts, &proof_json)
+        };
+        assert_eq!(prehashed(&hash_hex).unwrap(), serde_json::json!({ "verdict": "valid" }));
+        // The same proof through the raw dialect is a retransmission.
+        let dup = validate_proof_impl(&registry, &rln_id_hex, &signal_hex, &ts, &proof_json).unwrap();
+        assert_eq!(dup, serde_json::json!({ "verdict": "duplicate" }));
+        // Another message's hash: invalid, not an error.
+        let other = registry_id::bytes_to_hex(&rln_signal::signal_hash(b"another"));
+        assert_eq!(prehashed(&other).unwrap(), serde_json::json!({ "verdict": "invalid" }));
+        // Malformed: non-canonical, short, or the raw bytes in the hash slot.
+        for bad in ["ff".repeat(32), "ab".repeat(31), signal_hex.clone(), "zz".into()] {
+            let err = prehashed(&bad).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::InvalidArgument, "{bad}: {}", err.message);
+        }
 
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
     }
@@ -2985,6 +3106,95 @@ mod tests {
             "first allocation on a fresh (rln_identifier, epoch): {out}"
         );
         assert_eq!(out.get("membership_hash").and_then(|v| v.as_str()), Some(hash.as_str()));
+
+        sealed_store::store::publish(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // generate_proof_prehashed is generate_proof over the consumer-hashed x:
+    // the proof it mints validates through BOTH validate dialects — with the
+    // hash and with the original bytes — and a malformed hash is refused
+    // before any slot is reserved.
+    #[test]
+    fn generate_proof_prehashed_mints_a_proof_both_dialects_validate() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        nullifier_log::reset_for_test();
+        let dir =
+            std::env::temp_dir().join(format!("rln-ms-prehashed-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
+        let (imp, store) = imp_with_store(dir.clone());
+        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+
+        let reg = format!("logos:local:{}", "ac".repeat(32));
+        let rln_id_hex = "ee".repeat(32);
+        let (commitment_hex, secret_hex) = proof::generate_identity().expect("test identity");
+        let commitment =
+            registry_id::hex_to_bytes32(&commitment_hex).expect("generated commitment is 32 bytes");
+        let hash = registry_id::membership_hash(&reg, &commitment);
+        let leaf_index = 5u64;
+        seed_membership(
+            &store,
+            &hash,
+            &reg,
+            &commitment_hex,
+            &rln_id_hex,
+            &secret_hex,
+            MembershipState::Active,
+            leaf_index,
+            300,
+        );
+        path_cache::set_path_for_test(
+            &hash,
+            vec!["00".repeat(32); proof::RLN_TREE_DEPTH],
+            vec![0u8; proof::RLN_TREE_DEPTH],
+            leaf_index,
+        );
+
+        let signal = b"payload bytes, then a content topic, then eight timestamp bytes";
+        let signal_hex = registry_id::bytes_to_hex(signal);
+        let hash_hex = registry_id::bytes_to_hex(&rln_signal::signal_hash(signal));
+        let ts = now_unix().to_string();
+
+        let bad = generate_proof_with(
+            Ok(store.clone()),
+            &reg,
+            &rln_id_hex,
+            SignalArg::Prehashed(&"ff".repeat(32)),
+            &ts,
+        )
+        .unwrap_err();
+        assert_eq!(bad.kind, ErrorKind::InvalidArgument, "got: {}", bad.message);
+
+        let out = generate_proof_with(
+            Ok(store.clone()),
+            &reg,
+            &rln_id_hex,
+            SignalArg::Prehashed(&hash_hex),
+            &ts,
+        )
+        .expect("prehashed generate over a warm cache");
+        assert_eq!(out["share_x"].as_str().unwrap(), hash_hex, "got: {out}");
+        assert_eq!(
+            out["message_id"].as_u64(),
+            Some(0),
+            "the refused hash must not have spent a slot: {out}"
+        );
+        let root = registry_id::hex_to_bytes32(out["root"].as_str().unwrap()).expect("root");
+        roots::set_window_for_test(&reg, vec![root], now_unix());
+        let proof_json = out.to_string();
+
+        let raw = validate_proof_impl(&reg, &rln_id_hex, &signal_hex, &ts, &proof_json).unwrap();
+        assert_eq!(raw, serde_json::json!({ "verdict": "valid" }));
+        let pre = validate_proof_with(
+            &reg,
+            &rln_id_hex,
+            SignalArg::Prehashed(&hash_hex),
+            &ts,
+            &proof_json,
+        )
+        .unwrap();
+        assert_eq!(pre, serde_json::json!({ "verdict": "duplicate" }));
 
         sealed_store::store::publish(None);
         let _ = std::fs::remove_dir_all(&dir);

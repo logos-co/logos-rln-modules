@@ -46,6 +46,9 @@ never from consumer-side epoch math.
   **Every call passes its scope explicitly — the Module holds no default**;
   an empty `registry_id` or `rln_identifier_hex` fails `invalid_argument`.
 - `signal` (spec `Bytes`) travels as `signal_hex` — the raw bytes hex-encoded.
+  The `_prehashed` methods take `signal_hash_hex` instead: the circuit's
+  `x = hash_to_field_le(signal)` as its canonical 32-byte LE hex (see
+  "Pre-hashing the signal" below).
 
 ## Error envelope
 
@@ -80,6 +83,8 @@ switch on `class`, log `kind`.
 | `get_membership_state(scope)` | `get_membership_state(registry_id, rln_identifier_hex)` | tstr | `{"state":…}` + `membership_hash`/`leaf_index`/`rate_limit` when known; `"unknown"` + `"provisioning":{…}` (below) while provisioning works on the registry |
 | provisioning, one registry (helper) | `ensure_membership(registry_id, options_json)` | tstr | the registry's one live membership as a MembershipState view (from the local cache; any scope counts), else `{"state":"unknown","provisioning":{…}}` after spawning the same pass `start()` runs — registry-wide scope, `options_json` carries only `rate_limit`; gifter keys are `invalid_argument` (a gift is `register_membership`'s). Exists because `start()` is a `result` method (unreachable from QML) and the scope-taking methods refuse the empty scope |
 | `generate_proof(scope, signal, timestamp)` | `generate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp)` | result | RateLimitProof (below) + `"message_id"`, `"epoch_index"`, `"membership_hash"`; epoch derives from `timestamp` (Unix s), must be within now ± `max_epoch_gap`. Fails `permanent` (kind `permanent`) for an epoch below the membership's persisted allocation floor (backwards clock / widened `max_epoch_gap`) or an `epoch_size_sec` its allocations are not bound to — re-register to recover |
+| `generate_proof(scope, signal, timestamp)`, pre-hashed (extension) | `generate_proof_prehashed(registry_id, rln_identifier_hex, signal_hash_hex, timestamp)` | result | As `generate_proof`; `signal_hash_hex` is `hash_to_field_le(signal)` as 32-byte LE hex, decoded strictly (`invalid_argument` unless 32 bytes AND a canonical field element — a value at or above the modulus is refused, never reduced) |
+| `validate_proof(scope, signal, timestamp, proof)`, pre-hashed (extension) | `validate_proof_prehashed(registry_id, rln_identifier_hex, signal_hash_hex, timestamp, proof_json)` | result | As `validate_proof` with the verifier's own `hash_to_field_le(signal)`; interchangeable with `validate_proof` over the same proof (one nullifier log) |
 | `validate_proof(scope, signal, timestamp, proof)` | `validate_proof(registry_id, rln_identifier_hex, signal_hex, timestamp, proof_json)` | result | `{"verdict":str}` (see the verdict table); a cryptographically valid decomposed proof that omitted `external_nullifier` also carries the reconstructed value, and `rate_limit_violation` carries `"recovered_secret":hex`. `timestamp` is the value stamped on the message under validation: the proof's epoch must EQUAL its epoch and be within now ± `max_epoch_gap`, else `"invalid"` |
 | `get_epoch_quota(scope, timestamp)` | `get_epoch_quota(registry_id, rln_identifier_hex, timestamp)` | result | `{"epoch_index":N,"rate_limit":N,"remaining":N}` — one observation of `timestamp`'s epoch, purely local; `epoch_index` is a NUMBER (`floor(timestamp/epoch_size)`, what a QuotaProvider's `epochIndex` consumes); no usable membership → `rate_limit`/`remaining` both 0 (the wall-clock-fallback cue — never an exhausted budget); a timestamp whose epoch is outside now ± `max_epoch_gap`, below the membership's persisted allocation floor, or denominated in an `epoch_size_sec` its allocations aren't bound to fails `permanent` — the same refusals `generate_proof` would answer (spec: test a timestamp before committing to it), so `{rate_limit>0, remaining:0}` always means spendable-next-epoch |
 | registry parameters read (optional ext.) | `get_registry_parameters(registry_id, rln_identifier_hex)` | result | `{"epoch_size_sec","max_rate_limit","min_rate_limit","max_total_rate_limit","price_per_unit"}` |
@@ -222,6 +227,36 @@ extras:
 - Frozen byte-exact vectors (identity derivation, external nullifier, signal
   hash, public values, layout): `rust-lib/src/proof.rs`,
   `proof::tests::frozen_interop_vectors`.
+
+## Pre-hashing the signal
+
+`generate_proof` / `validate_proof` take the whole message as `signal_hex`,
+which a consumer in another process copies (at twice its size) across every
+hop to the module, where the only thing done with it is
+
+```text
+x = Fr::from_le_bytes_mod_order(keccak256(signal))        // zerokit hash_to_field_le
+```
+
+`generate_proof_prehashed` / `validate_proof_prehashed` take that `x`
+instead, as `signal_hash_hex`: its canonical 32-byte little-endian encoding
+(arkworks `serialize_compressed`), i.e. the exact string the reply's
+`share_x` carries. Sources of the value:
+
+- the [`rln-signal`](../rust-lib/rln-signal) crate — `signal_hash(&[u8]) ->
+  [u8; 32]` in Rust, or the one C symbol `rln_signal_hash(ptr, len, out[32])`
+  from its `staticlib`/`cdylib` + `include/rln_signal.h` (`nix build
+  .#rln-signal`); it is the definition the module itself links;
+- zerokit's `librln`, for a consumer that already links it:
+  `ffi_hash_to_field_le` followed by `ffi_fr_to_bytes_le`.
+
+Rules: the module decodes `signal_hash_hex` strictly — not 32 bytes, or at
+or above the field modulus, is `invalid_argument` (never re-reduced), so one
+`x` has exactly one wire spelling. The two dialects are interchangeable over
+the same proof: either validate method accepts a proof either generate
+method produced, and both feed the same nullifier log (`duplicate` across
+dialects is a retransmission). These two methods are a wire extension beyond
+the LIP's `generate_proof(scope, Bytes signal, …)`.
 
 ## Epoch semantics
 

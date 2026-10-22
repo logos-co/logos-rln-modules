@@ -1,6 +1,6 @@
 [package]
 name = "rln_module"
-version = "0.13.0"
+version = "0.14.1"
 edition = "2021"
 # std File::try_lock / TryLockError (keystore process lock) stabilized in 1.89.
 rust-version = "1.89"
@@ -9,9 +9,11 @@ rust-version = "1.89"
 name = "liblogos_rln_module"
 crate-type = ["staticlib"]
 
-# Standalone crate: the empty table keeps cargo from adopting any workspace
-# found in a parent directory.
+# Standalone crate: the table keeps cargo from adopting any workspace found
+# in a parent directory. rln-signal is its own root (own lock, nix-packaged
+# standalone for C/Nim consumers), so it is excluded rather than adopted.
 [workspace]
+exclude = ["rln-signal"]
 
 # Panicking across the FFI boundary is UB.
 [profile.release]
@@ -35,6 +37,11 @@ hkdf = "0.12"
 # RLN zk proof generation & verification (spec generate_proof/validate_proof).
 # The identity secret stays in this module — it never crosses to the sibling.
 rln = { version = "3.0.0", default-features = false }
+
+# The signal binding x = hash_to_field_le(signal), shared with consumers that
+# pre-hash (generate_proof_prehashed). Inside rust-lib/ so the module
+# builder's wholesale staging carries it.
+rln-signal = { path = "rln-signal" }
 
 # ChaCha20Rng for zerokit's seeded keygen (the RNG is chosen at type level).
 rand_chacha = "0.3"
