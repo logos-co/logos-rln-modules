@@ -1,0 +1,31 @@
+[package]
+name    = "rln_data_service_module"
+version = "0.1.0"
+edition = "2021"
+# The builder pins 1.94.0 (metadata.json nix.rust.toolchain).
+rust-version = "1.87"
+
+[lib]
+name = "liblogos_rln_data_service_module"
+crate-type = ["staticlib"]
+
+# Standalone crate: the empty table keeps cargo from adopting any workspace
+# found in a parent directory.
+[workspace]
+
+# Panicking across the FFI boundary is UB.
+[profile.release]
+panic = "abort"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The zone query's request/response cross libp2p_module's stream bridge as
+# base64 (src/lp.rs), as the membership module's protocolRequest does.
+base64 = "0.22"
+# The zone's JSON API is read with rustls so an https zone works too.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+
+# The runtime SDK, staged by the module builder (codegen.rust) from the same
+# logos-rust-sdk rev its generator came from.
+logos-rust-sdk = { path = "../logos-rust-sdk-src" }

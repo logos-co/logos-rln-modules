@@ -1,0 +1,52 @@
+{
+  "name": "liblogos_rln_data_service_module",
+  "display_name": "RLN Data Service",
+  "version": "0.1.0",
+  "description": "Serves an RLN registry's roots and Merkle proofs from a local membership zone to RLN modules over libp2p (/logos/rln/zone-query/1.0.0)",
+  "author": "Logos Blockchain Team",
+  "type": "core",
+  "interface": "cdylib",
+  "concurrency": "multi",
+  "category": "blockchain",
+  "main": "liblogos_rln_data_service_module_plugin",
+  "dependencies": [
+    "libp2p_module"
+  ],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "lidl": "rust-lib/liblogos_rln_data_service_module.lidl",
+    "rust": {
+      "crate": "rust-lib"
+    }
+  },
+  "dependency_overrides": {
+    "libp2p_module": {
+      "file": "rust-lib/deps/libp2p_module.lidl"
+    }
+  },
+  "nix": {
+    "external_libraries": [],
+    "packages": {
+      "build": [],
+      "runtime": []
+    },
+    "cmake": {
+      "find_packages": [],
+      "extra_include_dirs": []
+    },
+    "rust": {
+      "toolchain": "1.94.0",
+      "packages": {
+        "build": [
+          "pkg-config",
+          "perl",
+          "cmake",
+          "python3",
+          "clang"
+        ],
+        "runtime": []
+      }
+    }
+  }
+}

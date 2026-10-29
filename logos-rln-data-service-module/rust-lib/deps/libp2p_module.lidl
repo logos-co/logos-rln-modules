@@ -1,0 +1,23 @@
+; The subset of libp2p_module 1.1.0 this module drives: the custom-protocol
+; bridge's server side (README "Custom-protocol bridge"), node bring-up and
+; identity. libp2p_module is a universal (C++) module: every reply is a
+; {"success":bool,"error":s,"value":…} envelope, sometimes as a JSON string.
+; argsJson shapes:
+;   protocolAcceptStream {"proto":s,"timeoutMs":N}            -> {"streamId":N,"proto":s,"peerId":s}
+;   streamReadLpJson     {"streamId":N,"maxSize":N,"timeoutMs":N} -> {"dataB64":s}
+;   streamWriteLpJson    {"streamId":N,"dataB64":s}
+;   streamReleaseJson    {"streamId":N}
+;   createNode           {"addrs":[s,…], …}                   (rebuilds the node; before start)
+;   getNodeInfo          "PeerId" | "Multiaddrs" | "MyBoundPorts" | "Version"
+; libp2p_module dispatches every call on one thread: keep timeouts short.
+module libp2p_module {
+  version "1.1.0"
+  method mountProtocol(proto: tstr) -> result
+  method protocolAcceptStream(argsJson: tstr) -> result
+  method streamReadLpJson(argsJson: tstr) -> result
+  method streamWriteLpJson(argsJson: tstr) -> result
+  method streamReleaseJson(argsJson: tstr) -> result
+  method createNode(config: tstr) -> result
+  method start() -> result
+  method getNodeInfo(field: tstr) -> result
+}

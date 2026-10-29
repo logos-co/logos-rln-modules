@@ -1,0 +1,36 @@
+; liblogos_rln_data_service_module — the RLN data service. One node per
+; deployment runs it next to a membership zone (logos-rln-membership-zone's
+; Zone indexer, reachable over HTTP) and serves the zone's roots and Merkle
+; proofs to every other node's liblogos_rln_module over libp2p: the
+; /logos/rln/zone-query/1.0.0 protocol of logos-rln-module/docs/zone-query.md,
+; mounted on libp2p_module's custom-protocol bridge. The module holds no
+; tree: each request is answered from the zone's JSON API (GET /roots/{n},
+; GET /merkle_proof/{leaf_index}), translated field for field into the
+; protobuf reply, with a short cache on the roots window.
+;
+; Every method returns a LogosResult: `{"success":true,"value":{…}}` or
+; `{"success":false,"error":"…"}`.
+;
+; start(config_json): bring the service up. config_json is `{}` or
+;   {"zone":{"url":"http://127.0.0.1:3000"},          default zone (env LOGOS_RLN_ZONE_URL)
+;    "registries":{"<config account hex>":{"url":…}}, per-registry zones (optional)
+;    "listen":["/ip4/127.0.0.1/tcp/0"],              createNode+start libp2p on these
+;                                                     (env LOGOS_RLN_DATA_SERVICE_LISTEN,
+;                                                     comma-separated); absent: the
+;                                                     node libp2p_module already has
+;    "roots_cache_ms":2000,
+;    "max_request_bytes":4096}
+;   The value names what members must be told:
+;   {"started":true,"peer_id":…,"multiaddrs":[…],"protocol":"/logos/rln/zone-query/1.0.0",
+;    "zone_url":…}. Idempotent: a second start reconfigures and restarts the worker.
+; stop(): stop answering (the protocol stays mounted; libp2p_module has no
+;   unmount — inbound streams queue up to 1024 and are then dropped).
+; status(): {"running":bool,"peer_id":…,"multiaddrs":[…],"zone_url":…,
+;   "served":N,"errors":N,"last_error":"…","last_served_unix":N}
+
+module liblogos_rln_data_service_module {
+  version "0.1.0"
+  method start(config_json: tstr) -> result
+  method stop() -> result
+  method status() -> result
+}

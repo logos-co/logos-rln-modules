@@ -24,6 +24,7 @@
 
     logos-lez-rln-module.url = "path:./logos-lez-rln-module";
     logos-rln-module.url = "path:./logos-rln-module";
+    logos-rln-data-service-module.url = "path:./logos-rln-data-service-module";
   };
 
   outputs =
@@ -34,6 +35,7 @@
       logos-module-viewer,
       logos-lez-rln-module,
       logos-rln-module,
+      logos-rln-data-service-module,
       ...
     }:
     let
@@ -56,12 +58,15 @@
 
           lezRlnModule = logos-lez-rln-module.packages.${system};
           rlnModule = logos-rln-module.packages.${system};
+          dataServiceModule = logos-rln-data-service-module.packages.${system};
         in
         {
           logos-lez-rln-module = lezRlnModule.default;
           logos-lez-rln-module-lgx = lezRlnModule.lgx;
           logos-rln-module = rlnModule.default;
           logos-rln-module-lgx = rlnModule.lgx;
+          logos-rln-data-service-module = dataServiceModule.default;
+          logos-rln-data-service-module-lgx = dataServiceModule.lgx;
           wallet-module = walletModulePackage;
           default = rlnModule.lgx;
         }
@@ -73,6 +78,7 @@
           pkgs = import nixpkgs { inherit system; };
           logosLezRlnModuleLib = self.packages.${system}.logos-lez-rln-module;
           logosRlnModuleLib = self.packages.${system}.logos-rln-module;
+          logosRlnDataServiceModuleLib = self.packages.${system}.logos-rln-data-service-module;
           logosModuleViewerPackage = logos-module-viewer.packages.${system}.default;
           extension = if pkgs.stdenv.isDarwin then "dylib" else "so";
           inspectLezRlnModule = {
@@ -91,10 +97,19 @@
                   --module ${logosRlnModuleLib}/lib/liblogos_rln_module_plugin.${extension}
               ''}/bin/inspect-rln-module";
           };
+          inspectRlnDataServiceModule = {
+            type = "app";
+            program =
+              "${pkgs.writeShellScriptBin "inspect-rln-data-service-module" ''
+                exec ${logosModuleViewerPackage}/bin/logos-module-viewer \
+                  --module ${logosRlnDataServiceModuleLib}/lib/liblogos_rln_data_service_module_plugin.${extension}
+              ''}/bin/inspect-rln-data-service-module";
+          };
         in
         {
           inspect-lez-rln-module = inspectLezRlnModule;
           inspect-rln-module = inspectRlnModule;
+          inspect-rln-data-service-module = inspectRlnDataServiceModule;
           default = inspectRlnModule;
         }
       );

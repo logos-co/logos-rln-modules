@@ -11,6 +11,11 @@ applications, backed by the on-chain RLN registry deployed from
   membership management module (RLN-MEMBERSHIP-MANAGEMENT spec): credential
   generation + keystore, registration lifecycle, proof generation and
   verification. Talks to the registry only through the lez-rln module's wire.
+- **`logos-rln-data-service-module/`** — `liblogos_rln_data_service_module`,
+  the RLN data service: one node per deployment runs it next to the
+  membership zone and serves the zone's roots and Merkle proofs to every
+  other node's `liblogos_rln_module` over libp2p
+  (`logos-rln-module/docs/zone-query.md`).
 - **`logos-rln-membership-ui/`** — the membership UI (QML) driving the two
   modules from Logos Basecamp.
 - **`docs/intents.md`** — the `rln.*` Basecamp intent vocabulary: how an app
@@ -45,17 +50,19 @@ applications, backed by the on-chain RLN registry deployed from
 
 ## Build
 
-Each module is its own flake; the root flake aggregates the two Rust modules:
+Each module is its own flake; the root flake aggregates the three Rust modules:
 
 ```sh
 nix build .#logos-lez-rln-module-lgx
 nix build .#logos-rln-module-lgx
-nix run .#inspect-rln-module      # or .#inspect-lez-rln-module
+nix build .#logos-rln-data-service-module-lgx
+nix run .#inspect-rln-module      # or .#inspect-lez-rln-module, .#inspect-rln-data-service-module
 ```
 
 The Rust modules build from gitignored staged sources — refresh with
-`nix run ./logos-lez-rln-module#generate` and
-`nix run ./logos-rln-module#generate` (both clone-and-go; see each
+`nix run ./logos-lez-rln-module#generate`,
+`nix run ./logos-rln-module#generate` and
+`nix run ./logos-rln-data-service-module#generate` (all clone-and-go; see each
 module's README). Release bundles + package catalog: `tools/publish.sh`.
 
 ## License

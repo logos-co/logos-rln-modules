@@ -50,6 +50,7 @@ env:
   MODULE_DIRS: >-
     logos-lez-rln-module
     logos-rln-module
+    logos-rln-data-service-module
     logos-rln-membership-ui
     external/logos-rln-gifter/rust/rln-gifter-module
     external/logos-rln-gifter/rust/keycard-capture-module
@@ -240,7 +241,7 @@ jobs:
             if ! (
               set -euo pipefail
               case "$dir" in
-                logos-lez-rln-module|logos-rln-module)
+                logos-lez-rln-module|logos-rln-module|logos-rln-data-service-module)
                   nix run "path:./$dir#generate" -L ;;
                 logos-rln-membership-ui)
                   : ;;  # pure QML — no staging
