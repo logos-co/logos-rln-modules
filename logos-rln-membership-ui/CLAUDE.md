@@ -1,4 +1,4 @@
-# logos-rln-membership-ui (measured pre-0780862, 2026-07; wire rln 0.13.0 / lez 5.1.0 since 0.8.0)
+# logos-rln-membership-ui (measured pre-0780862, 2026-07; wire rln 0.14.0 / lez 7.0.0 since 0.9.0)
 
 - Every module call must go through `call()` in `qml/membership.js` — never
   `bridge.callModuleAsync` directly. `call()` applies the `| 0` coercion
@@ -17,15 +17,21 @@
   object is rejected as invalid_argument. Two call sites exist by design
   (wizard `OnboardingFlow.registerDelegated`, expert `RegisterView.doRegister`)
   and share `delegatedOptions`.
-- The wire has NO faucet, NO token and NO `lez_core` wallet since lez module
-  4.0.0 / 3.0.0: the registry module pays from `wallet_status().payer`, and
+- The wire has NO faucet and NO token since lez module 4.0.0, and the UI never
+  calls `lez_core`: since lez module 7.0.0 the registry module opens and
+  drives the `lez_core` wallet itself (3.0.0-6.x bundled their own). It pays
+  from `wallet_status().payer`, and
   the module's provisioning pass (the `provisioning` object on
   `ensure_membership` / `get_membership_state`) says how much to send where.
   Render the funding block from its structured fields (`payer`, `required`,
   `price`, `fee_reserve`, `balance`), never by parsing `detail`.
 - Retry decisions switch on the error envelope's `class` (`transient` →
   `M.isTransientError`), never on `kind` alone; pass the whole error
-  object, not `err.kind`. New membership states go into
+  object, not `err.kind`. A membership's leaf renders through `M.fmtLeaf`
+  only: since rln 0.14.0 a live membership may carry `leaf_pending:true`
+  with a placeholder `leaf_index` of 0 (the registry module did not report
+  one: it knows the leaf only of a registration it sent),
+  and 0 is also a real leaf. New membership states go into
   `M.MEMBERSHIP_STATES` (+ `StateBadge.qml`'s colour ladder); any string
   outside the list must still render, never crash the card.
 - The allocator step is the reference client configuration for membership

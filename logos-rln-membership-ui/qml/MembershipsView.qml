@@ -32,7 +32,8 @@ Item {
             }
             // Precompute display strings: the default table cell renders
             // rowItem[role] || "" — a numeric leaf_index of 0 must not
-            // disappear, so numbers become strings here.
+            // disappear, so numbers become strings here (and an unindexed
+            // leaf reads "pending" — M.fmtLeaf).
             view.rows = (r.memberships || []).map(function (m) {
                 var full = m.credential ? m.credential.identity_commitment : ""
                 return {
@@ -40,7 +41,7 @@ Item {
                     full_commitment: full,
                     state: m.state || "unknown",
                     rate: String(m.rate_limit),
-                    leaf: String(m.leaf_index),
+                    leaf: M.fmtLeaf(m),
                     membership_hash: m.membership_hash || "",
                     failed_reason: m.failed_reason || "",
                     // Only ever present alongside failed_reason (spec: a failed

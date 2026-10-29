@@ -415,6 +415,15 @@ function fmtOptionalNum(v) {
     return (v === undefined || v === null) ? "—" : String(v);
 }
 
+// A membership's leaf for display. Since rln module 0.14.0 the chain records
+// a leaf index only in its Registered event: until the registry module reports
+// the one its registration claimed, the view carries leaf_pending:true beside
+// a placeholder leaf_index of 0 — which is also a real leaf, so the flag, not
+// the number, decides.
+function fmtLeaf(m) {
+    return (m && m.leaf_pending === true) ? "pending" : fmtOptionalNum(m ? m.leaf_index : undefined);
+}
+
 // Transport/host/sequencer flakiness kinds — the rln and wallet modules
 // intermittently drop responses over QtRO under load, surfacing as these
 // kinds; retrying self-heals. Every other kind (bad_password, locked,

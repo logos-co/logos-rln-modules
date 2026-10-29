@@ -106,7 +106,9 @@ LogosScrollView {
             if (view.liveState === "pending") return
             pollTimer.stop()
             if (view.liveState === "active")
-                view.report("Membership ACTIVE at leaf " + r.leaf_index
+                view.report("Membership ACTIVE " + (r.leaf_pending === true
+                        ? "(leaf index pending — not reported yet)"
+                        : "at leaf " + r.leaf_index)
                     + ". See the Memberships tab for when it enters grace_period.", false)
             else if (view.liveState === "failed")
                 view.report("Registration FAILED — see the Memberships tab for the failure reason "

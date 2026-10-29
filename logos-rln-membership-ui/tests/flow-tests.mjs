@@ -2,10 +2,11 @@
 // scripted mock bridge injected through the inspector's `evaluate` command
 // (framework.mjs doesn't wrap it; the server supports it). No daemon, no
 // chain: the mock replies with the same parseReply-visible shapes as the
-// real wire (liblogos_rln_module.lidl 0.12.0 — ensure_membership with the
+// real wire (liblogos_rln_module.lidl 0.12.0 — 0.14.0's leaf_pending included
+// — ensure_membership with the
 // structured provisioning object, register_membership with the delegated
 // RegistryOptions, the LIP MembershipStatus vocabulary, {class,kind,message}
-// error envelopes — liblogos_lez_rln_module.lidl 5.0.0's wallet_status /
+// error envelopes — liblogos_lez_rln_module.lidl 7.0.0's wallet_status /
 // get_native_balance, rln_gifter_module.libp2p_call, and the two producer
 // modules' card_status / address). Methods the wire dropped (lez_core, the
 // faucet) answer an ERROR, so a call-site regression fails loudly. One
@@ -221,7 +222,7 @@ function mockExpr(cfg) {
           for (var ei = 0; ei < eopts.length; ei++) if (eopts[ei].key !== "rate_limit")
             return err("invalid_argument", "mock: ensure_membership accepts only rate_limit, got " + eopts[ei].key);
           var live = liveOnRegistry(args[0]);
-          if (live) return { registry_id: args[0], state: live.state, membership_hash: live.membership_hash, leaf_index: live.leaf_index, rate_limit: live.rate_limit };
+          if (live) return { registry_id: args[0], state: live.state, membership_hash: live.membership_hash, leaf_index: live.leaf_index, leaf_pending: live.leaf_pending, rate_limit: live.rate_limit };
           st.pass = { step: STEPS[0], rlnId: "00".repeat(32), rate: optionsRate(eopts) || 100 };
           return { registry_id: args[0], state: "unknown", provisioning: provisioningView(st.pass.step) };
         }
@@ -271,10 +272,12 @@ function mockExpr(cfg) {
             m.state = cfg.registerState;
           }
           if (m.state === "failed") return { registry_id: args[0], state: "failed" };
-          return { leaf_index: m.leaf_index, membership_hash: m.membership_hash, rate_limit: m.rate_limit, registry_id: args[0], state: m.state };
+          return { leaf_index: m.leaf_index, leaf_pending: m.leaf_pending, membership_hash: m.membership_hash, rate_limit: m.rate_limit, registry_id: args[0], state: m.state };
         }
         case "get_membership":
-          return { clock_timestamp: 1700003000, grace_period_duration: 600, grace_period_start_timestamp: 1700005580, leaf_index: 5, rate_limit: 300, registered: true, state: cfg.registerState };
+          // lez 7.0.0: leaf_index is optional, absent for a registration this
+          // module did not send.
+          return { clock_timestamp: 1700003000, grace_period_duration: 600, grace_period_start_timestamp: 1700005580, rate_limit: 300, registered: true, state: cfg.registerState };
         // rln_gifter_module.libp2p_call relays createNode/start: the raw
         // {success,value,error} envelope (error:"" on success).
         case "libp2p_call": return { success: true, value: "", error: "" };
@@ -725,6 +728,34 @@ test("petname is stable per commitment and varies across commitments", async (ap
   if (pa1 !== pa2) throw new Error(`petname not stable: ${pa1} vs ${pa2}`);
   if (pa1 === pb) throw new Error(`distinct commitments share a petname: ${pa1}`);
   if (await evalExpr(app, `M.petname("")`) !== "") throw new Error("empty commitment should yield ''");
+});
+
+// Since rln 0.14.0 / lez 7.0.0 the leaf index arrives once the registry module
+// reports the claim of the registration that landed: until then the view says
+// leaf_pending with a placeholder leaf_index of 0, and the UI must say
+// "pending", not "0" — leaf 0 is a real leaf.
+test("an unindexed membership shows its leaf as pending, an indexed leaf 0 as 0", async (app) => {
+  const c = "aa".repeat(32), c2 = "cc".repeat(32);
+  await setup(app, { memberships: [
+    { credential: { identity_commitment: c }, membership_hash: "ee".repeat(32), leaf_index: 0, leaf_pending: true, rate_limit: 300, state: "active", submitted_at: 1 },
+    { credential: { identity_commitment: c2 }, membership_hash: "ff".repeat(32), leaf_index: 0, rate_limit: 100, state: "active", submitted_at: 1 }] });
+  if (await evalExpr(app, `M.fmtLeaf({ leaf_index: 0, leaf_pending: true })`) !== "pending")
+    throw new Error("leaf_pending must render as pending");
+  if (await evalExpr(app, `M.fmtLeaf({ leaf_index: 0 })`) !== "0")
+    throw new Error("an indexed leaf 0 must render as 0");
+  if (await evalExpr(app, `M.fmtLeaf({})`) !== "—")
+    throw new Error("an absent leaf renders the placeholder");
+  await evalExpr(app, `root.showDetail("${c}")`);
+  await waitMode(app, "detail");
+  await waitFor(app, async () => {
+    if (await evalExpr(app, "detailCard.found") !== true) throw new Error("card not loaded");
+  }, "detail card to load");
+  // Through both reads: get_memberships and the get_membership_state poll.
+  await waitFor(app, async () => {
+    if (await evalExpr(app, "detailCard.refreshing") !== false) throw new Error("still refreshing");
+  }, "detail refresh to settle");
+  if (await evalExpr(app, "detailCard.leaf") !== "pending")
+    throw new Error(`unindexed leaf shown as ${await evalExpr(app, "detailCard.leaf")}`);
 });
 
 // 11. Regression: detail "Refresh status" under a flaky transport must not

@@ -72,7 +72,7 @@ Item {
             if (!row) { card.found = false; card.refreshing = false; return }
             card.found = true
             card.liveState = row.state || "unknown"
-            card.leaf = M.fmtOptionalNum(row.leaf_index)
+            card.leaf = M.fmtLeaf(row)
             card.rate = M.fmtOptionalNum(row.rate_limit)
             card.failedReason = row.failed_reason || ""
             card.submittedAt = row.submitted_at || 0
@@ -114,7 +114,7 @@ Item {
             if (!r.error) {
                 card.liveState = r.state || card.liveState
                 if (r.leaf_index !== undefined)
-                    card.leaf = String(r.leaf_index)
+                    card.leaf = M.fmtLeaf(r)
                 if (r.rate_limit !== undefined)
                     card.rate = String(r.rate_limit)
             }
