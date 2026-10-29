@@ -66,6 +66,8 @@ mod select;
 mod views;
 mod wallet_home;
 mod worker;
+mod zone;
+mod zone_wire;
 
 mod generated {
     #![allow(warnings)]
@@ -528,17 +530,10 @@ fn funded_submit_callback(store: Weak<Store>, hash: String) -> provider::Registe
                     let why = register_refusal(reply).unwrap_or_default();
                     m.record_async_submit_error(&why, false)
                 }
-                Ok(reply) => {
-                    m.tx_result = Some(reply.clone());
-                    // The reply's leaf_index is a pre-submit ESTIMATE; recorded
-                    // for observability, authoritative only after the poller's
-                    // read-back.
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(reply) {
-                        if let Some(leaf) = v.get("leaf_index").and_then(|x| x.as_u64()) {
-                            m.leaf_index = Some(leaf);
-                        }
-                    }
-                }
+                // The reply's leaf_index is that send's claim, which a racing
+                // registration can move: the poller takes the final one from
+                // get_membership once the record lands.
+                Ok(reply) => m.tx_result = Some(reply.clone()),
                 Err(e) => m.record_async_submit_error(&e.message, is_retryable_submit_error(e)),
             }),
             None => Err(ApiError::internal("store closed before the submit callback landed")),
@@ -924,8 +919,11 @@ fn get_membership_state_impl(
             }
             m.state = merged;
             if pm.registered {
-                // The pending→active re-read (spec MUST).
-                m.leaf_index = Some(pm.leaf_index);
+                // The pending→active re-read (spec MUST). A leaf the zone
+                // cannot give yet keeps whatever index the record has.
+                if pm.leaf_index.is_some() {
+                    m.leaf_index = pm.leaf_index;
+                }
                 m.rate_limit = Some(pm.rate_limit);
                 m.failed_reason = None;
                 m.retryable = None;
@@ -961,9 +959,9 @@ fn get_membership_state_impl(
     }
 
     let (leaf_index, rate_limit) = if pm.registered {
-        (pm.leaf_index, pm.rate_limit)
+        (pm.leaf_index.or(record.cache.leaf_index), pm.rate_limit)
     } else {
-        (record.cache.leaf_index.unwrap_or(0), record.cache.rate_limit.unwrap_or(0))
+        (record.cache.leaf_index, record.cache.rate_limit.unwrap_or(0))
     };
     let view = views::MembershipStateView::resolved(
         hash,
@@ -1051,7 +1049,7 @@ fn ensure_membership_impl(
                 &record.hash,
                 &registry.canonical,
                 record.cache.state,
-                record.cache.leaf_index.unwrap_or(0),
+                record.cache.leaf_index,
                 record.cache.rate_limit.unwrap_or(0),
             ));
         }
@@ -1176,9 +1174,12 @@ static LIFECYCLE: Mutex<()> = Mutex::new(());
 /// windows, begin maintenance, and clear any prior stop(). Idempotent —
 /// safe to call again to reconfigure. config_json:
 /// {"epoch_size_sec":N (required — the instance default), "max_epoch_gap"?:N,
-/// "registries"?:[<entry>,…]} where an entry is a CAIP-10 string, or an
-/// object {"registry_id":caip10, "epoch_size_sec"?:N, "max_epoch_gap"?:N}
-/// overriding the defaults for that registry.
+/// "zone_service"?:{peer_id, multiaddrs}, "registries"?:[<entry>,…]} where an
+/// entry is a CAIP-10 string, or an object {"registry_id":caip10,
+/// "epoch_size_sec"?:N, "max_epoch_gap"?:N, "zone_service"?:{…}} overriding
+/// the defaults for that registry. `zone_service` names the libp2p peer (or,
+/// for development, the HTTP base URL: {url}) that serves a registry's tree
+/// (see zone.rs).
 fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
     let _lifecycle = LIFECYCLE.lock().unwrap();
     panic_hook::install_once();
@@ -1211,8 +1212,13 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
     let mut tracked: Vec<String> = Vec::new();
     let mut overrides: std::collections::BTreeMap<String, RegistryOverride> =
         std::collections::BTreeMap::new();
-    let mut track = |raw: &str, over: Option<RegistryOverride>| {
+    let mut zone_peers: std::collections::HashMap<String, zone::ZoneService> =
+        std::collections::HashMap::new();
+    let mut track = |raw: &str, over: Option<RegistryOverride>, peer: Option<zone::ZoneService>| {
         if let Ok(registry) = registry_id::parse(raw) {
+            if let Some(peer) = peer {
+                zone_peers.insert(registry.canonical.clone(), peer);
+            }
             roots::track(&registry);
             if let Some(o) = over {
                 if o.epoch_size_sec.is_some() || o.max_epoch_gap.is_some() {
@@ -1227,7 +1233,7 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
     if let Some(arr) = cfg.get("registries").and_then(|x| x.as_array()) {
         for entry in arr {
             match entry {
-                serde_json::Value::String(raw) => track(raw, None),
+                serde_json::Value::String(raw) => track(raw, None, None),
                 serde_json::Value::Object(o) => {
                     let raw = o.get("registry_id").and_then(|x| x.as_str()).unwrap_or_default();
                     let over = RegistryOverride {
@@ -1240,7 +1246,8 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
                             .and_then(|x| x.as_u64())
                             .filter(|n| *n > 0),
                     };
-                    track(raw, Some(over));
+                    let peer = o.get("zone_service").and_then(zone::ZoneService::from_json);
+                    track(raw, Some(over), peer);
                 }
                 _ => {}
             }
@@ -1253,6 +1260,7 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
         .chain(overrides.values().filter_map(|o| o.epoch_size_sec))
         .collect();
     *lock(&CONFIG) = Some(ModuleConfig { epoch_size_sec, max_epoch_gap, overrides });
+    zone::configure(cfg.get("zone_service").and_then(zone::ZoneService::from_json), zone_peers);
     // A membership bound to a DIFFERENT epoch size can no longer generate
     // proofs; surface that at configure time. Warn-only — rejecting start()
     // would DoS validate_proof for every scope over one stale local
@@ -1382,16 +1390,21 @@ fn generate_proof_impl(
         .membership(&hash)
         .ok_or_else(|| ApiError::new(ErrorKind::UnknownMembership, "selected membership vanished"))?;
     // Leaf 0 is a VALID leaf: defaulting here would prove against the wrong
-    // membership and burn a message-id slot doing it. The cache is
-    // deliberately unauthenticated (lifecycle.rs), so refuse rather than
-    // guess — and refuse BEFORE the reservation below.
+    // membership and burn a message-id slot doing it, so refuse rather than
+    // guess — and refuse BEFORE the reservation below. A usable membership
+    // lacks one when the registry module did not send its registration (it
+    // reports the leaf a registration it sent claimed): not ready, rather
+    // than unknown.
     let leaf_index = record.cache.leaf_index.ok_or_else(|| {
         ApiError::new(
-            ErrorKind::UnknownMembership,
-            "the selected membership carries no leaf_index",
+            ErrorKind::NotReady,
+            "the selected membership has no leaf_index (the registry module did not \
+             report the leaf its registration claimed)",
         )
     })?;
     let rate_limit = record.cache.rate_limit.unwrap_or(0);
+    let own_leaf = proof::rate_commitment(&record.identity.identity_commitment, rate_limit)
+        .ok_or_else(|| ApiError::internal("stored identity_commitment is not a field element"))?;
 
     // Decrypt the credential in-module (requires an unlocked keystore).
     let credential = store.unseal_credential(&hash)?;
@@ -1403,7 +1416,7 @@ fn generate_proof_impl(
     let (path_elements_hex, path_indices) = match path_cache::hit(&hash, leaf_index) {
         Some(path) => path,
         None => {
-            path_cache::fill_path_cache(&registry, &hash, leaf_index, prov)?;
+            path_cache::fill_path_cache(&registry, &hash, leaf_index, &own_leaf, prov)?;
             path_cache::hit(&hash, leaf_index)
                 .ok_or_else(|| ApiError::internal("path cache: fetched path vanished before use"))?
         }
@@ -1738,9 +1751,10 @@ impl LogosRlnModuleImpl {
 impl LiblogosRlnModule for LogosRlnModuleImpl {
     fn on_context_ready(&self, ctx: &RustModuleContext) {
         panic_hook::install_once();
-        // The lp client to the sibling RLN module must be created on this
-        // (the host's main Qt) thread — see provider.rs.
+        // The lp clients (the sibling RLN module, libp2p_module) are warmed
+        // on this (the host's main Qt) thread — see provider.rs.
         provider::init_client();
+        zone::init_client();
         if ctx.instance_persistence_path.is_empty() {
             // No cwd fallback: a keystore in an unknown directory is worse
             // than a hard error at the first keystore op (see README).
@@ -2872,8 +2886,9 @@ mod tests {
     // client) — provider_failure proves a registry read was attempted. A
     // pre-filled cache (synthetic zero-sibling depth-20 path) must let
     // generate_proof succeed with ZERO registry I/O.
-    // The cache sits outside the authenticated surface, so an `active` row
-    // with no leaf_index is reachable by tampering. Leaf 0 is a valid leaf:
+    // An `active` row with no leaf_index is what a membership looks like
+    // until the registry module reports the leaf its registration claimed
+    // (and is reachable by tampering, the cache being unauthenticated). Leaf 0 is a valid leaf:
     // proving against it would spend a message-id slot on a proof no
     // verifier accepts, so the refusal must come BEFORE the reservation.
     #[test]
@@ -2916,7 +2931,7 @@ mod tests {
         let err =
             generate_proof_impl(Ok(store.clone()), &reg, &rln_id_hex, "aa", &now_unix().to_string())
                 .expect_err("a usable row without a leaf must not prove against leaf 0");
-        assert_eq!(err.kind, ErrorKind::UnknownMembership, "got: {}", err.message);
+        assert_eq!(err.kind, ErrorKind::NotReady, "got: {}", err.message);
         assert!(err.message.contains("leaf_index"), "got: {}", err.message);
 
         sealed_store::store::publish(None);
@@ -2929,6 +2944,13 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("rln-ms-path-cache-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        // Configured here rather than inherited from whichever test ran
+        // last: an epoch size, and a zone peer for the miss to dial (the
+        // dead transport answers it provider_failure).
+        start_impl(
+            r#"{"epoch_size_sec": 600, "zone_service": {"peer_id": "P", "multiaddr": "/ip4/127.0.0.1/tcp/1"}}"#,
+        )
+        .unwrap();
         let (imp, store) = imp_with_store(dir.clone());
         assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
 
@@ -3576,6 +3598,19 @@ mod tests {
                 r#"{{"credential":{{"identity_commitment":"{commitment}"}},"failed_reason":"metadata_tamper","leaf_index":7,"membership_hash":"fixture-hash","rate_limit":300,"registry_id":"{registry}","rln_identifier":"{rln_identifier}","state":"failed","submitted_at":1234567890,"tx_result":"tx-result-blob"}}"#
             )
         );
+
+        // A usable membership with no reported leaf reads
+        // leaf 0 — a real leaf — so it says so; one with its leaf does not.
+        let mut unindexed = record.clone();
+        unindexed.cache.state = MembershipState::Active;
+        unindexed.cache.failed_reason = None;
+        unindexed.cache.leaf_index = None;
+        let out = public_membership_json("fixture-hash", &unindexed, false, false, false);
+        assert_eq!(out["leaf_pending"], serde_json::json!(true), "got: {out}");
+        assert_eq!(out["leaf_index"], serde_json::json!(0), "got: {out}");
+        unindexed.cache.leaf_index = Some(0);
+        let out = public_membership_json("fixture-hash", &unindexed, false, false, false);
+        assert!(out.get("leaf_pending").is_none(), "got: {out}");
 
         // The absent case is pinned by the exact-shape asserts above.
         let bound_elsewhere = public_membership_json("fixture-hash", &record, false, false, true);

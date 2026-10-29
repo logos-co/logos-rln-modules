@@ -1,6 +1,6 @@
 [package]
 name = "rln_module"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 # std File::try_lock / TryLockError (keystore process lock) stabilized in 1.89.
 rust-version = "1.89"
@@ -39,6 +39,19 @@ rln = { version = "3.0.0", default-features = false }
 # ChaCha20Rng for zerokit's seeded keygen (the RNG is chosen at type level).
 rand_chacha = "0.3"
 
+# The zone query's request/response cross libp2p_module's protocolRequest as
+# base64 (src/zone.rs), as the gifter's do.
+base64 = "0.22"
+# A zone service named by URL (development) is the membership zone indexer's
+# JSON API, read with GETs (src/zone.rs); rustls so an https service can be
+# reached. The client the LEZ module uses for its sequencer reads.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+
 # The runtime SDK, staged by the module builder (codegen.rust) from the same
 # logos-rust-sdk rev its generator came from.
 logos-rust-sdk = { path = "../logos-rust-sdk-src" }
+
+[dev-dependencies]
+# The tree the membership zone builds (OptimalMerkleTree), so a test can prove
+# against the indexer's own paths.
+zerokit_utils = { version = "3.0.0", default-features = false }

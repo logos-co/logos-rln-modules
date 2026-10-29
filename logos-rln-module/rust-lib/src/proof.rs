@@ -33,7 +33,7 @@ use std::sync::LazyLock;
 
 use rand_chacha::ChaCha20Rng;
 use rln::prelude::{
-    compute_id_secret, graph_from_raw, hash_to_field_le, zkey_from_raw, ArkGroth16Backend, CanonicalDeserialize,
+    compute_id_secret, hash_to_field_le, ArkGroth16Backend, CanonicalDeserialize,
     CanonicalSerialize, Fr, Hasher, IdentityKeys, PoseidonHash, Proof, RLNBuilder, RLNMerkleProof,
     RLNProof, RLNProofValues, RLNWitnessInput, SecretFr, Stateless, VerifyProofError, RLN,
 };
@@ -44,19 +44,12 @@ use crate::registry_id::{bytes_to_hex, hex_to_bytes32, hex_to_vec};
 /// The circuit's fixed Merkle depth; a supplied path MUST have this length or
 /// witness construction fails.
 ///
-/// Not zerokit's default of 20 any more. LEZ v0.2.5 meters a transaction by its
-/// gas limit at one gas per cycle and refuses anything over ten million, and an
-/// on-chain merkle insert costs ~902,000 cycles per level — so a depth-20 tree
-/// cannot be registered into at all. The registry is depth 9 now, and this is
-/// the smallest circuit zerokit publishes that can cover it.
-pub(crate) const RLN_TREE_DEPTH: usize = 10;
-
-/// zerokit ships depth-10 artifacts in its repository but excludes them from
-/// the crates.io package to stay under the size limit, so they are vendored
-/// here. Verified identical in circuit version to the crate's embedded
-/// depth-20 pair, which matches the repository's byte for byte.
-const DEPTH_10_GRAPH: &[u8] = include_bytes!("../resources/tree_depth_10/graph.bin");
-const DEPTH_10_ZKEY: &[u8] = include_bytes!("../resources/tree_depth_10/rln_final.arkzkey");
+/// zerokit's default of 20 again (0.14.0): the tree is off chain, built by the
+/// membership zone (logos-rln-membership-zone) at the depth zerokit ships, so
+/// the on-chain insert cost that forced a depth-10 circuit (until 0.13.x) is
+/// gone. Every prover and verifier of a registry must use the same depth: a
+/// proof from a depth-10 module does not verify here, nor the reverse.
+pub(crate) const RLN_TREE_DEPTH: usize = rln::prelude::DEFAULT_TREE_DEPTH;
 
 /// Failures the proof engine can raise. `Invalid` is NOT modelled here — a
 /// proof that simply does not verify is `Ok(false)` from [`verify`], so the
@@ -298,22 +291,11 @@ impl RateLimitProof {
     }
 }
 
-/// The stateless RLN engine over the embedded Single-mode circuit, built
-/// once — the zkey/graph clones are several MB, too expensive to repeat on
-/// the per-message verify path.
+/// The stateless RLN engine over the crate's embedded Single-mode circuit
+/// (depth `DEFAULT_TREE_DEPTH`), built once — the zkey/graph clones are
+/// several MB, too expensive to repeat on the per-message verify path.
 static RLN_STATELESS: LazyLock<RLN<Stateless, ArkGroth16Backend<PoseidonHash>>> =
-    LazyLock::new(|| {
-        // `graph_from_raw` is told the depth it should find, so a mismatched
-        // artifact fails loudly here at first use rather than producing proofs
-        // against a tree shape nobody expects.
-        RLNBuilder::stateless()
-            .graph(
-                graph_from_raw(DEPTH_10_GRAPH, Some(RLN_TREE_DEPTH), None)
-                    .expect("vendored depth-10 graph must load"),
-            )
-            .zkey(zkey_from_raw(DEPTH_10_ZKEY).expect("vendored depth-10 zkey must load"))
-            .build()
-    });
+    LazyLock::new(|| RLNBuilder::stateless().build());
 
 /// The Single-mode `y` and `nullifier` out of zerokit's mode-generic proof
 /// values. This module only ever produces/parses Single-mode proofs, so a
@@ -477,6 +459,18 @@ pub(crate) mod depth_bridge {
         }
         fr_to_hex(&root)
     }
+}
+
+/// A membership's leaf, `rate_commitment = poseidon(id_commitment,
+/// rate_limit)` little-endian — what the zone service inserts for a
+/// `Registered` event, and so what a membership is found by in its tree.
+/// `None` when the commitment is not a canonical field element.
+pub(crate) fn rate_commitment(id_commitment_hex: &str, rate_limit: u64) -> Option<[u8; 32]> {
+    let id = hex_to_fr(id_commitment_hex, "id_commitment").ok()?;
+    let leaf = Hasher::<PoseidonHash>::hash_pair(id, Fr::from(rate_limit));
+    let mut out = [0u8; 32];
+    leaf.serialize_compressed(&mut out[..]).ok()?;
+    Some(out)
 }
 
 /// LE-hex 32-byte string → `Fr`. A non-canonical value (≥ the field modulus)
@@ -753,14 +747,14 @@ mod tests {
     // are randomized, so the proof is pinned structurally (layout) while its
     // public values are pinned byte-exact. Inputs: seed = 32×0x07,
     // rln_identifier = 32×0x09, epoch index = 1231028105, signal =
-    // "Hello, RLN!", zero-sibling all-left depth-10 path.
+    // "Hello, RLN!", zero-sibling all-left depth-20 path.
     // A change here breaks cross-node verification — never rebind silently.
     //
-    // REBOUND for the depth-10 circuit. `root` is the only value that moved,
-    // because the circuit folds the path to produce it and the path is now ten
-    // levels rather than twenty; every other value here is depth-independent
-    // and is unchanged, which is the evidence that nothing else shifted. Every
-    // verifier must ship the depth-10 artifacts for these to match.
+    // REBOUND to the depth-20 circuit (0.14.0), the root it had before the
+    // depth-10 on-chain tree. `root` is the only value that moved,
+    // because the circuit folds the path to produce it; every other value here
+    // is depth-independent and is unchanged, which is the evidence that
+    // nothing else shifted.
     #[test]
     fn frozen_interop_vectors() {
         // Identity derivation (zerokit seeded keygen, LE hex).
@@ -795,7 +789,7 @@ mod tests {
             .to_json();
         assert_eq!(
             j["root"].as_str().unwrap(),
-            "16f5e233ad4c8ee7d66d1b0909f942e3384eb12721296690d340cc77ff41aa1b"
+            "e6b1124d580df28efdb5a009ee7eb485cc33625df6b98fc058054217160d8a07"
         );
         assert_eq!(
             j["nullifier"].as_str().unwrap(),

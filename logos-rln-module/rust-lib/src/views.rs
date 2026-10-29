@@ -36,6 +36,12 @@ pub(crate) struct MembershipView {
     #[serde(skip_serializing_if = "Option::is_none")]
     failed_reason: Option<String>,
     leaf_index: u64,
+    /// `true` while a registered membership has no leaf index (the registry
+    /// module reports the leaf a registration it sent claimed, and did not
+    /// send this one): `leaf_index` then reads 0,
+    /// which is also a real leaf. Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leaf_pending: Option<bool>,
     membership_hash: String,
     rate_limit: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -80,6 +86,8 @@ impl MembershipView {
             epoch_size_mismatch: epoch_size_mismatch.then_some(true),
             failed_reason,
             leaf_index: cache.leaf_index.unwrap_or(0),
+            leaf_pending: (!quarantined && cache.state.is_usable() && cache.leaf_index.is_none())
+                .then_some(true),
             membership_hash: hash.to_string(),
             rate_limit: cache.rate_limit.unwrap_or(0),
             rate_limit_mismatch: rate_limit_mismatch.then_some(true),
@@ -103,6 +111,11 @@ impl MembershipView {
 pub(crate) struct MembershipStateView {
     #[serde(skip_serializing_if = "Option::is_none")]
     leaf_index: Option<u64>,
+    /// As on `MembershipView`: a usable membership whose leaf the registry
+    /// module has not reported yet, whose `leaf_index` reads 0. Omitted
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leaf_pending: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     membership_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -175,6 +188,7 @@ impl MembershipStateView {
     pub(crate) fn unknown(registry_id: &str) -> Self {
         MembershipStateView {
             leaf_index: None,
+            leaf_pending: None,
             membership_hash: None,
             rate_limit: None,
             provisioning: None,
@@ -193,12 +207,13 @@ impl MembershipStateView {
         hash: &str,
         registry_id: &str,
         state: MembershipState,
-        leaf_index: u64,
+        leaf_index: Option<u64>,
         rate_limit: u64,
     ) -> Self {
         MembershipStateView {
             provisioning: None,
-            leaf_index: Some(leaf_index),
+            leaf_index: Some(leaf_index.unwrap_or(0)),
+            leaf_pending: (state.is_usable() && leaf_index.is_none()).then_some(true),
             membership_hash: Some(hash.to_string()),
             rate_limit: Some(rate_limit),
             registry_id: registry_id.to_string(),

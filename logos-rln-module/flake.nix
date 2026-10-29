@@ -79,6 +79,7 @@
                 --concurrency multi \
                 --protocol-version ${protocolVersion} \
                 --dep liblogos_lez_rln_module="$root/rust-lib/deps/liblogos_lez_rln_module.lidl" \
+                --dep libp2p_module="$root/rust-lib/deps/libp2p_module.lidl" \
                 -o "$root/rust-lib/generated/provider_gen.rs"
               echo "staging the SDK source at logos-rust-sdk-src/ ..."
               rm -rf "''${root:?}/logos-rust-sdk-src"

@@ -16,7 +16,8 @@ use crate::registry_id::{hex_to_bytes32, CanonicalRegistryId};
 use crate::{lock, provider, ApiError, ErrorKind};
 
 /// Refresh cadence. Roots rotate over seconds–minutes and the window carries
-/// few historical roots (lez-rln ROOT_HISTORY_SIZE = 4); 10s keeps proofs
+/// few historical roots (the zone service's latest five —
+/// `zone_wire::ROOTS_WINDOW`); 10s keeps proofs
 /// against freshly published roots from being falsely rejected.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -71,6 +72,27 @@ pub(crate) fn adopt(canonical: &str, roots: Vec<[u8; 32]>) {
         canonical.to_string(),
         Window { roots, updated_at: crate::now_unix() },
     );
+}
+
+/// Admit the one root a proof was fetched against — the zone service's latest
+/// — into the window, newest first, keeping it at `ROOTS_WINDOW` roots. Like
+/// [`adopt`], so a node can validate a proof it just generated; unlike it,
+/// the rest of the window stands, since one root is not a window. The
+/// window's age is left alone: only a full refresh makes a window fresh.
+/// With no window yet, the root alone is one.
+pub(crate) fn admit(canonical: &str, root: [u8; 32]) {
+    let mut guard = lock(&WINDOWS);
+    let windows = guard.get_or_insert_with(HashMap::new);
+    match windows.get_mut(canonical) {
+        Some(w) if w.roots.contains(&root) => {}
+        Some(w) => {
+            w.roots.insert(0, root);
+            w.roots.truncate(crate::zone_wire::ROOTS_WINDOW as usize);
+        }
+        None => {
+            windows.insert(canonical.to_string(), Window { roots: vec![root], updated_at: crate::now_unix() });
+        }
+    }
 }
 
 /// Track a registry's roots and ensure the background refresher is running.
@@ -190,6 +212,20 @@ mod tests {
     #[test]
     fn cold_registry_has_no_window() {
         assert!(window("logos:local:never-refreshed").is_none());
+    }
+
+    #[test]
+    fn admit_puts_a_proofs_root_first_and_keeps_the_window_size() {
+        let canonical = "logos:local:admit-test";
+        admit(canonical, [1; 32]);
+        assert_eq!(window(canonical), Some(vec![[1; 32]]), "no window yet: the root alone is one");
+        adopt(canonical, (2..=6).map(|n| [n; 32]).collect());
+        admit(canonical, [4; 32]);
+        assert_eq!(window(canonical).unwrap()[0], [2; 32], "a root already in the window moves nothing");
+        admit(canonical, [9; 32]);
+        let w = window(canonical).unwrap();
+        assert_eq!(w.len(), crate::zone_wire::ROOTS_WINDOW as usize);
+        assert_eq!((w[0], w[4]), ([9; 32], [5; 32]), "newest first; the oldest drops out");
     }
 
     #[test]

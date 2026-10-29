@@ -3,17 +3,18 @@
 ; ../../logos-lez-rln-module/rust-lib/liblogos_lez_rln_module.lidl (same repo):
 ; update BOTH files in the same PR when either side changes. Wired via
 ; metadata.json dependency_overrides; logos-lidl-gen turns it into the typed
-; LiblogosLezRlnModuleClient — unused at runtime (provider.rs speaks raw lp_*
-; for per-call timeouts, like the sibling's wallet path) but the client
-; documents the consumed wire.
+; LiblogosLezRlnModuleClient that provider.rs calls (the *_async_with_timeout
+; twins, for per-call timeouts).
 module liblogos_lez_rln_module {
-  version "5.1.0"
+  version "7.0.0"
 
   ; All replies are compact JSON strings; "" is the error value.
 
   ; Idempotent on-chain registration; {"leaf_index":N,"pending":true,
-  ; "tx_result":…} (leaf_index is a pre-submit ESTIMATE) or
-  ; {"already_registered":true,"leaf_index":N}.
+  ; "tx_result":…} or {"already_registered":true,"leaf_index"?:N}. leaf_index
+  ; is that send's claim on the config's next_leaf_index, which a registration
+  ; landing first can move (the sibling re-sends with the next); this module
+  ; takes the final index from get_membership instead.
   ;
   ; Since v4.0.0 parameter 2 is the PAYER, not a token holding: it signs the
   ; tx, pays rate_limit x price_per_unit of NATIVE balance and pays the fee.
@@ -25,8 +26,11 @@ module liblogos_lez_rln_module {
 
   ; Membership PDA read + state from the on-chain clock: {"registered":false}
   ; or {"clock_timestamp":N,"grace_period_duration":N,
-  ; "grace_period_start_timestamp":N,"leaf_index":N,"rate_limit":N,
+  ; "grace_period_start_timestamp":N,"leaf_index"?:N,"rate_limit":N,
   ; "registered":true,"state":"active"|"grace_period"|"expired"}.
+  ; leaf_index (since v7.0.0) is the claim of the send that landed, recorded
+  ; by the sibling that sent it; absent when another sender registered it, and
+  ; then this membership cannot prove.
   ; clock_timestamp and grace_period_start_timestamp are MILLISECONDS
   ; (CLOCK_50); grace_period_duration is SECONDS.
   method get_membership(config_account_id: tstr, id_commitment_hex: tstr) -> tstr
@@ -38,20 +42,6 @@ module liblogos_lez_rln_module {
   ; active_duration and grace_period_duration are SECONDS.
   method get_registry_bounds(config_account_id: tstr) -> tstr
 
-  ; JSON array of proof objects (each with valid_roots from the same tree
-  ; snapshot); "[]" for an empty index list.
-  method get_merkle_proofs(config_account_id: tstr, leaf_indices_json: tstr) -> tstr
-
-  ; {"depth":N,"valid_roots":[…]} — the tree depth and its 32-byte
-  ; lowercase-hex roots (current + non-zero history).
-  ;
-  ; The consumer LIFTS these to the prover circuit depth before they reach the
-  ; valid-root window, which is why the depth has to travel with them: a proof
-  ; carries a lifted root, so an unlifted window matches nothing and a node
-  ; rejects proofs it generated itself. v3.0.0 and earlier answered a bare
-  ; array. See provider::lift_roots_reply.
-  method get_valid_roots(rln_account_id_hex: tstr) -> tstr
-
   ; Whether that module's own wallet is open and usable, and which account it
   ; pays with:
   ; {"detail":s,"network":s,"payer":hex64,"ready":b,
@@ -59,8 +49,10 @@ module liblogos_lez_rln_module {
   ; Never fails and never touches the chain. `network` (since v4.1.0) is the
   ; network the wallet home is recorded as bound to, "" while unbound or
   ; operator-configured; an unbound home stays "pending" until use_network.
-  ; Since v3.0.0 the provider links the LEZ wallet crate and brings a wallet
-  ; up itself, so every method above answers "" until this reports ready.
+  ; The provider brings its wallet up itself — since v7.0.0 the lez_core
+  ; module's, which it opens when nothing else has — so every method above
+  ; answers "" until this reports ready. `payer` is the best-funded account
+  ; in that wallet, or the one to fund when none is.
   ; Branch on `state`: "pending" is worth retrying, "failed" is not.
   method wallet_status() -> tstr
 

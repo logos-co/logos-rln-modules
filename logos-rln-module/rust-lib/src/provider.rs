@@ -4,6 +4,13 @@
 //! client (`modules().liblogos_lez_rln_module`), plus a `PluginProxy` to the
 //! gifter module.
 //!
+//! The registry's merkle tree is not the sibling's to serve any more (lez
+//! 7.0.0): the program keeps none, and roots and proofs come from the
+//! registry's zone service (`zone.rs`). The sibling still answers everything
+//! that is chain state — the membership record, bounds, the registration
+//! transaction, its wallet — and the leaf index, which it knows because it
+//! sent the registration that claimed it.
+//!
 //! Every outbound call carries its own timeout (`READ_TIMEOUT`,
 //! `REGISTER_TIMEOUT`, `GIFTER_REQUEST_TIMEOUT`) through the SDK's
 //! `*_with_timeout` entry points; the raw `lp_*` C ABI this file used to bind
@@ -373,7 +380,11 @@ pub(crate) struct ProviderMembership {
     /// active | grace_period | expired (meaningful only when registered;
     /// `Unknown` placeholder otherwise, never read while `!registered`).
     pub(crate) state: MembershipState,
-    pub(crate) leaf_index: u64,
+    /// Where the membership's leaf sits in the zone tree, as the registry
+    /// module that sent the registration recorded it (the claim of the send
+    /// that landed). `None` when it did not send it — callers keep whatever
+    /// index they had.
+    pub(crate) leaf_index: Option<u64>,
     pub(crate) rate_limit: u64,
 }
 
@@ -495,12 +506,13 @@ fn explained(
     }
 }
 
-/// Turn a sibling `get_valid_roots` reply into roots at the prover's circuit
+/// Turn a `{"depth":N,"valid_roots":[…]}` roots reply (the zone service's,
+/// as `zone::valid_roots` shapes it) into roots at the prover's circuit
 /// depth.
 ///
-/// A registry may be shallower than the circuit — ours is depth 9 against a
-/// depth-10 circuit — and `generate_proof` lifts its path and root to the
-/// circuit's depth. The valid-root window has to hold the same shape or the
+/// A registry may be shallower than the circuit (the membership zone's tree
+/// is 20, the circuit's, and lifts by nothing), and `generate_proof` lifts
+/// its path and root to the circuit's depth. The valid-root window has to hold the same shape or the
 /// comparison in `validate_proof` can never match, and a node rejects proofs
 /// it made itself. The lift belongs here because this is the one place every
 /// consumer of these roots goes through.
@@ -567,9 +579,8 @@ fn provider_failure(method: &str) -> ApiError {
 /// `registered` most of all — the poller treats an authoritative "not
 /// registered" as proof a live membership was erased and acts destructively,
 /// so a reply that never said it must degrade to `ProviderFailure`, which
-/// leaves the record untouched. (`leaf_index` has the same hazard from the
-/// other side: leaf 0 is a VALID leaf, so defaulting would prove against the
-/// wrong membership.)
+/// leaves the record untouched. `leaf_index` is optional: the sibling
+/// answers it only for a registration it sent (since lez 7.0.0).
 fn parse_membership_reply(raw: &str) -> Result<ProviderMembership, ApiError> {
     let fault = |msg: String| ApiError::new(ErrorKind::ProviderFailure, &msg);
     let v: serde_json::Value = serde_json::from_str(raw)
@@ -582,7 +593,7 @@ fn parse_membership_reply(raw: &str) -> Result<ProviderMembership, ApiError> {
         return Ok(ProviderMembership {
             registered: false,
             state: MembershipState::Unknown,
-            leaf_index: 0,
+            leaf_index: None,
             rate_limit: 0,
         });
     }
@@ -597,7 +608,7 @@ fn parse_membership_reply(raw: &str) -> Result<ProviderMembership, ApiError> {
             v.get("state").cloned().unwrap_or(serde_json::Value::Null),
         )
         .map_err(|_| fault("get_membership: unrecognized state".to_string()))?,
-        leaf_index: required("leaf_index")?,
+        leaf_index: v.get("leaf_index").and_then(serde_json::Value::as_u64),
         rate_limit: required("rate_limit")?,
     })
 }
@@ -685,57 +696,21 @@ impl RegistryProvider for LezRlnProvider {
         })
     }
 
+    /// From the zone service: the chain keeps no tree since lez 7.0.0.
     fn get_merkle_proof(
         &self,
         registry: &CanonicalRegistryId,
         leaf_index: u64,
     ) -> Result<serde_json::Value, ApiError> {
-        ensure_network(registry)?;
-        let client = lez_client();
-        let indices = format!("[{leaf_index}]");
-        let raw = read_reply(
-            "get_merkle_proofs",
-            await_reply("get_merkle_proofs", READ_TIMEOUT, |done| {
-                client.get_merkle_proofs_async_with_timeout(
-                    &registry.account,
-                    &indices,
-                    READ_TIMEOUT,
-                    done,
-                )
-            }),
-        )
-        .map_err(|e| explained(self, registry, e))?;
-        let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-            ApiError::new(ErrorKind::ProviderFailure, &format!("proofs reply parse: {e}"))
-        })?;
-        v.as_array()
-            .and_then(|arr| arr.first())
-            .cloned()
-            .ok_or_else(|| {
-                ApiError::new(
-                    ErrorKind::ProviderFailure,
-                    "empty proof array (leaf out of range?)",
-                )
-            })
+        crate::zone::merkle_proof(registry, leaf_index)
     }
 
+    /// From the zone service: its latest five roots.
     fn get_valid_roots(
         &self,
         registry: &CanonicalRegistryId,
     ) -> Result<Vec<String>, ApiError> {
-        ensure_network(registry)?;
-        let client = lez_client();
-        let raw = read_reply(
-            "get_valid_roots",
-            await_reply("get_valid_roots", READ_TIMEOUT, |done| {
-                client.get_valid_roots_async_with_timeout(&registry.account, READ_TIMEOUT, done)
-            }),
-        )
-        .map_err(|e| explained(self, registry, e))?;
-        let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-            ApiError::new(ErrorKind::ProviderFailure, &format!("roots reply parse: {e}"))
-        })?;
-        lift_roots_reply(&parsed)
+        lift_roots_reply(&crate::zone::valid_roots(registry)?)
     }
 
     fn get_registry_bounds(
@@ -882,6 +857,99 @@ mod lp_test_transport {
 
 #[cfg(test)]
 mod tests {
+    /// The membership zone's answers, end to end into a proof that verifies.
+    ///
+    /// The tree and JSON are built the way logos-rln-membership-zone builds
+    /// them (zerokit's `OptimalMerkleTree` at depth 20, leaf
+    /// `poseidon(id_commitment, rate_limit)` at the registration's index; the
+    /// `/roots` and `/merkle_proof` bodies of its JSON API), not by this
+    /// crate's fake, so the byte order, path order and direction bits are the
+    /// indexer's. The proof goes through the real provider, the HTTP client,
+    /// the path cache and the prover.
+    #[test]
+    fn a_membership_zone_proof_verifies_against_its_roots() {
+        use rln::prelude::{CanonicalSerialize, Fr, PoseidonHash};
+        use zerokit_utils::merkle_tree::{OptimalMerkleTree, ZerokitMerkleProof, ZerokitMerkleTree};
+
+        use crate::registry_id::{bytes_to_hex, hex_to_bytes32};
+
+        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let hex = |f: &Fr| {
+            let mut b = [0u8; 32];
+            f.serialize_compressed(&mut b[..]).unwrap();
+            bytes_to_hex(&b)
+        };
+        let fr = |b: [u8; 32]| <Fr as rln::prelude::CanonicalDeserialize>::deserialize_compressed(&b[..]).unwrap();
+        let other = |n: u8| crate::proof::rate_commitment(&format!("{n:02x}{}", "00".repeat(31)), 100).unwrap();
+
+        let (id_commitment, secret) = crate::proof::generate_identity().unwrap();
+        let own = crate::proof::rate_commitment(&id_commitment, 100).unwrap();
+        let mut tree = OptimalMerkleTree::<PoseidonHash>::default(20).unwrap();
+        tree.set(0, fr(other(1))).unwrap();
+        tree.set(1, fr(other(2))).unwrap();
+        tree.set(3, fr(other(3))).unwrap();
+        tree.delete(3).unwrap();
+        let before = hex(&tree.root());
+        tree.set(2, fr(own)).unwrap();
+        let root = hex(&tree.root());
+        let path = tree.proof(2).unwrap();
+
+        let roots_body = serde_json::json!({
+            "latest_lez_block_id": 9, "lez_timestamp_ms": 9_000, "covered_to_lez_block_id": 9,
+            "roots": [
+                {"root": "0f".repeat(32), "status": "pending", "from_lez_block_id": 9, "to_lez_block_id": 9,
+                 "change_count": 1, "published_at_unix": 3, "tx_hash": "aa".repeat(32), "msg_id": "bb".repeat(32)},
+                {"root": root, "status": "adopted", "from_lez_block_id": 5, "to_lez_block_id": 8,
+                 "change_count": 1, "published_at_unix": 2, "tx_hash": "cc".repeat(32), "msg_id": "dd".repeat(32)},
+                {"root": before, "status": "finalized", "l1_slot": 40, "from_lez_block_id": 1, "to_lez_block_id": 4,
+                 "change_count": 4, "published_at_unix": 1, "tx_hash": "ee".repeat(32), "msg_id": "ff".repeat(32)},
+            ],
+        })
+        .to_string();
+        let proof_body = serde_json::json!({
+            "root": root, "to_lez_block_id": 8, "status": {"status": "adopted"},
+            "leaf_index": 2, "rate_commitment": bytes_to_hex(&own),
+            "path_elements": path.get_path_elements().iter().map(hex).collect::<Vec<_>>(),
+            "identity_path_index": path.get_path_index(),
+        })
+        .to_string();
+        let url = crate::zone::fake::serve_json(
+            move |p| match p {
+                "/roots/5" => (200, roots_body.clone()),
+                "/merkle_proof/2" => (200, proof_body.clone()),
+                _ => (404, r#"{"error":"not found"}"#.to_owned()),
+            },
+            2,
+        );
+        let registry = crate::registry_id::parse(&format!("logos:zone-e2e-test:{}", "ab".repeat(32))).unwrap();
+        crate::zone::configure(
+            None,
+            std::collections::HashMap::from([(registry.canonical.clone(), crate::zone::ZoneService::Http { url })]),
+        );
+
+        let prov: &dyn super::RegistryProvider = &super::LEZ_RLN;
+        let hash = "provider-test-zone-proof";
+        crate::path_cache::fill_path_cache(&registry, hash, 2, &own, prov).unwrap();
+        let (path_elements_hex, path_indices) = crate::path_cache::hit(hash, 2).unwrap();
+        let material = crate::proof::WitnessMaterial {
+            identity_secret_hash_hex: secret,
+            rate_limit: 100,
+            message_id: 0,
+            path_elements_hex,
+            path_indices,
+        };
+        let proof = crate::proof::generate(&material, b"zone", 42, &[7u8; 32]).unwrap();
+        let window: Vec<[u8; 32]> =
+            prov.get_valid_roots(&registry).unwrap().iter().map(|r| hex_to_bytes32(r).unwrap()).collect();
+        crate::zone::configure(None, std::collections::HashMap::new());
+
+        let (root, before) = (hex_to_bytes32(&root).unwrap(), hex_to_bytes32(&before).unwrap());
+        assert_eq!(window, vec![[0x0f; 32], root, before], "every listed root, the pending one too");
+        assert!(crate::proof::verify(&proof, b"zone", &window).unwrap(), "the indexer's path proves against its root");
+        assert!(!crate::proof::verify(&proof, b"zone", &[before]).unwrap(), "and not against the root before the leaf");
+        assert_eq!(crate::roots::window(&registry.canonical), Some(vec![root]), "the proof's root is admitted");
+    }
+
     /// A registry shallower than the circuit must come back LIFTED.
     ///
     /// This is the regression for a node rejecting proofs it generated
@@ -988,17 +1056,24 @@ mod tests {
 
     #[test]
     fn a_registered_member_needs_every_contract_field() {
-        let Ok(pm) = parse_membership_reply(
-            r#"{"registered":true,"state":"active","leaf_index":0,"rate_limit":100}"#,
-        ) else {
+        // leaf_index is optional: the sibling knows it only for a
+        // registration it sent.
+        let Ok(pm) =
+            parse_membership_reply(r#"{"registered":true,"state":"active","rate_limit":100}"#)
+        else {
             panic!("a complete reply must decode");
         };
         assert!(pm.registered);
-        assert_eq!(pm.leaf_index, 0, "leaf 0 is a valid leaf");
+        assert_eq!(pm.leaf_index, None, "another sender's registration carries no leaf");
         assert_eq!(pm.rate_limit, 100);
+        let Ok(pm) = parse_membership_reply(
+            r#"{"registered":true,"state":"active","rate_limit":100,"leaf_index":0}"#,
+        ) else {
+            panic!("a reply with the sender's claim must decode");
+        };
+        assert_eq!(pm.leaf_index, Some(0), "leaf 0 is a leaf");
 
         for raw in [
-            r#"{"registered":true,"state":"active","rate_limit":100}"#,
             r#"{"registered":true,"state":"active","leaf_index":7}"#,
             r#"{"registered":true,"leaf_index":7,"rate_limit":100}"#,
         ] {
@@ -1018,6 +1093,7 @@ mod tests {
         assert!(provider.get_membership(&registry, &"11".repeat(32)).is_err());
         assert!(provider.get_merkle_proof(&registry, 0).is_err());
         assert!(provider.get_valid_roots(&registry).is_err());
+        assert!(provider.get_registry_bounds(&registry).is_err());
         assert!(provider.fee_state().is_err());
         // Fire-and-record: a submission the SDK cannot dispatch (no client)
         // is a synchronous provider_failure, and the callback is NOT also
@@ -1158,7 +1234,7 @@ mod tests {
         // And every provider method that takes the registry refuses with it.
         let provider = provider_for("logos").unwrap();
         assert_eq!(
-            provider.get_valid_roots(&registry).unwrap_err().kind,
+            provider.get_registry_bounds(&registry).unwrap_err().kind,
             ErrorKind::UnknownRegistry
         );
         lock(&NETWORK_GATE).remove(&registry.reference);

@@ -14,9 +14,24 @@ secret never crosses the module boundary. Proof crypto is zerokit `rln`
 (stateless) in-crate; the lez-rln registry provider (the `logos` CAIP-10
 namespace) stays a wire client of the sibling
 [`../logos-lez-rln-module`](../logos-lez-rln-module) for chain access (PDA
-derivation, clock reads, tx submission, Merkle proofs, valid roots), and
-delegated registration drives `rln_gifter_module` with the module's own
-commitment. No rln-layouts / risc0 dependencies.
+derivation, clock reads, tx submission), and delegated registration drives
+`rln_gifter_module` with the module's own commitment. No rln-layouts / risc0
+dependencies.
+
+Since 0.14.0 a `logos` registry's merkle tree is not on chain: the
+registration program emits events and a **zone service** builds the tree from
+them. The module asks that service, as protobuf over libp2p through
+`libp2p_module`'s `protocolRequest` (or, for development, the Zone indexer's
+JSON API over HTTP), for the valid roots (its newest five published roots,
+whatever their status) and one leaf's proof at the root it serves. The leaf
+index comes from the registry module, which sent the registration that
+claimed it; the proof's leaf is checked against the membership's own before
+its path is used. `libp2p_module` is a declared dependency (contract:
+`rust-lib/deps/libp2p_module.lidl`), so installing or loading this module
+brings it along. The protocol is [`docs/zone-query.md`](docs/zone-query.md);
+the service comes from `start()`'s `zone_service` (`{"peer_id":…,
+"multiaddrs":[…]}` or `{"url":…}`), else `LOGOS_RLN_ZONE_PEER_ID` +
+`LOGOS_RLN_ZONE_MULTIADDR` or `LOGOS_RLN_ZONE_URL`.
 
 ## Spec surface → wire methods
 
@@ -75,6 +90,10 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   per-registry cache (10s tick; >60s-stale = cold) that `validate_proof`
   serves from with no registry access on the hot path; cold = `not_ready`,
   never a false reject.
+- `rust-lib/src/zone.rs` + `zone_wire.rs` — the zone service client: peer
+  configuration, the libp2p exchange, response validation (the roots and
+  proof queries); and the hand-rolled protobuf codec for
+  `/logos/rln/zone-query/1.0.0`, mirroring the indexer's JSON.
 - `rust-lib/src/registry_id.rs` — CAIP-10 parse/canonicalize +
   `membership_hash` (the spec's SHA256 construction; frozen test vector).
 - `rust-lib/src/sealed_store/` — the keystore: Argon2id → HKDF sub-keys →
@@ -195,10 +214,14 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   keys); failures are `{"error":{"class":…,"kind":…,"message":…}}` —
   switch on `class`, log `kind`. The sibling module's `""`-on-error
   convention is NOT used here.
-- **Provisional leaf_index.** `register` returns the provider's pre-submit
-  estimate; the authoritative value is re-read from the registry at the
-  pending→active transition (spec MUST). Consumers needing the leaf for
-  proofs should read it after the membership reports `active`.
+- **Leaf index from the registry module.** The chain assigns one (the
+  config's `next_leaf_index`) but records it only in the `Registered` event,
+  and a racing registration can move it before the send lands, so `register`
+  returns none; the poller takes it from the registry module's
+  `get_membership`, which answers the claim of the send that landed, possibly
+  a tick after the membership reports `active`. Until then the Membership
+  view carries `leaf_pending:true` (and `leaf_index` 0) and `generate_proof`
+  answers `not_ready`.
 
 ## Staged sources (not committed)
 

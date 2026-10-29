@@ -1,0 +1,13 @@
+; libp2p_module contract — the subset the membership module's zone service
+; client (zone.rs) drives. Copied from the LIDL libp2p_module 1.1.0 publishes
+; (assets/lidl/libp2p_module.lidl in its catalog package); keep the signature
+; in step with it. Wired via metadata.json dependency_overrides; logos-lidl-gen
+; turns it into the typed Libp2pModuleClient.
+module libp2p_module {
+  version "1.1.0"
+
+  ; One request→response exchange on a fresh stream. argsJson:
+  ; {"peerId":s,"multiaddrs":[s,…],"proto":s,"requestB64":s,"timeoutMs":N};
+  ; the value carries "responseB64".
+  method protocolRequest(argsJson: tstr) -> result
+}

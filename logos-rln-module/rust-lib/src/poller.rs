@@ -3,8 +3,10 @@
 //!
 //! 1. every tick (15s), re-reads each `pending` membership from its
 //!    registry: observed ⇒ pending→active with the AUTHORITATIVE
-//!    leaf_index + rate_limit re-read into the store (spec MUST — the
-//!    submit-time values are estimates); not observed past the
+//!    rate_limit re-read into the store (spec MUST), and the leaf_index the
+//!    registry module reports once the registration it sent has landed (the
+//!    chain records it only in the Registered event); a usable record still
+//!    without a leaf index is re-read every tick until it has one; not observed past the
 //!    confirmation window ⇒ pending→failed. A provider failure leaves the
 //!    record pending — an unreachable registry proves nothing about the
 //!    submission.
@@ -99,7 +101,8 @@ fn observe(record: &MembershipRecord) -> Option<RecordUpdate> {
 enum RecordUpdate {
     Observed {
         state: MembershipState,
-        leaf_index: u64,
+        /// `None` while the zone has no leaf for it: keep the stored one.
+        leaf_index: Option<u64>,
         rate_limit: u64,
     },
     Absent,
@@ -107,16 +110,19 @@ enum RecordUpdate {
 
 /// Confirm/refresh write shared by both Observed branches: record the
 /// registry's authoritative state/leaf_index/rate_limit and clear any
-/// failed_reason/retryable.
+/// failed_reason/retryable. A leaf index the zone could not supply leaves the
+/// stored one alone: indices are never reused, so a known one stays right.
 fn apply_observed(
     hash: &str,
     state: MembershipState,
-    leaf_index: u64,
+    leaf_index: Option<u64>,
     rate_limit: u64,
 ) -> Result<MembershipState, crate::ApiError> {
     sealed::current_or_uninit()?.update_cache(hash, |m| {
         m.state = state;
-        m.leaf_index = Some(leaf_index);
+        if leaf_index.is_some() {
+            m.leaf_index = leaf_index;
+        }
         m.rate_limit = Some(rate_limit);
         m.failed_reason = None;
         m.retryable = None;
@@ -171,7 +177,14 @@ fn tick(refresh_states: bool) {
                 }
                 Ok(prior) => {
                     emit_transition(hash, &record, prior, state);
-                    eprintln!("membership poller: {hash} confirmed {state:?} at leaf {leaf_index}")
+                    match leaf_index {
+                        Some(leaf) => {
+                            eprintln!("membership poller: {hash} confirmed {state:?} at leaf {leaf}")
+                        }
+                        None => eprintln!(
+                            "membership poller: {hash} confirmed {state:?}; leaf not in the zone tree yet"
+                        ),
+                    }
                 }
             },
             Some(RecordUpdate::Absent)
@@ -199,19 +212,26 @@ fn tick(refresh_states: bool) {
         }
     }
 
-    if !refresh_states {
-        return;
-    }
     let refreshable = match sealed::current() {
         Some(store) => store.refreshable_records(),
         None => return,
     };
-    for record in refreshable {
+    // Between full refreshes, only the usable records the zone has not given
+    // a leaf yet: they cannot prove until it does.
+    let refreshable: Vec<MembershipRecord> = if refresh_states {
+        refreshable
+    } else {
+        refreshable
+            .into_iter()
+            .filter(|r| r.cache.state.is_usable() && r.cache.leaf_index.is_none())
+            .collect()
+    };
+    for record in &refreshable {
         let hash = &record.hash;
-        match observe(&record) {
+        match observe(record) {
             Some(RecordUpdate::Observed { state, leaf_index, rate_limit }) => {
                 if let Ok(prior) = apply_observed(hash, state, leaf_index, rate_limit) {
-                    emit_transition(hash, &record, prior, state);
+                    emit_transition(hash, record, prior, state);
                 }
             }
             Some(RecordUpdate::Absent) => {
@@ -224,7 +244,7 @@ fn tick(refresh_states: bool) {
                     })
                 });
                 if let Ok(prior) = updated {
-                    emit_transition(hash, &record, prior, MembershipState::Erased);
+                    emit_transition(hash, record, prior, MembershipState::Erased);
                 }
                 eprintln!("membership poller: {hash} vanished from registry — erased");
             }
@@ -232,7 +252,9 @@ fn tick(refresh_states: bool) {
         }
     }
 
-    refresh_paths();
+    if refresh_states {
+        refresh_paths();
+    }
 }
 
 /// One Merkle-path refresh pass over every USABLE (active/grace_period)
@@ -261,14 +283,20 @@ pub(crate) fn refresh_paths() {
         };
         let Some(provider) = provider_for(&registry.namespace) else { continue };
         // Leaf 0 is a VALID leaf, so a usable row without one cannot be
-        // defaulted — that would cache the wrong membership's path. The cache
-        // is deliberately unauthenticated (see lifecycle.rs), so this pairing
-        // is reachable by tampering, never by the module's own writers.
+        // defaulted — that would cache the wrong membership's path. A usable
+        // row has none when the registry module did not send its registration
+        // (it reports the leaf it claimed); the tick keeps re-reading.
         let Some(leaf_index) = record.cache.leaf_index else {
-            eprintln!("membership poller: {hash} is usable but carries no leaf_index — path refresh skipped");
+            eprintln!("membership poller: {hash} is usable but has no leaf_index yet — path refresh skipped");
             continue;
         };
-        if let Err(e) = path_cache::fill_path_cache(&registry, hash, leaf_index, provider) {
+        let Some(own_leaf) = record.cache.rate_limit.and_then(|rate| {
+            crate::proof::rate_commitment(&record.identity.identity_commitment, rate)
+        }) else {
+            eprintln!("membership poller: {hash} has no rate_limit or a bad commitment — path refresh skipped");
+            continue;
+        };
+        if let Err(e) = path_cache::fill_path_cache(&registry, hash, leaf_index, &own_leaf, provider) {
             // Keep the previous cache entry — a slightly-stale but still
             // verifiable path beats none.
             eprintln!("membership poller: {hash} path refresh failed: {}", e.message);

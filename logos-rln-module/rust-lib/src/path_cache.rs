@@ -56,14 +56,31 @@ pub(crate) fn hit(hash: &str, current_leaf_index: u64) -> Option<(Vec<String>, V
 
 /// Fetch `hash`'s Merkle path from `registry` at `leaf_index` and cache it.
 /// Shared by the poller's background refresh and `generate_proof`'s
-/// on-demand miss fallback.
+/// on-demand miss fallback. `expected_leaf` is the membership's own leaf
+/// (`proof::rate_commitment`): the index is the claim the registry module
+/// recorded when it sent the registration, and a path to any other leaf would
+/// prove against another membership after burning a message-id slot.
 pub(crate) fn fill_path_cache(
     registry: &CanonicalRegistryId,
     hash: &str,
     leaf_index: u64,
+    expected_leaf: &[u8; 32],
     prov: &dyn RegistryProvider,
 ) -> Result<(), ApiError> {
     let merkle = prov.get_merkle_proof(registry, leaf_index)?;
+    let leaf = merkle
+        .get("leaf")
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::registry_id::hex_to_bytes32);
+    if leaf.as_ref() != Some(expected_leaf) {
+        return Err(ApiError::new(
+            ErrorKind::ProviderFailure,
+            &format!(
+                "leaf {leaf_index} of {} is not this membership's leaf — the recorded index is wrong",
+                registry.canonical
+            ),
+        ));
+    }
     let mut path_elements_hex = json_str_array(&merkle, "path_elements")?;
     let mut path_indices = json_u8_array(&merkle, "path_indices")?;
 
@@ -78,7 +95,8 @@ pub(crate) fn fill_path_cache(
     crate::proof::depth_bridge::pad_path(&mut path_elements_hex, &mut path_indices, depth);
 
     // Adopt the snapshot's valid_roots into the root window (see
-    // roots::adopt); older providers may omit the field.
+    // roots::adopt); a zone proof carries only the root it hashes to, which
+    // is admitted beside the window instead (roots::admit).
     if let Ok(roots_hex) = json_str_array(&merkle, "valid_roots") {
         let roots: Vec<[u8; 32]> = roots_hex
             .iter()
@@ -86,6 +104,12 @@ pub(crate) fn fill_path_cache(
             .filter_map(|h| crate::registry_id::hex_to_bytes32(&h))
             .collect();
         crate::roots::adopt(&registry.canonical, roots);
+    } else if let Some(root) = merkle
+        .get("root")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|h| crate::registry_id::hex_to_bytes32(&crate::proof::depth_bridge::fold_root(h, depth)))
+    {
+        crate::roots::admit(&registry.canonical, root);
     }
     lock(&PATHS).get_or_insert_with(HashMap::new).insert(
         hash.to_string(),
@@ -137,5 +161,61 @@ mod tests {
         assert_eq!(elements, vec!["11".repeat(32)]);
         assert_eq!(indices, vec![1]);
         assert!(hit(hash, 1).is_none(), "the old leaf_index's path is gone once the refresh overwrote it");
+    }
+
+    /// A provider whose proofs come from an in-memory zone tree.
+    struct ZoneProvider(crate::zone::fake::FakeZone);
+
+    impl RegistryProvider for ZoneProvider {
+        fn get_merkle_proof(&self, _: &CanonicalRegistryId, leaf_index: u64) -> Result<serde_json::Value, ApiError> {
+            crate::zone::proof_reply_for_test(&|q| self.0.respond(q), leaf_index)
+        }
+        fn get_membership(&self, _: &CanonicalRegistryId, _: &str) -> Result<crate::provider::ProviderMembership, ApiError> {
+            unimplemented!()
+        }
+        fn register_async(&self, _: &CanonicalRegistryId, _: &str, _: &str, _: u64, _: crate::provider::RegisterCallback) -> Result<(), ApiError> {
+            unimplemented!()
+        }
+        fn get_valid_roots(&self, _: &CanonicalRegistryId) -> Result<Vec<String>, ApiError> {
+            unimplemented!()
+        }
+        fn get_registry_bounds(&self, _: &CanonicalRegistryId) -> Result<serde_json::Value, ApiError> {
+            unimplemented!()
+        }
+        fn wallet_status(&self) -> Result<serde_json::Value, ApiError> {
+            unimplemented!()
+        }
+        fn payer_balance(&self) -> Result<u128, ApiError> {
+            unimplemented!()
+        }
+        fn fee_state(&self) -> Result<serde_json::Value, ApiError> {
+            unimplemented!()
+        }
+        fn check_registry(&self, _: &CanonicalRegistryId) -> Result<serde_json::Value, ApiError> {
+            unimplemented!()
+        }
+    }
+
+    fn leaf(n: u8) -> [u8; 32] {
+        crate::proof::rate_commitment(&format!("{n:02x}{}", "00".repeat(31)), 100).expect("leaf")
+    }
+
+    /// The recorded index is the registry module's claim; a path to someone
+    /// else's leaf is refused before it is cached, and the right one is cached
+    /// with its root admitted into the window.
+    #[test]
+    fn only_the_memberships_own_leaf_is_cached() {
+        let registry =
+            crate::registry_id::parse(&format!("logos:path-cache-test:{}", "ee".repeat(32))).unwrap();
+        let zone = crate::zone::fake::FakeZone::new((1..=4).map(leaf).collect());
+        let root = zone.root();
+        let prov = ZoneProvider(zone);
+        let hash = "path-cache-test-own-leaf";
+        let err = fill_path_cache(&registry, hash, 1, &leaf(1), &prov).unwrap_err();
+        assert!(err.message.contains("not this membership's leaf"), "{}", err.message);
+        assert!(hit(hash, 1).is_none(), "a wrong leaf's path is never cached");
+        fill_path_cache(&registry, hash, 0, &leaf(1), &prov).unwrap();
+        assert!(hit(hash, 0).is_some());
+        assert_eq!(crate::roots::window(&registry.canonical), Some(vec![root]), "the proof's root, at the circuit's depth");
     }
 }

@@ -87,9 +87,11 @@ switch on `class`, log `kind`.
 | list (helper) | `get_memberships(registry_id)` | tstr | `{"memberships":[…]}` |
 
 The public **Membership view** (spec `Membership` + status):
-`{"credential":{"identity_commitment":hex},"leaf_index":N,"membership_hash":hex,
-"rate_limit":N,"registry_id":caip10,"rln_identifier":hex,"state":str,…}` — no
-secret ever appears. A `"failed"` state carries `"failed_reason":str` and
+`{"credential":{"identity_commitment":hex},"leaf_index":N,"leaf_pending"?:bool,
+"membership_hash":hex,"rate_limit":N,"registry_id":caip10,"rln_identifier":hex,
+"state":str,…}` — no secret ever appears. `leaf_pending:true` (0.14.0) means a
+usable membership whose leaf index the registry module has not reported yet;
+`leaf_index` then reads 0, which is also a real leaf, so the flag decides. A `"failed"` state carries `"failed_reason":str` and
 `"retryable":bool` (spec: a failed submission SHALL report whether it is
 retryable).
 
@@ -123,10 +125,10 @@ lp timeouts for (the logos-core default is ~20 s):
 | Method | Budget | Why |
 |---|---|---|
 | `register` | 90 s | a fresh registration first does a synchronous registry-bounds pre-check (one registry read, ≤70 s worst case) before it mints, durably persists, and returns; only the on-chain submission is background. The idempotent short-circuit (a live local membership for the scope) returns in milliseconds |
-| `generate_proof` | 90 s | warm: served from the background-maintained Merkle-path cache, no registry read; cold miss: one registry read (Merkle path, ≤70 s worst case) + proving (~seconds) |
+| `generate_proof` | 90 s | warm: served from the background-maintained Merkle-path cache, no zone read; cold miss: one zone read (Merkle path, ≤30 s worst case) + proving (~seconds) |
 | `get_registry_parameters` | 90 s | one registry read (≤70 s worst case) |
 | `get_membership_state` | 90 s | one registry read |
-| `get_merkle_proof` / `get_valid_roots` | 90 s | one registry read |
+| `get_merkle_proof` / `get_valid_roots` | 90 s | one zone read (≤30 s worst case) |
 | `validate_proof` | 5 s | pure local computation |
 | `get_epoch_quota` | 5 s | pure local state |
 
