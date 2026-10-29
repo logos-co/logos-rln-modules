@@ -90,10 +90,10 @@ fn read_interval(waited: Duration) -> Duration {
 }
 
 /// The execution gas limit the sibling's wallet declares for a registration:
-/// `GAS_LIMIT` in logos-lez-rln-module/rust-lib/src/wallet.rs, written into
-/// every home it provisions. A registration costs ~9.1M cycles, so the stock
-/// 2,000,000 default cannot be what an adopted home declares either.
-const DECLARED_GAS_LIMIT: u128 = 10_000_000;
+/// `GAS_LIMIT` in logos-lez-rln-module/rust-lib/src/wallet.rs — the wallet's
+/// stock 2,000,000, ample for a Register (~52k cycles) now that the
+/// registry's tree is off chain.
+const DECLARED_GAS_LIMIT: u128 = 2_000_000;
 
 /// The serialized-size allowance the wallet sizes its `max_fee` against
 /// (`ASSUMED_DATA_BYTES` in the LEZ wallet). A Register tx is a few hundred
@@ -117,8 +117,7 @@ const BASE_FEE_HEADROOM: u128 = 2;
 /// `get_fee_state` (or one before lez 5.0.0 on an https sequencer: its quote
 /// read spoke plain http only), a transport error or an unparsable
 /// reply: the wallet's own declared cap, `(gas_limit + ASSUMED_DATA_BYTES) x
-/// ASSUMED_BASE_FEE (64)`, ~646M. It is what every release before 0.10.0
-/// waited for, so an older sibling keeps working exactly as it did.
+/// ASSUMED_BASE_FEE (64)`, ~134M at the stock gas limit.
 const FALLBACK_FEE_RESERVE: u128 = (DECLARED_GAS_LIMIT + ASSUMED_DATA_BYTES) * 64;
 
 /// Where a reserve came from, so the log can say when it changes.
@@ -134,8 +133,8 @@ enum ReserveBasis {
 /// A tx's `max_fee` is only a cap: the chain checks `max_fee >= reserve` and
 /// then debits `gas_limit x base_fee_exec + data_bytes x base_fee_stor + tip`
 /// at the including block's fee state, refunded down to the actual fee. So
-/// the payer has to hold that reserve, not the cap — ~182M at devnet's base
-/// fee 8 (ceiling 9) against the cap's 646M. The fee still dominates a price
+/// the payer has to hold that reserve, not the cap — ~38M at devnet's base
+/// fee 8 (ceiling 9) against the cap's 134M. The fee still dwarfs a price
 /// near 1M, so "can afford the price" remains the wrong question.
 fn fee_reserve_from(quote: &serde_json::Value) -> Option<u128> {
     let ceiling = |key: &str| quote.get(key).and_then(serde_json::Value::as_u64).map(u128::from);
@@ -727,8 +726,8 @@ mod tests {
     fn the_reserve_is_sized_from_the_quoted_ceiling() {
         let (reserve, basis) = fee_reserve(Ok(devnet_quote()));
         assert_eq!(basis, ReserveBasis::Quote(15082));
-        // (10M gas x 9 + 100k bytes x 9) x 2.
-        assert_eq!(reserve, 181_800_000);
+        // (2M gas x 9 + 100k bytes x 9) x 2.
+        assert_eq!(reserve, 37_800_000);
         assert!(reserve < FALLBACK_FEE_RESERVE);
     }
 
@@ -745,11 +744,11 @@ mod tests {
     }
 
     /// No quote — an older sibling without get_fee_state, "", a transport
-    /// error, a reply that is not a quote — is the pre-0.10.0 behaviour
-    /// exactly: the wallet's fixed 646.4M cap.
+    /// error, a reply that is not a quote — falls back to the wallet's fixed
+    /// cap, 134.4M at the stock gas limit.
     #[test]
     fn no_quote_falls_back_to_the_fixed_reserve() {
-        assert_eq!(FALLBACK_FEE_RESERVE, 646_400_000);
+        assert_eq!(FALLBACK_FEE_RESERVE, 134_400_000);
         let fallback = (FALLBACK_FEE_RESERVE, ReserveBasis::Fallback);
         let failure = ApiError::new(ErrorKind::ProviderFailure, "get_fee_state failed");
         assert_eq!(fee_reserve(Err(failure)), fallback);
@@ -764,7 +763,7 @@ mod tests {
     }
 
     /// The gate this module exists to get right. The fee reserve dominates the
-    /// price by two orders of magnitude or more, whichever way it is sized, so
+    /// price by an order of magnitude or more, whichever way it is sized, so
     /// an account sized for the price alone cannot transact — and the failure
     /// it would hit is a bare "Incorrect fee" from the sequencer, naming
     /// neither number.
@@ -774,7 +773,7 @@ mod tests {
         let (quoted, _) = fee_reserve(Ok(devnet_quote()));
         for reserve in [quoted, FALLBACK_FEE_RESERVE] {
             assert!(
-                reserve > price * 100,
+                reserve > price * 10,
                 "if the reserve ever stops dwarfing the price, revisit this gate: \
                  reserve {reserve}, price {price}"
             );
