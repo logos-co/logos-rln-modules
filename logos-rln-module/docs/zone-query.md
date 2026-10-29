@@ -167,9 +167,15 @@ URL names the registry instead.
 
 What the module side is ready for and the service does not do yet.
 
-- **The libp2p transport.** Mount the handler on `/logos/rln/zone-query/1.0.0`
-  with the messages above; they mirror the JSON field for field, and the HTTP
-  mapping folds `proof` into the flat `MerkleProof`.
+- **The libp2p transport** is mounted by `liblogos_rln_data_service_module`
+  (`logos-rln-data-service-module/`), not by the service: one node per
+  deployment runs it next to the zone and answers
+  `/logos/rln/zone-query/1.0.0` from the zone's JSON API (the HTTP mapping
+  above, folding `proof` into the flat `MerkleProof`), with the roots window
+  cached for a couple of seconds. Members are told its `peer_id` and
+  `multiaddrs` (`start()`'s reply) through `zone_service` or
+  `LOGOS_RLN_ZONE_PEER_ID` + `LOGOS_RLN_ZONE_MULTIADDR`. A service that
+  mounts the protocol itself would make that node unnecessary.
 - **An indexer-only mode.** Running with no Bedrock node: follow a LEZ
   sequencer, serve the head as `/roots` entry 0 with status `head`, publish
   nothing. The only way to run the service beside a local sequencer in an e2e.
