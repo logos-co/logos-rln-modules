@@ -58,8 +58,6 @@ pub(crate) struct Registry {
     pub(crate) tree_id: String,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) registration_program_id: String,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) merkle_program_id: String,
 }
 
 fn parse(raw: &str) -> Result<Vec<Network>, String> {
@@ -166,7 +164,7 @@ mod tests {
                 let hex = bytes_to_hex(&bytes);
                 assert!(!seen.contains(&hex), "{} listed twice", r.config_account);
                 seen.push(hex);
-                for id in [&r.tree_id, &r.registration_program_id, &r.merkle_program_id] {
+                for id in [&r.tree_id, &r.registration_program_id] {
                     assert!(
                         crate::hex_to_bytes32(id).is_some(),
                         "{}: {id} is not 32-byte hex",

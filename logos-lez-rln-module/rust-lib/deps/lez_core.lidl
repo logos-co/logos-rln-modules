@@ -1,0 +1,49 @@
+; lez_core contract — the subset liblogos_lez_rln_module drives. Supplied as a
+; dependency_override, so the typed LezCoreClient is generated from these
+; methods only. Hand-written from logos-execution-zone-module's
+; src/lez_core_module.h at 51a6fee (lez_core 0.5.1, LEZ v0.3.1); keep the
+; signatures in step with it. lez_core is a universal C++ module: its
+; std::vector<std::string> / std::vector<bool> / std::vector<uint8_t> params
+; are [tstr] / [bool] / bstr on this wire, and an EMPTY string (or an empty
+; list) is how it reports failure.
+;
+; One wallet handle per host: open and create_new refuse while one is open,
+; and there is no close. A refusal is not distinguishable from a failed open
+; by the return value, so callers ask get_sequencer_addr (non-empty = a wallet
+; is open) before treating it as an error.
+module lez_core {
+  version "0.5.1"
+
+  ; lez_core's own persistence dir — where its wallet is meant to live — or
+  ; "-" when the host gave it none.
+  method wallet_dir() -> tstr
+
+  ; 0 = opened; non-zero = refused (already open) or failed.
+  method open(config_path: tstr, storage_path: tstr) -> int
+
+  ; Creates storage and opens it; the recovery mnemonic, "" on failure or when
+  ; a wallet is already open.
+  method create_new(config_path: tstr, storage_path: tstr, password: tstr) -> tstr
+
+  method save() -> int
+
+  ; [{"account_id":hex64,"is_public":bool}]; [] on failure.
+  method list_accounts() -> [any]
+
+  ; A new public account's id as hex64; "" on failure. Not persisted until save.
+  method create_account_public() -> tstr
+
+  ; Decimal u128 balance; "" on failure.
+  method get_balance(account_id_hex: tstr, is_public: bool) -> tstr
+
+  ; {"nonce":hex32,"shards":[{"program":hex64,"data":hex}]}; "" on failure.
+  method get_account_public(account_id_hex: tstr) -> tstr
+
+  ; instruction is the borsh-serialized instruction. payer "" = self-pay.
+  ; shard_program_account_ids_hex: one per account ("" = the called program's
+  ; shard), or empty. {"success":b,"tx_hash":s,"secrets":[..],"error":s}.
+  method send_generic_public_transaction(account_ids: [tstr], signing_requirements: [bool], instruction: bstr, program_id_hex: tstr, payer_account_id_hex: tstr, shard_program_account_ids_hex: [tstr]) -> tstr
+
+  ; The open wallet's sequencer; "" when no wallet is open.
+  method get_sequencer_addr() -> tstr
+}

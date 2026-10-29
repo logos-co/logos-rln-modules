@@ -1041,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "lez_rln_module"
-version = "5.1.0"
+version = "7.0.0"
 dependencies = [
  "borsh",
  "logos-rust-sdk",
@@ -1757,8 +1757,8 @@ dependencies = [
 
 [[package]]
 name = "rln-layouts"
-version = "0.1.0"
-source = "git+https://github.com/logos-co/logos-lez-rln.git?rev=b51af7397d1dd61972223e417cb02cdd8395d859#b51af7397d1dd61972223e417cb02cdd8395d859"
+version = "0.2.0"
+source = "git+https://github.com/logos-co/logos-lez-rln.git?rev=15ff472a0e9b9b4b2c5da3ecab5b7cbd9d5a5a87#15ff472a0e9b9b4b2c5da3ecab5b7cbd9d5a5a87"
 dependencies = [
  "borsh",
  "bytemuck",

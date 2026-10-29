@@ -1,6 +1,6 @@
 [package]
 name    = "lez_rln_module"
-version = "5.1.0"
+version = "7.0.0"
 edition = "2021"
 # u64::is_multiple_of (clippy's manual_is_multiple_of fix) stabilized in 1.87;
 # the builder pins 1.94.0 (metadata.json nix.rust.toolchain).
@@ -21,8 +21,10 @@ panic = "abort"
 [dependencies]
 # rln-layouts is the on-chain borsh wire format, pinned to the logos-lez-rln
 # rev whose deployed programs it must match; bump the rev together with any
-# layout change.
-rln-layouts = { git = "https://github.com/logos-co/logos-lez-rln.git", rev = "b51af7397d1dd61972223e417cb02cdd8395d859" }
+# layout change. The off-chain-tree layouts (120-byte config with
+# next_leaf_index, no merkle program) are on feat/rln-zone-events until it
+# merges to main.
+rln-layouts = { git = "https://github.com/logos-co/logos-lez-rln.git", rev = "15ff472a0e9b9b4b2c5da3ecab5b7cbd9d5a5a87" }
 risc0-zkvm = { version = "3.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
 borsh = { version = "1", default-features = false, features = ["derive"] }
@@ -32,14 +34,12 @@ serde = { version = "1", features = ["derive"] }
 # logos-rust-sdk rev its generator came from.
 logos-rust-sdk = { path = "../logos-rust-sdk-src" }
 serde_json = "1"
-# rln (zerokit) for Poseidon: a membership's leaf is
-# rate_commitment = poseidon(id_commitment, rate_limit), and on LEZ v0.3.0 the
-# tree assigns the leaf index, so finding a membership's leaf means hashing
-# its leaf and looking it up in the tree.
-rln = { version = "3.0.0", default-features = false }
 # get_fee_state / tx_included read the sequencer directly (wallet_ffi exposes
 # neither); rustls so an https-only zone (the LEZ 0.3 testnet) can be read.
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 
 [dev-dependencies]
+# rln (zerokit) only for the testnet tests' seeded identity: the module no
+# longer hashes leaves, since the tree (and the leaf lookup) moved off chain.
+rln = { version = "3.0.0", default-features = false }
 rand_chacha = "0.3"

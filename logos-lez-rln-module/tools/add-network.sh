@@ -23,10 +23,17 @@ table="$(cd "$(dirname "$0")/.." && pwd)/rust-lib/networks.json"
 [[ "$reference" =~ ^[-_a-z0-9]{1,32}$ ]] \
     || { echo "reference must match [-_a-z0-9]{1,32}: $reference" >&2; exit 1; }
 
-for field in name sequencer config_account tree_id registration_program_id merkle_program_id; do
+for field in name sequencer config_account tree_id registration_program_id; do
     jq -e --arg f "$field" '.[$f] | strings | length > 0' "$descriptor" >/dev/null \
         || { echo "$descriptor has no $field" >&2; exit 1; }
 done
+# A descriptor naming a merkle_program_id was deployed by the on-chain-tree
+# program: its 144-byte config is unreadable here (check_registry answers
+# wrong_generation), so it has no place in the table.
+if jq -e 'has("merkle_program_id")' "$descriptor" >/dev/null; then
+    echo "$descriptor names a merkle_program_id: an on-chain-tree deployment this module cannot read" >&2
+    exit 1
+fi
 
 config=$(jq -r .config_account "$descriptor")
 if jq -e --arg c "$config" '[.networks[].registries[].config_account] | index($c)' "$table" >/dev/null; then
@@ -54,8 +61,7 @@ jq --arg r "$reference" --arg d "$description" --arg s "$sequencer" \
         deployment: .name,
         config_account,
         tree_id,
-        registration_program_id,
-        merkle_program_id
+        registration_program_id
     }) as $reg
     | if any(.networks[]; .reference == $r)
       then .networks |= map(if .reference == $r then .registries += [$reg] else . end)

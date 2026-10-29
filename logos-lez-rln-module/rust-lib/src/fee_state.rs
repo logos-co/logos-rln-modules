@@ -4,7 +4,7 @@
 //! A registration's `max_fee` is only a cap. What the chain holds back from
 //! the payer is `gas_limit x base_fee_exec + data_bytes x base_fee_stor + tip`
 //! at the block the tx lands in, and a caller deciding whether it can afford
-//! to register needs that number, not the cap. `wallet_ffi` exposes no fee
+//! to register needs that number, not the cap. `lez_core` exposes no fee
 //! read, so this is the one call this module makes to the sequencer directly
 //! instead of through its wallet — to the sequencer the wallet's own config
 //! names, so it is always the same chain.

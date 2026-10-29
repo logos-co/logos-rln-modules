@@ -1,5 +1,5 @@
 //! Live-registry integration tests: rln_core's chain-facing logic (layout
-//! offsets, PDA derivation, proof construction, clock decode, lifecycle
+//! offsets, PDA derivation, clock decode, lifecycle
 //! state) validated against a DEPLOYED registration program.
 //!
 //! Read-only and OFF by default — every test no-ops unless
@@ -9,35 +9,33 @@
 //! LEZ_RLN_TESTNET_TESTS=1 cargo test testnet_ -- --nocapture
 //! ```
 //!
-//! The registry under test comes from a logos-lez-rln checkout's deployment
-//! records: `<LEZ_RLN_CHECKOUT>/deployments/<name>/deployment.json`
+//! The registry under test comes from a deployment descriptor:
+//! `LEZ_RLN_TESTNET_DEPLOYMENT_JSON` names the file directly (a descriptor
+//! from logos-rln-e2e's `deployments/`, or one a fresh deployment printed);
+//! otherwise `<LEZ_RLN_CHECKOUT>/deployments/<name>/deployment.json`
 //! (checkout default: `../logos-lez-rln` next to this repo), `<name>` =
-//! `LEZ_RLN_TESTNET_DEPLOYMENT` (default `DEFAULT_DEPLOYMENT`, the current
-//! hosted-testnet deployment). The sequencer is reached over its public JSON-RPC
+//! `LEZ_RLN_TESTNET_DEPLOYMENT` (default `DEFAULT_DEPLOYMENT`). The sequencer is reached over its public JSON-RPC
 //! (`getAccount` — the same read the wallet module's `get_account_public`
 //! serves this module at runtime) via a `curl` subprocess, so the shipping
 //! crate gains no HTTP/TLS dependency and Cargo.lock stays untouched.
 //!
 //! What this catches that unit pins cannot: ConfigState layout drift
 //! against the DEPLOYED program (the guest image is pinned by provisioned
-//! deployments), PDA-derivation divergence, tree/proof encoding drift, and
-//! chain-clock unit changes.
+//! deployments), PDA-derivation divergence, and chain-clock unit changes.
+//! The tree is off chain (7.0.0), so proofs and roots are not tested here.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand_chacha::ChaCha20Rng;
-use rln::prelude::{
-    CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, IdentityKeys, PoseidonHash,
-};
+use rln::prelude::{CanonicalSerialize, Fr, IdentityKeys, PoseidonHash};
 
-use crate::hex_to_bytes32;
 use crate::rln_core as native;
 use native::bytes_to_hex;
 
-/// 32-byte little-endian canonical form of a field element — the node/leaf
-/// wire format the tree accounts store.
+/// 32-byte little-endian canonical form of a field element — the
+/// id_commitment wire format.
 fn fr_to_bytes_le(fr: &Fr) -> [u8; 32] {
     let mut bytes = [0u8; 32];
     fr.serialize_compressed(bytes.as_mut_slice())
@@ -45,21 +43,14 @@ fn fr_to_bytes_le(fr: &Fr) -> [u8; 32] {
     bytes
 }
 
-/// Parses a 32-byte little-endian value as a field element; None if
-/// non-canonical (>= the BN254 scalar field modulus).
-fn bytes_le_to_fr(bytes: &[u8; 32]) -> Option<Fr> {
-    Fr::deserialize_compressed(bytes.as_slice()).ok()
-}
-
 struct Deployment {
     sequencer: String,
     config_account: [u8; 32],
     tree_id_hex: String,
     registration_program_id_hex: String,
-    merkle_program_id_hex: String,
 }
 
-const DEFAULT_DEPLOYMENT: &str = "testnet-faucet-260908";
+const DEFAULT_DEPLOYMENT: &str = "testnet-zone-events";
 
 /// Gate + deployment loader. `None` = skip (gate unset).
 fn testnet() -> Option<Deployment> {
@@ -67,19 +58,30 @@ fn testnet() -> Option<Deployment> {
         eprintln!("testnet test skipped: set LEZ_RLN_TESTNET_TESTS=1 to run against the live registry");
         return None;
     }
-    let name = std::env::var("LEZ_RLN_TESTNET_DEPLOYMENT").unwrap_or_else(|_| DEFAULT_DEPLOYMENT.to_string());
-    // Deployment descriptors live with the programs in logos-co/logos-lez-rln;
-    // LEZ_RLN_CHECKOUT points at that checkout (default: a sibling of this
-    // repo).
-    let checkout = std::env::var("LEZ_RLN_CHECKOUT").map(PathBuf::from).unwrap_or_else(|_| {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../logos-lez-rln")
-    });
-    let path = checkout.join("deployments").join(&name).join("deployment.json");
-    let doc: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("deployment record {}: {e}", path.display())),
-    )
-    .expect("deployment.json parses");
+    let path = match std::env::var("LEZ_RLN_TESTNET_DEPLOYMENT_JSON") {
+        Ok(file) if !file.trim().is_empty() => PathBuf::from(file.trim()),
+        _ => {
+            let name = std::env::var("LEZ_RLN_TESTNET_DEPLOYMENT")
+                .unwrap_or_else(|_| DEFAULT_DEPLOYMENT.to_string());
+            // LEZ_RLN_CHECKOUT points at a logos-lez-rln checkout (default: a
+            // sibling of this repo).
+            let checkout = std::env::var("LEZ_RLN_CHECKOUT").map(PathBuf::from).unwrap_or_else(|_| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../logos-lez-rln")
+            });
+            checkout.join("deployments").join(&name).join("deployment.json")
+        }
+    };
+    // A descriptor naming a merkle program belongs to the on-chain-tree
+    // generation; its config cannot pass the size check below, so say why.
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("deployment record {}: {e}", path.display()));
+    assert!(
+        !raw.contains("\"merkle_program_id\""),
+        "{} is an on-chain-tree deployment (names a merkle_program_id); point \
+         LEZ_RLN_TESTNET_DEPLOYMENT_JSON at an event-emitting one",
+        path.display()
+    );
+    let doc: serde_json::Value = serde_json::from_str(&raw).expect("deployment.json parses");
     let field = |key: &str| {
         doc.get(key)
             .and_then(|v| v.as_str())
@@ -91,7 +93,6 @@ fn testnet() -> Option<Deployment> {
         config_account: b58_decode32(&field("config_account")),
         tree_id_hex: field("tree_id"),
         registration_program_id_hex: field("registration_program_id"),
-        merkle_program_id_hex: field("merkle_program_id"),
     })
 }
 
@@ -245,17 +246,6 @@ fn fetch_config(dep: &Deployment) -> (Vec<u8>, [u8; 32]) {
     (data, program)
 }
 
-fn merkle_program(config_data: &[u8]) -> [u8; 32] {
-    native::config_field_32(config_data, native::CONFIG_OFFSET_MERKLE_PROGRAM_ID)
-}
-
-fn fetch_tree(dep: &Deployment, config_data: &[u8], registration: &[u8; 32]) -> ([u8; 32], Vec<u8>) {
-    let main = native::tree_main_account_id(config_data, registration).unwrap();
-    let data = get_shard(&dep.sequencer, &main, &merkle_program(config_data))
-        .expect("derived tree-main PDA must hold the merkle program's shard");
-    (main, data)
-}
-
 fn chain_now_ms(dep: &Deployment) -> u64 {
     let data = get_shard(
         &dep.sequencer,
@@ -291,7 +281,6 @@ fn testnet_config_account_matches_deployment_and_bounds_decode() {
         dep.registration_program_id_hex,
         "the config's shard is the registration program's"
     );
-    assert_eq!(bytes_to_hex(&merkle_program(&data)), dep.merkle_program_id_hex);
     assert_eq!(
         bytes_to_hex(&native::config_field_32(&data, native::CONFIG_OFFSET_TREE_ID)),
         dep.tree_id_hex
@@ -303,39 +292,36 @@ fn testnet_config_account_matches_deployment_and_bounds_decode() {
     let registrations = native::config_field_u64(&data, native::CONFIG_OFFSET_TOTAL_REGISTRATIONS);
     let active = native::config_field_u32(&data, native::CONFIG_OFFSET_ACTIVE_DURATION);
     let grace = native::config_field_u32(&data, native::CONFIG_OFFSET_GRACE_DURATION);
+    let next_leaf = native::config_field_u64(&data, native::CONFIG_OFFSET_NEXT_LEAF_INDEX);
+    // next_leaf_index counts every registration ever made; total_registrations
+    // drops on slash and erase, so it can only trail.
+    assert!(
+        registrations <= next_leaf,
+        "{registrations} live registrations but only {next_leaf} ever assigned"
+    );
     assert!(max_total >= native::MIN_RATE_LIMIT, "capacity fits at least one member");
     assert!(current <= max_total, "used {current} within capacity {max_total}");
     assert!(price > 0, "priced registration");
     assert!(active > 0 && grace > 0, "nonzero lifecycle durations");
     eprintln!(
-        "live config: {registrations} registrations, rate {current}/{max_total}, \
-         price {price}, active {active}, grace {grace}"
+        "live config: {registrations} registrations ({next_leaf} leaves assigned), \
+         rate {current}/{max_total}, price {price}, active {active}, grace {grace}"
     );
 }
 
-// The full account-derivation loop against the DEPLOYED program: the tree
-// main PDA derived from (registration program, tree_id) must hold the merkle
-// program's shard, and register_plan must re-derive the very config account
-// the deployment record names (proving PDA seeds + hashing match the chain).
+// The full account-derivation loop against the DEPLOYED program:
+// register_plan must re-derive the very config account the deployment record
+// names (proving PDA seeds + hashing match the chain).
 #[test]
 fn testnet_register_plan_derives_the_deployed_accounts() {
     let Some(dep) = testnet() else { return };
     let (config_data, owner) = fetch_config(&dep);
-    let (main, tree_main_data) = fetch_tree(&dep, &config_data, &owner);
 
-    let plan =
-        native::register_plan(&config_data, &tree_main_data, &owner, &[0x11; 32]).unwrap();
+    let plan = native::register_plan(&config_data, &owner, &[0x11; 32]).unwrap();
     assert_eq!(
         plan.config_account_id, dep.config_account,
         "config PDA re-derivation must round-trip to the deployed account"
     );
-    assert_eq!(plan.tree_main_account_id, main);
-    assert_eq!(bytes_to_hex(&plan.merkle_program_id), dep.merkle_program_id_hex);
-    assert!(
-        plan.next_leaf_index < (1u64 << rln_layouts::TREE_DEPTH),
-        "leaf index inside TREE_DEPTH"
-    );
-    eprintln!("live tree: next_leaf_index {}", plan.next_leaf_index);
 }
 
 // The CLOCK_50 account (the module's ONLY time source for lifecycle state)
@@ -358,63 +344,6 @@ fn testnet_clock_account_decodes_to_live_chain_time() {
     eprintln!("live clock: {chain_ms} (drift {}s)", drift / 1000);
 }
 
-#[test]
-fn testnet_valid_roots_come_from_the_live_tree() {
-    let Some(dep) = testnet() else { return };
-    let (config_data, owner) = fetch_config(&dep);
-    let (_, tree_main_data) = fetch_tree(&dep, &config_data, &owner);
-
-    let roots = native::get_valid_roots(&tree_main_data).unwrap();
-    assert!(!roots.is_empty());
-    assert!(roots.len() <= 1 + rln_layouts::ROOT_HISTORY_SIZE);
-    assert_ne!(roots[0], [0u8; 32], "current root");
-    eprintln!("live roots: {} in window, current {}", roots.len(), bytes_to_hex(&roots[0]));
-}
-
-// Full cryptographic round-trip against DEPLOYED tree data: build a proof
-// for a live leaf from the fetched merkle shard, then recompute the root from
-// (leaf, path) with poseidon and demand it equals both the proof's root and a
-// member of the live valid-root window. Works on an empty tree too (leaf 0
-// against cached defaults).
-#[test]
-fn testnet_merkle_proof_recomputes_the_live_root() {
-    let Some(dep) = testnet() else { return };
-    let (config_data, owner) = fetch_config(&dep);
-    let (_, tree_main_data) = fetch_tree(&dep, &config_data, &owner);
-
-    let next = rln_layouts::TreeMainLayout::parse(&tree_main_data).next_index();
-    let leaf_index = next.saturating_sub(1);
-    let proofs = native::merkle_proofs_exec(&tree_main_data, &[leaf_index]).unwrap();
-    assert_eq!(proofs.len(), 1);
-    let proof = &proofs[0];
-    assert_eq!(proof.leaf_index, leaf_index);
-    assert_eq!(proof.depth as usize, proof.path_elements.len());
-    assert_eq!(proof.path_elements.len(), proof.path_indices.len());
-
-    let fr_of = |hex: &str| {
-        let bytes = hex_to_bytes32(hex).expect("32-byte node hex");
-        bytes_le_to_fr(&bytes).expect("field element")
-    };
-    let mut node = fr_of(&proof.leaf);
-    for (sibling_hex, &is_right) in proof.path_elements.iter().zip(&proof.path_indices) {
-        let sibling = fr_of(sibling_hex);
-        node = if is_right == 1 {
-            Hasher::<PoseidonHash>::hash_pair(sibling, node)
-        } else {
-            Hasher::<PoseidonHash>::hash_pair(node, sibling)
-        };
-    }
-    let recomputed = bytes_to_hex(&fr_to_bytes_le(&node));
-    assert_eq!(recomputed, proof.root, "path must hash back to the tree root");
-
-    let roots = native::get_valid_roots(&tree_main_data).unwrap();
-    assert!(
-        roots.iter().any(|r| bytes_to_hex(r) == proof.root),
-        "proof root inside the live valid-root window"
-    );
-    eprintln!("live proof: leaf {leaf_index} recomputes root {recomputed}");
-}
-
 // Membership PDA read for a well-known throwaway identity. Normally absent
 // — pinning that never-registered reads as empty (the same signal as
 // erased/slashed, which is why the spec's Unknown state exists). If some
@@ -424,12 +353,10 @@ fn testnet_merkle_proof_recomputes_the_live_root() {
 fn testnet_membership_read_absent_or_decodes_with_live_state() {
     let Some(dep) = testnet() else { return };
     let (config_data, owner) = fetch_config(&dep);
-    let (_, tree_main_data) = fetch_tree(&dep, &config_data, &owner);
 
     let identity_keys = IdentityKeys::generate_seeded::<PoseidonHash, ChaCha20Rng>(&[0x5A; 32]);
     let id_commitment = fr_to_bytes_le(&identity_keys.id_commitment());
-    let plan =
-        native::register_plan(&config_data, &tree_main_data, &owner, &id_commitment).unwrap();
+    let plan = native::register_plan(&config_data, &owner, &id_commitment).unwrap();
 
     match get_shard(&dep.sequencer, &plan.membership_account_id, &owner) {
         None => eprintln!(
@@ -446,10 +373,8 @@ fn testnet_membership_read_absent_or_decodes_with_live_state() {
                 membership.grace_period_duration_sec,
                 chain_now_ms(&dep),
             );
-            let leaf = native::registration_leaf(&membership.id_commitment, membership.rate_limit)
-                .and_then(|leaf| native::find_leaf_index(&tree_main_data, &leaf));
             eprintln!(
-                "live membership: leaf {leaf:?} rate {} state {state}",
+                "live membership: rate {} state {state}",
                 membership.rate_limit
             );
         }

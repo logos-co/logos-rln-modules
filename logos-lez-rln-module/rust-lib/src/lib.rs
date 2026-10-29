@@ -1,12 +1,17 @@
 //! liblogos_lez_rln_module — the LEZ RLN registry provider.
 //!
-//! Serves the membership stack's chain access: registry reads (roots, merkle
-//! proofs, membership PDA + lifecycle state, registry bounds), the Register
-//! tx, and the faucet funding flow (claim_tokens / get_token_balance). The
+//! Serves the membership stack's chain access: registry reads (membership PDA
+//! and lifecycle state, registry bounds) and the Register tx. Since 7.0.0 the
+//! program keeps no merkle tree: a zone service builds it off chain from the
+//! program's events, and the membership module asks that service for roots
+//! and proofs. The leaf index is this module's: it records the claim of each
+//! Register it sends (`leaf_claims.rs`). The
 //! chain logic lives in-crate (`mod rln_core`, plain Rust — no C ABI), and
-//! wallet access goes through the SDK's `PluginProxy` to the wallet module
-//! (`lez_core`) with per-call timeouts (60s reads, 180s registration tx)
-//! via `call_json_async_with_timeout` — no raw `lp_*` ABI in this crate.
+//! wallet access goes to the wallet module (`lez_core`, since 7.0.0 again)
+//! through a typed client generated from `deps/lez_core.lidl`, with per-call
+//! timeouts (60s reads, 180s registration tx) — no raw `lp_*` ABI in this
+//! crate. This module opens that wallet itself when nothing else has
+//! (`wallet.rs`).
 //!
 //! Identity and credential generation live in the membership
 //! module (secrets never cross the module wire); this module only ever sees
@@ -15,7 +20,8 @@
 //! Concurrency is "multi" (metadata.json, since 2.1.0): handlers run on Qt
 //! worker threads and overlap, so one wallet round-trip stuck in a slow
 //! sequencer read no longer wedges every other call. Every handler reaches
-//! the wallet through the ASYNC call plus a channel wait (`wallet_call`): the
+//! the wallet through the ASYNC call plus a channel wait (`await_reply` in
+//! `wallet.rs`): the
 //! SDK delivers the reply from the module's Qt event loop, so the worker only
 //! blocks on its channel and the loop stays free. The synchronous twin is
 //! never used from a worker — it would marshal onto the main thread and
@@ -34,6 +40,7 @@ use std::time::{Duration, Instant};
 
 mod base58;
 mod fee_state;
+mod leaf_claims;
 mod networks;
 mod rln_core;
 mod wallet;
@@ -270,14 +277,12 @@ fn fetch_shard(account_id_hex: &str, program: &[u8; 32], who: &str) -> Option<Ve
     }
 }
 
-/// The resolved config and the two program ids every on-chain entry point
-/// needs: the registration program (the config's owner, and the program every
-/// PDA hangs off) and the merkle program (whose shard of `tree_main` holds the
-/// tree, and which `Register` claims).
+/// The resolved config and the program every on-chain entry point needs: the
+/// registration program (the config's owner, and the program every PDA hangs
+/// off).
 struct RlnConfigContext {
     config_data: Vec<u8>,
     registration_program: [u8; 32],
-    merkle_program: [u8; 32],
 }
 
 /// Why a config account cannot serve as a registry here. `status` is the
@@ -357,12 +362,9 @@ fn config_context(config_account_id: &str) -> Result<RlnConfigContext, RegistryP
             ),
         ));
     }
-    let merkle_program =
-        native::config_field_32(&config_data, native::CONFIG_OFFSET_MERKLE_PROGRAM_ID);
     Ok(RlnConfigContext {
         config_data,
         registration_program,
-        merkle_program,
     })
 }
 
@@ -422,7 +424,7 @@ pub(crate) fn fee_payer_env_hex() -> String {
 /// Empty used to mean "self-pay by the signer", which was right when the
 /// signer was a token holding that held no native balance and something else
 /// had to pay. The signer now IS the payer, so the fallback is the account the
-/// wallet resolved at bring-up — configured, imported or derived.
+/// wallet would pay with now — configured, or the best-funded account in it.
 fn fee_payer_hex() -> String {
     let configured = fee_payer_env_hex();
     if !configured.is_empty() {
@@ -431,7 +433,7 @@ fn fee_payer_hex() -> String {
     wallet::payer_hex()
 }
 
-/// Submit one public transaction through the module's own wallet. `None` =
+/// Submit one public transaction through the `lez_core` wallet. `None` =
 /// failed, already logged.
 fn send_generic_tx(
     who: &str,
@@ -454,20 +456,7 @@ fn derive_register_plan(
     id_commitment: &[u8; 32],
     who: &str,
 ) -> Option<RlnRegisterPlan> {
-    let tree_main_hex = match native::tree_main_account_id(&ctx.config_data, &ctx.registration_program) {
-        Ok(id) => bytes_to_hex(&id),
-        Err(e) => {
-            eprintln!("{who}: derive tree main failed: {e}");
-            return None;
-        }
-    };
-    let tree_main_data = fetch_shard(&tree_main_hex, &ctx.merkle_program, who)?;
-    match native::register_plan(
-        &ctx.config_data,
-        &tree_main_data,
-        &ctx.registration_program,
-        id_commitment,
-    ) {
+    match native::register_plan(&ctx.config_data, &ctx.registration_program, id_commitment) {
         Ok(plan) => Some(plan),
         Err(e) => {
             eprintln!("{who}: register_plan failed: {e}");
@@ -488,71 +477,6 @@ fn chain_now_ms(who: &str) -> Option<u64> {
             None
         }
     }
-}
-
-/// The leaf index of a membership that exists, from the tree.
-///
-/// On LEZ v0.3.0 the merkle program assigns the slot as the registration
-/// applies and the membership record does not keep it, so the index is found
-/// by looking the member's leaf up in the tree. `None` (logged) when the tree
-/// cannot be read or does not hold the leaf — never a guess.
-fn membership_leaf_index(
-    ctx: &RlnConfigContext,
-    membership: &rln_layouts::MembershipState,
-    who: &str,
-) -> Option<u64> {
-    let tree = fetch_tree_shard(ctx, who)?;
-    let Some(leaf) = native::registration_leaf(&membership.id_commitment, membership.rate_limit)
-    else {
-        eprintln!("{who}: the membership's id_commitment is not a field element");
-        return None;
-    };
-    let found = native::find_leaf_index(&tree, &leaf);
-    if found.is_none() {
-        eprintln!("{who}: the tree holds no leaf for this membership");
-    }
-    found
-}
-
-/// The tree's merkle shard — one read, so the roots and every proof built from
-/// it come from the same tree state.
-fn fetch_tree_shard(ctx: &RlnConfigContext, who: &str) -> Option<Vec<u8>> {
-    let main = match native::tree_main_account_id(&ctx.config_data, &ctx.registration_program) {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!("{who}: derive tree main failed: {e}");
-            return None;
-        }
-    };
-    fetch_shard(&bytes_to_hex(&main), &ctx.merkle_program, who)
-}
-
-fn roots_to_json_array(roots: &[[u8; 32]]) -> serde_json::Value {
-    serde_json::Value::Array(
-        roots
-            .iter()
-            .map(|r| serde_json::Value::String(bytes_to_hex(r)))
-            .collect(),
-    )
-}
-
-/// Serialize proofs plus the shared `valid_roots` array to the wire JSON.
-/// `serde_json::Value` objects are BTreeMaps, so keys serialize
-/// alphabetically — the frozen wire order (pinned by
-/// `augmented_proofs_match_legacy_string_roundtrip`).
-fn proofs_with_roots_json(proofs: &[native::ProofJson], roots_array: &serde_json::Value) -> String {
-    let augmented: Vec<serde_json::Value> = proofs
-        .iter()
-        .map(|p| {
-            let mut obj = match serde_json::to_value(p) {
-                Ok(serde_json::Value::Object(obj)) => obj,
-                _ => serde_json::Map::new(),
-            };
-            obj.insert("valid_roots".to_string(), roots_array.clone());
-            serde_json::Value::Object(obj)
-        })
-        .collect();
-    serde_json::Value::Array(augmented).to_string()
 }
 
 /// The `tx_hash` of a send reply (`{success, tx_hash, error}`), or "".
@@ -586,7 +510,6 @@ fn submit_register(
     // Account order and shard per account must match the guest's Register
     // (lez-rln methods/guest registration.rs), which asserts both:
     //   config      registration shard
-    //   tree_main   merkle shard (PDA of the registration program)
     //   payer       native balance, signs
     //   treasury    native balance
     //   clock       CLOCK_50, clock program shard
@@ -604,7 +527,6 @@ fn submit_register(
     };
     let mentions = vec![
         mention(&plan.config_account_id, false, &registration_hex),
-        mention(&plan.tree_main_account_id, false, &bytes_to_hex(&ctx.merkle_program)),
         mention(&payer_bytes, true, &native_hex),
         mention(&plan.treasury_account_id, false, &native_hex),
         mention(
@@ -614,7 +536,13 @@ fn submit_register(
         ),
         mention(&plan.membership_account_id, false, &registration_hex),
     ];
-    send_generic_tx(who, mentions, instruction, registration_hex, fee_payer_hex())
+    let send_result = send_generic_tx(who, mentions, instruction, registration_hex, fee_payer_hex())?;
+    // The sender is the only party that knows a member's leaf: record the
+    // claim of every send the sequencer took (see leaf_claims.rs).
+    if !tx_hash_of(&send_result).is_empty() {
+        leaf_claims::record(&bytes_to_hex(&plan.membership_account_id), plan.leaf_index);
+    }
+    Some(send_result)
 }
 
 /// How often the watcher looks at the chain, and how many times a reverted
@@ -636,7 +564,8 @@ struct RegisterWatch {
 /// with fresh claims if it reverted.
 ///
 /// On LEZ v0.3.0 a registration whose claims no longer hold (its clock claim
-/// outside the registry's tolerance, a price or duration changed under it) is
+/// outside the registry's tolerance, a price or duration changed under it, its
+/// leaf index taken by a registration that landed first) is
 /// still included in a block — charged, with no effect, and nothing sent back
 /// to the submitter. So the fate is read from the chain: the membership
 /// appearing is success; the transaction in a block without it is a revert,
@@ -661,7 +590,7 @@ fn preflight_register(
     rate_limit: u64,
     payer_hex: &str,
 ) -> Result<(), String> {
-    native::check_register(&ctx.config_data, plan.next_leaf_index, id_commitment, rate_limit)?;
+    native::check_register(&ctx.config_data, id_commitment, rate_limit)?;
     let quote: Option<serde_json::Value> = serde_json::from_str(&fee_state::get_fee_state()).ok();
     let ceiling = |key: &str| {
         quote
@@ -717,11 +646,8 @@ fn register_watch(mut w: RegisterWatch) {
             fetch_shard_quiet(&membership_hex, &ctx.registration_program)
                 .and_then(|data| native::decode_membership(&data).ok())
         };
-        if let Some(m) = landed() {
-            match membership_leaf_index(&ctx, &m, WHO) {
-                Some(leaf) => eprintln!("{WHO}: registered at leaf {leaf}"),
-                None => eprintln!("{WHO}: registered"),
-            }
+        if landed().is_some() {
+            eprintln!("{WHO}: registered");
             return;
         }
         if fee_state::tx_included(&w.tx_hash) != Some(true) {
@@ -761,7 +687,7 @@ fn register_watch(mut w: RegisterWatch) {
         };
         w.tx_hash = tx_hash_of(&send_result);
         let reply = serde_json::json!({
-            "leaf_index": plan.next_leaf_index as i64,
+            "leaf_index": plan.leaf_index,
             "tx_result": send_result,
             "pending": true,
         })
@@ -772,91 +698,6 @@ fn register_watch(mut w: RegisterWatch) {
 }
 
 // ------------------------------------------------------------- method bodies
-
-fn get_valid_roots_impl(rln_account_id_hex: &str) -> String {
-    let Some(ctx) = resolve_config_context(rln_account_id_hex, "get_valid_roots") else {
-        return String::new();
-    };
-
-    let Some(main_data) = fetch_tree_shard(&ctx, "get_valid_roots") else {
-        return String::new();
-    };
-
-    let roots = match native::get_valid_roots(&main_data) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("get_valid_roots: valid_roots_from_main failed: {e}");
-            return String::new();
-        }
-    };
-
-    // The depth rides along because the consumer cannot use these roots
-    // without it: a registry shallower than the prover's circuit has every
-    // root lifted to the circuit's depth before it is compared with a root a
-    // proof carries. It costs nothing — the header is already fetched.
-    let depth = match native::tree_depth(&main_data) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("get_valid_roots: tree depth unreadable: {e}");
-            return String::new();
-        }
-    };
-
-    serde_json::json!({ "depth": depth, "valid_roots": roots_to_json_array(&roots) })
-        .to_string()
-}
-
-fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> String {
-    let indices_doc = serde_json::from_str::<serde_json::Value>(leaf_indices_json).ok();
-    let Some(indices_array) = indices_doc.as_ref().and_then(|v| v.as_array()) else {
-        eprintln!("get_merkle_proofs: leaf_indices_json is not a JSON array");
-        return String::new();
-    };
-    if indices_array.is_empty() {
-        return "[]".to_string();
-    }
-    let mut leaf_indices: Vec<u64> = Vec::with_capacity(indices_array.len());
-    for val in indices_array {
-        if !val.is_number() {
-            eprintln!("get_merkle_proofs: leaf index is not a number");
-            return String::new();
-        }
-        // Non-integer numbers truncate toward zero.
-        let idx = val
-            .as_u64()
-            .or_else(|| val.as_i64().map(|v| v as u64))
-            .or_else(|| val.as_f64().map(|v| v as u64))
-            .unwrap_or(0);
-        leaf_indices.push(idx);
-    }
-
-    let Some(ctx) = resolve_config_context(config_account_id, "get_merkle_proofs") else {
-        return String::new();
-    };
-
-    // The whole tree is one shard of one account, so a single read is a
-    // consistent snapshot: the roots and every proof come from the same state.
-    let Some(main_data) = fetch_tree_shard(&ctx, "get_merkle_proofs") else {
-        return String::new();
-    };
-    let roots = match native::get_valid_roots(&main_data) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("get_merkle_proofs: valid_roots failed: {e}");
-            return String::new();
-        }
-    };
-    let proofs = match native::merkle_proofs_exec(&main_data, &leaf_indices) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("get_merkle_proofs: merkle_proofs_exec failed: {e}");
-            return String::new();
-        }
-    };
-
-    // Inject valid_roots into each proof object so a single RPC returns both.
-    proofs_with_roots_json(&proofs, &roots_to_json_array(&roots))
-}
 
 // -------------------------------------------------------------------- module
 
@@ -903,17 +744,10 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
 
     fn on_context_ready(&self, ctx: &RustModuleContext) {
         // Bring-up runs on its own thread: this hook fires on the host's Qt
-        // main thread, and opening a wallet calibrates sequencers and then
-        // syncs the chain — work the loop must not be holding.
+        // main thread, and asking lez_core for its wallet dir, opening the
+        // wallet (which calibrates the sequencer client) and picking a payer
+        // are calls the loop must not be holding.
         wallet::spawn_bring_up(&ctx.instance_persistence_path);
-    }
-
-    fn get_valid_roots(&self, rln_account_id_hex: String) -> String {
-        get_valid_roots_impl(&rln_account_id_hex)
-    }
-
-    fn get_merkle_proofs(&self, config_account_id: String, leaf_indices_json: String) -> String {
-        get_merkle_proofs_impl(&config_account_id, &leaf_indices_json)
     }
 
     fn register_member(
@@ -954,23 +788,23 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         let membership_pda_hex = bytes_to_hex(&plan.membership_account_id);
 
         // Idempotency pre-check: if the membership PDA is already populated
-        // for this (tree_id, id_commitment), recover its leaf_index instead
-        // of resubmitting — the on-chain Register handler enforces uniqueness
-        // via Claim::Pda, so a resubmit always fails.
+        // for this (tree_id, id_commitment), say so instead of resubmitting —
+        // the on-chain Register handler enforces uniqueness via the one-shot
+        // membership init, so a resubmit always fails. The membership account
+        // does not record its leaf index; this module knows it only if it sent
+        // the registration (leaf_claims.rs).
         // decode_membership carries its own length guard (DataTooShort), so
         // a short or absent account simply fails to decode.
-        if let Some(membership) = fetch_shard_quiet(&membership_pda_hex, &ctx.registration_program)
+        if fetch_shard_quiet(&membership_pda_hex, &ctx.registration_program)
             .and_then(|existing| native::decode_membership(&existing).ok())
+            .is_some()
         {
-            let Some(leaf) = membership_leaf_index(&ctx, &membership, "register_member") else {
-                return String::new();
-            };
-            eprintln!("register_member: membership already exists at leaf {leaf} — skipping resubmit");
-            return serde_json::json!({
-                "leaf_index": leaf as i64,
-                "already_registered": true,
-            })
-            .to_string();
+            eprintln!("register_member: membership already exists — skipping resubmit");
+            let mut reply = serde_json::json!({ "already_registered": true });
+            if let Some(leaf_index) = leaf_claims::lookup(&membership_pda_hex) {
+                reply["leaf_index"] = leaf_index.into();
+            }
+            return reply.to_string();
         }
 
         if let Err(why) =
@@ -983,11 +817,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         // In-flight dedup (see REG_IN_FLIGHT): the first caller submits;
         // concurrent and repeat callers get the first submission's reply.
         let reg_key = membership_pda_hex.clone();
-        let placeholder = serde_json::json!({
-            "leaf_index": plan.next_leaf_index as i64,
-            "pending": true,
-        })
-        .to_string();
+        let placeholder = serde_json::json!({ "pending": true }).to_string();
         let prior = reg_in_flight(|m| match m.get(&reg_key) {
             Some((reply, _)) => Some(reply.clone()),
             None => {
@@ -1010,11 +840,12 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         };
 
         // Return once the sequencer accepts the submission; don't block on
-        // confirmation — next_leaf_index is only a pre-submit estimate.
-        // Callers poll get_membership() for the authoritative leaf_index
-        // from the membership PDA.
+        // confirmation. Callers poll get_membership() for the membership and
+        // its leaf index: the claim here is not final, since a registration
+        // landing first takes it (StaleLeafIndex) and the watcher re-sends
+        // with the next one.
         let reply = serde_json::json!({
-            "leaf_index": plan.next_leaf_index as i64,
+            "leaf_index": plan.leaf_index,
             "tx_result": send_result,
             "pending": true,
         })
@@ -1078,17 +909,10 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         let Some(now_ms) = chain_now_ms("get_membership") else {
             return String::new();
         };
-        // A membership that exists has a leaf; failing to find it is a read
-        // problem, reported as one ("") rather than as a membership without one.
-        let Some(leaf_index) = membership_leaf_index(&ctx, &membership, "get_membership") else {
-            return String::new();
-        };
-
-        serde_json::json!({
+        let mut reply = serde_json::json!({
             "clock_timestamp": now_ms,
             "grace_period_duration": membership.grace_period_duration_sec,
             "grace_period_start_timestamp": membership.grace_period_start_timestamp_ms,
-            "leaf_index": leaf_index as i64,
             "rate_limit": membership.rate_limit as i64,
             "registered": true,
             "state": native::membership_status(
@@ -1096,8 +920,13 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
                 membership.grace_period_duration_sec,
                 now_ms,
             ),
-        })
-        .to_string()
+        });
+        // The membership exists, so the latest claim this module sent for it
+        // is its leaf (leaf_claims.rs). Absent when another sender registered it.
+        if let Some(leaf_index) = leaf_claims::lookup(&membership_pda_hex) {
+            reply["leaf_index"] = leaf_index.into();
+        }
+        reply.to_string()
     }
 
     fn check_registry(&self, config_account_id: String) -> String {
@@ -1191,45 +1020,6 @@ mod tests {
         });
     }
 
-    // Pins proofs_with_roots_json to the byte output of the string
-    // round-trip (serialize → re-parse as Value → insert valid_roots →
-    // re-serialize) that defines the frozen wire format.
-    #[test]
-    fn augmented_proofs_match_legacy_string_roundtrip() {
-        let proofs = vec![native::ProofJson {
-            leaf: "aa".repeat(32),
-            root: "bb".repeat(32),
-            leaf_index: 5,
-            depth: 2,
-            path_elements: vec!["cc".repeat(32), "dd".repeat(32)],
-            path_indices: vec![1, 0],
-        }];
-        let roots_array = roots_to_json_array(&[[0xEE; 32]]);
-
-        let legacy_json = serde_json::to_string(&proofs).unwrap();
-        let legacy_parsed = serde_json::from_str::<serde_json::Value>(&legacy_json)
-            .ok()
-            .and_then(|v| v.as_array().cloned())
-            .unwrap_or_default();
-        let legacy: Vec<serde_json::Value> = legacy_parsed
-            .into_iter()
-            .map(|p| {
-                let mut obj = p.as_object().cloned().unwrap_or_default();
-                obj.insert("valid_roots".to_string(), roots_array.clone());
-                serde_json::Value::Object(obj)
-            })
-            .collect();
-        let legacy_str = serde_json::Value::Array(legacy).to_string();
-
-        let current_str = proofs_with_roots_json(&proofs, &roots_array);
-        assert_eq!(current_str, legacy_str);
-        // Alphabetical keys, valid_roots last.
-        assert!(current_str.starts_with("[{\"depth\":2,\"leaf\":\"aa"));
-        assert!(current_str.contains("\"root\":\"bb"));
-        let expected_tail = format!("\"valid_roots\":[\"{}\"]}}]", "ee".repeat(32));
-        assert!(current_str.ends_with(&expected_tail));
-    }
-
     #[test]
     fn a_listed_config_on_another_network_is_refused() {
         let devnet_config = "9d6c0f59718f05ecb3f6ae58259821bfff6594e20866d6cd2a214c53e4ec0511";
@@ -1240,14 +1030,5 @@ mod tests {
         assert!(network_conflict(None, devnet_config).is_none());
         // Not in the table: it may well live on the bound chain.
         assert!(network_conflict(Some("testnet"), &"ab".repeat(32)).is_none());
-    }
-
-    #[test]
-    fn merkle_proofs_input_validation_shortcircuits() {
-        // These paths return before any wallet call.
-        assert_eq!(get_merkle_proofs_impl("cfg", "notjson"), "");
-        assert_eq!(get_merkle_proofs_impl("cfg", "{}"), "");
-        assert_eq!(get_merkle_proofs_impl("cfg", "[]"), "[]");
-        assert_eq!(get_merkle_proofs_impl("cfg", "[\"x\"]"), "");
     }
 }

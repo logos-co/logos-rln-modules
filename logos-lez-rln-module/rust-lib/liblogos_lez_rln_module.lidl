@@ -1,7 +1,7 @@
 ; liblogos_lez_rln_module — the LEZ RLN registry provider. The contract is the
 ; surface its two consumers use: the membership module's registry provider
-; (register_member / get_membership / get_registry_bounds / get_merkle_proofs
-; / get_valid_roots — see logos-rln-module/rust-lib/deps/) and anything that
+; (register_member / get_membership / get_registry_bounds — see
+; logos-rln-module/rust-lib/deps/) and anything that
 ; needs to know whether the module can afford to register (wallet_status /
 ; get_native_balance). Identity and credential generation belong to the
 ; membership module, which keeps the secret in-module; this module never
@@ -38,42 +38,56 @@
 ; v4.2.1 adds the testnet network (testnet-z1) to the built-in table; data only.
 ; v5.1.0 adds check_registry: whether a registry is deployed on the wallet's
 ; chain, and why not.
+; v7.0.0 follows the program off chain for its tree: the registry keeps no
+; merkle tree (a zone service builds it from the program's Registered/
+; Extended/Slashed/Erased events, and the membership module asks it for
+; roots and proofs over libp2p). The config still numbers registrations
+; (next_leaf_index, claimed by Register and carried by the Registered event),
+; but the membership account does not record its index: get_valid_roots and
+; get_merkle_proofs are gone, register_member no longer refuses with
+; tree_full, and leaf_index is this module's to answer because it sent the
+; registration — each send's claim is recorded (leaf_claims.json in the
+; module's persistence dir); register_member replies carry the claim of that
+; send, and get_membership answers the latest claim once the membership
+; exists (the leaf, since a re-send follows only a send that reverted; absent
+; for a membership another sender registered). Configs are the 120-byte
+; layout (no merkle_program_id, next_leaf_index appended); a 112- or 144-byte
+; config reads as wrong_generation.
+; The same release goes back to the lez_core wallet (depends [lez_core]): with
+; the tree off chain a Register costs ~52k gas, well inside the shared
+; wallet's stock 2M limit, so the bundled wallet_ffi is gone. Nothing on a
+; headless node opens lez_core, so this module does: in lez_core's own
+; wallet_dir (or LEE_WALLET_HOME_DIR), creating the wallet when there is none,
+; and adopting one another consumer already opened if it is on the same
+; sequencer (on another chain: wallet_status "failed"). The payer is any
+; public account in that wallet with funds — LEZ_RLN_PAYER when it names one
+; the wallet holds, else the best-funded, re-picked whenever a payment is
+; made; with nothing funded, wallet_status names one account to fund.
+; LEZ_RLN_PAYER_KEY is ignored (lez_core cannot import a key). No wallet sync:
+; reads and nonces come from the sequencer.
 module liblogos_lez_rln_module {
-  version "5.1.0"
+  version "7.0.0"
   description "RLN registry provider (LEZ chain reads + registration/funding txs)"
   category "blockchain"
-
-  ; {"depth":N,"valid_roots":[…]} — the tree's configured depth and its
-  ; 32-byte lowercase-hex roots (current + non-zero history); "" on error.
-  ;
-  ; The depth is not decoration. A registry may be shallower than the prover's
-  ; circuit (ours is 9 against a depth-10 circuit), and a proof carries a root
-  ; lifted to the circuit's depth — so a consumer must lift these to compare
-  ; them at all. Reporting roots without the depth to lift them by is what let
-  ; a node reject proofs it had just generated itself. It costs nothing: the
-  ; depth is one byte of the tree main header this call already reads.
-  ; v3.0.0 and earlier answered a bare array.
-  method get_valid_roots(rln_account_id_hex: tstr) -> tstr
-
-  ; leaf_indices_json is a JSON array of leaf indices. Returns a compact
-  ; JSON array of proof objects, each augmented with "valid_roots", from a
-  ; stable tree snapshot (5 attempts, "" on sustained churn); "[]" for an
-  ; empty index list, "" on error.
-  method get_merkle_proofs(config_account_id: tstr, leaf_indices_json: tstr) -> tstr
+  depends [lez_core]
 
   ; Idempotent on-chain registration. Existing membership PDA →
-  ; {"already_registered":true,"leaf_index":N}; otherwise submits the
-  ; Register tx and returns {"leaf_index":N,"pending":true,"tx_result":s}
-  ; without waiting for confirmation; "" on error.
+  ; {"already_registered":true}; otherwise submits the Register tx and
+  ; returns {"leaf_index":N,"pending":true,"tx_result":s} without waiting for
+  ; confirmation; "" on error. leaf_index is this send's claim, which a racing
+  ; registration can move (the watcher re-sends with the next): the final
+  ; index is get_membership's. already_registered carries leaf_index when
+  ; this module sent the registration.
   ; payer_account_id signs the tx, pays rate_limit x price_per_unit of NATIVE
   ; balance to the treasury, and pays the fee — one account, not the
   ; pre-4.0.0 (holding signs, LEZ_RLN_PAYER pays) pair. "" selects the
-  ; module's own payer; a caller paying on someone else's behalf (a gifter)
-  ; names its account, whose key this module's wallet must hold.
+  ; module's own payer (since 7.0.0: the best-funded account in the lez_core
+  ; wallet); a caller paying on someone else's behalf (a gifter) names its
+  ; account, whose key that wallet must hold.
   ; Since 5.1.0 a registration the program would refuse is not submitted:
   ; {"error":"<kind>: <reason>"} with kind invalid_commitment (zero, or not a BN254
-  ; field element, read little-endian), invalid_rate_limit, registry_full,
-  ; tree_full or insufficient_balance (price + fee reserve at the next base
+  ; field element, read little-endian), invalid_rate_limit, registry_full
+  ; or insufficient_balance (price + fee reserve at the next base
   ; fee ceiling). "" stays the answer for a config or chain read that failed.
   method register_member(config_account_id: tstr, payer_account_id: tstr, id_commitment_hex: tstr, rate_limit: int) -> tstr
 
@@ -88,8 +102,10 @@ module liblogos_lez_rln_module {
   ; Membership PDA read + lifecycle state derived from the on-chain CLOCK_50
   ; timestamp (never local time). {"registered":false} when the PDA is absent
   ; or emptied (erase/slash); otherwise {"clock_timestamp":N,
-  ; "grace_period_duration":N,"grace_period_start_timestamp":N,"leaf_index":N,
-  ; "rate_limit":N,"registered":true,"state":"active"|"grace_period"|"expired"};
+  ; "grace_period_duration":N,"grace_period_start_timestamp":N,
+  ; "leaf_index"?:N,"rate_limit":N,"registered":true,
+  ; "state":"active"|"grace_period"|"expired"}; leaf_index (since 7.0.0) when
+  ; this module sent the registration — the claim of the send that landed.
   ; "" on error (including clock fetch failure). clock_timestamp and
   ; grace_period_start_timestamp are MILLISECONDS (CLOCK_50);
   ; grace_period_duration is SECONDS.
@@ -105,18 +121,21 @@ module liblogos_lez_rln_module {
   ; grace_period_duration are SECONDS.
   method get_registry_bounds(config_account_id: tstr) -> tstr
 
-  ; Whether this module's wallet is open and usable, and which account it
-  ; pays with:
+  ; Whether the lez_core wallet is open and usable to this module, and which
+  ; account it pays with:
   ; {"detail":s,"network":s,"payer":hex64,"ready":b,
   ;  "state":"pending"|"ready"|"failed"}.
   ; `network` (since 4.1.0) is the network the home is recorded as bound to,
   ; "" while unbound or when the home was configured by its operator.
-  ; Never fails and never touches the chain — `payer` is read from local
-  ; configuration, so it answers before the first sync, and callers poll this
-  ; as a liveness probe. Ask get_native_balance what that account can afford.
+  ; Never fails and never touches the chain — `payer` is the last pick (the
+  ; best-funded account, or the one published for funding when none is), so
+  ; callers poll this as a liveness probe. Fund that account, or any account
+  ; in the wallet: get_native_balance("") re-picks and reports the result.
   ; Branch on `state`, not on `ready`: the distinction that matters is
-  ; retry-or-give-up. "pending" is bring-up still in flight (open + first
-  ; sync) and worth waiting on; "failed" will not resolve by waiting, and
+  ; retry-or-give-up. "pending" is bring-up still in flight (asking lez_core
+  ; for its dir, opening the wallet, picking a payer) and worth waiting on;
+  ; "failed" will not resolve by waiting (lez_core open on another chain,
+  ; LEZ_RLN_PAYER not in the wallet), and
   ; `detail` says why. Every chain-facing method answers "" until "ready".
   ; Since 4.1.0 an unconfigured home is "pending" with the detail "no network
   ; selected — no wallet_config.json, LEZ_RLN_SEQUENCER unset;

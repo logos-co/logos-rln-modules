@@ -10,14 +10,10 @@ endif()
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/metadata.json
                ${CMAKE_CURRENT_BINARY_DIR}/metadata.json COPYONLY)
 
-# EXTERNAL_LIBS links the prebuilt wallet_ffi the LEZ flake supplies (see
-# flake.nix externalLibInputs). The Rust archive below declares its symbols and
-# nothing else in this plugin references them, so without naming it here the
-# plugin builds clean and then fails to resolve eleven wallet_ffi_* symbols at
-# load.
+# No external libraries since 7.0.0: the wallet is the lez_core module's,
+# reached over the protocol like any other module.
 logos_module(
     NAME liblogos_lez_rln_module
-    EXTERNAL_LIBS wallet_ffi
 )
 
 # ── Rust static library ──────────────────────────────────────────────────────

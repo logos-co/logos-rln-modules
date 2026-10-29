@@ -1,9 +1,8 @@
 # logos-lez-rln-module — the RLN registry provider (Rust)
 
 `liblogos_lez_rln_module`, built on logos-rust-sdk / logos-module-builder. It
-serves the membership stack's chain access: registry reads (roots, merkle
-proofs, membership PDA + lifecycle state, registry bounds), the Register tx,
-and the faucet funding flow (`claim_tokens`/`get_token_balance`). Its two
+serves the membership stack's chain access: registry reads (membership PDA +
+lifecycle state, registry bounds) and the Register tx. Its two
 consumers are the membership module's registry provider and the membership
 UI's funding flow; identity/credential generation lives in the membership
 module, so this module never handles secrets. The chain logic lives in-crate
@@ -14,22 +13,49 @@ v2.0.0 dropped the C++-era frozen wire surface: `generate_identity`,
 `start_*_broadcast` methods and the `valid_roots`/`merkle_proof` events
 (the membership module polls the getter methods instead).
 
+v7.0.0 follows the program's tree off chain. The registration program keeps
+no merkle tree; it numbers registrations in the config's `next_leaf_index`
+(claimed by `Register`, carried by the `Registered` event, not stored in the
+membership account) and emits `Registered`/`Extended`/`Slashed`/`Erased`
+events, from which a zone service builds the depth-20 tree. Roots and proofs
+come from that service, which the membership module queries over libp2p
+(`logos-rln-module/docs/zone-query.md`), so `get_valid_roots` and
+`get_merkle_proofs` are gone here. The leaf index is this module's to answer,
+because it sent the registration: it records each send's claim
+(`leaf_claims.json` in its persistence dir), `register_member` replies carry
+it, and `get_membership` answers the latest claim once the membership exists.
+Configs are the 120-byte layout: no `merkle_program_id`, `next_leaf_index`
+appended. Of the registries in `networks.json` only testnet's
+`testnet-zone-events` is on this program; the others were deployed by the
+on-chain-tree program, and until they are redeployed `check_registry` reports
+them as `wrong_generation`.
+
+The same release goes back to the `lez_core` wallet module instead of
+bundling `wallet_ffi`: a Register now costs ~52k gas, inside the shared
+wallet's stock 2M limit. The module opens that wallet itself when nothing else has (a
+delivery node has no wallet app), pays from any funded account in it, and
+publishes one to fund when none is — see "Design constraints". Every reply
+shape is unchanged; `LEZ_RLN_PAYER_KEY` is ignored.
+
 ## Layout
 
 - `metadata.json` — module manifest: `codegen.rust` drives logos-module-builder
-  (lidl scaffold + Qt cdylib glue). No module dependencies since 3.0.0.
-- `rust-lib/liblogos_lez_rln_module.lidl` — the module contract (9 methods,
+  (lidl scaffold + Qt cdylib glue). Depends on `lez_core` (the wallet module)
+  since 7.0.0, as it did before 3.0.0; `rust-lib/deps/lez_core.lidl` is the
+  subset it calls, from which the typed client is generated.
+- `rust-lib/liblogos_lez_rln_module.lidl` — the module contract (8 methods,
   no events).
-- `rust-lib/src/wallet.rs` — the wallet this module owns: bring-up, the home it
-  adopts or provisions (and for which network), and the three chain operations
-  it used to make over lp.
+- `rust-lib/src/wallet.rs` — the `lez_core` wallet as this module uses it:
+  bring-up (where the wallet lives, opening or adopting it, for which
+  network), the payer pick, and the chain operations, each a `lez_core` call
+  behind the `Core` trait (a fake in the tests).
 - `rust-lib/networks.json` + `rust-lib/src/networks.rs` — the built-in table of
   known networks (CAIP-2 reference → sequencer + registries), embedded at
   compile time. Add one from an e2e descriptor with
   `tools/add-network.sh <reference> <deployment.json>`.
 - `rust-lib/src/fee_state.rs` — `get_fee_state` (since 4.2.0): the
-  sequencer's `getFeeState` quote, read over a std-only HTTP/1.0 POST from the
-  sequencer the wallet's config names (plain http only; https answers `""`).
+  sequencer's `getFeeState` quote, read with `ureq` (rustls, so http and
+  https) from the sequencer the wallet's config names.
 - `rust-lib/src/lib.rs` — the provider implementation (the handlers).
 - `rust-lib/src/rln_core.rs` — the RLN core (tree/proof/register/funding logic),
   depending only on the shared `rln-layouts` crate.
@@ -41,11 +67,11 @@ v2.0.0 dropped the C++-era frozen wire surface: `generate_identity`,
 
 | Variable | Meaning |
 |---|---|
-| `LEE_WALLET_HOME_DIR` | An existing wallet home to adopt; default `<instance_persistence_path>/wallet-home`. |
+| `LEE_WALLET_HOME_DIR` | The wallet home to open in `lez_core`; default `lez_core`'s own `wallet_dir()`. |
 | `LEZ_RLN_SEQUENCER` | Sequencer URL for a home this module provisions. |
 | `LEZ_RLN_NETWORK` | A network from `rust-lib/networks.json`, by reference (e.g. `devnet`). Alone it provisions the home from the table; beside `LEZ_RLN_SEQUENCER` it only labels the home so a registry on another network is refused. |
-| `LEZ_RLN_PAYER` | The account that pays (base58 or hex). |
-| `LEZ_RLN_PAYER_KEY` | A funded account's private key (32-byte hex), imported at bring-up. |
+| `LEZ_RLN_PAYER` | The account that pays (base58 or hex); must be an account the wallet holds. Default: the best-funded public account. |
+| `LEZ_RLN_PAYER_KEY` | Ignored since 7.0.0 (`lez_core` cannot import a key); logged once if set. |
 
 Which chain a home talks to, first match wins:
 
@@ -97,8 +123,7 @@ nix build 'path:.#lgx'       # .lgx bundle for LEZ_RLN_LGX
 ## Live-registry tests (testnet)
 
 `src/testnet_tests.rs` validates rln_core's chain-facing logic — ConfigState
-offsets, PDA derivation, valid roots, merkle-proof construction (recomputed
-via poseidon), clock decode, membership reads — against a DEPLOYED
+offsets, PDA derivation, clock decode, membership reads — against a DEPLOYED
 registration program. Read-only, off by default (each test skips unless
 gated), no new crate deps (`curl` subprocess speaks the sequencer's
 JSON-RPC `getAccount` — the same read the wallet serves this module at
@@ -121,30 +146,35 @@ PDA-derivation divergence, tree-encoding drift, chain-clock unit changes.
   itself until SIGKILL). Under multi the Qt glue runs each call on its own
   worker; a stuck handler leaks one worker instead of starving every caller.
   All state lives in lock-guarded statics; the impl struct has no fields.
-- **The wallet is this module's own, in-process** (`rust-lib/src/wallet.rs`),
-  since 3.0.0. It links the LEZ `wallet` crate rather than calling the
-  `lez_core` module, because a host has exactly one `lez_core` wallet handle,
-  `open`/`create_new` both refuse while one is open, there is no close, and
-  nothing reads back the gas limit a wallet was opened with. A registration
-  needs ~9.1M cycles against a stock 2,000,000 default, so losing that race
-  meant every registration refused with a bare "Incorrect fee". The crate
-  keeps `#![deny(unsafe_code)]`: the Rust crate, never the C ABI.
-- **It cannot pay its own way, and that is structural.** A fee is reserved
-  from a *native* balance, the payer must sign so the wallet has to hold its
-  key, and native balance enters an account only at genesis, over the bridge,
-  or by transfer from something already funded. `LEZ_RLN_PAYER_KEY` hands in
-  one funded key — imported, so it grants that one account and wipes nothing,
-  unlike a mnemonic restore. A wallet home staged by
-  `tools/deployments/stage.sh` needs none of that: adopting one through
-  `LEE_WALLET_HOME_DIR` brings its payer derivation with it.
+- **The wallet is `lez_core`'s** (since 7.0.0; 3.0.0 to 6.x linked
+  `wallet_ffi` and ran their own). A host has exactly one `lez_core` wallet
+  handle, `open`/`create_new` both refuse while one is open, and there is no
+  close — whoever opens first chooses the config, gas limit included. That
+  was fatal while a registration needed ~9.1M gas against the stock 2M; with
+  the tree off chain a Register costs ~52k and a slash ~650k, so any config
+  serves, and the config this module writes declares no `gas_limit`.
+- **This module opens the wallet, because nothing else will.** A delivery
+  node has no wallet app. Bring-up asks `lez_core.wallet_dir()` (or takes
+  `LEE_WALLET_HOME_DIR`), plans the network exactly as before, then `open`s
+  the storage or `create_new`s it. A refusal is ambiguous (already open, or a
+  failed open — same code), so `get_sequencer_addr` decides: a wallet open
+  on this home's sequencer is adopted, one on another chain is `failed`,
+  none at all is retried. No sync: the wallet serves no reads while one
+  runs, a fresh one takes tens of minutes, and account reads and nonces come
+  from the sequencer anyway.
+- **The payer is any funded account in that wallet.** `LEZ_RLN_PAYER` if it
+  names one the wallet holds; otherwise the best-funded public account,
+  re-picked on every payment and every `get_native_balance("")`, so funding
+  any account is noticed without a restart. With nothing funded,
+  `wallet_status().payer` names one account to fund — recorded in this
+  module's persistence dir (`payer.json`) so it stays put. Native balance
+  enters an account only at genesis, over the bridge or by transfer: funding
+  is the operator's one step.
 - **Bring-up runs on its own thread.** `on_context_ready` fires on the host's
-  Qt main thread, and opening a wallet calibrates sequencers and then syncs
-  the chain. Handlers wait on a condvar for a bounded window and answer an
-  empty string if it has not settled; the status method is how a consumer
-  tells "still coming up" from "broken".
-- **The wallet sits behind a read-write lock.** Reads and sends take a shared
-  guard; deriving an account or syncing takes an exclusive one — the honest
-  model, since the wallet serves no reads while a sync runs. The state lock is
+  Qt main thread and only creates the `lez_core` client; everything after is
+  a call to another module. Handlers wait on a condvar for a bounded window
+  and answer an empty string if it has not settled; the status method is how
+  a consumer tells "still coming up" from "broken". The state lock is
   released before any call: holding it across a round trip would serialize
   every handler, the wedge the `single` -> `multi` bump was made to escape.
 - **`REG_IN_FLIGHT` dedup in `register_member`**: callers can fire

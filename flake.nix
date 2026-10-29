@@ -13,19 +13,12 @@
 
     logos-core.url = "github:logos-co/logos-cpp-sdk/25c88f4d48fa95ea4437194bcf60bd8d0cf84a74";
 
-    # v0.2.5-rc3 plus two commits (adklempner/logos-execution-zone
-    # feat/wallet-gas-limit-rc3): the wallet takes its execution gas limit from
-    # config instead of a 2,000,000 constant, and scales its fee cap with it.
-    # Gas is cycles in v0.2.5, so that constant is a ceiling on how expensive a program a module may call, and a
-    # registration needs about nine million. Nothing on the path from a module
-    # into the wallet carries a gas argument, so config is the only way to
-    # raise it. Drop this the moment it lands upstream.
-    logos-execution-zone.url = "github:adklempner/logos-execution-zone?rev=2fe8c5ce51c4018b31e8e144350357185db9cc48";
-
-    logos-wallet-module = {
-      url = "github:logos-blockchain/logos-execution-zone-module?rev=0ea57f8a1c57539d6ee0961a9cd27b064685b9e8";
-      inputs.logos-execution-zone.follows = "logos-execution-zone";
-    };
+    # The lez_core wallet module liblogos_lez_rln_module (7.0.0+) drives: 0.5.1,
+    # on LEZ v0.3.1 — the release the official catalog publishes, which is
+    # where a delivery install gets it. Exported as `wallet-module` for the e2e
+    # harness. Its own lock pins LEZ; the stock 2M gas limit covers every
+    # registration-program call, so no gas-limit fork is needed any more.
+    logos-wallet-module.url = "github:logos-blockchain/logos-execution-zone-module?rev=51a6fee385eedfdc65ba71f01447c5411a54bdf7";
 
     logos-module-viewer.url = "github:logos-co/logos-module-viewer";
 
