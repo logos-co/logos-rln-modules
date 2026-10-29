@@ -176,6 +176,12 @@ What the module side is ready for and the service does not do yet.
 - **Several registries.** The request's `registry` (config account) has no
   HTTP counterpart: a service for more than one registry needs it in the path,
   or a `404` when it is not the one served.
+- **Privacy-preserving transactions.** The reader hand-decodes `getBlockRange`
+  bodies and stops at the first `LeeTransaction::PrivacyPreserving` (tag 1),
+  whose layout it does not know, so it cannot read past that block (testnet
+  block 61148, 2026-10-29) and never publishes again. Decode the block with
+  the LEZ crates' borsh types, or skip a transaction by a length the
+  sequencer serves.
 - **A wire version.** A body-shape change is a wire change for every reader:
   a `version` field in the `/` summary, or a path prefix (`/v1/…`), would let
   a module refuse an unknown shape with a clear message instead of a field
