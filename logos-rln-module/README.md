@@ -18,7 +18,7 @@ derivation, clock reads, tx submission), and delegated registration drives
 `rln_gifter_module` with the module's own commitment. No rln-layouts / risc0
 dependencies.
 
-Since 0.14.0 a `logos` registry's merkle tree is not on chain: the
+Since 0.15.0 a `logos` registry's merkle tree is not on chain: the
 registration program emits events and a **zone service** builds the tree from
 them. The module asks that service, as protobuf over libp2p through
 `libp2p_module`'s `protocolRequest` (or, for development, the Zone indexer's

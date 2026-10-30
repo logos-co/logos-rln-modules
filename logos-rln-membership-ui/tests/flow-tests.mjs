@@ -2,7 +2,7 @@
 // scripted mock bridge injected through the inspector's `evaluate` command
 // (framework.mjs doesn't wrap it; the server supports it). No daemon, no
 // chain: the mock replies with the same parseReply-visible shapes as the
-// real wire (liblogos_rln_module.lidl 0.12.0 — 0.14.0's leaf_pending included
+// real wire (liblogos_rln_module.lidl 0.12.0 — 0.15.0's leaf_pending included
 // — ensure_membership with the
 // structured provisioning object, register_membership with the delegated
 // RegistryOptions, the LIP MembershipStatus vocabulary, {class,kind,message}
@@ -730,7 +730,7 @@ test("petname is stable per commitment and varies across commitments", async (ap
   if (await evalExpr(app, `M.petname("")`) !== "") throw new Error("empty commitment should yield ''");
 });
 
-// Since rln 0.14.0 / lez 7.0.0 the leaf index arrives once the registry module
+// Since rln 0.15.0 / lez 7.0.0 the leaf index arrives once the registry module
 // reports the claim of the registration that landed: until then the view says
 // leaf_pending with a placeholder leaf_index of 0, and the UI must say
 // "pending", not "0" — leaf 0 is a real leaf.

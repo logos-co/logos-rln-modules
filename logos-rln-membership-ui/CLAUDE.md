@@ -1,4 +1,4 @@
-# logos-rln-membership-ui (measured pre-0780862, 2026-07; wire rln 0.14.0 / lez 7.0.0 since 0.9.0)
+# logos-rln-membership-ui (measured pre-0780862, 2026-07; wire rln 0.15.0 / lez 7.0.0 since 0.9.0)
 
 - Every module call must go through `call()` in `qml/membership.js` — never
   `bridge.callModuleAsync` directly. `call()` applies the `| 0` coercion
@@ -28,7 +28,7 @@
 - Retry decisions switch on the error envelope's `class` (`transient` →
   `M.isTransientError`), never on `kind` alone; pass the whole error
   object, not `err.kind`. A membership's leaf renders through `M.fmtLeaf`
-  only: since rln 0.14.0 a live membership may carry `leaf_pending:true`
+  only: since rln 0.15.0 a live membership may carry `leaf_pending:true`
   with a placeholder `leaf_index` of 0 (the registry module did not report
   one: it knows the leaf only of a registration it sent),
   and 0 is also a real leaf. New membership states go into

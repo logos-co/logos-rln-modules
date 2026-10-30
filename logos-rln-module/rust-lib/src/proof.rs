@@ -44,7 +44,7 @@ use crate::registry_id::{bytes_to_hex, hex_to_bytes32, hex_to_vec};
 /// The circuit's fixed Merkle depth; a supplied path MUST have this length or
 /// witness construction fails.
 ///
-/// zerokit's default of 20 again (0.14.0): the tree is off chain, built by the
+/// zerokit's default of 20 again (0.15.0): the tree is off chain, built by the
 /// membership zone (logos-rln-membership-zone) at the depth zerokit ships, so
 /// the on-chain insert cost that forced a depth-10 circuit (until 0.13.x) is
 /// gone. Every prover and verifier of a registry must use the same depth: a
@@ -750,7 +750,7 @@ mod tests {
     // "Hello, RLN!", zero-sibling all-left depth-20 path.
     // A change here breaks cross-node verification — never rebind silently.
     //
-    // REBOUND to the depth-20 circuit (0.14.0), the root it had before the
+    // REBOUND to the depth-20 circuit (0.15.0), the root it had before the
     // depth-10 on-chain tree. `root` is the only value that moved,
     // because the circuit folds the path to produce it; every other value here
     // is depth-independent and is unchanged, which is the evidence that

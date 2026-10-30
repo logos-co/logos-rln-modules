@@ -10,14 +10,14 @@
 ; hot path). Every call is scoped by (registry_id, rln_identifier); the
 ; lez-rln provider ("logos" namespace) is a wire client of the sibling
 ; liblogos_lez_rln_module, and delegated registration drives rln_gifter_module.
-; Since 0.14.0 (needs liblogos_lez_rln_module >= 7.0.0) a `logos` registry's
+; Since 0.15.0 (needs liblogos_lez_rln_module >= 7.0.0) a `logos` registry's
 ; merkle tree is off chain: roots and proofs come from the registry's zone
 ; service (logos-rln-membership-zone) as protobuf over libp2p (libp2p_module
 ; protocolRequest, /logos/rln/zone-query/1.0.0 — docs/zone-query.md), or for
 ; development from the Zone indexer's JSON API over HTTP (GET /roots/{n},
 ; /merkle_proof/{leaf_index}), configured by start()'s zone_service. The
 ; proof circuit is zerokit's depth 20 again (it was depth 10 for the on-chain
-; tree until 0.13.x): proofs do not cross-verify between a 0.14.0 module and
+; tree until 0.13.x): proofs do not cross-verify between a 0.15.0 module and
 ; an older one. The chain still answers membership records and registration;
 ; the leaf index is the registry module's, which sent the registration that
 ; claimed it. libp2p_module is a declared dependency
@@ -53,7 +53,7 @@
 ; Events are a third channel, pushed over the lp event stream rather than
 ; returned from a call — see the events section below.
 module liblogos_rln_module {
-  version "0.14.0"
+  version "0.15.0"
   description "RLN Membership Management Module"
   category "blockchain"
   depends [liblogos_lez_rln_module, libp2p_module]
@@ -84,7 +84,7 @@ module liblogos_rln_module {
   ; wraps it in {"memberships":[…]}). failed_reason/retryable/rln_identifier/
   ; tx_result/rate_limit_mismatch are present only when the method comments
   ; above describe them as such; retryable never appears without failed_reason.
-  ; leaf_pending (since 0.14.0) is true while an active/grace_period
+  ; leaf_pending (since 0.15.0) is true while an active/grace_period
   ; membership has no leaf index — the registry module reports the leaf a
   ; registration it sent claimed, and did not send this one — and leaf_index
   ; then reads 0; omitted otherwise.
@@ -107,7 +107,7 @@ module liblogos_rln_module {
   ; membership_hash/leaf_index/rate_limit are present only once a single
   ; membership resolves for the scope (state:"unknown" -> none of the three;
   ; more than one candidate is an ambiguous_selection ERROR, not this shape).
-  ; leaf_pending as on Membership (since 0.14.0).
+  ; leaf_pending as on Membership (since 0.15.0).
   type MembershipState {
     ? leaf_index: int
     ? leaf_pending: bool
@@ -269,17 +269,17 @@ module liblogos_rln_module {
   method select_membership(registry_id: tstr, rln_identifier_hex: tstr, selector_json: tstr) -> tstr
 
   ; Provider passthrough. One leaf's proof and the root it hashes to. Since
-  ; 0.14.0 served by the registry's zone service (one proof query, at the
+  ; 0.15.0 served by the registry's zone service (one proof query, at the
   ; root it serves), not the chain; not_ready when no zone service is
   ; configured or it has no leaf at that index (404) or nothing to serve
   ; yet (503), unknown_membership for a path to an empty leaf: {"depth":N,"leaf":…,"leaf_index":N,
   ; "path_elements":[…],"path_indices":[…],"root":…}. No valid_roots since
-  ; 0.14.0: one root is not a window (get_valid_roots answers that).
+  ; 0.15.0: one root is not a window (get_valid_roots answers that).
   method get_merkle_proof(registry_id: tstr, leaf_index: int) -> tstr
 
   ; Provider passthrough. {"valid_roots":["<hex64>",…]} — wrapped in an
   ; object so the same shape can become the pass-2 subscription event
-  ; payload (which must carry registry_id). Since 0.14.0 the zone service's
+  ; payload (which must carry registry_id). Since 0.15.0 the zone service's
   ; newest five published roots, newest first, whatever their status.
   method get_valid_roots(registry_id: tstr) -> tstr
 
@@ -471,7 +471,7 @@ module liblogos_rln_module {
   ; {"registry_id":"<caip10>","epoch_size_sec"?:N,"max_epoch_gap"?:N}
   ; overriding the defaults for that registry (spec: epoch size and gap are
   ; per-registry configuration; the rate-limiting methods resolve them per
-  ; registry). Since 0.14.0 "zone_service"?:{"peer_id":s,"multiaddrs":[s,…]}
+  ; registry). Since 0.15.0 "zone_service"?:{"peer_id":s,"multiaddrs":[s,…]}
   ; (or a single "multiaddr":s; the libp2p peer) names the service serving a
   ; registry's tree — top-level for every registry, or in a registries object
   ; entry for that one. For development {"url":"http(s)://…"} names a Zone
@@ -494,7 +494,7 @@ module liblogos_rln_module {
   ; the price plus a fee reserve sized from the chain's live fee quote
   ; (liblogos_lez_rln_module >= 4.2.0 get_fee_state): (gas limit x the next
   ; block's exec base-fee ceiling + 100k bytes x its storage ceiling) x 2,
-  ; instead of the wallet's fixed cap. Since 0.14.0 the gas limit is the
+  ; instead of the wallet's fixed cap. Since 0.15.0 the gas limit is the
   ; wallet's stock 2M (the tree is off chain): ~38M at base fee 8, 134.4M
   ; with no quote (it was 10M: ~182M, and 646.4M).
   method start(config_json: tstr) -> result

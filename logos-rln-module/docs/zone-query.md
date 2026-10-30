@@ -6,7 +6,7 @@ numbers registrations (the config's `next_leaf_index`, claimed by `Register`
 and carried by `Registered` as `leaf_index`), but no account records a
 member's index, so a **zone service** follows the events and maintains the
 registry's depth-20 Poseidon tree. This document is the request/response
-protocol `liblogos_rln_module` (0.14.0+) speaks to such a service. The client
+protocol `liblogos_rln_module` (0.15.0+) speaks to such a service. The client
 is `rust-lib/src/zone.rs`; the codec, with byte-pinned tests, is
 `rust-lib/src/zone_wire.rs`.
 

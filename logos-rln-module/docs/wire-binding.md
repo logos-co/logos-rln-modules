@@ -89,7 +89,7 @@ switch on `class`, log `kind`.
 The public **Membership view** (spec `Membership` + status):
 `{"credential":{"identity_commitment":hex},"leaf_index":N,"leaf_pending"?:bool,
 "membership_hash":hex,"rate_limit":N,"registry_id":caip10,"rln_identifier":hex,
-"state":str,…}` — no secret ever appears. `leaf_pending:true` (0.14.0) means a
+"state":str,…}` — no secret ever appears. `leaf_pending:true` (0.15.0) means a
 usable membership whose leaf index the registry module has not reported yet;
 `leaf_index` then reads 0, which is also a real leaf, so the flag decides. A `"failed"` state carries `"failed_reason":str` and
 `"retryable":bool` (spec: a failed submission SHALL report whether it is

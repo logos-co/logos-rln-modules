@@ -415,7 +415,7 @@ function fmtOptionalNum(v) {
     return (v === undefined || v === null) ? "—" : String(v);
 }
 
-// A membership's leaf for display. Since rln module 0.14.0 the chain records
+// A membership's leaf for display. Since rln module 0.15.0 the chain records
 // a leaf index only in its Registered event: until the registry module reports
 // the one its registration claimed, the view carries leaf_pending:true beside
 // a placeholder leaf_index of 0 — which is also a real leaf, so the flag, not
