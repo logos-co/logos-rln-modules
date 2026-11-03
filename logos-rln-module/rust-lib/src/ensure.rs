@@ -273,18 +273,17 @@ fn provision_one(
     // 1. The wallet.
     //
     // This wait has NO deadline either, for the same reason the funding wait
-    // below has none. The commonest cause of a wallet that is not ready yet is
-    // an unreachable sequencer — opening one is a chain read — and that is an
-    // outage, not a verdict: the sibling now retries the open for as long as it
-    // takes and stays `pending` while it does. A deadline here could only stop
-    // watching, and stopping is permanent, because `run` records Refused and
-    // `ensure::run` is entered from `start()` and nowhere else. That is exactly
-    // how a node that booted during an outage used to stay dead for the rest of
-    // the process's life, long after the chain came back.
+    // below has none. A wallet that is not ready yet is `pending` for a reason
+    // waiting can resolve — no network selected until `use_network`, a first
+    // sync still running — and a deadline here could only stop watching, and
+    // stopping is permanent, because `run` records Refused and `ensure::run`
+    // is entered from `start()` and nowhere else.
     //
     // `failed` stays terminal: the sibling reserves it for the causes where
-    // waiting cannot help — no wallet home, no sequencer configured, a payer key
-    // it cannot import — and reports an unreachable chain as `pending`.
+    // waiting cannot help — no wallet home, no sequencer configured, a home
+    // whose storage or config the wallet cannot parse, a payer key it cannot
+    // import. (Since LEZ v0.3.1 opening the wallet is a local parse, not a
+    // chain read, so an unreachable sequencer no longer blocks it.)
     record(&registry.canonical, Step::WaitingForWallet, "");
     let began = Instant::now();
     let mut noticed = false;

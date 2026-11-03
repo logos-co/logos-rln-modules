@@ -1041,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "lez_rln_module"
-version = "5.1.0"
+version = "5.2.0"
 dependencies = [
  "borsh",
  "logos-rust-sdk",

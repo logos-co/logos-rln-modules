@@ -40,7 +40,7 @@ use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::base58;
 use crate::networks;
@@ -839,10 +839,8 @@ pub(crate) fn spawn_bring_up(persistence_path: &str) {
 
 /// Open a configured home on its own thread.
 fn start_bring_up(home: PathBuf) {
-    // One bring-up per process, ever. It retries an unreachable sequencer
-    // indefinitely, so a second call would leave two loops opening the same
-    // home against each other rather than the one wasted attempt it used to
-    // cost.
+    // One bring-up per process, ever: a second call would open the same home
+    // twice and settle the readiness state against itself.
     if BRINGUP_STARTED.swap(true, Ordering::SeqCst) {
         eprintln!("lez-rln wallet: bring-up already running, ignoring the repeat");
         return;
@@ -886,7 +884,13 @@ fn bring_up(home: &Path) {
     let config_path = home.join(CONFIG_FILE);
     let storage_path = home.join("storage.json");
 
-    let handle = open_with_retry(&config_path, &storage_path);
+    let handle = match open_or_create(&config_path, &storage_path) {
+        Ok(h) => h,
+        Err(e) => {
+            fail(&e);
+            return;
+        }
+    };
 
     if let Err(e) = import_payer_key(&handle) {
         fail(&e);
@@ -916,100 +920,21 @@ fn bring_up(home: &Path) {
     eprintln!("lez-rln wallet: ready ({})", home.display());
 }
 
-/// Open the wallet, retrying for as long as it takes.
+/// Open the wallet, or create one on a home that has none. One attempt.
 ///
-/// Opening a wallet is a chain read: `wallet_ffi_open` builds the sequencer
-/// client, which calibrates every configured endpoint and then drops any it has
-/// no statistics for — so on a fresh home an unreachable sequencer leaves the
-/// leader list empty and the open fails outright. That is the ordinary shape of
-/// a node started while the chain is down, and it used to be terminal: one
-/// failure latched `Failed`, nothing re-armed it, and the node never registered
-/// again however healthy the chain became. A node that gives up is a node that
-/// is still broken an hour after the outage ended.
+/// Since LEZ v0.3.1 both `wallet_ffi_open` and `wallet_ffi_create_new` are
+/// local: they parse `storage.json` and `wallet_config.json` and build an HTTP
+/// client from the configured URL, and touch no network. A null handle is
+/// therefore a parse failure — a storage written by an older wallet, a config
+/// without `sequencer`, a corrupt file — and no number of retries changes the
+/// answer, so it settles as `failed` at once: the state that tells a consumer
+/// not to wait. (The retry loop this replaces was written for the rc3 FFI,
+/// whose open calibrated sequencers over the network and so could fail
+/// transiently.)
 ///
-/// So there is no attempt limit and no deadline, for the same reason
-/// `logos-rln-module`'s funding wait has none: nothing this module can do makes
-/// the sequencer answer sooner, and a deadline only converts a recoverable
-/// outage into a permanent one. The wallet stays `pending` throughout, which is
-/// precisely the answer that tells a consumer to come back — `failed` is
-/// reserved for the causes where waiting cannot help, and an unreachable
-/// sequencer is not one of them.
-///
-/// The FFI reports a failed open as a null handle and nothing more, so a
-/// corrupt storage file is indistinguishable here from an unreachable chain and
-/// is retried the same way. That is the right trade: the node is equally
-/// unusable under either cause, so the only cost is the word `wallet_status`
-/// prints, while the benefit is that the common cause now heals itself. The
-/// detail string carries the real error either way, and `LATCH_AFTER` makes a
-/// persistent failure say so in as many words.
-fn open_with_retry(config: &Path, storage: &Path) -> Handle {
-    /// Past this much continuous failure, keep retrying but stop implying the
-    /// wait is routine: something needs looking at.
-    const LATCH_AFTER: Duration = Duration::from_secs(600);
-
-    let start = Instant::now();
-    let mut attempt = 0_u64;
-    loop {
-        attempt += 1;
-        match open_or_create(config, storage) {
-            Ok(h) => {
-                if attempt > 1 {
-                    eprintln!(
-                        "lez-rln wallet: opened on attempt {attempt} after {}s",
-                        start.elapsed().as_secs()
-                    );
-                }
-                return h;
-            }
-            Err(e) => {
-                let waited = start.elapsed();
-                let detail = if waited >= LATCH_AFTER {
-                    format!(
-                        "cannot open the wallet after {}s and {attempt} attempts — is the \
-                         sequencer reachable? last error: {e}",
-                        waited.as_secs()
-                    )
-                } else {
-                    format!("opening the wallet: {e}")
-                };
-                // Loud on the first failure and then once per escalation, not
-                // once per attempt: at the 5s cadence a long outage would
-                // otherwise bury every other line in the node's log.
-                if attempt == 1 || waited >= LATCH_AFTER {
-                    eprintln!("lez-rln wallet: {detail}");
-                }
-                pending(&detail);
-                sleep_in_slices(open_retry_interval(waited));
-            }
-        }
-    }
-}
-
-/// Read often at first, then rarely — the cadence `logos-rln-module`'s funding
-/// wait already settled on: 5s for the first minute, 30s to ten minutes, then
-/// every five.
-fn open_retry_interval(waited: Duration) -> Duration {
-    if waited < Duration::from_secs(60) {
-        Duration::from_secs(5)
-    } else if waited < Duration::from_secs(600) {
-        Duration::from_secs(30)
-    } else {
-        Duration::from_secs(300)
-    }
-}
-
-/// Sleep in short slices so a five-minute backoff does not keep the process
-/// alive for five minutes past a shutdown.
-fn sleep_in_slices(total: Duration) {
-    const SLICE: Duration = Duration::from_secs(5);
-    let mut left = total;
-    while left > Duration::ZERO {
-        let step = if left < SLICE { left } else { SLICE };
-        std::thread::sleep(step);
-        left -= step;
-    }
-}
-
+/// The FFI reports only the null handle; the cause is on the
+/// `[wallet-ffi] Failed to open wallet` line it prints just before, so the
+/// failure reason says where to look.
 #[allow(unsafe_code)]
 fn open_or_create(config: &Path, storage: &Path) -> Result<Handle, String> {
     let c = cstring(config)?;
@@ -1019,7 +944,12 @@ fn open_or_create(config: &Path, storage: &Path) -> Result<Handle, String> {
         // SAFETY: two valid null-terminated paths, alive across the call.
         let raw = unsafe { ffi::wallet_ffi_open(c.as_ptr(), s.as_ptr()) };
         if raw.is_null() {
-            return Err(format!("open {} returned no handle", storage.display()));
+            return Err(format!(
+                "cannot open the wallet at {}: see the preceding `[wallet-ffi] Failed to open \
+                 wallet` line for the cause (storage.json or {CONFIG_FILE} does not parse under \
+                 this wallet version); fix or recreate the home and restart",
+                storage.display()
+            ));
         }
         return Ok(Handle(raw));
     }
@@ -1040,7 +970,9 @@ fn open_or_create(config: &Path, storage: &Path) -> Result<Handle, String> {
     let out = unsafe { ffi::wallet_ffi_create_new(c.as_ptr(), s.as_ptr(), pw.as_ptr()) };
     if out.wallet.is_null() {
         return Err(format!(
-            "create_new at {} returned no handle",
+            "cannot create a wallet at {}: see the preceding `[wallet-ffi]` line for the cause \
+             ({CONFIG_FILE} does not parse under this wallet version, or the home is not \
+             writable)",
             storage.display()
         ));
     }
@@ -1585,37 +1517,37 @@ mod tests {
         assert!(s.contains(r#""ready":false"#), "got {s}");
     }
 
-    /// An unreachable sequencer must read as `pending`, never `failed`: the
-    /// state is what a consumer branches on to decide whether to keep waiting,
-    /// and `logos-rln-module`'s provisioning pass abandons a registry for the
-    /// life of the process on `failed`.
+    /// A home the wallet cannot parse must read as `failed`, never `pending`:
+    /// the state is what a consumer branches on to decide whether to keep
+    /// waiting, and nothing heals an unparseable file. The reason must name
+    /// the `[wallet-ffi]` line, since that is where the FFI puts the cause.
     #[test]
-    fn a_failed_open_stays_pending_and_says_why() {
-        pending("opening the wallet: open /nope/storage.json returned no handle");
+    fn an_unopenable_home_fails_and_points_at_the_ffi_line() {
+        let dir = std::env::temp_dir().join(format!("lez-rln-unopenable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = dir.join("storage.json");
+        std::fs::write(&storage, "{}").unwrap();
+        let config = dir.join(CONFIG_FILE);
+        std::fs::write(&config, wallet_config_json("http://127.0.0.1:9")).unwrap();
+
+        let err = match open_or_create(&config, &storage) {
+            Ok(_) => panic!("'{{}}' is not a wallet storage"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("[wallet-ffi]"),
+            "no pointer to the cause: {err}"
+        );
+        assert!(err.contains("storage.json"), "no path: {err}");
+
+        fail(&err);
         let s = status_json();
-        assert!(s.contains(r#""state":"pending""#), "got {s}");
+        assert!(s.contains(r#""state":"failed""#), "got {s}");
         assert!(s.contains(r#""ready":false"#), "got {s}");
-        assert!(s.contains("returned no handle"), "detail is lost: {s}");
+        assert!(s.contains("[wallet-ffi]"), "detail is lost: {s}");
         // Leave the shared state as the other tests expect to find it.
         pending("");
-    }
-
-    /// The cadence matters more than the numbers: a retry that stayed at 5s
-    /// would hammer a dead endpoint for as long as the outage lasts.
-    #[test]
-    fn the_open_retry_backs_off_but_never_stops() {
-        assert_eq!(
-            open_retry_interval(Duration::from_secs(0)),
-            Duration::from_secs(5)
-        );
-        assert_eq!(
-            open_retry_interval(Duration::from_secs(120)),
-            Duration::from_secs(30)
-        );
-        assert_eq!(
-            open_retry_interval(Duration::from_secs(3600)),
-            Duration::from_secs(300)
-        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn mention(account_hex: &str, shard_program_hex: &str) -> Mention {
