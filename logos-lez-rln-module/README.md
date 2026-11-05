@@ -20,16 +20,17 @@ v2.0.0 dropped the C++-era frozen wire surface: `generate_identity`,
   (lidl scaffold + Qt cdylib glue). No module dependencies since 3.0.0.
 - `rust-lib/liblogos_lez_rln_module.lidl` — the module contract (9 methods,
   no events).
-- `rust-lib/src/wallet.rs` — the wallet this module owns: bring-up, the home it
-  adopts or provisions (and for which network), and the three chain operations
-  it used to make over lp.
+- `rust-lib/src/wallet.rs` — the wallet this module owns (LEZ `core_ffi`):
+  bring-up, the home it adopts or provisions (and for which network), account
+  reads and the one transaction it sends.
 - `rust-lib/networks.json` + `rust-lib/src/networks.rs` — the built-in table of
   known networks (CAIP-2 reference → sequencer + registries), embedded at
   compile time. Add one from an e2e descriptor with
   `tools/add-network.sh <reference> <deployment.json>`.
-- `rust-lib/src/fee_state.rs` — `get_fee_state` (since 4.2.0): the
-  sequencer's `getFeeState` quote, read over a std-only HTTP/1.0 POST from the
-  sequencer the wallet's config names (plain http only; https answers `""`).
+- `rust-lib/src/fee_state.rs` — the raw JSON-RPC reads `core_ffi` has no
+  call for: `getFeeState` (`get_fee_state`, since 4.2.0), `getLastBlockId`,
+  `getTransaction` and the head block's timestamp (chain time, since 6.0.0),
+  over ureq + rustls against the sequencer the wallet's config names.
 - `rust-lib/src/lib.rs` — the provider implementation (the handlers).
 - `rust-lib/src/rln_core.rs` — the RLN core (tree/proof/register/funding logic),
   depending only on the shared `rln-layouts` crate.
@@ -98,7 +99,7 @@ nix build 'path:.#lgx'       # .lgx bundle for LEZ_RLN_LGX
 
 `src/testnet_tests.rs` validates rln_core's chain-facing logic — ConfigState
 offsets, PDA derivation, valid roots, merkle-proof construction (recomputed
-via poseidon), clock decode, membership reads — against a DEPLOYED
+via poseidon), chain time, membership reads — against a DEPLOYED
 registration program. Read-only, off by default (each test skips unless
 gated), no new crate deps (`curl` subprocess speaks the sequencer's
 JSON-RPC `getAccount` — the same read the wallet serves this module at
@@ -111,7 +112,9 @@ LEZ_RLN_TESTNET_DEPLOYMENT=shared-5ade-v2 LEZ_RLN_TESTNET_TESTS=1 cargo test tes
 
 The registry comes from `../deployments/<name>/deployment.json`. These
 catch what unit pins can't: layout drift against the pinned guest image,
-PDA-derivation divergence, tree-encoding drift, chain-clock unit changes.
+PDA-derivation divergence, tree-encoding drift, chain-time unit changes.
+The default deployment is a v0.3 one: against an rc1 chain name a deployment
+provisioned there with `LEZ_RLN_TESTNET_DEPLOYMENT`.
 
 ## Design constraints (read before changing)
 
@@ -122,7 +125,7 @@ PDA-derivation divergence, tree-encoding drift, chain-clock unit changes.
   worker; a stuck handler leaks one worker instead of starving every caller.
   All state lives in lock-guarded statics; the impl struct has no fields.
 - **The wallet is this module's own, in-process** (`rust-lib/src/wallet.rs`),
-  since 3.0.0. It links the LEZ `wallet` crate rather than calling the
+  since 3.0.0. It links LEZ's `core_ffi` library rather than calling the
   `lez_core` module, because a host has exactly one `lez_core` wallet handle,
   `open`/`create_new` both refuse while one is open, there is no close, and
   nothing reads back the gas limit a wallet was opened with. A registration

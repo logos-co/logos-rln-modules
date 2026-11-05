@@ -1,31 +1,27 @@
 //! liblogos_lez_rln_module — the LEZ RLN registry provider.
 //!
 //! Serves the membership stack's chain access: registry reads (roots, merkle
-//! proofs, membership PDA + lifecycle state, registry bounds), the Register
-//! tx, and the faucet funding flow (claim_tokens / get_token_balance). The
-//! chain logic lives in-crate (`mod rln_core`, plain Rust — no C ABI), and
-//! wallet access goes through the SDK's `PluginProxy` to the wallet module
-//! (`lez_core`) with per-call timeouts (60s reads, 180s registration tx)
-//! via `call_json_async_with_timeout` — no raw `lp_*` ABI in this crate.
+//! proofs, membership PDA + lifecycle state, registry bounds) and the
+//! `Register` transaction. The chain logic lives in-crate (`mod rln_core`,
+//! plain Rust — no C ABI); the wallet is this module's own, over LEZ's
+//! `core_ffi` (`mod wallet`), and the few sequencer reads that library has no
+//! call for go out as raw JSON-RPC (`mod fee_state`).
 //!
 //! Identity and credential generation live in the membership
 //! module (secrets never cross the module wire); this module only ever sees
 //! the public id_commitment.
 //!
 //! Concurrency is "multi" (metadata.json, since 2.1.0): handlers run on Qt
-//! worker threads and overlap, so one wallet round-trip stuck in a slow
-//! sequencer read no longer wedges every other call. Every handler reaches
-//! the wallet through the ASYNC call plus a channel wait (`wallet_call`): the
-//! SDK delivers the reply from the module's Qt event loop, so the worker only
-//! blocks on its channel and the loop stays free. The synchronous twin is
-//! never used from a worker — it would marshal onto the main thread and
-//! serialize every in-flight call behind one nested wait.
+//! worker threads and overlap, so one round trip stuck in a slow sequencer
+//! read does not wedge every other call. The wallet's own lock is taken inside
+//! each `core_ffi` entry point and released before it returns; this crate
+//! holds no lock across a round trip.
 
-// Author code is unsafe-free: every outbound call goes through the SDK's
-// safe `PluginProxy`. Three sites are exempted from `deny(unsafe_code)`, all
-// of them C-ABI boundaries rather than logic: the generated module-impl
-// scaffold, the install hook it resolves by linkage, and the test-only link
-// stubs that stand in for the host's `lp_*` symbols.
+// Author code is unsafe-free. The sites exempted from `deny(unsafe_code)` are
+// C-ABI boundaries rather than logic: the generated module-impl scaffold, the
+// install hook it resolves by linkage, the `core_ffi` declarations and calls
+// in `wallet.rs`, and the test-only link stubs that stand in for the host's
+// `lp_*` and the library's `wallet_ffi_*` symbols.
 #![deny(unsafe_code)]
 
 use std::sync::Mutex;
@@ -198,51 +194,42 @@ fn resolve_account_id(id: &str) -> String {
     wallet::account_id_from_base58(id)
 }
 
-/// The native token program's id: the shard key of an account's native
-/// balance (LEZ v0.3.0 `NATIVE_TOKEN_PROGRAM_ID`).
+/// The native token program's id: the actor whose state on an account is its
+/// native balance (`NATIVE_TOKEN_PROGRAM_ID`).
 const NATIVE_TOKEN_PROGRAM: [u8; 32] = [0; 32];
 
-/// Tri-state fetch: Present / legitimately Absent (no such shard, or an empty
-/// one) / Error (RPC failure, malformed JSON or hex). Logs nothing.
+/// Tri-state fetch: Present / legitimately Absent (no such account, no such
+/// actor state, or an empty one) / Error (the read failed). Logs nothing.
 enum FetchOutcome {
     Present(Vec<u8>),
     Absent,
     Error,
 }
 
-/// Every shard of an account as `(program, data)`, or `None` when the read
-/// failed. An account that does not exist reads as no shards.
+/// Every actor state of an account as `(program, data)`, or `None` when the
+/// read failed. An account that does not exist reads as no states.
 ///
-/// LEZ v0.3.0 shards an account's data by owning program, so "the account's
-/// data" is no longer one thing: callers name the program whose shard they
-/// mean.
-fn fetch_shards(account_id_hex: &str) -> Option<Vec<([u8; 32], Vec<u8>)>> {
-    let json = wallet::get_account_public(account_id_hex);
-    if json.is_empty() {
-        return None;
+/// An account's data is kept per program, so "the account's data" is not one
+/// thing: callers name the program whose state they mean.
+fn fetch_actor_states(account_id_hex: &str) -> Option<Vec<([u8; 32], Vec<u8>)>> {
+    match wallet::read_account(account_id_hex) {
+        wallet::AccountRead::Present(states) => Some(states),
+        wallet::AccountRead::Absent => Some(Vec::new()),
+        wallet::AccountRead::Error => None,
     }
-    let doc = serde_json::from_str::<serde_json::Value>(&json).ok()?;
-    let shards = doc.as_object()?.get("shards")?.as_object()?;
-    let mut out = Vec::with_capacity(shards.len());
-    for (program_hex, data) in shards {
-        let program = hex_to_bytes32(program_hex)?;
-        let data = hex_to_bytes(data.as_str()?, None)?;
-        out.push((program, data));
-    }
-    Some(out)
 }
 
 fn fetch_shard_tri_state(account_id_hex: &str, program: &[u8; 32]) -> FetchOutcome {
-    let Some(shards) = fetch_shards(account_id_hex) else {
+    let Some(states) = fetch_actor_states(account_id_hex) else {
         return FetchOutcome::Error;
     };
-    match shards.into_iter().find(|(p, _)| p == program) {
+    match states.into_iter().find(|(p, _)| p == program) {
         Some((_, data)) if !data.is_empty() => FetchOutcome::Present(data),
         _ => FetchOutcome::Absent,
     }
 }
 
-/// Some(data) only for a populated shard; logs nothing. Used where "not yet
+/// Some(data) only for a populated state; logs nothing. Used where "not yet
 /// present" is an expected state — today only register_member's idempotency
 /// pre-check.
 fn fetch_shard_quiet(account_id_hex: &str, program: &[u8; 32]) -> Option<Vec<u8>> {
@@ -252,13 +239,13 @@ fn fetch_shard_quiet(account_id_hex: &str, program: &[u8; 32]) -> Option<Vec<u8>
     }
 }
 
-/// Loud fetch of one program's shard: logs each failure mode.
+/// Loud fetch of one program's state on an account: logs each failure mode.
 fn fetch_shard(account_id_hex: &str, program: &[u8; 32], who: &str) -> Option<Vec<u8>> {
     match fetch_shard_tri_state(account_id_hex, program) {
         FetchOutcome::Present(data) => Some(data),
         FetchOutcome::Absent => {
             eprintln!(
-                "{who}: {account_id_hex} has no shard of program {}",
+                "{who}: {account_id_hex} holds no state of program {}",
                 bytes_to_hex(program)
             );
             None
@@ -272,8 +259,8 @@ fn fetch_shard(account_id_hex: &str, program: &[u8; 32], who: &str) -> Option<Ve
 
 /// The resolved config and the two program ids every on-chain entry point
 /// needs: the registration program (the config's owner, and the program every
-/// PDA hangs off) and the merkle program (whose shard of `tree_main` holds the
-/// tree, and which `Register` claims).
+/// PDA hangs off) and the merkle program (whose actor state on `tree_main`
+/// holds the tree).
 struct RlnConfigContext {
     config_data: Vec<u8>,
     registration_program: [u8; 32],
@@ -310,18 +297,18 @@ fn config_context(config_account_id: &str) -> Result<RlnConfigContext, RegistryP
     if let Some(reason) = network_conflict(wallet::bound_network().as_deref(), &config_hex) {
         return Err(RegistryProblem::new("network_conflict", reason));
     }
-    let Some(shards) = fetch_shards(&config_hex) else {
+    let Some(states) = fetch_actor_states(&config_hex) else {
         return Err(RegistryProblem::new(
             "unreachable",
             format!("could not read config account {config_hex} from the sequencer"),
         ));
     };
-    // On LEZ v0.3.0 a program's id is the header account its deployer created,
-    // not derivable from anything a registry id carries. The config is the
-    // registration program's PDA and holds exactly one program shard — that
-    // program's — so its shard key IS the registration program id. A native
-    // balance shard (someone sent it tokens) is not a program and is skipped.
-    let mut program_shards = shards
+    // A program's id is the header account its deployer created, not
+    // derivable from anything a registry id carries. The config is the
+    // registration program's PDA and holds exactly one program's state — that
+    // program's — so its key IS the registration program id. A native balance
+    // (someone sent it tokens) is not a program and is skipped.
+    let mut program_shards = states
         .into_iter()
         .filter(|(p, data)| *p != NATIVE_TOKEN_PROGRAM && !data.is_empty());
     let Some((registration_program, config_data)) = program_shards.next() else {
@@ -338,7 +325,7 @@ fn config_context(config_account_id: &str) -> Result<RlnConfigContext, RegistryP
     if program_shards.next().is_some() {
         return Err(RegistryProblem::new(
             "unexpected_layout",
-            format!("config account {config_hex} holds more than one program shard"),
+            format!("config account {config_hex} holds more than one program's state"),
         ));
     }
     // The one place a config account is admitted, and so the one place its
@@ -350,7 +337,7 @@ fn config_context(config_account_id: &str) -> Result<RlnConfigContext, RegistryP
         return Err(RegistryProblem::new(
             "wrong_generation",
             format!(
-                "config shard is {} bytes, expected {} — this is a config from a different \
+                "config state is {} bytes, expected {} — this is a config from a different \
                  program generation, not a short read",
                 config_data.len(),
                 native::CONFIG_STATE_SIZE,
@@ -431,17 +418,16 @@ fn fee_payer_hex() -> String {
     wallet::payer_hex()
 }
 
-/// Submit one public transaction through the module's own wallet. `None` =
-/// failed, already logged.
+/// Submit one public transaction through the module's own wallet: `message`
+/// goes to the actor `mentions[root]` selects. `None` = failed, already logged.
 fn send_generic_tx(
     who: &str,
-    mentions: Vec<wallet::Mention>,
-    instruction: Vec<u8>,
-    program_hex: String,
-    payer_hex: String,
+    mentions: &[wallet::Mention],
+    root: usize,
+    message: &[u8],
+    payer_hex: &str,
 ) -> Option<String> {
-    let send_result =
-        wallet::send_generic_public_transaction(&mentions, &instruction, &program_hex, &payer_hex);
+    let send_result = wallet::send_generic_public_transaction(mentions, root, message, payer_hex);
     if send_result.is_empty() {
         eprintln!("{who}: transaction failed");
         return None;
@@ -476,26 +462,29 @@ fn derive_register_plan(
     }
 }
 
-/// CLOCK_50's timestamp, from the clock program's shard of the clock account —
-/// the chain time the registry judges lifecycles by and `Register` claims.
-fn chain_now_ms(who: &str) -> Option<u64> {
-    let clock_hex = bytes_to_hex(&rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES);
-    let data = fetch_shard(&clock_hex, &rln_layouts::clock_program_account_id(), who)?;
-    match native::decode_clock_timestamp_ms(&data) {
-        Ok(ts) => Some(ts),
-        Err(e) => {
-            eprintln!("{who}: clock decode error: {e}");
-            None
-        }
+/// Chain time in milliseconds: the head block's timestamp, which the registry
+/// judges lifecycles by. `None` (logged) when the chain cannot be read.
+fn chain_time_ms(who: &str) -> Option<u64> {
+    let time = fee_state::head_block_timestamp_ms();
+    if time.is_none() {
+        eprintln!("{who}: chain time unavailable");
     }
+    time
 }
+
+/// How far behind the head block's timestamp a `Register` dates itself. The
+/// program accepts the message for 900 s from its `now_ms`, but refuses one
+/// dated after the block it lands in: the sequencer's clock can step back
+/// between the head read and the next block, and a few seconds of slack costs
+/// nothing against a window that long.
+const CHAIN_TIME_SLACK_MS: u64 = 5_000;
 
 /// The leaf index of a membership that exists, from the tree.
 ///
-/// On LEZ v0.3.0 the merkle program assigns the slot as the registration
-/// applies and the membership record does not keep it, so the index is found
-/// by looking the member's leaf up in the tree. `None` (logged) when the tree
-/// cannot be read or does not hold the leaf — never a guess.
+/// The merkle program assigns the slot as the registration applies and the
+/// membership record does not keep it, so the index is found by looking the
+/// member's leaf up in the tree. `None` (logged) when the tree cannot be read
+/// or does not hold the leaf — never a guess.
 fn membership_leaf_index(
     ctx: &RlnConfigContext,
     membership: &rln_layouts::MembershipState,
@@ -514,8 +503,8 @@ fn membership_leaf_index(
     found
 }
 
-/// The tree's merkle shard — one read, so the roots and every proof built from
-/// it come from the same tree state.
+/// The tree: the merkle program's state on `tree_main` — one read, so the
+/// roots and every proof built from it come from the same tree state.
 fn fetch_tree_shard(ctx: &RlnConfigContext, who: &str) -> Option<Vec<u8>> {
     let main = match native::tree_main_account_id(&ctx.config_data, &ctx.registration_program) {
         Ok(id) => id,
@@ -563,8 +552,8 @@ fn tx_hash_of(send_result: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Build and send one `Register` with claims read from the chain now.
-/// `None` = not submitted, already logged.
+/// Build and send one `Register`, dated by chain time read now. `None` = not
+/// submitted, already logged.
 fn submit_register(
     ctx: &RlnConfigContext,
     plan: &RlnRegisterPlan,
@@ -573,48 +562,43 @@ fn submit_register(
     payer_hex: &str,
     who: &str,
 ) -> Option<String> {
-    // now_ms is a claim the guest asserts against the clock shard, so it is
-    // read last, just before sending.
-    let now_ms = chain_now_ms(who)?;
-    let instruction = match native::register_build_instruction(plan, id_commitment, rate_limit, now_ms) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            eprintln!("{who}: register_build_instruction failed: {e}");
-            return None;
-        }
-    };
-    // Account order and shard per account must match the guest's Register
-    // (lez-rln methods/guest registration.rs), which asserts both:
-    //   config      registration shard
-    //   tree_main   merkle shard (PDA of the registration program)
-    //   payer       native balance, signs
-    //   treasury    native balance
-    //   clock       CLOCK_50, clock program shard
-    //   membership  registration shard (created)
-    let registration_hex = bytes_to_hex(&ctx.registration_program);
-    let native_hex = bytes_to_hex(&NATIVE_TOKEN_PROGRAM);
-    let mention = |account: &[u8; 32], signs: bool, shard: &str| wallet::Mention {
-        account_hex: bytes_to_hex(account),
-        signs,
-        shard_program_hex: shard.to_string(),
-    };
-    let Some(payer_bytes) = hex_to_bytes32(payer_hex) else {
+    let Some(payer) = hex_to_bytes32(payer_hex) else {
         eprintln!("{who}: payer {payer_hex} is not 32-byte hex");
         return None;
     };
-    let mentions = vec![
-        mention(&plan.config_account_id, false, &registration_hex),
-        mention(&plan.tree_main_account_id, false, &bytes_to_hex(&ctx.merkle_program)),
-        mention(&payer_bytes, true, &native_hex),
-        mention(&plan.treasury_account_id, false, &native_hex),
+    // The validity window opens at now_ms, so it is read last, just before
+    // sending.
+    let now_ms = chain_time_ms(who)?.saturating_sub(CHAIN_TIME_SLACK_MS);
+    let message = match native::register_build_message(plan, id_commitment, rate_limit, &payer, now_ms)
+    {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("{who}: register_build_message failed: {e}");
+            return None;
+        }
+    };
+    // Every actor the program touches while handling Register is declared:
+    // the config (the message's receiver), the membership it writes for the
+    // first time (admitted by its PDA seed), the tree it inserts into, and the
+    // two native balances the payment moves between. The payer signs; the
+    // treasury must already exist, which preflight_register checks.
+    use wallet::MentionKind::{NoSign, Pda, Signer};
+    let mention = |account: [u8; 32], program: [u8; 32], kind| wallet::Mention { account, program, kind };
+    let mentions = [
+        mention(plan.config_account_id, ctx.registration_program, NoSign),
         mention(
-            &rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES,
-            false,
-            &bytes_to_hex(&rln_layouts::clock_program_account_id()),
+            plan.membership_account_id,
+            ctx.registration_program,
+            Pda {
+                program: ctx.registration_program,
+                seed: rln_layouts::membership_seed(&plan.tree_id, id_commitment),
+            },
         ),
-        mention(&plan.membership_account_id, false, &registration_hex),
+        mention(plan.tree_main_account_id, plan.merkle_program_id, NoSign),
+        mention(payer, NATIVE_TOKEN_PROGRAM, Signer),
+        mention(plan.treasury_account_id, NATIVE_TOKEN_PROGRAM, NoSign),
     ];
-    send_generic_tx(who, mentions, instruction, registration_hex, fee_payer_hex())
+    send_generic_tx(who, &mentions, 0, &message, &fee_payer_hex())
 }
 
 /// How often the watcher looks at the chain, and how many times a reverted
@@ -632,28 +616,18 @@ struct RegisterWatch {
     tx_hash: String,
 }
 
-/// Follow a submitted registration until its membership appears, re-sending it
-/// with fresh claims if it reverted.
-///
-/// On LEZ v0.3.0 a registration whose claims no longer hold (its clock claim
-/// outside the registry's tolerance, a price or duration changed under it) is
-/// still included in a block — charged, with no effect, and nothing sent back
-/// to the submitter. So the fate is read from the chain: the membership
-/// appearing is success; the transaction in a block without it is a revert,
-/// re-planned and re-sent. A transaction the sequencer still holds (deferred on
-/// the block gas cap, which fits one registration per block) is left alone:
-/// re-sending it would race the original, and the loser pays a full
-/// registration's gas for nothing.
 /// Storage bytes a Register declares beside its gas limit when the fee
 /// reserve is sized; the same allowance liblogos_rln_module reserves for.
 const REGISTER_DATA_ALLOWANCE: u128 = 100_000;
 
-/// Everything the guest would refuse that can be known before signing:
-/// rln_core::check_register's argument and capacity checks, and whether the
-/// payer can cover the price plus the fee reserve at the next block's base fee
-/// ceiling (skipped when no fee quote can be had — an outage is not a refusal).
-/// LEZ v0.3.0 has no transaction simulation, so this is the only way to keep a
-/// doomed registration from being signed and charged.
+/// Everything the program would refuse that can be known before signing:
+/// rln_core::check_register's argument and capacity checks, that the treasury
+/// exists (a declared actor must be admitted, and the treasury's native
+/// balance is admitted only by existing), and whether the payer can cover the
+/// price plus the fee reserve at the next block's base fee ceiling (skipped
+/// when no fee quote can be had — an outage is not a refusal). There is no
+/// transaction simulation, so this is the only way to keep a doomed
+/// registration from being signed and charged.
 fn preflight_register(
     ctx: &RlnConfigContext,
     plan: &RlnRegisterPlan,
@@ -662,6 +636,13 @@ fn preflight_register(
     payer_hex: &str,
 ) -> Result<(), String> {
     native::check_register(&ctx.config_data, plan.next_leaf_index, id_commitment, rate_limit)?;
+    if let wallet::AccountRead::Absent = wallet::read_account(&bytes_to_hex(&plan.treasury_account_id)) {
+        return Err(format!(
+            "treasury_missing: the registry's treasury {} does not exist on this chain; run_setup \
+             seeds it",
+            bytes_to_hex(&plan.treasury_account_id)
+        ));
+    }
     let quote: Option<serde_json::Value> = serde_json::from_str(&fee_state::get_fee_state()).ok();
     let ceiling = |key: &str| {
         quote
@@ -700,6 +681,22 @@ fn spawn_register_watch(w: RegisterWatch) {
     }
 }
 
+/// Follow a submitted registration until its membership appears, re-sending it
+/// if it reverted.
+///
+/// A registration the program refuses (its `now_ms` outside the validity
+/// window, the registry filled up under it) is still included in a block —
+/// charged, with no effect, and nothing sent back to the submitter. So the
+/// fate is read from the chain: the membership appearing is success; the
+/// transaction in a block without it is a revert, re-planned and re-sent with
+/// a fresh `now_ms`, which is exactly what a window revert needs. A
+/// transaction the sequencer still holds (deferred on the block gas cap, which
+/// fits one registration per block) is left alone: re-sending it would race
+/// the original, and the loser pays a full registration's gas for nothing.
+///
+/// The block's own revert list is not consulted: reading it means fetching
+/// and borsh-decoding every transaction in the block, and the membership read
+/// answers the same question for one account.
 fn register_watch(mut w: RegisterWatch) {
     const WHO: &str = "register_member(watch)";
     let deadline = Instant::now() + REG_IN_FLIGHT_TTL;
@@ -739,9 +736,9 @@ fn register_watch(mut w: RegisterWatch) {
             reg_in_flight(|m| m.remove(&w.reg_key));
             return;
         }
-        // A revert that fresh claims cannot fix (an argument the guest refuses,
-        // a full registry, a payer that cannot pay) would revert, and be
-        // charged, on every re-send.
+        // A revert that a fresh now_ms cannot fix (an argument the program
+        // refuses, a full registry, a missing treasury, a payer that cannot
+        // pay) would revert, and be charged, on every re-send.
         if let Err(why) = preflight_register(&ctx, &plan, &w.id_commitment, w.rate_limit, &w.payer_hex) {
             eprintln!("{WHO}: tx {} reverted and a re-send would too — not re-sending: {why}", w.tx_hash);
             let reply = serde_json::json!({ "error": why }).to_string();
@@ -749,8 +746,8 @@ fn register_watch(mut w: RegisterWatch) {
             return;
         }
         eprintln!(
-            "{WHO}: tx {} is in a block but registered nothing — it reverted; re-sending with \
-             fresh claims",
+            "{WHO}: tx {} is in a block but registered nothing — it reverted; re-sending dated \
+             by chain time now",
             w.tx_hash
         );
         resubmits += 1;
@@ -834,7 +831,7 @@ fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> S
         return String::new();
     };
 
-    // The whole tree is one shard of one account, so a single read is a
+    // The whole tree is one actor state of one account, so a single read is a
     // consistent snapshot: the roots and every proof come from the same state.
     let Some(main_data) = fetch_tree_shard(&ctx, "get_merkle_proofs") else {
         return String::new();
@@ -955,8 +952,8 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
 
         // Idempotency pre-check: if the membership PDA is already populated
         // for this (tree_id, id_commitment), recover its leaf_index instead
-        // of resubmitting — the on-chain Register handler enforces uniqueness
-        // via Claim::Pda, so a resubmit always fails.
+        // of resubmitting — the program refuses a Register for a membership
+        // that exists, so a resubmit is charged for nothing.
         // decode_membership carries its own length guard (DataTooShort), so
         // a short or absent account simply fails to decode.
         if let Some(membership) = fetch_shard_quiet(&membership_pda_hex, &ctx.registration_program)
@@ -1072,10 +1069,10 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             }
         };
 
-        // Lifecycle state MUST come from chain time; the sequencer refreshes
-        // CLOCK_50 every 50 blocks and the guest judges extend/erase against
-        // it, so a local clock would disagree with the registry's view.
-        let Some(now_ms) = chain_now_ms("get_membership") else {
+        // Lifecycle state MUST come from chain time: the program judges
+        // extend/erase against the block's timestamp, so a local clock would
+        // disagree with the registry's view.
+        let Some(now_ms) = chain_time_ms("get_membership") else {
             return String::new();
         };
         // A membership that exists has a leaf; failing to find it is a read
@@ -1129,10 +1126,10 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
                 native::config_field_u64(cfg, native::CONFIG_OFFSET_CURRENT_TOTAL_RATE_LIMIT),
             "grace_period_duration":
                 native::config_field_u32(cfg, native::CONFIG_OFFSET_GRACE_DURATION),
-            "max_rate_limit": native::MAX_RATE_LIMIT,
+            "max_rate_limit": native::config_field_u64(cfg, native::CONFIG_OFFSET_MAX_RATE_LIMIT),
             "max_total_rate_limit":
                 native::config_field_u64(cfg, native::CONFIG_OFFSET_MAX_TOTAL_RATE_LIMIT),
-            "min_rate_limit": native::MIN_RATE_LIMIT,
+            "min_rate_limit": native::config_field_u64(cfg, native::CONFIG_OFFSET_MIN_RATE_LIMIT),
             // u128 exceeds JSON number precision → decimal string, like
             // get_token_balance's balance.
             "price_per_unit":

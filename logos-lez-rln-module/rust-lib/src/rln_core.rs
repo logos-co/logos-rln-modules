@@ -3,7 +3,7 @@
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use rln_layouts::{
-    combine_seeds, label_seed,
+    config_seed, main_seed, membership_seed,
     MembershipState, TreeMainLayout, ROOT_HISTORY_SIZE,
     OFFSET_CACHED_NODES, OFFSET_DEPTH, OFFSET_ROOT, OFFSET_TREE_DATA, TREE_DEPTH,
     read_sparse_node,
@@ -11,7 +11,6 @@ use rln_layouts::{
 use serde::Serialize;
 use sha2::{Sha256, Digest};
 
-pub use rln_layouts::{MAX_RATE_LIMIT, MIN_RATE_LIMIT};
 
 /// The BN254 scalar field modulus, big-endian. The guest reads a commitment
 /// as a little-endian field element and panics on one >= this.
@@ -48,9 +47,11 @@ pub fn check_register(
                     (as little-endian bytes it is >= the modulus)"
             .into());
     }
-    if !(MIN_RATE_LIMIT..=MAX_RATE_LIMIT).contains(&rate_limit) {
+    let min = config_field_u64(config_data, CONFIG_OFFSET_MIN_RATE_LIMIT);
+    let max = config_field_u64(config_data, CONFIG_OFFSET_MAX_RATE_LIMIT);
+    if !(min..=max).contains(&rate_limit) {
         return Err(format!(
-            "invalid_rate_limit: {rate_limit} is outside the registry's {MIN_RATE_LIMIT}..={MAX_RATE_LIMIT}"
+            "invalid_rate_limit: {rate_limit} is outside the registry's {min}..={max}"
         ));
     }
     let current = config_field_u64(config_data, CONFIG_OFFSET_CURRENT_TOTAL_RATE_LIMIT);
@@ -76,13 +77,13 @@ pub struct RlnMerkleProof {
     pub path_indices: [u8; TREE_DEPTH],
 }
 
-/// Derived account IDs, and the values the `Register` instruction claims,
-/// for a registration transaction.
+/// The accounts a registration transaction declares, and what the config and
+/// tree say at planning time.
 ///
-/// LEZ v0.3.0 runs a program's plan phase without account data, so every value
-/// the guest used to read for itself is now a claim the host makes and the
-/// guest asserts in apply. They are read from the chain just before sending;
-/// a claim that went stale in between is refused, not misapplied.
+/// The program reads its own state when the message is delivered, so nothing
+/// here is asserted on chain: the ids are what the transaction declares, the
+/// rest is what a submitter checks before paying for a message the program
+/// would refuse.
 pub struct RlnRegisterPlan {
     pub config_account_id: [u8; 32],
     pub tree_main_account_id: [u8; 32],
@@ -90,19 +91,17 @@ pub struct RlnRegisterPlan {
     /// Membership PDA from (registration program, tree_id, id_commitment).
     pub membership_account_id: [u8; 32],
     /// The config's tree_id (`CONFIG_OFFSET_TREE_ID`), carried so callers
-    /// building the `Register` instruction never re-slice raw config bytes.
+    /// building the `Register` message never re-slice raw config bytes.
     pub tree_id: [u8; 32],
-    /// Claim: the merkle program's header account id, from the config.
+    /// The merkle program's header account id, from the config: the program
+    /// whose actor state on `tree_main` holds the tree.
     pub merkle_program_id: [u8; 32],
     /// The tree's `next_index` at planning time: where this registration
     /// lands if nothing else does first. An estimate only — the tree assigns
     /// the slot itself when the registration applies.
     pub next_leaf_index: u64,
-    /// Claim: the config's price per rate-limit unit.
+    /// The config's price per rate-limit unit, for the affordability check.
     pub price_per_unit: u128,
-    /// Claims: the config's durations, snapshotted into the membership.
-    pub active_duration_sec: u32,
-    pub grace_period_duration_sec: u32,
 }
 
 /// `rln_layouts::ConfigState` field offsets (borsh: fixed-width fields in
@@ -111,7 +110,7 @@ pub struct RlnRegisterPlan {
 /// These were once described as append-only and read against a MINIMUM size,
 /// so one module could serve a 240-byte and a 296-byte config at the same
 /// time. Registration becoming native-only removed six fields from the middle
-/// and the layout is now 144 bytes, which ends both claims: a field removed
+/// and the layout is now 160 bytes, which ends both claims: a field removed
 /// from the middle re-points every offset after it.
 ///
 /// `ConfigState` carries no version discriminator, so nothing in the account
@@ -128,6 +127,8 @@ pub const CONFIG_OFFSET_MAX_TOTAL_RATE_LIMIT: usize = 120;
 pub const CONFIG_OFFSET_CURRENT_TOTAL_RATE_LIMIT: usize = 128;
 pub const CONFIG_OFFSET_ACTIVE_DURATION: usize = 136;
 pub const CONFIG_OFFSET_GRACE_DURATION: usize = 140;
+pub const CONFIG_OFFSET_MIN_RATE_LIMIT: usize = 144;
+pub const CONFIG_OFFSET_MAX_RATE_LIMIT: usize = 152;
 
 /// Exact serialized size of the config account, from the shared crate rather
 /// than restated here. A config of any other length belongs to a different
@@ -206,14 +207,11 @@ fn derive_pda(program_id: &[u8; 32], pda_seed: &[u8; 32]) -> [u8; 32] {
     hash.into()
 }
 
-/// Borsh-encode an instruction — the deployed programs' wire format.
-///
-/// LEZ v0.2.5 decodes a program's instruction with borsh and widened the
-/// instruction stream from `u32` words to plain bytes, so this and the guests
-/// have to flip together: a risc0-serde payload does not decode, and the
-/// mismatch shows up as a failed execution rather than a type error.
-fn serialize_instruction<T: BorshSerialize>(instruction: &T) -> Result<Vec<u8>, RlnError> {
-    borsh::to_vec(instruction).map_err(|_| RlnError::SerializationError)
+/// Borsh-encode a message — the deployed programs' wire format. A payload the
+/// guest decodes differently does not fail to decode, it runs as a different
+/// message, so this and the guests flip together.
+fn serialize_message<T: BorshSerialize>(message: &T) -> Result<Vec<u8>, RlnError> {
+    borsh::to_vec(message).map_err(|_| RlnError::SerializationError)
 }
 
 /// Parse tree-main account data and return the valid roots.
@@ -317,7 +315,7 @@ pub fn build_merkle_proof(main_data: &[u8], leaf_index: u64) -> Result<RlnMerkle
 }
 
 /// The tree's main account: a PDA of the REGISTRATION program, whose merkle
-/// shard (keyed by the merkle program) holds the tree.
+/// program actor state holds the tree.
 pub fn tree_main_account_id(
     config_data: &[u8],
     registration_program: &[u8; 32],
@@ -325,11 +323,8 @@ pub fn tree_main_account_id(
     if config_data.len() != CONFIG_STATE_SIZE {
         return Err(RlnError::InvalidConfig);
     }
-    let tree_id: &[u8; 32] = &config_field_32(config_data, CONFIG_OFFSET_TREE_ID);
-    Ok(derive_pda(
-        registration_program,
-        &combine_seeds(&[&label_seed("main"), tree_id]),
-    ))
+    let tree_id = config_field_32(config_data, CONFIG_OFFSET_TREE_ID);
+    Ok(derive_pda(registration_program, &main_seed(&tree_id)))
 }
 
 /// One wire proof object. Serialized by the caller via `serde_json::Value`
@@ -379,8 +374,8 @@ pub fn merkle_proofs_exec(main_data: &[u8], leaf_indices: &[u64]) -> Result<Vec<
     Ok(proofs)
 }
 
-/// Plan a registration transaction: derive its accounts and read every claim
-/// the guest asserts from the config and the tree's merkle shard.
+/// Plan a registration transaction: derive its accounts from the config and
+/// read the tree's next slot from the merkle program's actor state.
 pub fn register_plan(
     config_data: &[u8],
     tree_main_data: &[u8],
@@ -395,50 +390,42 @@ pub fn register_plan(
     }
 
     let tree_main = TreeMainLayout::parse(tree_main_data);
-    let tree_id: &[u8; 32] = &config_field_32(config_data, CONFIG_OFFSET_TREE_ID);
-
-    let config_account_id =
-        derive_pda(registration_program, &combine_seeds(&[&label_seed("config"), tree_id]));
-    let tree_main_account_id =
-        derive_pda(registration_program, &combine_seeds(&[&label_seed("main"), tree_id]));
-    let membership_account_id = derive_pda(
-        registration_program,
-        &combine_seeds(&[&label_seed("membership"), tree_id, id_commitment]),
-    );
+    let tree_id = config_field_32(config_data, CONFIG_OFFSET_TREE_ID);
 
     Ok(RlnRegisterPlan {
-        config_account_id,
-        tree_main_account_id,
+        config_account_id: derive_pda(registration_program, &config_seed(&tree_id)),
+        tree_main_account_id: derive_pda(registration_program, &main_seed(&tree_id)),
         treasury_account_id: config_field_32(config_data, CONFIG_OFFSET_TREASURY_ACCOUNT_ID),
-        membership_account_id,
-        tree_id: *tree_id,
+        membership_account_id: derive_pda(
+            registration_program,
+            &membership_seed(&tree_id, id_commitment),
+        ),
+        tree_id,
         merkle_program_id: config_field_32(config_data, CONFIG_OFFSET_MERKLE_PROGRAM_ID),
         next_leaf_index: tree_main.next_index(),
         price_per_unit: config_field_u128(config_data, CONFIG_OFFSET_PRICE_PER_UNIT),
-        active_duration_sec: config_field_u32(config_data, CONFIG_OFFSET_ACTIVE_DURATION),
-        grace_period_duration_sec: config_field_u32(config_data, CONFIG_OFFSET_GRACE_DURATION),
     })
 }
 
-/// Build the `Instruction::Register` payload as borsh bytes. `now_ms` is the
-/// CLOCK_50 timestamp read just before sending — a claim, like the plan's.
-pub fn register_build_instruction(
+/// Build the `Message::Register` payload as borsh bytes. `payer` signs the
+/// transaction and is debited the price; `now_ms` is the submitter's reading
+/// of chain time, read just before sending, which opens the message's
+/// validity window.
+pub fn register_build_message(
     plan: &RlnRegisterPlan,
     id_commitment: &[u8; 32],
     rate_limit: u64,
+    payer: &[u8; 32],
     now_ms: u64,
 ) -> Result<Vec<u8>, RlnError> {
-    let instruction = rln_layouts::Instruction::Register {
+    let message = rln_layouts::Message::Register {
         tree_id: plan.tree_id,
         id_commitment: *id_commitment,
         rate_limit,
-        merkle_program_id: plan.merkle_program_id,
+        payer: *payer,
         now_ms,
-        price_per_unit: plan.price_per_unit,
-        active_duration_sec: plan.active_duration_sec,
-        grace_period_duration_sec: plan.grace_period_duration_sec,
     };
-    serialize_instruction(&instruction)
+    serialize_message(&message)
 }
 
 /// A membership's leaf: `rate_commitment = poseidon(id_commitment, rate_limit)`,
@@ -483,17 +470,6 @@ pub fn decode_membership(account_data: &[u8]) -> Result<MembershipState, RlnErro
         .map_err(|_| RlnError::SerializationError)
 }
 
-/// Extract the timestamp from fetched CLOCK_50 account data (borsh
-/// `ClockAccountData { block_id: u64, timestamp: u64 }` — LE u64 at 8..16).
-pub fn decode_clock_timestamp_ms(account_data: &[u8]) -> Result<u64, RlnError> {
-    if account_data.len() < 16 {
-        return Err(RlnError::DataTooShort);
-    }
-    Ok(u64::from_le_bytes(
-        account_data[8..16].try_into().expect("8-byte clock field"),
-    ))
-}
-
 /// Registry-visible lifecycle state of a membership at chain time `now_ms`.
 /// Registration sets `grace_period_start_ms = now_ms + active_duration`, so
 /// before grace_start the membership is active; the guest's own boundary
@@ -536,6 +512,8 @@ mod tests {
             current_total_rate_limit: 4_242,
             active_duration_for_new_memberships_sec: 100,
             grace_period_duration_for_new_memberships_sec: 10,
+            min_rate_limit: 100,
+            max_rate_limit: 600,
         };
         borsh::to_vec(&cfg).unwrap()
     }
@@ -560,11 +538,13 @@ mod tests {
         );
         assert_eq!(config_field_u32(&bytes, CONFIG_OFFSET_ACTIVE_DURATION), 100);
         assert_eq!(config_field_u32(&bytes, CONFIG_OFFSET_GRACE_DURATION), 10);
+        assert_eq!(config_field_u64(&bytes, CONFIG_OFFSET_MIN_RATE_LIMIT), 100);
+        assert_eq!(config_field_u64(&bytes, CONFIG_OFFSET_MAX_RATE_LIMIT), 600);
         // The last field ends exactly at the account's length. A floor would
         // let a config from another generation through; only an exact match
         // distinguishes this layout, since nothing in the account names it.
         assert_eq!(
-            CONFIG_OFFSET_GRACE_DURATION + 4,
+            CONFIG_OFFSET_MAX_RATE_LIMIT + 8,
             CONFIG_STATE_SIZE,
             "the offset table must span the whole config, with nothing after it"
         );
@@ -614,17 +594,6 @@ mod tests {
             tree_main_account_id(&good, &owner),
             Err(RlnError::InvalidConfig)
         ));
-    }
-
-    // Pins decode_clock_timestamp to clock_core's borsh ClockAccountData
-    // layout: block_id u64 at 0..8, timestamp u64 at 8..16.
-    #[test]
-    fn clock_timestamp_decodes_and_rejects_short_data() {
-        let mut data = Vec::new();
-        data.extend_from_slice(&9u64.to_le_bytes());
-        data.extend_from_slice(&1_234_567u64.to_le_bytes());
-        assert_eq!(decode_clock_timestamp_ms(&data), Ok(1_234_567));
-        assert_eq!(decode_clock_timestamp_ms(&data[..15]), Err(RlnError::DataTooShort));
     }
 
     // Boundary semantics come from the guest helpers: grace starts AT
@@ -722,7 +691,6 @@ mod tests {
         );
     }
 
-    // Every claim the guest asserts comes from the config and the tree shard.
     #[test]
     fn field_elements_are_read_little_endian() {
         let mut ok = [0xffu8; 32];
@@ -743,24 +711,50 @@ mod tests {
     #[test]
     fn check_register_refuses_what_the_guest_would() {
         let config = make_config_state();
+        let (min_rate, max_rate) = (
+            config_field_u64(&config, CONFIG_OFFSET_MIN_RATE_LIMIT),
+            config_field_u64(&config, CONFIG_OFFSET_MAX_RATE_LIMIT),
+        );
         let good = [0x01u8; 32];
-        assert!(check_register(&config, 0, &good, MIN_RATE_LIMIT).is_ok());
+        assert!(check_register(&config, 0, &good, min_rate).is_ok());
+        assert!(check_register(&config, 0, &good, max_rate).is_ok());
         let mut bad = [0x01u8; 32];
         bad[31] = 0xff;
-        assert!(check_register(&config, 0, &bad, MIN_RATE_LIMIT).unwrap_err().starts_with("invalid_commitment"));
-        assert!(check_register(&config, 0, &[0u8; 32], MIN_RATE_LIMIT).unwrap_err().starts_with("invalid_commitment"));
-        assert!(check_register(&config, 0, &good, MIN_RATE_LIMIT - 1).unwrap_err().starts_with("invalid_rate_limit"));
-        assert!(check_register(&config, 0, &good, MAX_RATE_LIMIT + 1).unwrap_err().starts_with("invalid_rate_limit"));
-        assert!(check_register(&config, 1u64 << TREE_DEPTH, &good, MIN_RATE_LIMIT).unwrap_err().starts_with("tree_full"));
+        assert!(check_register(&config, 0, &bad, min_rate).unwrap_err().starts_with("invalid_commitment"));
+        assert!(check_register(&config, 0, &[0u8; 32], min_rate).unwrap_err().starts_with("invalid_commitment"));
+        assert_eq!(
+            check_register(&config, 0, &good, min_rate - 1).unwrap_err(),
+            "invalid_rate_limit: 99 is outside the registry's 100..=600"
+        );
+        assert!(check_register(&config, 0, &good, max_rate + 1).unwrap_err().starts_with("invalid_rate_limit"));
+        assert!(check_register(&config, 1u64 << TREE_DEPTH, &good, min_rate).unwrap_err().starts_with("tree_full"));
         let mut full = config.clone();
         let max = config_field_u64(&full, CONFIG_OFFSET_MAX_TOTAL_RATE_LIMIT);
         full[CONFIG_OFFSET_CURRENT_TOTAL_RATE_LIMIT..CONFIG_OFFSET_CURRENT_TOTAL_RATE_LIMIT + 8]
             .copy_from_slice(&max.to_le_bytes());
-        assert!(check_register(&full, 0, &good, MIN_RATE_LIMIT).unwrap_err().starts_with("registry_full"));
+        assert!(check_register(&full, 0, &good, min_rate).unwrap_err().starts_with("registry_full"));
+    }
+
+    /// The bounds are the registry's own, not a constant of this module.
+    #[test]
+    fn check_register_reads_the_registry_bounds() {
+        let mut config = make_config_state();
+        config[CONFIG_OFFSET_MIN_RATE_LIMIT..CONFIG_OFFSET_MIN_RATE_LIMIT + 8]
+            .copy_from_slice(&20u64.to_le_bytes());
+        config[CONFIG_OFFSET_MAX_RATE_LIMIT..CONFIG_OFFSET_MAX_RATE_LIMIT + 8]
+            .copy_from_slice(&100u64.to_le_bytes());
+        let good = [0x01u8; 32];
+        assert!(check_register(&config, 0, &good, 20).is_ok());
+        assert!(check_register(&config, 0, &good, 100).is_ok());
+        assert!(check_register(&config, 0, &good, 19).unwrap_err().starts_with("invalid_rate_limit"));
+        assert_eq!(
+            check_register(&config, 0, &good, 101).unwrap_err(),
+            "invalid_rate_limit: 101 is outside the registry's 20..=100"
+        );
     }
 
     #[test]
-    fn register_plan_reads_every_claim() {
+    fn register_plan_derives_the_accounts_and_reads_the_tree() {
         let config = make_config_state();
         let program = [0xAA; 32];
         let plan = register_plan(&config, &make_tree_shard(37), &program, &[0x77; 32]).unwrap();
@@ -769,9 +763,11 @@ mod tests {
         assert_eq!(plan.treasury_account_id, [0x33; 32]);
         assert_eq!(plan.next_leaf_index, 37);
         assert_eq!(plan.price_per_unit, 77_000_000_000_000_000_000);
-        assert_eq!(plan.active_duration_sec, 100);
-        assert_eq!(plan.grace_period_duration_sec, 10);
         let tree_id = [0x42; 32];
+        assert_eq!(
+            plan.config_account_id,
+            derive_pda(&program, &combine_seeds(&[&label_seed("config"), &tree_id]))
+        );
         assert_eq!(
             plan.membership_account_id,
             derive_pda(&program, &combine_seeds(&[&label_seed("membership"), &tree_id, &[0x77; 32]]))
@@ -780,15 +776,19 @@ mod tests {
             plan.tree_main_account_id,
             tree_main_account_id(&config, &program).unwrap()
         );
+        assert_eq!(
+            plan.tree_main_account_id,
+            derive_pda(&program, &combine_seeds(&[&label_seed("main"), &tree_id]))
+        );
     }
 
-    // Pins the Register instruction's byte encoding (borsh: a one-byte variant
+    // Pins the Register message's byte encoding (borsh: a one-byte variant
     // discriminant, fixed-width arrays inline, integers little-endian). This is
     // consensus wire format shared with the deployed guest: a module encoding
     // against a guest that reads a different layout does not fail to decode,
-    // it executes a different instruction — hence literals, not derivations.
+    // it executes a different message — hence literals, not derivations.
     #[test]
-    fn register_instruction_bytes_pin() {
+    fn register_message_bytes_pin() {
         let mut plan = register_plan(
             &make_config_state(),
             &make_tree_shard(0x0102),
@@ -797,50 +797,33 @@ mod tests {
         )
         .unwrap();
         plan.tree_id = [0xAB; 32];
-        let bytes = register_build_instruction(&plan, &[0xCD; 32], 0x1_0000_0002, 0x0A0B).unwrap();
-        assert_eq!(bytes.len(), 1 + 32 + 32 + 8 + 32 + 8 + 16 + 4 + 4);
+        let bytes =
+            register_build_message(&plan, &[0xCD; 32], 0x1_0000_0002, &[0xEE; 32], 0x0A0B).unwrap();
+        assert_eq!(bytes.len(), 1 + 32 + 32 + 8 + 32 + 8);
         assert_eq!(bytes[0], 2, "Register variant discriminant");
         assert_eq!(&bytes[1..33], &[0xABu8; 32], "tree_id");
         assert_eq!(&bytes[33..65], &[0xCDu8; 32], "id_commitment");
         assert_eq!(&bytes[65..73], &[2, 0, 0, 0, 1, 0, 0, 0], "rate_limit u64 LE");
-        assert_eq!(&bytes[73..105], &[0x11u8; 32], "merkle_program_id");
+        assert_eq!(&bytes[73..105], &[0xEEu8; 32], "payer");
         assert_eq!(&bytes[105..113], &[0x0B, 0x0A, 0, 0, 0, 0, 0, 0], "now_ms u64 LE");
-        assert_eq!(
-            &bytes[113..129],
-            &77_000_000_000_000_000_000u128.to_le_bytes(),
-            "price_per_unit u128 LE"
-        );
-        assert_eq!(&bytes[129..133], &[100, 0, 0, 0], "active_duration_sec");
-        assert_eq!(&bytes[133..137], &[10, 0, 0, 0], "grace_period_duration_sec");
     }
 
     // The guest decodes what this encodes, so the two must round-trip.
     #[test]
-    fn register_instruction_round_trips_through_borsh() {
+    fn register_message_round_trips_through_borsh() {
         let plan = register_plan(&make_config_state(), &make_tree_shard(5), &[0xAA; 32], &[0xCD; 32])
             .unwrap();
-        let bytes = register_build_instruction(&plan, &[0xCD; 32], 200, 9_999).unwrap();
-        let rln_layouts::Instruction::Register {
-            tree_id,
-            id_commitment,
-            rate_limit,
-            merkle_program_id,
-            now_ms,
-            price_per_unit,
-            active_duration_sec,
-            grace_period_duration_sec,
-        } = rln_layouts::Instruction::try_from_slice(&bytes).expect("decodes")
+        let bytes = register_build_message(&plan, &[0xCD; 32], 200, &[0xEE; 32], 9_999).unwrap();
+        let rln_layouts::Message::Register { tree_id, id_commitment, rate_limit, payer, now_ms } =
+            rln_layouts::Message::try_from_slice(&bytes).expect("decodes")
         else {
-            panic!("expected a Register instruction");
+            panic!("expected a Register message");
         };
         assert_eq!(tree_id, [0x42; 32]);
         assert_eq!(id_commitment, [0xCD; 32]);
         assert_eq!(rate_limit, 200);
-        assert_eq!(merkle_program_id, [0x11; 32]);
+        assert_eq!(payer, [0xEE; 32]);
         assert_eq!(now_ms, 9_999);
-        assert_eq!(price_per_unit, 77_000_000_000_000_000_000);
-        assert_eq!(active_duration_sec, 100);
-        assert_eq!(grace_period_duration_sec, 10);
     }
 
     // The tree, not the membership, holds a member's index: found by its

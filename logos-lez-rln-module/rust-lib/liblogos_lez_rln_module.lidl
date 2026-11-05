@@ -38,8 +38,17 @@
 ; v4.2.1 adds the testnet network (testnet-z1) to the built-in table; data only.
 ; v5.1.0 adds check_registry: whether a registry is deployed on the wallet's
 ; chain, and why not.
+; v5.2.0: get_registry_bounds reads the registry's own rate-limit range.
+; v6.0.0 moves to LEZ v0.4.0-rc1 (core_ffi, the actor model). The surface is
+; unchanged; what changed underneath: chain time is the head block's
+; timestamp (no clock account), a Register is one message to the config actor
+; with a validity window instead of a clock claim, the treasury must exist
+; before anyone registers, a failed transaction is included and charged, and
+; the wallet storage is opened with LEE_WALLET_PASSWORD (empty = plaintext; a
+; v0.3 storage with a Private entry no longer parses — re-mint). wallet_status
+; gains payer_public_key.
 module liblogos_lez_rln_module {
-  version "5.1.0"
+  version "6.0.0"
   description "RLN registry provider (LEZ chain reads + registration/funding txs)"
   category "blockchain"
 
@@ -64,7 +73,8 @@ module liblogos_lez_rln_module {
   ; Idempotent on-chain registration. Existing membership PDA →
   ; {"already_registered":true,"leaf_index":N}; otherwise submits the
   ; Register tx and returns {"leaf_index":N,"pending":true,"tx_result":s}
-  ; without waiting for confirmation; "" on error.
+  ; without waiting for confirmation; "" on error. leaf_index is a pre-submit
+  ; ESTIMATE (the tree assigns the slot); get_membership reports the real one.
   ; payer_account_id signs the tx, pays rate_limit x price_per_unit of NATIVE
   ; balance to the treasury, and pays the fee — one account, not the
   ; pre-4.0.0 (holding signs, LEZ_RLN_PAYER pays) pair. "" selects the
@@ -73,8 +83,13 @@ module liblogos_lez_rln_module {
   ; Since 5.1.0 a registration the program would refuse is not submitted:
   ; {"error":"<kind>: <reason>"} with kind invalid_commitment (zero, or not a BN254
   ; field element, read little-endian), invalid_rate_limit, registry_full,
-  ; tree_full or insufficient_balance (price + fee reserve at the next base
-  ; fee ceiling). "" stays the answer for a config or chain read that failed.
+  ; tree_full, insufficient_balance (price + fee reserve at the next base
+  ; fee ceiling) or, since 6.0.0, treasury_missing (the registry's treasury
+  ; account does not exist on the chain; lez-rln's run_setup seeds it). ""
+  ; stays the answer for a config or chain read that failed.
+  ; A transaction the program refuses after submission is still included in a
+  ; block and charged; the module watches for the membership and re-sends a
+  ; reverted registration, dated by chain time again, up to five times.
   method register_member(config_account_id: tstr, payer_account_id: tstr, id_commitment_hex: tstr, rate_limit: int) -> tstr
 
   ; Live NATIVE balance of account_id as a decimal STRING (u128 exceeds JSON
@@ -85,32 +100,39 @@ module liblogos_lez_rln_module {
   ; and a zero-balance one are the same answer.
   method get_native_balance(account_id: tstr) -> tstr
 
-  ; Membership PDA read + lifecycle state derived from the on-chain CLOCK_50
-  ; timestamp (never local time). {"registered":false} when the PDA is absent
-  ; or emptied (erase/slash); otherwise {"clock_timestamp":N,
+  ; Membership PDA read + lifecycle state derived from chain time — the head
+  ; block's timestamp, never local time. {"registered":false} when the PDA is
+  ; absent or emptied (erase/slash); otherwise {"clock_timestamp":N,
   ; "grace_period_duration":N,"grace_period_start_timestamp":N,"leaf_index":N,
   ; "rate_limit":N,"registered":true,"state":"active"|"grace_period"|"expired"};
-  ; "" on error (including clock fetch failure). clock_timestamp and
-  ; grace_period_start_timestamp are MILLISECONDS (CLOCK_50);
-  ; grace_period_duration is SECONDS.
+  ; "" on error (including a chain-time read failure). clock_timestamp (the
+  ; head block's timestamp; the key predates 6.0.0) and
+  ; grace_period_start_timestamp are MILLISECONDS; grace_period_duration is
+  ; SECONDS.
   method get_membership(config_account_id: tstr, id_commitment_hex: tstr) -> tstr
 
-  ; Registry-declared registration bounds: the compile-time rate-limit range
-  ; plus ConfigState capacity/pricing/duration fields read by offset.
+  ; Registry-declared registration bounds: the registry's own rate-limit
+  ; range (min_rate_limit..=max_rate_limit, set when its config was
+  ; initialised — two registries on one program deployment may differ) plus
+  ; the capacity/pricing/duration fields, all read from ConfigState by offset.
   ; price_per_unit is a decimal STRING (u128 exceeds JSON number precision)
   ; and is denominated in NATIVE balance. {"active_duration":N,
-  ; "current_total_rate_limit":N,"grace_period_duration":N,"max_rate_limit":600,
-  ; "max_total_rate_limit":N,"min_rate_limit":100,"price_per_unit":"<decimal>",
+  ; "current_total_rate_limit":N,"grace_period_duration":N,"max_rate_limit":N,
+  ; "max_total_rate_limit":N,"min_rate_limit":N,"price_per_unit":"<decimal>",
   ; "total_registrations":N}; "" on error. active_duration and
   ; grace_period_duration are SECONDS.
   method get_registry_bounds(config_account_id: tstr) -> tstr
 
   ; Whether this module's wallet is open and usable, and which account it
   ; pays with:
-  ; {"detail":s,"network":s,"payer":hex64,"ready":b,
+  ; {"detail":s,"network":s,"payer":hex64,"payer_public_key":hex64,"ready":b,
   ;  "state":"pending"|"ready"|"failed"}.
   ; `network` (since 4.1.0) is the network the home is recorded as bound to,
   ; "" while unbound or when the home was configured by its operator.
+  ; `payer_public_key` (since 6.0.0) is the payer's public key, "" until ready
+  ; and when the wallet holds no key for it (logged at bring-up: such a payer
+  ; cannot sign). It is what funds the payer: genesis funding and a transfer
+  ; into an account that does not exist yet both go by public key.
   ; Never fails and never touches the chain — `payer` is read from local
   ; configuration, so it answers before the first sync, and callers poll this
   ; as a liveness probe. Ask get_native_balance what that account can afford.

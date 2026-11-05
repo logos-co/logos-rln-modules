@@ -1,6 +1,6 @@
 //! Live-registry integration tests: rln_core's chain-facing logic (layout
-//! offsets, PDA derivation, proof construction, clock decode, lifecycle
-//! state) validated against a DEPLOYED registration program.
+//! offsets, PDA derivation, proof construction, chain time, lifecycle state)
+//! validated against a DEPLOYED registration program.
 //!
 //! Read-only and OFF by default — every test no-ops unless
 //! `LEZ_RLN_TESTNET_TESTS=1`. Run with:
@@ -12,16 +12,17 @@
 //! The registry under test comes from a logos-lez-rln checkout's deployment
 //! records: `<LEZ_RLN_CHECKOUT>/deployments/<name>/deployment.json`
 //! (checkout default: `../logos-lez-rln` next to this repo), `<name>` =
-//! `LEZ_RLN_TESTNET_DEPLOYMENT` (default `DEFAULT_DEPLOYMENT`, the current
-//! hosted-testnet deployment). The sequencer is reached over its public JSON-RPC
-//! (`getAccount` — the same read the wallet module's `get_account_public`
-//! serves this module at runtime) via a `curl` subprocess, so the shipping
-//! crate gains no HTTP/TLS dependency and Cargo.lock stays untouched.
+//! `LEZ_RLN_TESTNET_DEPLOYMENT` (default `DEFAULT_DEPLOYMENT`, the last
+//! hosted-testnet deployment, made on LEZ v0.3: against an rc1 chain name a
+//! deployment provisioned there). The sequencer is reached over its public
+//! JSON-RPC (`getAccount` — the same read the wallet's `read_account` serves
+//! this module at runtime) via a `curl` subprocess, so the tests exercise the
+//! RPC shape the wallet library hides.
 //!
 //! What this catches that unit pins cannot: ConfigState layout drift
 //! against the DEPLOYED program (the guest image is pinned by provisioned
 //! deployments), PDA-derivation divergence, tree/proof encoding drift, and
-//! chain-clock unit changes.
+//! chain-time unit changes.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -199,22 +200,25 @@ fn rpc(sequencer: &str, method: &str, params: serde_json::Value) -> serde_json::
     doc.get("result").cloned().expect("JSON-RPC result")
 }
 
-/// An account's shards as `(program, data)` — empty when the account is
-/// absent. LEZ v0.3.0 answers `getAccount` with
-/// `{"nonce", "data": {"shards": {"<base58 program>": [bytes…]}}}`: an
-/// account's data is sharded by owning program, and the native balance is the
-/// shard of the native token program (`[0; 32]`).
-fn get_shards(sequencer: &str, id: &[u8; 32]) -> Vec<([u8; 32], Vec<u8>)> {
+/// An account's actor states as `(program, data)` — empty when the account is
+/// absent (`getAccount` answers `null`). An existing one answers
+/// `{"nonce", "data": {"actor_states": {"<base58 program>": [bytes…]}}}`: an
+/// account's data is kept per program, and the native balance is the native
+/// token program's (`[0; 32]`).
+fn get_actor_states(sequencer: &str, id: &[u8; 32]) -> Vec<([u8; 32], Vec<u8>)> {
     let result = rpc(sequencer, "getAccount", serde_json::json!([b58_encode(id)]));
-    let Some(shards) = result["data"]["shards"].as_object() else {
+    if result.is_null() {
         return Vec::new();
-    };
-    shards
+    }
+    let states = result["data"]["actor_states"]
+        .as_object()
+        .expect("an existing account carries data.actor_states");
+    states
         .iter()
         .map(|(program, bytes)| {
             let data: Vec<u8> = bytes
                 .as_array()
-                .expect("shard byte array")
+                .expect("actor state byte array")
                 .iter()
                 .map(|v| v.as_u64().expect("byte") as u8)
                 .collect();
@@ -223,24 +227,24 @@ fn get_shards(sequencer: &str, id: &[u8; 32]) -> Vec<([u8; 32], Vec<u8>)> {
         .collect()
 }
 
-/// One program's shard of an account; `None` when absent or empty (the
+/// One program's state on an account; `None` when absent or empty (the
 /// module's FetchOutcome::Absent).
 fn get_shard(sequencer: &str, id: &[u8; 32], program: &[u8; 32]) -> Option<Vec<u8>> {
-    get_shards(sequencer, id)
+    get_actor_states(sequencer, id)
         .into_iter()
         .find(|(p, data)| p == program && !data.is_empty())
         .map(|(_, data)| data)
 }
 
-/// The config shard and the program that owns it — the registration program,
-/// whose id on v0.3.0 is the deployer's header account, discoverable only as
-/// the config's shard key.
+/// The config state and the program that owns it — the registration program,
+/// whose id is the deployer's header account, discoverable only as the key of
+/// the config's one program state.
 fn fetch_config(dep: &Deployment) -> (Vec<u8>, [u8; 32]) {
-    let mut program_shards: Vec<_> = get_shards(&dep.sequencer, &dep.config_account)
+    let mut program_shards: Vec<_> = get_actor_states(&dep.sequencer, &dep.config_account)
         .into_iter()
         .filter(|(p, data)| *p != [0u8; 32] && !data.is_empty())
         .collect();
-    assert_eq!(program_shards.len(), 1, "the config holds exactly one program shard");
+    assert_eq!(program_shards.len(), 1, "the config holds exactly one program's state");
     let (program, data) = program_shards.remove(0);
     (data, program)
 }
@@ -256,14 +260,10 @@ fn fetch_tree(dep: &Deployment, config_data: &[u8], registration: &[u8; 32]) -> 
     (main, data)
 }
 
+/// Chain time the way the module reads it: the head block's timestamp.
 fn chain_now_ms(dep: &Deployment) -> u64 {
-    let data = get_shard(
-        &dep.sequencer,
-        &rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES,
-        &rln_layouts::clock_program_account_id(),
-    )
-    .expect("CLOCK_50's clock-program shard");
-    native::decode_clock_timestamp_ms(&data).unwrap()
+    crate::fee_state::fetch_head_timestamp(&dep.sequencer)
+        .unwrap_or_else(|e| panic!("head block timestamp from {}: {e}", dep.sequencer))
 }
 
 // --------------------------------------------------------------------- tests
@@ -303,7 +303,10 @@ fn testnet_config_account_matches_deployment_and_bounds_decode() {
     let registrations = native::config_field_u64(&data, native::CONFIG_OFFSET_TOTAL_REGISTRATIONS);
     let active = native::config_field_u32(&data, native::CONFIG_OFFSET_ACTIVE_DURATION);
     let grace = native::config_field_u32(&data, native::CONFIG_OFFSET_GRACE_DURATION);
-    assert!(max_total >= native::MIN_RATE_LIMIT, "capacity fits at least one member");
+    let min_rate = native::config_field_u64(&data, native::CONFIG_OFFSET_MIN_RATE_LIMIT);
+    let max_rate = native::config_field_u64(&data, native::CONFIG_OFFSET_MAX_RATE_LIMIT);
+    assert!(0 < min_rate && min_rate <= max_rate, "registry bounds {min_rate}..={max_rate}");
+    assert!(max_total >= min_rate, "capacity fits at least one member");
     assert!(current <= max_total, "used {current} within capacity {max_total}");
     assert!(price > 0, "priced registration");
     assert!(active > 0 && grace > 0, "nonzero lifecycle durations");
@@ -338,12 +341,12 @@ fn testnet_register_plan_derives_the_deployed_accounts() {
     eprintln!("live tree: next_leaf_index {}", plan.next_leaf_index);
 }
 
-// The CLOCK_50 account (the module's ONLY time source for lifecycle state)
-// must decode and sit near wall time. Chain time is epoch MILLISECONDS on
-// this deployment class; a week of slack tolerates sequencer lag while
-// still failing loudly on a unit change (seconds would be ~1000x off).
+// The head block's timestamp (the module's ONLY time source for lifecycle
+// state) must decode and sit near wall time. Chain time is epoch MILLISECONDS;
+// a week of slack tolerates a stalled sequencer while still failing loudly on
+// a unit change (seconds would be ~1000x off).
 #[test]
-fn testnet_clock_account_decodes_to_live_chain_time() {
+fn testnet_head_block_timestamp_is_live_chain_time() {
     let Some(dep) = testnet() else { return };
     let chain_ms = chain_now_ms(&dep);
     let wall_ms = SystemTime::now()
@@ -419,7 +422,7 @@ fn testnet_merkle_proof_recomputes_the_live_root() {
 // — pinning that never-registered reads as empty (the same signal as
 // erased/slashed, which is why the spec's Unknown state exists). If some
 // run of the write path ever registers it, the record must decode and its
-// lifecycle state must derive against the LIVE chain clock.
+// lifecycle state must derive against LIVE chain time.
 #[test]
 fn testnet_membership_read_absent_or_decodes_with_live_state() {
     let Some(dep) = testnet() else { return };
@@ -439,8 +442,9 @@ fn testnet_membership_read_absent_or_decodes_with_live_state() {
         Some(data) => {
             let membership = native::decode_membership(&data).unwrap();
             assert_eq!(membership.id_commitment, id_commitment);
-            assert!(membership.rate_limit >= native::MIN_RATE_LIMIT);
-            assert!(membership.rate_limit <= native::MAX_RATE_LIMIT);
+            let cfg = &config_data;
+            assert!(membership.rate_limit >= native::config_field_u64(cfg, native::CONFIG_OFFSET_MIN_RATE_LIMIT));
+            assert!(membership.rate_limit <= native::config_field_u64(cfg, native::CONFIG_OFFSET_MAX_RATE_LIMIT));
             let state = native::membership_status(
                 membership.grace_period_start_timestamp_ms,
                 membership.grace_period_duration_sec,
@@ -483,9 +487,9 @@ fn testnet_fee_state_is_a_live_quote() {
 // Offline self-checks for the helpers this file leans on (always run).
 #[test]
 fn base58_roundtrip_matches_known_vector() {
-    let clock = rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES;
-    let encoded = b58_encode(&clock);
-    assert_eq!(b58_decode32(&encoded), clock);
+    let id: [u8; 32] = core::array::from_fn(|i| i as u8 * 7);
+    let encoded = b58_encode(&id);
+    assert_eq!(b58_decode32(&encoded), id);
     // A fixed vector, not a live account: it pins the base58 alphabet and
     // the leading-zero handling, and belongs to no deployment record.
     assert_eq!(

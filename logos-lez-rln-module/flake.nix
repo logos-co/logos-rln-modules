@@ -10,7 +10,7 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
-    # No module-level dependencies since 3.0.0: this module links wallet_ffi
+    # No module-level dependencies since 3.0.0: this module links core_ffi
     # and holds its own wallet handle rather than calling the lez_core module,
     # so nothing here resolves a dependency lidl any more.
     #
@@ -20,18 +20,13 @@
     # on macOS, a Metal toolchain stub and an unsandboxed build; the LEZ flake
     # supplies all of that and a module flake cannot.
     #
-    # Upstream LEZ v0.3.1: wallet_ffi_open/create_new take no statistics path,
-    # and the wallet config names one `sequencer`. The wallet takes its execution gas limit
-    # from config here (#884), which a registration needs: ~9.1M of the 10M
-    # cap, against a stock default of 2M. The rc3 fork this replaced carried
-    # that patch before it landed.
+    # Upstream LEZ v0.4.0-rc1: the wallet library is `core_ffi` (packages.core,
+    # header core_ffi.h), wallet_ffi_open takes the storage password, and a
+    # transaction names the actor its message is delivered to. The wallet takes
+    # its execution gas limit from config (#884), which a registration needs:
+    # ~9.1M of the 10M cap, against a stock default of 2M.
     logos-execution-zone.url =
-      "github:logos-blockchain/logos-execution-zone/v0.3.1";
-    # v0.3.1's own lock pins a rust-overlay whose stable.latest predates Rust
-    # 1.98 (its rust-toolchain.toml), and the pinned logos-blockchain-mmr needs
-    # 1.98's const `usize::bit_width`: the wallet package fails to build without
-    # a newer overlay. Drop this once upstream relocks it.
-    logos-execution-zone.inputs.rust-overlay.url = "github:oxalica/rust-overlay";
+      "github:logos-blockchain/logos-execution-zone/v0.4.0-rc1";
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:
@@ -49,16 +44,16 @@
       # RISC0_SKIP_BUILD_KERNELS comes from metadata nix.rust.env: risc0-zkvm
       # is serde-only here, no proving.
       #
-      # wallet_ffi is the LEZ flake's own `wallet` package — the prebuilt
+      # core_ffi is the LEZ flake's own `core` package — the prebuilt
       # library, header included — wired exactly as lez_core wires it.
       module = logos-module-builder.lib.mkLogosModule {
         src = ./.;
         configFile = ./metadata.json;
         flakeInputs = inputs;
         externalLibInputs = {
-          wallet_ffi = {
+          core_ffi = {
             input = inputs.logos-execution-zone;
-            packages.default = "wallet";
+            packages.default = "core";
           };
         };
       };
