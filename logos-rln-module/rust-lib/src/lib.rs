@@ -1104,23 +1104,27 @@ fn get_memberships_impl(
 /// Default `max_epoch_gap` (see [`epoch_params_for`]) when `start()` sets none.
 const DEFAULT_MAX_EPOCH_GAP: u64 = 1;
 
-/// A registry's deviation from the instance defaults (spec: epoch size and
-/// max gap are per-REGISTRY configuration). Doubles as the start reply's
-/// override object — an unset key is omitted, never null.
-#[derive(Clone, Copy, Default, serde::Serialize)]
-struct RegistryOverride {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    epoch_size_sec: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_epoch_gap: Option<u64>,
+/// One registry's configuration in force (spec: epoch size and max gap are
+/// per-REGISTRY configuration). Every registry a `start()` names has one;
+/// the start reply's `overrides` object is this table.
+#[derive(Clone, Copy, serde::Serialize)]
+struct RegistryConfig {
+    epoch_size_sec: u64,
+    max_epoch_gap: u64,
+    /// The rate a membership provisioned on this registry asks for.
+    #[serde(skip)]
+    rate_limit: u64,
 }
 
-/// Runtime configuration applied by `start()`: instance defaults plus
-/// per-registry overrides, keyed by canonical registry_id.
+/// Runtime configuration applied by `start()`: instance defaults for
+/// registries no call has named, plus the per-registry table keyed by
+/// canonical registry_id. `registries` keeps first-named order — the first
+/// `logos` registry binds the wallet network.
 struct ModuleConfig {
     epoch_size_sec: u64,
     max_epoch_gap: u64,
-    overrides: std::collections::BTreeMap<String, RegistryOverride>,
+    registries: Vec<String>,
+    per_registry: std::collections::BTreeMap<String, RegistryConfig>,
 }
 
 static CONFIG: Mutex<Option<ModuleConfig>> = Mutex::new(None);
@@ -1140,10 +1144,10 @@ fn epoch_params_for(registry_canonical: &str) -> Result<(u64, u64), ApiError> {
             "start() has not configured epoch_size_sec; rate limiting is not ready",
         )
     })?;
-    let o = c.overrides.get(registry_canonical);
-    let size = o.and_then(|o| o.epoch_size_sec).unwrap_or(c.epoch_size_sec);
-    let gap = o.and_then(|o| o.max_epoch_gap).unwrap_or(c.max_epoch_gap);
-    Ok((size, gap))
+    Ok(match c.per_registry.get(registry_canonical) {
+        Some(r) => (r.epoch_size_sec, r.max_epoch_gap),
+        None => (c.epoch_size_sec, c.max_epoch_gap),
+    })
 }
 
 #[cfg(test)]
@@ -1151,13 +1155,12 @@ fn epoch_size() -> Result<u64, ApiError> {
     epoch_params_for("").map(|(size, _)| size)
 }
 
-/// start()'s stale-binding warning. Names the whole effective set (instance
-/// default + overrides) because that is what the check compares against —
-/// naming only the default would report a value the check never used.
-fn epoch_binding_warning(hash: &str, bound: u64, effective: &[u64]) -> String {
+/// start()'s stale-binding warning: the membership's own registry's
+/// configured size, which is what the check compared against.
+fn epoch_binding_warning(hash: &str, registry: &str, bound: u64, configured: u64) -> String {
     format!(
-        "membership start: entry {hash} allocations are bound to \
-         epoch_size_sec={bound}, configured sizes are {effective:?}; \
+        "membership start: entry {hash} on {registry} allocations are bound to \
+         epoch_size_sec={bound}, configured size is {configured}; \
          generate_proof for it will fail permanent"
     )
 }
@@ -1176,9 +1179,18 @@ static LIFECYCLE: Mutex<()> = Mutex::new(());
 /// windows, begin maintenance, and clear any prior stop(). Idempotent —
 /// safe to call again to reconfigure. config_json:
 /// {"epoch_size_sec":N (required — the instance default), "max_epoch_gap"?:N,
-/// "registries"?:[<entry>,…]} where an entry is a CAIP-10 string, or an
-/// object {"registry_id":caip10, "epoch_size_sec"?:N, "max_epoch_gap"?:N}
-/// overriding the defaults for that registry.
+/// "rate_limit"?:N, "provision"?:bool, "registries"?:[<entry>,…]} where an
+/// entry is a CAIP-10 string, or an object {"registry_id":caip10,
+/// "epoch_size_sec"?:N, "max_epoch_gap"?:N, "rate_limit"?:N}.
+///
+/// A call sets the registries it names and leaves every other registry's
+/// configuration in force: an object entry sets its registry's values
+/// (absent fields take this call's defaults); a plain string pins this
+/// call's defaults for a registry nothing has configured yet and leaves a
+/// configured one alone. The instance defaults apply to registries no call
+/// has named. Two consumers sharing this instance — delivery naming its
+/// registry, a host naming the mix registry at its own epoch — therefore
+/// never undo each other.
 fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
     let _lifecycle = LIFECYCLE.lock().unwrap();
     panic_hook::install_once();
@@ -1206,21 +1218,37 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_MAX_EPOCH_GAP);
 
-    // Warm each configured registry's root window; unparseable entries are
-    // skipped.
-    let mut tracked: Vec<String> = Vec::new();
-    let mut overrides: std::collections::BTreeMap<String, RegistryOverride> =
-        std::collections::BTreeMap::new();
-    let mut track = |raw: &str, over: Option<RegistryOverride>| {
+    // The rate a provisioned membership asks for. The registry declares no
+    // default yet, so this is the module's, and a caller that wants another
+    // says so here rather than registering by hand.
+    let default_rate = cfg
+        .get("rate_limit")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_RATE_LIMIT);
+
+    // Merge into the table in force; unparseable entries are skipped.
+    let (mut registries, mut per_registry) = match lock(&CONFIG).as_ref() {
+        Some(c) => (c.registries.clone(), c.per_registry.clone()),
+        None => (Vec::new(), std::collections::BTreeMap::new()),
+    };
+    let mut track = |raw: &str, set: Option<RegistryConfig>| {
         if let Ok(registry) = registry_id::parse(raw) {
             roots::track(&registry);
-            if let Some(o) = over {
-                if o.epoch_size_sec.is_some() || o.max_epoch_gap.is_some() {
-                    overrides.insert(registry.canonical.clone(), o);
+            match set {
+                Some(c) => {
+                    per_registry.insert(registry.canonical.clone(), c);
+                }
+                None => {
+                    per_registry.entry(registry.canonical.clone()).or_insert(RegistryConfig {
+                        epoch_size_sec,
+                        max_epoch_gap,
+                        rate_limit: default_rate,
+                    });
                 }
             }
-            if !tracked.contains(&registry.canonical) {
-                tracked.push(registry.canonical);
+            if !registries.contains(&registry.canonical) {
+                registries.push(registry.canonical);
             }
         }
     };
@@ -1230,64 +1258,68 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
                 serde_json::Value::String(raw) => track(raw, None),
                 serde_json::Value::Object(o) => {
                     let raw = o.get("registry_id").and_then(|x| x.as_str()).unwrap_or_default();
-                    let over = RegistryOverride {
-                        epoch_size_sec: o
-                            .get("epoch_size_sec")
-                            .and_then(|x| x.as_u64())
-                            .filter(|n| *n > 0),
-                        max_epoch_gap: o
-                            .get("max_epoch_gap")
-                            .and_then(|x| x.as_u64())
-                            .filter(|n| *n > 0),
+                    let positive =
+                        |key: &str| o.get(key).and_then(|x| x.as_u64()).filter(|n| *n > 0);
+                    let set = RegistryConfig {
+                        epoch_size_sec: positive("epoch_size_sec").unwrap_or(epoch_size_sec),
+                        max_epoch_gap: positive("max_epoch_gap").unwrap_or(max_epoch_gap),
+                        rate_limit: positive("rate_limit").unwrap_or(default_rate),
                     };
-                    track(raw, Some(over));
+                    track(raw, Some(set));
                 }
                 _ => {}
             }
         }
     }
 
-    let overrides_view = (!overrides.is_empty())
-        .then(|| serde_json::to_value(&overrides).unwrap_or(serde_json::Value::Null));
-    let effective_sizes: Vec<u64> = std::iter::once(epoch_size_sec)
-        .chain(overrides.values().filter_map(|o| o.epoch_size_sec))
-        .collect();
-    *lock(&CONFIG) = Some(ModuleConfig { epoch_size_sec, max_epoch_gap, overrides });
-    // A membership bound to a DIFFERENT epoch size can no longer generate
-    // proofs; surface that at configure time. Warn-only — rejecting start()
-    // would DoS validate_proof for every scope over one stale local
-    // membership. Approximate under overrides: a binding matching ANY
-    // configured size passes (epoch_size_bindings carries no registry).
+    let overrides_view = (!per_registry.is_empty())
+        .then(|| serde_json::to_value(&per_registry).unwrap_or(serde_json::Value::Null));
+    // A membership bound to a DIFFERENT epoch size than its registry's can no
+    // longer generate proofs; surface that at configure time. Warn-only —
+    // rejecting start() would DoS validate_proof for every scope over one
+    // stale local membership.
     if let Some(store) = sealed_store::store::current() {
-        for (hash, bound) in store.epoch_size_bindings() {
-            if bound != 0 && !effective_sizes.contains(&bound) {
-                eprintln!("{}", epoch_binding_warning(&hash, bound, &effective_sizes));
+        for (hash, registry, bound) in store.epoch_size_bindings() {
+            let canonical =
+                registry_id::parse(&registry).map(|r| r.canonical).unwrap_or(registry);
+            let configured = per_registry
+                .get(&canonical)
+                .map(|c| c.epoch_size_sec)
+                .unwrap_or(epoch_size_sec);
+            if bound != 0 && bound != configured {
+                eprintln!("{}", epoch_binding_warning(&hash, &canonical, bound, configured));
             }
         }
     }
     // Permit + (re)spawn the maintenance workers, and warm the tracked
     // registries' root windows and every usable membership's Merkle path in
     // the background — must not block start() itself.
-    let warm_roots = !tracked.is_empty();
+    let warm_roots = !registries.is_empty();
     // Provisioning rides the same one-shot pass, after the warm-up: it may
     // wait minutes for a wallet and for funding, and start() must not.
     // Opt out with {"provision": false}; on by default because a config that
     // names registries is a node that intends to prove against them, and
-    // every attempt is idempotent per scope. Nothing is spent when the config
-    // names no registry.
+    // every attempt is idempotent per scope. Nothing is spent when no call
+    // named a registry. Every registry in force is passed, not only this
+    // call's: a membership already present stands the pass down at once, so
+    // a reconfigure never abandons another consumer's registry.
     let provision = cfg
         .get("provision")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
-    let provision_registries = if provision { tracked.clone() } else { Vec::new() };
-    // The rate a provisioned membership asks for. The registry declares no
-    // default yet, so this is the module's, and a caller that wants another
-    // says so here rather than registering by hand.
-    let provision_rate = cfg
-        .get("rate_limit")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(DEFAULT_RATE_LIMIT);
-    let selection_order = tracked.clone();
+    let provision_registries: Vec<(String, u64)> = if provision {
+        registries
+            .iter()
+            .map(|r| {
+                (r.clone(), per_registry.get(r).map(|c| c.rate_limit).unwrap_or(default_rate))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let selection_order = registries.clone();
+    let reply_registries = registries.clone();
+    *lock(&CONFIG) = Some(ModuleConfig { epoch_size_sec, max_epoch_gap, registries, per_registry });
     worker::start(move || {
         // First, before anything reaches the registry module: the first
         // `logos` registry id is what binds its wallet to a network when
@@ -1307,16 +1339,14 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
             eprintln!("membership start: path warm-up panicked: {payload:?}");
         }
         if !provision_registries.is_empty() {
-            let run = std::panic::AssertUnwindSafe(|| {
-                ensure::run(provision_registries, provision_rate)
-            });
+            let run = std::panic::AssertUnwindSafe(|| ensure::run(provision_registries));
             if let Err(payload) = std::panic::catch_unwind(run) {
                 eprintln!("membership start: provisioning panicked: {payload:?}");
             }
         }
     });
 
-    ok_json(views::StartReply::new(epoch_size_sec, max_epoch_gap, overrides_view, tracked))
+    ok_json(views::StartReply::new(epoch_size_sec, max_epoch_gap, overrides_view, reply_registries))
 }
 
 /// Spec stop(): halt the maintenance tasks. Sleeping workers are joined
@@ -1629,6 +1659,7 @@ fn validate_proof_with(
     // timestamp must never move the nullifier log's prune floor.
     let retain_floor = now_epoch.saturating_sub(gap);
     let view = match nullifier_log::record_verified(
+        &registry.canonical,
         expected_epoch,
         rlp.nullifier(),
         rlp.share_x(),
@@ -2139,10 +2170,12 @@ mod tests {
     }
 
     // Spec: epoch size and max gap are per-REGISTRY configuration — an
-    // object registries entry carries overrides, a plain string inherits.
+    // object registries entry sets them, a plain string takes the call's
+    // defaults; the reply's overrides object is the table in force.
     #[test]
     fn start_per_registry_overrides_select_epoch_config() {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        reset_config_for_test();
         let reg_a = format!("logos:local:{}", "ab".repeat(32));
         let reg_b = format!("logos:local:{}", "cd".repeat(32));
         let cfg = serde_json::json!({
@@ -2155,37 +2188,85 @@ mod tests {
         })
         .to_string();
         let out = start_impl(&cfg).unwrap();
-        // Exact wire shape: sorted keys, unset keys omitted (never null).
+        // Exact wire shape: sorted keys, both values always present.
         assert_eq!(
             out["overrides"].to_string(),
-            format!(r#"{{"{reg_b}":{{"epoch_size_sec":60,"max_epoch_gap":5}}}}"#),
+            format!(
+                r#"{{"{reg_a}":{{"epoch_size_sec":600,"max_epoch_gap":2}},"{reg_b}":{{"epoch_size_sec":60,"max_epoch_gap":5}}}}"#
+            ),
             "got: {out}"
         );
-        assert!(
-            out["overrides"].get(reg_a.as_str()).is_none(),
-            "a plain string entry carries no override: {out}"
-        );
+        assert_eq!(out["registries"], serde_json::json!([reg_a, reg_b]));
         assert_eq!(epoch_params_for(&reg_a).unwrap(), (600, 2));
         assert_eq!(epoch_params_for(&reg_b).unwrap(), (60, 5));
+        // A registry no call named takes the instance defaults.
+        assert_eq!(epoch_params_for("logos:local:other").unwrap(), (600, 2));
 
-        // Reconfiguring without overrides clears them (idempotent start).
+        // No registries at all: no overrides key.
+        reset_config_for_test();
         let out = start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
         assert!(out.get("overrides").is_none(), "no overrides key when none are set: {out}");
-        assert_eq!(epoch_params_for(&reg_b).unwrap(), (600, DEFAULT_MAX_EPOCH_GAP));
+        reset_config_for_test();
     }
 
-    // With an override configured, the warning must not name only the
-    // instance default — a value the check never used.
+    // A reconfigure names what it sets and leaves the rest alone: delivery's
+    // start (its own registry only) must not undo the host's mix registry
+    // epoch, and vice versa.
     #[test]
-    fn epoch_binding_warning_names_every_configured_size() {
-        let msg = epoch_binding_warning("abc123", 300, &[600, 60]);
-        assert!(msg.contains("epoch_size_sec=300"), "got: {msg}");
-        assert!(msg.contains("configured sizes are [600, 60]"), "got: {msg}");
-        assert!(!msg.contains("config says"), "the single-value phrasing is gone: {msg}");
+    fn start_keeps_registries_it_does_not_name() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        reset_config_for_test();
+        let deliv = format!("logos:local:{}", "ab".repeat(32));
+        let mix = format!("logos:local:{}", "cd".repeat(32));
+        let host = serde_json::json!({
+            "epoch_size_sec": 600,
+            "registries": [deliv, {"registry_id": mix, "epoch_size_sec": 10, "max_epoch_gap": 3}],
+        })
+        .to_string();
+        start_impl(&host).unwrap();
+        assert_eq!(epoch_params_for(&mix).unwrap(), (10, 3));
 
-        // The un-overridden instance still reads naturally.
-        let plain = epoch_binding_warning("abc123", 300, &[600]);
-        assert!(plain.contains("configured sizes are [600]"), "got: {plain}");
+        // Delivery names only its registry, as a plain string.
+        let out =
+            start_impl(&serde_json::json!({"epoch_size_sec": 600, "registries": [deliv]}).to_string())
+                .unwrap();
+        assert_eq!(epoch_params_for(&mix).unwrap(), (10, 3), "the mix registry lost its epoch: {out}");
+        assert_eq!(epoch_params_for(&deliv).unwrap(), (600, DEFAULT_MAX_EPOCH_GAP));
+        assert_eq!(
+            out["registries"],
+            serde_json::json!([deliv, mix]),
+            "every registry in force is reported"
+        );
+
+        // A plain string under other defaults leaves a configured registry
+        // alone; the instance defaults still move for unnamed registries.
+        start_impl(
+            &serde_json::json!({"epoch_size_sec": 10, "max_epoch_gap": 3, "registries": [mix]})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(epoch_params_for(&mix).unwrap(), (10, 3));
+        assert_eq!(epoch_params_for(&deliv).unwrap(), (600, DEFAULT_MAX_EPOCH_GAP));
+        assert_eq!(epoch_params_for("logos:local:other").unwrap(), (10, 3));
+
+        // An object entry sets: absent fields take this call's defaults.
+        start_impl(
+            &serde_json::json!({"epoch_size_sec": 600, "registries": [{"registry_id": mix}]})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(epoch_params_for(&mix).unwrap(), (600, DEFAULT_MAX_EPOCH_GAP));
+        reset_config_for_test();
+    }
+
+    // The warning names the membership's registry and that registry's
+    // configured size — the value the check compared against.
+    #[test]
+    fn epoch_binding_warning_names_the_registry_size() {
+        let msg = epoch_binding_warning("abc123", "logos:local:d", 300, 600);
+        assert!(msg.contains("on logos:local:d"), "got: {msg}");
+        assert!(msg.contains("epoch_size_sec=300"), "got: {msg}");
+        assert!(msg.contains("configured size is 600"), "got: {msg}");
     }
 
     // Spec: before start() configures the epoch size, the epoch-dependent
@@ -3365,6 +3446,47 @@ mod tests {
         );
 
         sealed_store::store::publish(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // One payer, one nonce: the provisioning pass holds after a submit while
+    // the registry's registration is pending, and stands down at once when a
+    // later start() supersedes it.
+    #[test]
+    fn provisioning_holds_while_its_registration_is_pending() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-ms-hold-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (imp, store) = imp_with_store(dir.clone());
+        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+        let registry = format!("logos:local:{}", "7a".repeat(32));
+        let parsed = registry_id::parse(&registry).unwrap();
+        let hash = "hold-pending";
+        seed_membership(
+            &store,
+            hash,
+            &registry,
+            &"11".repeat(32),
+            "",
+            &"22".repeat(32),
+            MembershipState::Pending,
+            0,
+            100,
+        );
+        assert!(ensure::pending_membership_present(&parsed));
+
+        // A superseded pass does not wait on it.
+        let t0 = std::time::Instant::now();
+        ensure::wait_confirmed(&parsed, u64::MAX);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2), "a superseded pass must return at once");
+
+        // Confirmed: nothing to hold for, superseded or not.
+        store.update_cache(hash, |m| m.state = MembershipState::Active).unwrap();
+        assert!(!ensure::pending_membership_present(&parsed));
+        let t0 = std::time::Instant::now();
+        ensure::wait_confirmed(&parsed, ensure::ticket_in_force());
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+        drop(imp);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

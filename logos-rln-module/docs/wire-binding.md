@@ -77,7 +77,7 @@ switch on `class`, log `kind`.
 
 | Spec function | Method (args) | Dialect | Success reply (the `value` for result methods) |
 |---|---|---|---|
-| `start(config)` | `start(config_json)` | result | `{"started":true,"epoch_size_sec":N,"max_epoch_gap":N,"registries":[…]}` + `"overrides":{registry:{…}}` when any registries entry set per-registry values. config: `{"epoch_size_sec":N (required default), "max_epoch_gap"?:N, "registries"?:[caip10 \| {"registry_id","epoch_size_sec"?,"max_epoch_gap"?}]}` — spec: epoch size and max gap are per-REGISTRY configuration; an object entry overrides the defaults for that registry |
+| `start(config)` | `start(config_json)` | result | `{"started":true,"epoch_size_sec":N,"max_epoch_gap":N,"registries":[…]}` + `"overrides":{registry:{"epoch_size_sec","max_epoch_gap"}}`, the per-registry table in force, once any call named a registry. config: `{"epoch_size_sec":N (required default), "max_epoch_gap"?:N, "rate_limit"?:N, "provision"?:bool, "registries"?:[caip10 \| {"registry_id","epoch_size_sec"?,"max_epoch_gap"?,"rate_limit"?}]}` — spec: epoch size and max gap are per-REGISTRY configuration; a call sets the registries it names and leaves the others in force (see start() config) |
 | `stop()` | `stop()` | result | `{"stopped":true}` |
 | `register(scope, options)` | `register_membership(registry_id, rln_identifier_hex, options_json)` | tstr | public Membership view (below), `"state":"pending"` on a fresh submit; `options_json` is the RegistryOptions ARRAY (below), the common `rate_limit` key defaulted when absent |
 | `get_membership_state(scope)` | `get_membership_state(registry_id, rln_identifier_hex)` | tstr | `{"state":…}` + `membership_hash`/`leaf_index`/`rate_limit` when known; `"unknown"` + `"provisioning":{…}` (below) while provisioning works on the registry |
@@ -274,8 +274,9 @@ the LIP's `generate_proof(scope, Bytes signal, …)`.
   **application parameter** — every
   proof generator and verifier of a deployment must configure the same value.
   Both it and `max_epoch_gap` are per-REGISTRY (spec): a `registries` entry
-  may override the instance defaults for its registry, and every
-  epoch-dependent call resolves the values by the scope's registry.
+  sets them for its registry, and every epoch-dependent call resolves the
+  values by the scope's registry. Two registries on one instance can run
+  different epochs (a 10 s mix registry beside a 600 s delivery one).
 - `validate_proof` enforces application binding + epoch agreement + freshness:
   the expected epoch derives from the supplied message `timestamp`; the
   proof's carried epoch, when present, must equal it; the proof's external
@@ -286,8 +287,10 @@ the LIP's `generate_proof(scope, Bytes signal, …)`.
   `validate_proof`, and the two ends agree on the epoch by construction.
   **Double-signal detection across
   messages is now the Module's job, not the consumer's** (a spec change): the
-  Module keeps an in-memory nullifier log (per epoch, retained at least
-  `max_epoch_gap` epochs, never on disk) and, when a proof reuses a nullifier
+  Module keeps an in-memory nullifier log (per registry and epoch, retained
+  at least that registry's `max_epoch_gap` epochs, never on disk — epoch
+  indices of registries with different `epoch_size_sec` are incomparable, so
+  one registry's pruning never touches another's) and, when a proof reuses a nullifier
   under a different `share_x`, reconstructs the offender's identity secret from
   the two colliding shares and returns it as `recovered_secret`.
 
@@ -368,9 +371,26 @@ keys are registry-specific:
 
 Listed registries get their valid-root windows warmed immediately
 (`epoch_size_sec` is required — see Epoch semantics). A `registries` entry
-is either a CAIP-10 string or an object overriding `epoch_size_sec` /
-`max_epoch_gap` for that registry; the reply echoes active overrides under
-an `overrides` key. There is no
+is either a CAIP-10 string or an object setting `epoch_size_sec` /
+`max_epoch_gap` / `rate_limit` (the rate provisioning registers at) for that
+registry; the reply echoes the per-registry table in force under an
+`overrides` key and every registry any call named under `registries`.
+
+A call sets the registries it names and leaves every other registry's
+configuration in force: an object entry sets its registry's values (absent
+fields take this call's defaults); a plain string pins this call's defaults
+for a registry nothing has configured yet and leaves a configured one
+alone; the instance defaults (`epoch_size_sec` / `max_epoch_gap` at the top
+level) apply to registries no call has named. Consumers sharing one
+instance therefore compose: delivery's `{"epoch_size_sec":600,"registries":["D"]}`
+after a host's `{"epoch_size_sec":600,"registries":["D",{"registry_id":"M","epoch_size_sec":10,"max_epoch_gap":3}]}`
+leaves M at 10 s. To move a configured registry, name it with an object.
+Provisioning (on unless `"provision":false`) covers every registry in force,
+each at its own rate; a registry that already holds a membership stands the
+pass down at once. Registrations go out one registry at a time: the pass
+holds until each has left `pending` before submitting the next, because two
+submits from one payer in flight together share a nonce and the second is
+dropped silently. There is no
 default-scope key: every other method takes its
 `(registry_id, rln_identifier_hex)` scope explicitly. `stop()` tears the
 maintenance workers down: sleeping workers join within a ~200 ms grace; a

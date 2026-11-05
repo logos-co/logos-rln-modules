@@ -51,6 +51,11 @@ const WALLET_WAIT_NOTICE: Duration = Duration::from_secs(300);
 /// stop.
 const TICK: Duration = Duration::from_secs(5);
 
+/// How long the pass holds for one registry's submitted registration to leave
+/// `pending` before it submits the next registry's. A bound, not a deadline:
+/// past it the pass moves on and the next submit takes its chances.
+const CONFIRM_HOLD: Duration = Duration::from_secs(900);
+
 /// Which provisioning pass is the current one.
 ///
 /// `worker::start()` spawns a fresh warm task and DETACHES any still in
@@ -63,7 +68,8 @@ const TICK: Duration = Duration::from_secs(5);
 ///
 /// Every pass takes a ticket on entry and both waits check it, so exactly one
 /// pass is ever live and the newest wins — which is the right one, because it
-/// carries the registries and rate the latest `start()` named.
+/// carries every registry in force after the latest `start()`, at the rate
+/// each was configured with.
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Should this pass stop — because the module stopped, or because a later
@@ -181,14 +187,15 @@ impl Step {
     }
 }
 
-/// Provision a membership for each registry `start()` named.
+/// Provision a membership for each registry in force after `start()`, at
+/// that registry's rate.
 ///
 /// Errors are logged and abandoned per registry rather than propagated: this
 /// runs detached, there is nobody to return to, and one unreachable registry
 /// must not stop the others.
-pub(crate) fn run(registries: Vec<String>, rate_limit: u64) {
+pub(crate) fn run(registries: Vec<(String, u64)>) {
     let mine = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
-    run_as(registries, rate_limit, mine)
+    run_as(registries, mine)
 }
 
 /// `run` for one registry asked for OUTSIDE `start()` — `ensure_membership`
@@ -197,11 +204,11 @@ pub(crate) fn run(registries: Vec<String>, rate_limit: u64) {
 /// funding keeps waiting. The next `start()` ends it like any other pass, and
 /// `is_running` keeps two from working the same registry at once.
 pub(crate) fn run_alongside(registry: String, rate_limit: u64) {
-    run_as(vec![registry], rate_limit, EPOCH.load(Ordering::SeqCst))
+    run_as(vec![(registry, rate_limit)], EPOCH.load(Ordering::SeqCst))
 }
 
-fn run_as(registries: Vec<String>, rate_limit: u64, mine: u64) {
-    for raw in registries {
+fn run_as(registries: Vec<(String, u64)>, mine: u64) {
+    for (raw, rate_limit) in registries {
         if superseded(mine) {
             return;
         }
@@ -216,11 +223,48 @@ fn run_as(registries: Vec<String>, rate_limit: u64, mine: u64) {
         // Read per registry rather than captured once: this runs detached and
         // the store can be republished under it (on_context_ready re-opening
         // it), so a handle taken at spawn time could outlive its store.
-        if let Err(e) = provision_one(&registry, rate_limit, mine) {
-            record(&registry.canonical, Step::Refused, &e.message);
-            eprintln!("provision {}: {}", registry.canonical, e.message);
+        match provision_one(&registry, rate_limit, mine) {
+            Ok(()) => wait_confirmed(&registry, mine),
+            Err(e) => {
+                record(&registry.canonical, Step::Refused, &e.message);
+                eprintln!("provision {}: {}", registry.canonical, e.message);
+            }
         }
     }
+}
+
+/// Does this node hold a registration on this registry that the chain has
+/// not confirmed yet?
+pub(crate) fn pending_membership_present(registry: &registry_id::CanonicalRegistryId) -> bool {
+    crate::sealed_store::store::current()
+        .map(|s| {
+            records_for_registry(&s, registry).iter().any(|r| {
+                !r.quarantined && r.cache.state == crate::lifecycle::MembershipState::Pending
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// One payer, one nonce: a registration submitted while the previous one is
+/// still pending is signed with the nonce that one has yet to consume, and
+/// the sequencer drops it without a word — the second registry's membership
+/// then stays `pending` for good. So the pass holds after each submit until
+/// the registry's membership has left pending, the pass is superseded, or
+/// `CONFIRM_HOLD` runs out.
+pub(crate) fn wait_confirmed(registry: &registry_id::CanonicalRegistryId, mine: u64) {
+    let started = Instant::now();
+    while pending_membership_present(registry) {
+        if superseded(mine) || started.elapsed() >= CONFIRM_HOLD {
+            return;
+        }
+        std::thread::sleep(TICK);
+    }
+}
+
+/// The pass ticket in force — what a pass started now would hold.
+#[cfg(test)]
+pub(crate) fn ticket_in_force() -> u64 {
+    EPOCH.load(Ordering::SeqCst)
 }
 
 /// Does this node already have a membership on this registry — ANY

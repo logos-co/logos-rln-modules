@@ -224,8 +224,9 @@ impl EpochQuotaView {
 }
 
 /// `start`'s reply. Not a `.lidl` record. Every field but `overrides` is
-/// always present; that one is omitted unless a `registries` entry set a
-/// per-registry epoch size or max gap, which the common `start()` does not.
+/// always present; that one is the per-registry table in force (every
+/// registry any `start()` named, with its epoch size and max gap), omitted
+/// while no call has named a registry.
 #[derive(Serialize)]
 pub(crate) struct StartReply {
     epoch_size_sec: u64,

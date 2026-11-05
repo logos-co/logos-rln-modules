@@ -554,12 +554,13 @@ impl Store {
             .collect()
     }
 
-    /// Every membership's persisted epoch-size binding (0 = not yet bound).
-    pub fn epoch_size_bindings(&self) -> Vec<(String, u64)> {
+    /// Every membership's persisted epoch-size binding (0 = not yet bound),
+    /// with the registry it belongs to.
+    pub fn epoch_size_bindings(&self) -> Vec<(String, String, u64)> {
         self.snapshot_arc()
             .records
             .values()
-            .map(|r| (r.hash.clone(), r.alloc.epoch_size_sec))
+            .map(|r| (r.hash.clone(), r.identity.registry_id.clone(), r.alloc.epoch_size_sec))
             .collect()
     }
 
@@ -1233,7 +1234,10 @@ mod tests {
 
         let store = Store::open(dir.clone()).unwrap();
         assert_eq!(store.unlock("pw").unwrap(), 1);
-        assert_eq!(store.epoch_size_bindings(), vec![(hash.clone(), 600)]);
+        assert_eq!(
+            store.epoch_size_bindings(),
+            vec![(hash.clone(), registry.to_string(), 600)]
+        );
         let rewound = store.reserve_message_id(&hash, "aa", 10, 9, 5, 600);
         assert!(matches!(rewound, Err(e) if e.kind == ErrorKind::Permanent));
         let q_floor = store.remaining_budget(&hash, "aa", 10, 5, 600);
