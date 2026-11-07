@@ -23,16 +23,15 @@
 //! only plaintext-safe sidecar metadata. Provider calls from this worker go
 //! out through `provider.rs`'s async twin + channel wait, like every other
 //! caller — the module is concurrency "multi", so a slow registry read holds
-//! up nothing else. A transient failure never kills the worker: each tick
-//! body runs under `catch_unwind` (pure Rust, no FFI frames — safe to
-//! catch); only the supervisor retires it (`stop()`, or a restart's
-//! generation bump).
+//! up nothing else. A failed read is logged and the tick moves on; only the
+//! supervisor retires the worker (`stop()`, or a restart's generation bump).
+//! A panic aborts the host process (`panic = "abort"`).
 
 use std::time::Duration;
 
-use crate::lifecycle::{self, MembershipRecord, MembershipState, CONFIRMATION_WINDOW_SECS};
+use crate::lifecycle::{self, confirmation_deadline, MembershipRecord, MembershipState};
 use crate::path_cache;
-use crate::provider::provider_for;
+use crate::provider::{provider_for, ProviderMembership};
 use crate::registry_id;
 use crate::sealed_store::store as sealed;
 use crate::worker;
@@ -59,15 +58,14 @@ pub(crate) fn run_loop(my_gen: u64) {
         }
         tick_no = tick_no.wrapping_add(1);
         let refresh = tick_no.is_multiple_of(REFRESH_EVERY);
-        if let Err(payload) = std::panic::catch_unwind(|| tick(refresh)) {
-            eprintln!("membership poller: tick panicked: {payload:?}");
-        }
+        tick(refresh);
     }
 }
 
-/// One registry read for one record; returns the update to apply, or None
-/// to leave the record untouched (provider failure).
-fn observe(record: &MembershipRecord) -> Option<RecordUpdate> {
+/// One registry read for one record: `Some(Some(_))` = the registry holds
+/// it, `Some(None)` = the registry authoritatively does not, `None` = no
+/// answer (provider failure), leave the record untouched.
+fn observe(record: &MembershipRecord) -> Option<Option<ProviderMembership>> {
     let registry = match registry_id::parse(&record.identity.registry_id) {
         Ok(r) => r,
         Err(e) => {
@@ -80,12 +78,7 @@ fn observe(record: &MembershipRecord) -> Option<RecordUpdate> {
     };
     let provider = provider_for(&registry.namespace)?;
     match provider.get_membership(&registry, &record.identity.identity_commitment) {
-        Ok(pm) if pm.registered => Some(RecordUpdate::Observed {
-            state: pm.state,
-            leaf_index: pm.leaf_index,
-            rate_limit: pm.rate_limit,
-        }),
-        Ok(_) => Some(RecordUpdate::Absent),
+        Ok(pm) => Some(pm),
         Err(e) => {
             eprintln!(
                 "membership poller: {} read failed: {}",
@@ -96,56 +89,52 @@ fn observe(record: &MembershipRecord) -> Option<RecordUpdate> {
     }
 }
 
-enum RecordUpdate {
-    Observed {
-        state: MembershipState,
-        leaf_index: u64,
-        rate_limit: u64,
-    },
-    Absent,
+/// What a record the registry does not hold becomes: one that was on the
+/// registry (state ∈ active/grace/expired, or ever active) is erased or
+/// slashed and consumers MUST stop using it; one the cache knows nothing
+/// about (`Unknown` after a lost sidecar, never seen active) was never
+/// registered as far as anyone can tell, and reads `failed`, retryable, so
+/// it is not mistaken for a removal.
+pub(crate) fn absent_verdict(record: &MembershipRecord) -> (MembershipState, &'static str) {
+    if record.cache.state == MembershipState::Unknown && record.cache.first_active_at.is_none() {
+        (MembershipState::Failed, "not_on_registry")
+    } else {
+        (MembershipState::Erased, "removed_from_registry")
+    }
 }
 
-/// Confirm/refresh write shared by both Observed branches: record the
+/// A cache write that yields to a fresher writer: `f` runs only while the
+/// record's state is still `expected`, the state the caller read before its
+/// (possibly ~70 s) registry round-trip. `Ok(Some(prior))` = written;
+/// `Ok(None)` = another writer moved the record meanwhile, nothing changed.
+pub(crate) fn write_if_still(
+    hash: &str,
+    expected: MembershipState,
+    f: impl FnOnce(&mut lifecycle::CacheState),
+) -> Result<Option<MembershipState>, crate::error::ApiError> {
+    let prior = sealed::current_or_uninit()?.update_cache(hash, |m| {
+        if m.state == expected {
+            f(m);
+        }
+    })?;
+    Ok((prior == expected).then_some(prior))
+}
+
+/// Confirm/refresh write shared by both observed branches: record the
 /// registry's authoritative state/leaf_index/rate_limit and clear any
-/// failed_reason/retryable.
+/// failed_reason/retryable — unless the record already moved on.
 fn apply_observed(
     hash: &str,
-    state: MembershipState,
-    leaf_index: u64,
-    rate_limit: u64,
-) -> Result<MembershipState, crate::ApiError> {
-    sealed::current_or_uninit()?.update_cache(hash, |m| {
-        m.state = state;
-        m.leaf_index = Some(leaf_index);
-        m.rate_limit = Some(rate_limit);
+    expected: MembershipState,
+    pm: &ProviderMembership,
+) -> Result<Option<MembershipState>, crate::error::ApiError> {
+    write_if_still(hash, expected, |m| {
+        m.state = pm.state;
+        m.leaf_index = Some(pm.leaf_index);
+        m.rate_limit = Some(pm.rate_limit);
         m.failed_reason = None;
         m.retryable = None;
     })
-}
-
-/// Fire `membership_state_changed` (module docs: LIDL events section) after
-/// a successful, change-gated store write — called with no store lock held.
-/// `record` is the pre-transition snapshot the caller already had in hand
-/// from `pending_records`/`refreshable_records`;
-/// `lifecycle::transition_event` no-ops when `new_state` didn't actually
-/// change anything.
-fn emit_transition(
-    hash: &str,
-    record: &MembershipRecord,
-    prior: MembershipState,
-    new_state: MembershipState,
-) {
-    if let Some((registry_id, rln_identifier, membership_hash, state, previous)) =
-        lifecycle::transition_event(hash, record, prior, new_state)
-    {
-        crate::emit_membership_state_changed(
-            &registry_id,
-            &rln_identifier,
-            &membership_hash,
-            &state,
-            &previous,
-        );
-    }
 }
 
 fn tick(refresh_states: bool) {
@@ -157,42 +146,40 @@ fn tick(refresh_states: bool) {
         // Store not initialized (no persistence path) — nothing to poll.
         None => return,
     };
-    let now = crate::now_unix();
+    let now = crate::util::now_unix();
     for record in pending {
         let hash = &record.hash;
+        let expected = record.cache.state;
         match observe(&record) {
-            Some(RecordUpdate::Observed {
-                state,
-                leaf_index,
-                rate_limit,
-            }) => match apply_observed(hash, state, leaf_index, rate_limit) {
+            Some(Some(pm)) => match apply_observed(hash, expected, &pm) {
                 Err(e) => {
                     eprintln!("membership poller: confirm update failed: {}", e.message)
                 }
-                Ok(prior) => {
-                    emit_transition(hash, &record, prior, state);
-                    eprintln!("membership poller: {hash} confirmed {state:?} at leaf {leaf_index}")
+                Ok(Some(prior)) => {
+                    lifecycle::emit_transition(hash, &record, prior, pm.state);
+                    eprintln!(
+                        "membership poller: {hash} confirmed {:?} at leaf {}",
+                        pm.state, pm.leaf_index
+                    )
                 }
+                Ok(None) => {}
             },
-            Some(RecordUpdate::Absent)
-                if now.saturating_sub(record.identity.submitted_at)
-                    > CONFIRMATION_WINDOW_SECS =>
-            {
-                let result = sealed::current_or_uninit().and_then(|s| {
-                    s.update_cache(hash, |m| {
-                        m.state = MembershipState::Failed;
-                        m.failed_reason = Some("confirmation_window_elapsed".to_string());
-                        // Re-registration can be attempted (spec: a failed
-                        // submission SHALL report whether it is retryable).
-                        m.retryable = Some(true);
-                    })
+            Some(None) if now > confirmation_deadline(&record) => {
+                let result = write_if_still(hash, expected, |m| {
+                    m.state = MembershipState::Failed;
+                    m.failed_reason = Some("confirmation_window_elapsed".to_string());
+                    // Re-registration can be attempted (spec: a failed
+                    // submission SHALL report whether it is retryable).
+                    m.retryable = Some(true);
                 });
                 match result {
                     Err(e) => eprintln!("membership poller: fail update failed: {}", e.message),
-                    Ok(prior) => {
-                        emit_transition(hash, &record, prior, MembershipState::Failed);
+                    Ok(Some(prior)) => {
+                        crate::lifecycle::forget_granted_by(hash);
+                        lifecycle::emit_transition(hash, &record, prior, MembershipState::Failed);
                         eprintln!("membership poller: {hash} failed (window elapsed)");
                     }
+                    Ok(None) => {}
                 }
             }
             _ => {}
@@ -208,25 +195,27 @@ fn tick(refresh_states: bool) {
     };
     for record in refreshable {
         let hash = &record.hash;
+        let expected = record.cache.state;
         match observe(&record) {
-            Some(RecordUpdate::Observed { state, leaf_index, rate_limit }) => {
-                if let Ok(prior) = apply_observed(hash, state, leaf_index, rate_limit) {
-                    emit_transition(hash, &record, prior, state);
+            Some(Some(pm)) => {
+                if let Ok(Some(prior)) = apply_observed(hash, expected, &pm) {
+                    lifecycle::emit_transition(hash, &record, prior, pm.state);
                 }
             }
-            Some(RecordUpdate::Absent) => {
-                // Was on the registry (state ∈ active/grace/expired), now
-                // gone: erased/slashed. Consumers MUST stop using it.
-                let updated = sealed::current_or_uninit().and_then(|s| {
-                    s.update_cache(hash, |m| {
-                        m.state = MembershipState::Erased;
-                        m.failed_reason = Some("removed_from_registry".to_string());
-                    })
+            Some(None) => {
+                let (state, reason) = absent_verdict(&record);
+                let updated = write_if_still(hash, expected, |m| {
+                    m.state = state;
+                    m.failed_reason = Some(reason.to_string());
+                    if state == MembershipState::Failed {
+                        m.retryable = Some(true);
+                    }
                 });
-                if let Ok(prior) = updated {
-                    emit_transition(hash, &record, prior, MembershipState::Erased);
+                if let Ok(Some(prior)) = updated {
+                    crate::lifecycle::forget_granted_by(hash);
+                    lifecycle::emit_transition(hash, &record, prior, state);
+                    eprintln!("membership poller: {hash} not on the registry — {reason}");
                 }
-                eprintln!("membership poller: {hash} vanished from registry — erased");
             }
             None => {}
         }

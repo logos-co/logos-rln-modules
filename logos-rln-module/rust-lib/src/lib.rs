@@ -14,7 +14,7 @@
 //!   message_id reservation) and `lifecycle.rs` (the state machine, merged
 //!   view)
 //! - registry provider → `provider.rs` (trait + the lez-rln provider over
-//!   the SDK's generated client of the sibling liblogos_lez_rln_module; also
+//!   the SDK's generated client of the liblogos_lez_rln_module; also
 //!   the gifter client for delegated registration)
 //! - Pending confirmation window + involuntary-removal detection →
 //!   `poller.rs` (a `worker.rs`-supervised worker)
@@ -29,13 +29,13 @@
 //! Wire conventions: every method returns a compact JSON object (serde_json
 //! ⇒ alphabetical keys); failures are
 //! `{"error":{"class":…,"kind":…,"message":…}}` — consumers switch on
-//! `class` (see `ErrorKind::class`) and log `kind`. The sibling RLN
+//! `class` (see `ErrorKind::class`) and log `kind`. The lez
 //! module's ""-on-error convention is not used here.
 //!
 //! Concurrency is "multi" (metadata.json): handlers take `&self` and
 //! overlap, so one call blocked in a registry read (the register bounds
 //! pre-check, get_membership_state, get_merkle_proof, get_valid_roots — up
-//! to ~70s) no longer serializes the rest. Registration itself stays
+//! to ~70s) does not serialize the rest. Registration itself stays
 //! fire-and-record (the SDK's async twin); the poller thread does the
 //! periodic reads.
 
@@ -47,9 +47,9 @@
 #![deny(unsafe_code)]
 
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod ensure;
+mod error;
 mod keychain;
 mod lifecycle;
 mod nullifier_log;
@@ -63,6 +63,7 @@ mod registry_id;
 mod roots;
 mod sealed_store;
 mod select;
+mod util;
 mod views;
 mod wallet_home;
 mod worker;
@@ -77,11 +78,13 @@ mod generated {
     ));
 }
 pub(crate) use generated::*;
+pub(crate) use error::{ApiError, ErrorKind};
+pub(crate) use util::{lock, now_unix};
 
 // `MembershipState` is lifecycle's enum, NOT the generated record of the same
 // name (the scaffold materializes the .lidl `type` blocks): a single-name
 // import shadows the glob import above, deliberately.
-use lifecycle::{MembershipRecord, MembershipState, StoredCredential};
+use lifecycle::{note_granted_by, MembershipRecord, MembershipState, StoredCredential};
 use sealed_store::store::Store;
 use zeroize::Zeroize;
 
@@ -102,111 +105,6 @@ pub(crate) fn publish_test_store(dir: std::path::PathBuf) -> Arc<Store> {
 }
 
 // -------------------------------------------------------------------- errors
-
-/// Reply-envelope error kinds. The spec's RLN Module API mandates
-/// distinguishing at least NOT_READY / TRANSIENT / BUDGET_EXHAUSTED /
-/// PERMANENT (the rate-limiting portion), plus this crate's management kinds
-/// unknown_registry / unknown_membership / provider_failure.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ErrorKind {
-    UnknownRegistry,
-    UnknownMembership,
-    ProviderFailure,
-    Locked,
-    BadPassword,
-    NoUsableMembership,
-    AmbiguousSelection,
-    InvalidArgument,
-    KeychainUnavailable,
-    Internal,
-    /// Module cannot serve the call yet (registry view not warm) — retry.
-    NotReady,
-    /// A recoverable failure (registry/RPC/engine hiccup) — the caller MAY retry.
-    Transient,
-    /// The epoch's rate-limit budget is spent — retry next epoch.
-    BudgetExhausted,
-    /// Retrying as-is cannot succeed. Constructed by the rate-limit
-    /// allocator's floor/epoch-size guards (`store::reserve_message_id`):
-    /// an epoch below the persisted allocation floor, or a configured
-    /// `epoch_size_sec` this membership's allocations are not bound to.
-    Permanent,
-}
-
-impl ErrorKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            ErrorKind::UnknownRegistry => "unknown_registry",
-            ErrorKind::UnknownMembership => "unknown_membership",
-            ErrorKind::ProviderFailure => "provider_failure",
-            ErrorKind::Locked => "locked",
-            ErrorKind::BadPassword => "bad_password",
-            ErrorKind::NoUsableMembership => "no_usable_membership",
-            ErrorKind::AmbiguousSelection => "ambiguous_selection",
-            ErrorKind::InvalidArgument => "invalid_argument",
-            ErrorKind::KeychainUnavailable => "keychain_unavailable",
-            ErrorKind::Internal => "internal",
-            ErrorKind::NotReady => "not_ready",
-            ErrorKind::Transient => "transient",
-            ErrorKind::BudgetExhausted => "budget_exhausted",
-            ErrorKind::Permanent => "permanent",
-        }
-    }
-
-    /// The coarse RLN-API error class (the spec's RlnErrorKind quartet),
-    /// carried in every error envelope. `locked` maps to not_ready: the
-    /// keystore password is invisible to the spec surface, so the caller
-    /// retries after the app's unlock flow.
-    fn class(self) -> &'static str {
-        match self {
-            ErrorKind::NotReady | ErrorKind::Locked => "not_ready",
-            ErrorKind::Transient | ErrorKind::ProviderFailure => "transient",
-            ErrorKind::BudgetExhausted => "budget_exhausted",
-            ErrorKind::UnknownRegistry
-            | ErrorKind::UnknownMembership
-            | ErrorKind::BadPassword
-            | ErrorKind::NoUsableMembership
-            | ErrorKind::AmbiguousSelection
-            | ErrorKind::InvalidArgument
-            | ErrorKind::KeychainUnavailable
-            | ErrorKind::Internal
-            | ErrorKind::Permanent => "permanent",
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct ApiError {
-    pub(crate) kind: ErrorKind,
-    pub(crate) message: String,
-}
-
-impl ApiError {
-    pub(crate) fn new(kind: ErrorKind, message: &str) -> Self {
-        ApiError {
-            kind,
-            message: message.to_string(),
-        }
-    }
-
-    pub(crate) fn internal(message: &str) -> Self {
-        ApiError::new(ErrorKind::Internal, message)
-    }
-
-    /// The typed error object: {"class":…,"kind":…,"message":…}, in
-    /// alphabetical wire order (see `views.rs`).
-    fn body(&self) -> serde_json::Value {
-        serde_json::to_value(views::ErrorBody::new(
-            self.kind.class(),
-            self.kind.as_str(),
-            self.message.clone(),
-        ))
-        .unwrap_or(serde_json::Value::Null)
-    }
-
-    pub(crate) fn to_json(&self) -> String {
-        serde_json::json!({ "error": self.body() }).to_string()
-    }
-}
 
 /// Flatten a handler result into the wire string (the tstr-method dialect):
 /// the Ok value, or the in-band {"error":{…}} envelope.
@@ -230,21 +128,6 @@ pub(crate) fn reply_result(
 /// Serialize a typed reply view (`views.rs`) into its wire `Value`.
 fn ok_json<T: serde::Serialize>(v: T) -> Result<serde_json::Value, ApiError> {
     serde_json::to_value(v).map_err(|e| ApiError::internal(&format!("serialize reply: {e}")))
-}
-
-/// Poison-recovering lock: a poisoned mutex is a bug elsewhere, not a
-/// reason to wedge every future call.
-pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Wall-clock UNIX seconds; a clock before the epoch reads as 0 rather
-/// than panicking.
-pub(crate) fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 // ------------------------------------------------------------------- helpers
@@ -307,7 +190,8 @@ fn parse_scope(
 /// The provisioning task's progress for a registry, shaped for the reply.
 fn provisioning_view(registry: &str) -> Option<views::ProvisioningView> {
     ensure::progress(registry).map(|p| {
-        let view = views::ProvisioningView::new(p.step.as_str(), p.detail);
+        let view = views::ProvisioningView::new(p.step.as_str(), p.detail)
+            .with_fallback_reason(p.fallback_reason);
         match p.funding {
             Some(f) => view.with_funding(&f.payer, f.required, f.price, f.fee_reserve, f.balance),
             None => view,
@@ -316,8 +200,8 @@ fn provisioning_view(registry: &str) -> Option<views::ProvisioningView> {
 }
 
 /// Whether a record backs a scope: registered under the same rln_identifier,
-/// or carrying none — pre-scope legacy records back every application on
-/// their registry.
+/// or carrying none: a record with no rln_identifier (registry-wide, as
+/// `start()` provisions) backs every application on its registry.
 fn scope_matches(record: &MembershipRecord, rln_id_hex: &str) -> bool {
     record.identity.rln_identifier == rln_id_hex || record.identity.rln_identifier.is_empty()
 }
@@ -330,24 +214,80 @@ pub(crate) fn scope_matches_for_test(record_rln_id: &str, scope_rln_id: &str) ->
 }
 
 /// The registry records backing a scope (spec: a membership "MAY back any
-/// application whose scope names its registry"). If the scope has a USABLE
-/// match, only its matching records are candidates — a dedicated membership
-/// shadows the registry's others; otherwise every record backs it.
+/// application whose scope names its registry"), by the same rank the state
+/// read uses: the scope's OWN usable records shadow everything else; with
+/// none, the registry-wide ones (no rln_identifier); with none of those,
+/// every record backs it. A scope whose own membership is active beside a
+/// start()-provisioned registry-wide one proves with its own — the state
+/// read answers that record, and so must the proof.
 fn scope_candidates(
     records: &[MembershipRecord],
     rln_id_hex: &str,
 ) -> Vec<MembershipRecord> {
-    let has_usable_match = records
+    let usable = |r: &&MembershipRecord| !r.quarantined && r.cache.state.is_usable();
+    let own: Vec<MembershipRecord> =
+        records.iter().filter(usable).filter(|r| r.identity.rln_identifier == rln_id_hex).cloned().collect();
+    if !own.is_empty() {
+        return own;
+    }
+    let wide: Vec<MembershipRecord> =
+        records.iter().filter(usable).filter(|r| r.identity.rln_identifier.is_empty()).cloned().collect();
+    if !wide.is_empty() {
+        return wide;
+    }
+    records.to_vec()
+}
+
+/// Which record answers a `get_membership_state(scope)` read.
+enum ScopeState {
+    One(MembershipRecord),
+    Ambiguous(&'static str),
+    None,
+}
+
+/// Resolve a scope's state by rank over the registry's non-quarantined
+/// records: the scope's OWN records first (its one live record; with none
+/// live, the latest terminal one — a refused registration reads back as
+/// `failed` by its scope, never as the registry's other membership), then
+/// the registry-wide records (no rln_identifier, as
+/// `start()` provisions them) by the same rule, then any usable membership
+/// on the registry (spec: a membership "MAY back any application whose
+/// scope names its registry"). More than one live record at the winning
+/// rank is ambiguous. Proof-time resolution stays `scope_candidates`'s
+/// (usable records only).
+fn resolve_scope_state(records: &[MembershipRecord], rln_id_hex: &str) -> ScopeState {
+    let own: Vec<&MembershipRecord> = records
         .iter()
-        .any(|r| !r.quarantined && scope_matches(r, rln_id_hex) && r.cache.state.is_usable());
-    if has_usable_match {
-        records
-            .iter()
-            .filter(|r| scope_matches(r, rln_id_hex))
-            .cloned()
-            .collect()
-    } else {
-        records.to_vec()
+        .filter(|r| !r.quarantined && r.identity.rln_identifier == rln_id_hex)
+        .collect();
+    let wide: Vec<&MembershipRecord> = records
+        .iter()
+        .filter(|r| !r.quarantined && r.identity.rln_identifier.is_empty())
+        .collect();
+    for rank in [own, wide] {
+        if rank.is_empty() {
+            continue;
+        }
+        let live: Vec<&&MembershipRecord> = rank.iter().filter(|r| r.cache.state.is_live()).collect();
+        return match live.len() {
+            1 => ScopeState::One((*live[0]).clone()),
+            0 => {
+                let latest = rank.iter().max_by_key(|r| r.identity.submitted_at).expect("non-empty rank");
+                ScopeState::One((*latest).clone())
+            }
+            _ => ScopeState::Ambiguous(
+                "multiple live memberships registered under this scope; use get_memberships / select_membership",
+            ),
+        };
+    }
+    let usable: Vec<&MembershipRecord> =
+        records.iter().filter(|r| !r.quarantined && r.cache.state.is_usable()).collect();
+    match usable.len() {
+        0 => ScopeState::None,
+        1 => ScopeState::One(usable[0].clone()),
+        _ => ScopeState::Ambiguous(
+            "multiple memberships back this scope; use get_memberships / select_membership",
+        ),
     }
 }
 
@@ -365,16 +305,179 @@ fn provider_of(
 // -------------------------------------------------------------- method impls
 
 /// Delegated-registration options (the RegistryOptions FLAT
-/// "gifter_peer_id"/"gifter_multiaddr"/"auth_*" keys, selected by
-/// "delegated":"true"). The auth surface is vector-agnostic: "auth_type"
-/// and its payload material pass to the gifter verbatim.
-struct DelegatedOptions {
-    gifter_peer_id: String,
-    gifter_multiaddr: String,
-    auth_type: Option<String>,
-    auth_payload: Option<String>,
-    auth_provider: Option<String>,
-    auth_args: Option<String>,
+/// "discover"/"gifter_peer_id"/"gifter_multiaddr"/"auth_*" keys, selected
+/// by "delegated":"true"). The auth surface is vector-agnostic: "auth_type"
+/// and its payload material pass to the gifter verbatim. Allocators that
+/// advertise the (registry, auth_type) pair through libp2p service
+/// discovery are asked first (`discover`, default true); the configured
+/// pair, empty when none, comes after them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DelegatedOptions {
+    pub(crate) discover: bool,
+    pub(crate) gifter_peer_id: String,
+    pub(crate) gifter_multiaddr: String,
+    pub(crate) auth_type: Option<String>,
+    pub(crate) auth_payload: Option<String>,
+    pub(crate) auth_provider: Option<String>,
+    pub(crate) auth_args: Option<String>,
+}
+
+/// The shape rules a delegated registration's options must meet, checked
+/// BEFORE a credential is minted (the auth_type vocabulary itself is OPEN):
+/// a way to find a gifter (discovery or a pair to dial), payload material
+/// only with a named vector, and exactly one payload source for a named
+/// vector.
+fn validate_delegated(d: &DelegatedOptions) -> Result<(), ApiError> {
+    if d.gifter_peer_id.is_empty() != d.gifter_multiaddr.is_empty() {
+        return Err(ApiError::new(
+            ErrorKind::InvalidArgument,
+            "gifter_peer_id and gifter_multiaddr go together",
+        ));
+    }
+    if !d.discover && d.gifter_peer_id.is_empty() {
+        return Err(ApiError::new(
+            ErrorKind::InvalidArgument,
+            "delegated registration needs discover or gifter_peer_id and gifter_multiaddr",
+        ));
+    }
+    if d.auth_type.is_none()
+        && (d.auth_payload.is_some() || d.auth_provider.is_some() || d.auth_args.is_some())
+    {
+        return Err(ApiError::new(
+            ErrorKind::InvalidArgument,
+            "auth_payload/auth_provider/auth_args need auth_type",
+        ));
+    }
+    if let Some(t) = d.auth_type.as_deref() {
+        match (&d.auth_payload, &d.auth_provider) {
+            (Some(_), Some(_)) => {
+                return Err(ApiError::new(
+                    ErrorKind::InvalidArgument,
+                    "auth_payload and auth_provider are mutually exclusive",
+                ))
+            }
+            (None, None) => {
+                return Err(ApiError::new(
+                    ErrorKind::InvalidArgument,
+                    &format!("auth_type '{t}' needs auth_payload or auth_provider"),
+                ))
+            }
+            _ => {}
+        }
+    }
+    if let Some(p) = &d.auth_payload {
+        let h = p.trim_start_matches("0x");
+        if h.is_empty() || h.len() % 2 != 0 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(ApiError::new(
+                ErrorKind::InvalidArgument,
+                "auth_payload must be hex-encoded bytes",
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl DelegatedOptions {
+    /// `start()`'s `allocator` block — `{"discover"?,"peer_id"?,"multiaddr"?,
+    /// "auth_type"?,"auth_payload"?|"auth_provider"?,"auth_args"?}` — as the
+    /// delegated options provisioning registers with. `None`/`null` = no
+    /// allocator; `{}` = discovery alone.
+    fn from_allocator_block(
+        v: Option<&serde_json::Value>,
+        what: &str,
+    ) -> Result<Option<Self>, ApiError> {
+        let obj = match v {
+            None | Some(serde_json::Value::Null) => return Ok(None),
+            Some(serde_json::Value::Object(o)) => o,
+            Some(_) => {
+                return Err(ApiError::new(
+                    ErrorKind::InvalidArgument,
+                    &format!("{what} must be an object {{discover?, peer_id?, multiaddr?, auth_type?, auth_payload?|auth_provider?, auth_args?}}"),
+                ))
+            }
+        };
+        let discover = match obj.get("discover") {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(other) => {
+                return Err(ApiError::new(
+                    ErrorKind::InvalidArgument,
+                    &format!("{what}.discover must be a boolean, got {other}"),
+                ))
+            }
+        };
+        let text = |key: &str| -> Result<Option<String>, ApiError> {
+            match obj.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(serde_json::Value::String(s)) if s.trim().is_empty() => Ok(None),
+                Some(serde_json::Value::String(s)) => Ok(Some(s.trim().to_string())),
+                Some(other) => Err(ApiError::new(
+                    ErrorKind::InvalidArgument,
+                    &format!("{what}.{key} must be a string, got {other}"),
+                )),
+            }
+        };
+        let d = Self {
+            discover,
+            gifter_peer_id: text("peer_id")?.unwrap_or_default(),
+            gifter_multiaddr: text("multiaddr")?.unwrap_or_default(),
+            auth_type: text("auth_type")?,
+            auth_payload: text("auth_payload")?,
+            auth_provider: text("auth_provider")?,
+            auth_args: text("auth_args")?,
+        };
+        validate_delegated(&d).map_err(|e| ApiError::new(e.kind, &format!("{what}: {}", e.message)))?;
+        Ok(Some(d))
+    }
+
+    /// The RegistryOptions flat pairs `parse_registry_options` leaves
+    /// (rate_limit removed) — `register_membership`'s delegated vocabulary.
+    /// `None` = a funded registration, which takes no auth material.
+    fn from_registry_options(opts: &serde_json::Value) -> Result<Option<Self>, ApiError> {
+        if !flat_bool_option(opts, "delegated") {
+            if ["auth_type", "auth_payload", "auth_provider", "auth_args"]
+                .iter()
+                .any(|k| opts.get(*k).is_some())
+            {
+                // Auth material on the funded path is a caller mistake, not a no-op.
+                return Err(ApiError::new(
+                    ErrorKind::InvalidArgument,
+                    "auth_* options apply to delegated registration only — set \"delegated\":\"true\"",
+                ));
+            }
+            return Ok(None);
+        }
+        let d = Self {
+            discover: match opts.get("discover") {
+                None => true,
+                Some(_) => flat_bool_option(opts, "discover"),
+            },
+            gifter_peer_id: opts
+                .get("gifter_peer_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            gifter_multiaddr: opts
+                .get("gifter_multiaddr")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            auth_type: flat_str_option(opts, "auth_type"),
+            auth_payload: flat_str_option(opts, "auth_payload"),
+            auth_provider: flat_str_option(opts, "auth_provider"),
+            auth_args: flat_str_option(opts, "auth_args"),
+        };
+        validate_delegated(&d)?;
+        Ok(Some(d))
+    }
+}
+
+/// The allocator `start()` configured for a registry, if any.
+pub(crate) fn allocator_for(registry_canonical: &str) -> Option<DelegatedOptions> {
+    lock(&CONFIG)
+        .as_ref()
+        .and_then(|c| c.per_registry.get(registry_canonical))
+        .and_then(|c| c.allocator.clone())
 }
 
 /// Read a RegistryOptions flat boolean field. `parse_registry_options` has
@@ -397,8 +500,7 @@ fn flat_str_option(options: &serde_json::Value, key: &str) -> Option<String> {
 
 /// Applied when the common "rate_limit" option key is absent (spec: "absent,
 /// the registry … applies its default"); the lez registry declares no default
-/// yet, so the module supplies one. TODO: prefer a registry-declared default
-/// (via get_registry_parameters) once logos-lez-rln surfaces one.
+/// yet, so the module supplies one.
 const DEFAULT_RATE_LIMIT: u64 = 100;
 
 /// The wire's options_json: the spec RegistryOptions ARRAY of {"key","value"}
@@ -469,17 +571,28 @@ fn parse_registry_options(options_json: &str) -> Result<(u64, serde_json::Value)
     Ok((rate_limit, serde_json::Value::Object(map)))
 }
 
-/// Gifter `request` args for a delegated registration: the module-generated
-/// commitment (never the secret) plus the caller's gifter and auth-vector
-/// selection, passed through verbatim. With an auth_provider the gifter
-/// client produces the payload bound to exactly this commitment.
-fn delegated_request_args(d: &DelegatedOptions, commitment_hex: &str, rate_limit: u64) -> String {
+/// Gifter `request` args for a delegated registration: the scope's registry
+/// (its config account, so a gifter serving another refuses at once instead
+/// of registering an orphan), the module-generated commitment (never the
+/// secret) plus the caller's gifter and auth-vector selection, passed through
+/// verbatim. With an auth_provider the gifter client produces the payload
+/// bound to exactly this commitment.
+fn delegated_request_args(
+    d: &DelegatedOptions,
+    commitment_hex: &str,
+    rate_limit: u64,
+    registry_account: &str,
+) -> String {
     let mut args = serde_json::json!({
-        "gifterPeerId": d.gifter_peer_id,
-        "gifterMultiaddr": d.gifter_multiaddr,
+        "discover": d.discover,
+        "config": registry_account,
         "identityCommitment": commitment_hex,
         "rate": rate_limit,
     });
+    if !d.gifter_peer_id.is_empty() {
+        args["gifterPeerId"] = d.gifter_peer_id.as_str().into();
+        args["gifterMultiaddr"] = d.gifter_multiaddr.as_str().into();
+    }
     if let Some(t) = &d.auth_type {
         args["authType"] = t.as_str().into();
     }
@@ -520,14 +633,17 @@ fn funded_submit_callback(store: Weak<Store>, hash: String) -> provider::Registe
     Box::new(move |result| {
         let update = match store.upgrade() {
             Some(store) => store.update_cache(&hash, |m| match &result {
-                // The registry module refused to submit (since lez 5.1.0: an
-                // argument or balance the program would reject). Nothing was
-                // sent, so nothing will land: fail now, with its reason,
-                // instead of waiting out the confirmation window.
+                // The lez module refused to submit (an argument or balance the
+                // program would reject). Nothing was sent: fail now with its
+                // reason instead of waiting out the confirmation window.
                 Ok(reply) if register_refusal(reply).is_some() => {
                     let why = register_refusal(reply).unwrap_or_default();
                     m.record_async_submit_error(&why, false)
                 }
+                // A reply that lands after the poller confirmed the record
+                // from the registry has nothing authoritative to add: the
+                // estimate must not replace the chain's leaf.
+                Ok(_) if m.state != MembershipState::Pending => {}
                 Ok(reply) => {
                     m.tx_result = Some(reply.clone());
                     // The reply's leaf_index is a pre-submit ESTIMATE; recorded
@@ -549,57 +665,111 @@ fn funded_submit_callback(store: Weak<Store>, hash: String) -> provider::Registe
     })
 }
 
+/// The failure reason of a registration the poller gave up on before the
+/// registry showed it.
+const WINDOW_ELAPSED: &str = "confirmation_window_elapsed";
+
+/// How long a delegated registration may stay unconfirmed: the gifter
+/// client's whole budget, then the funded window for the registry to show
+/// what the allocator submitted at the very end of it.
+pub(crate) fn delegated_confirm_deadline(submitted_at: u64) -> u64 {
+    submitted_at + provider::GIFTER_REQUEST_TIMEOUT.as_secs() + lifecycle::CONFIRMATION_WINDOW_SECS
+}
+
 /// Fire-and-record tail of a delegated submit: a gifter {"error":…} marks
-/// the record failed; a grant records the leaf estimate and a funded-style
-/// tx_result envelope. Confirmation stays the poller's registry read-back.
-fn delegated_submit_callback(store: Weak<Store>, hash: String) -> provider::RegisterCallback {
+/// the record failed (and says so on `membership_state_changed`), as does a
+/// grant on a registry other than the scope's (the poller would never see
+/// it); a grant records the leaf estimate and a funded-style tx_result
+/// envelope on a pending record, and re-opens one the window already failed
+/// — the gift is on the chain, so the poller confirms it. A record the
+/// registry already confirmed keeps its authoritative leaf. Confirmation
+/// stays the poller's registry read-back.
+fn delegated_submit_callback(
+    store: Weak<Store>,
+    hash: String,
+    registry_account: String,
+) -> provider::RegisterCallback {
     Box::new(move |result| {
-        let update = match store.upgrade() {
-            Some(store) => store.update_cache(&hash, |m| match &result {
-                Ok(reply) => match serde_json::from_str::<serde_json::Value>(reply) {
-                    Ok(v) => {
-                        if let Some(e) = v.get("error") {
-                            // A late gifter rejection must not overwrite a state
-                            // the poller already confirmed from the registry
-                            // (authoritative). Only a still-pending record fails.
-                            if m.state == MembershipState::Pending {
-                                let msg = e
-                                    .as_str()
-                                    .map(String::from)
-                                    .unwrap_or_else(|| e.to_string());
-                                m.state = MembershipState::Failed;
-                                m.failed_reason = Some(format!("gifter_failed: {msg}"));
-                            }
-                            return;
-                        }
-                        if let Some(leaf) = v.get("leaf_index").and_then(|x| x.as_u64()) {
-                            m.leaf_index = Some(leaf);
-                        }
-                        let tx = v.get("tx_hash").and_then(|x| x.as_str()).unwrap_or("");
-                        let inner = serde_json::json!(
-                            {"error": "", "secrets": [], "success": true, "tx_hash": tx})
-                        .to_string();
-                        m.tx_result = Some(
-                            serde_json::json!(
-                                {"leaf_index": m.leaf_index.unwrap_or(0), "pending": true, "tx_result": inner})
-                            .to_string(),
-                        );
-                    }
-                    Err(parse) => {
-                        // The record stays PENDING for the poller's registry
-                        // read-back, but the operator should see the garbage.
-                        eprintln!(
-                            "membership delegated callback: unparseable gifter reply ({parse}): {reply}"
-                        );
-                        m.tx_result = Some(reply.clone());
-                    }
-                },
-                Err(e) => m.record_async_submit_error(&e.message, is_retryable_submit_error(e)),
-            }),
-            None => Err(ApiError::internal("store closed before the submit callback landed")),
+        let Some(store) = store.upgrade() else {
+            eprintln!("membership delegated callback: store closed before the submit callback landed");
+            return;
         };
-        if let Err(e) = update {
-            eprintln!("membership delegated callback: {}", e.message);
+        let before = store.membership(&hash);
+        let mut reopened = false;
+        let update = store.update_cache(&hash, |m| match &result {
+            Ok(reply) => match serde_json::from_str::<serde_json::Value>(reply) {
+                Ok(v) => {
+                    let granted_elsewhere = v
+                        .get("config_account")
+                        .and_then(|x| x.as_str())
+                        .filter(|got| !got.eq_ignore_ascii_case(&registry_account))
+                        .map(|got| format!("registered on {got}, not {registry_account}"));
+                    let error = v
+                        .get("error")
+                        .map(|e| e.as_str().map(String::from).unwrap_or_else(|| e.to_string()))
+                        .or(granted_elsewhere);
+                    if let Some(msg) = error {
+                        // A late gifter rejection must not overwrite a state
+                        // the poller already confirmed from the registry
+                        // (authoritative). Only a still-pending record fails.
+                        if m.state == MembershipState::Pending {
+                            m.state = MembershipState::Failed;
+                            m.failed_reason = Some(format!("gifter_failed: {msg}"));
+                        }
+                        return;
+                    }
+                    // Who granted is bookkeeping, whatever the record's state:
+                    // the poller may have confirmed the gift from the registry
+                    // before this reply arrived.
+                    note_granted_by(&hash, &v);
+                    match m.state {
+                        MembershipState::Pending => {}
+                        MembershipState::Failed
+                            if m.failed_reason.as_deref() == Some(WINDOW_ELAPSED) =>
+                        {
+                            m.state = MembershipState::Pending;
+                            m.failed_reason = None;
+                            m.retryable = None;
+                            reopened = true;
+                        }
+                        _ => return,
+                    }
+                    if let Some(leaf) = v.get("leaf_index").and_then(|x| x.as_u64()) {
+                        m.leaf_index = Some(leaf);
+                    }
+                    let tx = v.get("tx_hash").and_then(|x| x.as_str()).unwrap_or("");
+                    let inner = serde_json::json!(
+                        {"error": "", "secrets": [], "success": true, "tx_hash": tx})
+                    .to_string();
+                    m.tx_result = Some(
+                        serde_json::json!(
+                            {"leaf_index": m.leaf_index.unwrap_or(0), "pending": true, "tx_result": inner})
+                        .to_string(),
+                    );
+                }
+                Err(parse) => {
+                    // The record stays PENDING for the poller's registry
+                    // read-back, but the operator should see the garbage.
+                    eprintln!(
+                        "membership delegated callback: unparseable gifter reply ({parse}): {reply}"
+                    );
+                    m.tx_result = Some(reply.clone());
+                }
+            },
+            Err(e) => m.record_async_submit_error(&e.message, is_retryable_submit_error(e)),
+        });
+        let prior = match update {
+            Ok(prior) => prior,
+            Err(e) => {
+                eprintln!("membership delegated callback: {}", e.message);
+                return;
+            }
+        };
+        if reopened {
+            poller::ensure_running();
+        }
+        if let (Some(before), Some(after)) = (before, store.membership(&hash)) {
+            lifecycle::emit_transition(&hash, &before, prior, after.cache.state);
         }
     })
 }
@@ -619,7 +789,7 @@ impl RegisterClaim {
     /// serialize on `TEST_GLOBAL_LOCK` must use a scope of their own, or a
     /// concurrent registration's claim surfaces as their result.
     fn take(registry: &str, rln_id_hex: &str) -> Result<RegisterClaim, ApiError> {
-        let mut set = REGISTER_IN_FLIGHT.lock().unwrap();
+        let mut set = lock(&REGISTER_IN_FLIGHT);
         let set = set.get_or_insert_with(std::collections::HashSet::new);
         if !set.insert((registry.to_string(), rln_id_hex.to_string())) {
             return Err(ApiError::new(
@@ -633,7 +803,7 @@ impl RegisterClaim {
 
 impl Drop for RegisterClaim {
     fn drop(&mut self) {
-        if let Some(set) = REGISTER_IN_FLIGHT.lock().unwrap().as_mut() {
+        if let Some(set) = lock(&REGISTER_IN_FLIGHT).as_mut() {
             set.remove(&(self.0.clone(), self.1.clone()));
         }
     }
@@ -652,10 +822,17 @@ fn register_impl(
     options_json: &str,
 ) -> Result<serde_json::Value, ApiError> {
     let (registry, _, rln_id_hex) = parse_scope(registry_id_raw, rln_identifier_hex)?;
-    register_scoped(store, &registry, &rln_id_hex, options_json)
+    // "delegated":"true" selects delegated registration via the RLN
+    // Membership Allocation Protocol (the .lidl documents the option
+    // vocabulary). Validated up front so a malformed request never mints a
+    // credential.
+    let (rate_limit, opts) = parse_registry_options(options_json)?;
+    let delegated = DelegatedOptions::from_registry_options(&opts)?;
+    register_scoped(store, &registry, &rln_id_hex, rate_limit, delegated)
 }
 
-/// The registration itself, on an ALREADY-PARSED scope.
+/// The registration itself, on an ALREADY-PARSED scope and options:
+/// `delegated` = `None` for a funded registration.
 ///
 /// Split from `register_impl` so an in-module caller can register under an
 /// EMPTY rln_identifier, which the wire deliberately refuses (the spec says
@@ -671,95 +848,15 @@ pub(crate) fn register_scoped(
     store: Result<Arc<Store>, ApiError>,
     registry: &registry_id::CanonicalRegistryId,
     rln_id_hex: &str,
-    options_json: &str,
+    rate_limit: u64,
+    delegated: Option<DelegatedOptions>,
 ) -> Result<serde_json::Value, ApiError> {
     let registry = registry.clone();
     let rln_id_hex = rln_id_hex.to_string();
     let prov = provider_of(&registry)?;
     // Claimed for the whole dispatch (RAII): the live-record scan below is
-    // only sound while no sibling register for the same scope is in flight.
+    // only sound while no other register for the same scope is in flight.
     let _claim = RegisterClaim::take(&registry.canonical, &rln_id_hex)?;
-
-    // "delegated":"true" selects delegated registration via the RLN
-    // Membership Allocation Protocol (the .lidl documents the option
-    // vocabulary). Validated up front so a malformed request never mints a
-    // credential.
-    let (rate_limit, opts) = parse_registry_options(options_json)?;
-    let delegated = if flat_bool_option(&opts, "delegated") {
-        Some(DelegatedOptions {
-            gifter_peer_id: opts
-                .get("gifter_peer_id")
-                .and_then(|x| x.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            gifter_multiaddr: opts
-                .get("gifter_multiaddr")
-                .and_then(|x| x.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            auth_type: flat_str_option(&opts, "auth_type"),
-            auth_payload: flat_str_option(&opts, "auth_payload"),
-            auth_provider: flat_str_option(&opts, "auth_provider"),
-            auth_args: flat_str_option(&opts, "auth_args"),
-        })
-    } else {
-        None
-    };
-    if let Some(d) = &delegated {
-        if d.gifter_peer_id.is_empty() || d.gifter_multiaddr.is_empty() {
-            return Err(ApiError::new(
-                ErrorKind::InvalidArgument,
-                "delegated registration needs gifter_peer_id and gifter_multiaddr",
-            ));
-        }
-        // Shape-only checks (the auth_type vocabulary is OPEN): payload
-        // material needs a named vector, and a named vector needs exactly
-        // one payload source (auth_payload xor auth_provider) — validated
-        // BEFORE a credential is minted.
-        if d.auth_type.is_none()
-            && (d.auth_payload.is_some() || d.auth_provider.is_some() || d.auth_args.is_some())
-        {
-            return Err(ApiError::new(
-                ErrorKind::InvalidArgument,
-                "auth_payload/auth_provider/auth_args need auth_type",
-            ));
-        }
-        if let Some(t) = d.auth_type.as_deref() {
-            match (&d.auth_payload, &d.auth_provider) {
-                (Some(_), Some(_)) => {
-                    return Err(ApiError::new(
-                        ErrorKind::InvalidArgument,
-                        "auth_payload and auth_provider are mutually exclusive",
-                    ))
-                }
-                (None, None) => {
-                    return Err(ApiError::new(
-                        ErrorKind::InvalidArgument,
-                        &format!("auth_type '{t}' needs auth_payload or auth_provider"),
-                    ))
-                }
-                _ => {}
-            }
-        }
-        if let Some(p) = &d.auth_payload {
-            let h = p.trim_start_matches("0x");
-            if h.is_empty() || h.len() % 2 != 0 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(ApiError::new(
-                    ErrorKind::InvalidArgument,
-                    "auth_payload must be hex-encoded bytes",
-                ));
-            }
-        }
-    } else if ["auth_type", "auth_payload", "auth_provider", "auth_args"]
-        .iter()
-        .any(|k| opts.get(*k).is_some())
-    {
-        // Auth material on the funded path is a caller mistake, not a no-op.
-        return Err(ApiError::new(
-            ErrorKind::InvalidArgument,
-            "auth_* options apply to delegated registration only — set \"delegated\":\"true\"",
-        ));
-    }
 
     // Idempotent PER SCOPE: a LIVE (pending/active/grace_period) record for
     // this scope short-circuits; terminal states (failed, expired, erased)
@@ -831,16 +928,18 @@ pub(crate) fn register_scoped(
         submitted_at: now_unix(),
     };
     store.insert(&hash, identity, &credential, rate_limit)?;
+    if delegated.is_some() {
+        let deadline = delegated_confirm_deadline(now_unix());
+        store.update_cache(&hash, |m| m.confirm_deadline = Some(deadline))?;
+    }
 
     let submit = match &delegated {
         Some(d) => provider::gifter_request_async(
-            &delegated_request_args(d, &commitment_hex, rate_limit),
-            delegated_submit_callback(Arc::downgrade(&store), hash.clone()),
+            &delegated_request_args(d, &commitment_hex, rate_limit, &registry.account),
+            delegated_submit_callback(Arc::downgrade(&store), hash.clone(), registry.account.clone()),
         ),
         None => prov.register_async(
             &registry,
-            // The provider's wire takes the flat option object, not the array.
-            &opts.to_string(),
             &commitment_hex,
             rate_limit,
             funded_submit_callback(Arc::downgrade(&store), hash.clone()),
@@ -862,9 +961,9 @@ pub(crate) fn register_scoped(
 }
 
 /// Spec get_membership_state(scope): a live registry read overlaid on the
-/// local record of the membership backing the scope (scope_candidates). No
-/// candidate → UNKNOWN; more than one → AmbiguousSelection. Transitions the
-/// merged view implies are persisted.
+/// local record answering the scope (`resolve_scope_state`). No record →
+/// UNKNOWN; more than one live at the winning rank → AmbiguousSelection.
+/// Transitions the merged view implies are persisted.
 ///
 /// Takes NO register claim: this is the module's most-polled read and the
 /// claim is exclusive per scope — holding it here would serialize polls (and
@@ -888,27 +987,37 @@ fn get_membership_state_impl(
         );
     };
     let records = records_for_registry(&store, &registry);
-    let candidates: Vec<_> = scope_candidates(&records, &rln_id_hex)
-        .into_iter()
-        .filter(|r| !r.quarantined)
-        .collect();
-    if candidates.is_empty() {
-        return ok_json(
-            views::MembershipStateView::unknown(&registry.canonical)
-                .with_provisioning(provisioning_view(&registry.canonical)),
-        );
-    }
-    if candidates.len() > 1 {
-        return Err(ApiError::new(
-            ErrorKind::AmbiguousSelection,
-            "multiple memberships back this scope; use get_memberships / select_membership",
-        ));
-    }
-    let record = &candidates[0];
+    let record = match resolve_scope_state(&records, &rln_id_hex) {
+        ScopeState::None => {
+            return ok_json(
+                views::MembershipStateView::unknown(&registry.canonical)
+                    .with_provisioning(provisioning_view(&registry.canonical)),
+            )
+        }
+        ScopeState::Ambiguous(why) => return Err(ApiError::new(ErrorKind::AmbiguousSelection, why)),
+        // An allocator's refusal while a provisioning pass works this
+        // registry is a verdict the pass is already acting on (the funded
+        // fallback follows): the pass's own step says what is going on, and a
+        // live record replaces this one when it lands. Any other terminal
+        // record reads through to the registry — a gift the window gave up
+        // on may be there after all, and only this read heals it.
+        ScopeState::One(r)
+            if !r.cache.state.is_live()
+                && r.cache.failed_reason.as_deref().is_some_and(|w| w.starts_with("gifter_failed"))
+                && ensure::is_running(&registry.canonical) =>
+        {
+            return ok_json(
+                views::MembershipStateView::unknown(&registry.canonical)
+                    .with_provisioning(provisioning_view(&registry.canonical)),
+            )
+        }
+        ScopeState::One(r) => r,
+    };
+    let record = &record;
     let hash = &record.hash;
 
     let pm = prov.get_membership(&registry, &record.identity.identity_commitment)?;
-    let registry_state = if pm.registered { Some(pm.state) } else { None };
+    let registry_state = pm.as_ref().map(|p| p.state);
     let merged = lifecycle::merge_state(Some(record), registry_state, now_unix());
 
     if merged != record.cache.state {
@@ -923,7 +1032,7 @@ fn get_membership_state_impl(
                 return; // lost the race to a fresher writer — keep theirs
             }
             m.state = merged;
-            if pm.registered {
+            if let Some(pm) = &pm {
                 // The pending→active re-read (spec MUST).
                 m.leaf_index = Some(pm.leaf_index);
                 m.rate_limit = Some(pm.rate_limit);
@@ -942,36 +1051,32 @@ fn get_membership_state_impl(
             Err(e) => eprintln!("membership state persist: {}", e.message),
             // Emit only when this call's CAS actually wrote the transition.
             Ok(prior) if prior == snapshot_state => {
-                if let Some((registry_id, rln_identifier, membership_hash, state, previous)) =
-                    lifecycle::transition_event(hash, record, prior, merged)
-                {
-                    // Emitted after the store write returned: no store lock
-                    // is held across the event emit.
-                    emit_membership_state_changed(
-                        &registry_id,
-                        &rln_identifier,
-                        &membership_hash,
-                        &state,
-                        &previous,
-                    );
-                }
+                // After the store write returned: no store lock is held
+                // across the event emit.
+                lifecycle::emit_transition(hash, record, prior, merged);
             }
             Ok(_) => {} // lost the race — the winner emitted its own event
         }
     }
 
-    let (leaf_index, rate_limit) = if pm.registered {
-        (pm.leaf_index, pm.rate_limit)
-    } else {
-        (record.cache.leaf_index.unwrap_or(0), record.cache.rate_limit.unwrap_or(0))
+    let (leaf_index, rate_limit) = match &pm {
+        Some(pm) => (pm.leaf_index, pm.rate_limit),
+        None => (record.cache.leaf_index.unwrap_or(0), record.cache.rate_limit.unwrap_or(0)),
     };
-    let view = views::MembershipStateView::resolved(
+    let mut view = views::MembershipStateView::resolved(
         hash,
         &registry.canonical,
         merged,
         leaf_index,
         rate_limit,
     );
+    if !merged.is_live() {
+        // Why, and whether to try again — read back after the write above so
+        // a reason this very call recorded is what the caller sees.
+        if let Some(now) = store.membership(hash) {
+            view = view.with_failure(now.cache.failed_reason.clone(), now.cache.retryable);
+        }
+    }
     ok_json(view)
 }
 
@@ -1007,10 +1112,9 @@ fn select_membership_impl(
 /// reachable from a ui_qml app. `start()` answers over the `result` channel,
 /// which nulls through the QML bridge, and every scope-taking method refuses
 /// the empty (registry-wide) scope that provisioning registers — so a UI that
-/// wants "a membership that backs every app on this registry" had no way to
-/// ask for one. This is that way and nothing more: the pass it spawns is the
-/// one `start()` runs, ended by the next `start()` like any pass — and, unlike
-/// a `start()` pass, ending none itself (`ensure::run_alongside`).
+/// wants "a membership that backs every app on this registry" calls this.
+/// The pass it spawns is the one `start()` runs, ended by the next `start()`
+/// like any pass, and ending none itself (`ensure::run_alongside`).
 ///
 /// Answers from the local records on purpose. The question is "is this
 /// registry provisioned", which any live record answers; the registry read
@@ -1062,7 +1166,13 @@ fn ensure_membership_impl(
             ))
         }
     }
-    if !ensure::is_running(&registry.canonical) {
+    if worker::is_stopped() {
+        return Err(ApiError::new(ErrorKind::NotReady, "module stopped; start() first"));
+    }
+    // The claim is the check and the marker in one step: two calls racing
+    // each other spawn one pass, and the marker rides into the thread so
+    // the registry reads as running from this reply on.
+    if let Some(pass) = ensure::ActivePass::claim(&registry.canonical) {
         // Recorded before the spawn so this very reply already shows a step,
         // and a second call racing the thread's first record sees one too.
         ensure::mark_requested(&registry.canonical);
@@ -1070,8 +1180,9 @@ fn ensure_membership_impl(
         std::thread::Builder::new()
             .name("rln-ensure".to_owned())
             .spawn(move || {
-                // The order start() keeps: the registry's network binds the
-                // sibling's wallet before anything reads through it.
+                let _claim = pass;
+                // The order start() keeps: the registry's network binds
+                // the lez module's wallet before anything reads through it.
                 provider::select_networks(std::slice::from_ref(&canonical));
                 ensure::run_alongside(canonical, rate_limit);
             })
@@ -1107,13 +1218,16 @@ const DEFAULT_MAX_EPOCH_GAP: u64 = 1;
 /// One registry's configuration in force (spec: epoch size and max gap are
 /// per-REGISTRY configuration). Every registry a `start()` names has one;
 /// the start reply's `overrides` object is this table.
-#[derive(Clone, Copy, serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct RegistryConfig {
     epoch_size_sec: u64,
     max_epoch_gap: u64,
     /// The rate a membership provisioned on this registry asks for.
     #[serde(skip)]
     rate_limit: u64,
+    /// The allocator provisioning asks first, before a funded registration.
+    #[serde(skip)]
+    allocator: Option<DelegatedOptions>,
 }
 
 /// Runtime configuration applied by `start()`: instance defaults for
@@ -1192,7 +1306,7 @@ static LIFECYCLE: Mutex<()> = Mutex::new(());
 /// registry, a host naming the mix registry at its own epoch — therefore
 /// never undo each other.
 fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
-    let _lifecycle = LIFECYCLE.lock().unwrap();
+    let _lifecycle = lock(&LIFECYCLE);
     panic_hook::install_once();
     let cfg: serde_json::Value = if config_json.trim().is_empty() {
         serde_json::json!({})
@@ -1226,6 +1340,11 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
         .and_then(serde_json::Value::as_u64)
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_RATE_LIMIT);
+    // The allocator provisioning asks first (the RLN Membership Allocation
+    // Protocol), for every registry this call names unless an entry carries
+    // its own block (or `null`, which opts that registry out). Without one,
+    // provisioning is the funded registration alone.
+    let default_allocator = DelegatedOptions::from_allocator_block(cfg.get("allocator"), "config_json.allocator")?;
 
     // Merge into the table in force; unparseable entries are skipped.
     let (mut registries, mut per_registry) = match lock(&CONFIG).as_ref() {
@@ -1244,6 +1363,7 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
                         epoch_size_sec,
                         max_epoch_gap,
                         rate_limit: default_rate,
+                        allocator: default_allocator.clone(),
                     });
                 }
             }
@@ -1260,10 +1380,16 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
                     let raw = o.get("registry_id").and_then(|x| x.as_str()).unwrap_or_default();
                     let positive =
                         |key: &str| o.get(key).and_then(|x| x.as_u64()).filter(|n| *n > 0);
+                    // An entry's own block wins; an explicit null opts out.
+                    let allocator = match o.get("allocator") {
+                        None => default_allocator.clone(),
+                        Some(v) => DelegatedOptions::from_allocator_block(Some(v), &format!("registries[{raw}].allocator"))?,
+                    };
                     let set = RegistryConfig {
                         epoch_size_sec: positive("epoch_size_sec").unwrap_or(epoch_size_sec),
                         max_epoch_gap: positive("max_epoch_gap").unwrap_or(max_epoch_gap),
                         rate_limit: positive("rate_limit").unwrap_or(default_rate),
+                        allocator,
                     };
                     track(raw, Some(set));
                 }
@@ -1307,11 +1433,16 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
         .get("provision")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
-    let provision_registries: Vec<(String, u64)> = if provision {
+    let provision_registries: Vec<ensure::Provision> = if provision {
         registries
             .iter()
             .map(|r| {
-                (r.clone(), per_registry.get(r).map(|c| c.rate_limit).unwrap_or(default_rate))
+                let c = per_registry.get(r);
+                ensure::Provision {
+                    registry: r.clone(),
+                    rate_limit: c.map(|c| c.rate_limit).unwrap_or(default_rate),
+                    allocator: c.and_then(|c| c.allocator.clone()),
+                }
             })
             .collect()
     } else {
@@ -1320,29 +1451,22 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
     let selection_order = registries.clone();
     let reply_registries = registries.clone();
     *lock(&CONFIG) = Some(ModuleConfig { epoch_size_sec, max_epoch_gap, registries, per_registry });
+    // Every pass in flight ends here, provisioning or not: a start that turns
+    // provisioning off must not leave an earlier pass funding and registering
+    // at a configuration it replaced.
+    let ticket = ensure::supersede();
     worker::start(move || {
         // First, before anything reaches the registry module: the first
         // `logos` registry id is what binds its wallet to a network when
         // nothing else configured one, and that must be the first one
         // configured, not whichever the warm-up happens to reach first.
-        if let Err(payload) =
-            std::panic::catch_unwind(|| provider::select_networks(&selection_order))
-        {
-            eprintln!("membership start: network selection panicked: {payload:?}");
-        }
+        provider::select_networks(&selection_order);
         if warm_roots {
-            if let Err(payload) = std::panic::catch_unwind(roots::refresh_all) {
-                eprintln!("membership start: root warm-up panicked: {payload:?}");
-            }
+            roots::refresh_all();
         }
-        if let Err(payload) = std::panic::catch_unwind(poller::refresh_paths) {
-            eprintln!("membership start: path warm-up panicked: {payload:?}");
-        }
+        poller::refresh_paths();
         if !provision_registries.is_empty() {
-            let run = std::panic::AssertUnwindSafe(|| ensure::run(provision_registries));
-            if let Err(payload) = std::panic::catch_unwind(run) {
-                eprintln!("membership start: provisioning panicked: {payload:?}");
-            }
+            ensure::run_with(provision_registries, ticket);
         }
     });
 
@@ -1356,8 +1480,11 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
 /// supervisor's generation counter keeps a detached straggler from ever
 /// duplicating a worker.
 fn stop_impl() -> Result<serde_json::Value, ApiError> {
-    let _lifecycle = LIFECYCLE.lock().unwrap();
+    let _lifecycle = lock(&LIFECYCLE);
     worker::stop();
+    // A pass blocked in a registry read outlives the stop; the next start()
+    // clears the stopped flag, so the ticket is what ends it.
+    ensure::supersede();
     ok_json(views::StopReply::new())
 }
 
@@ -1815,7 +1942,7 @@ impl LogosRlnModuleImpl {
 impl LiblogosRlnModule for LogosRlnModuleImpl {
     fn on_context_ready(&self, ctx: &RustModuleContext) {
         panic_hook::install_once();
-        // The lp client to the sibling RLN module must be created on this
+        // The lp client to the lez module must be created on this
         // (the host's main Qt) thread — see provider.rs.
         provider::init_client();
         if ctx.instance_persistence_path.is_empty() {
@@ -2060,9 +2187,8 @@ mod tests {
         .to_string()
     }
 
-    /// Seed one membership the way the old tests seeded a MembershipMeta
-    /// literal: insert (Pending), then push the cache row to the wanted
-    /// state/leaf/rate. Needs the store unlocked.
+    /// Seed one membership: insert (Pending), then push the cache row to
+    /// the wanted state/leaf/rate. Needs the store unlocked.
     #[allow(clippy::too_many_arguments)]
     fn seed_membership(
         store: &Store,
@@ -2103,6 +2229,262 @@ mod tests {
         imp.open_store(dir);
         let store = imp.store().expect("test store open").clone();
         (imp, store)
+    }
+
+    // A scope's state is its own record's, whatever else the registry holds:
+    // a pending or failed scoped registration beside the registry's active
+    // membership is NOT ambiguous. Only with no record of its own does a
+    // scope fall back to the registry-wide one, then to any usable one.
+    #[test]
+    fn membership_state_resolves_its_record_by_scope_rank() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-scope-rank-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_imp, store) = imp_with_store(dir.clone());
+        store.unlock("pw").unwrap();
+        let registry = format!("logos:local:{}", "5c".repeat(32));
+        let (r1, r2, r3) = ("a1".repeat(32), "a2".repeat(32), "a3".repeat(32));
+        let state_of = |scope: &str| match resolve_scope_state(&store.records_for(&registry), scope) {
+            ScopeState::One(r) => Ok(r.hash.clone()),
+            ScopeState::Ambiguous(why) => Err(why.to_string()),
+            ScopeState::None => Ok(String::new()),
+        };
+
+        // Nothing: unknown. One active R1: it backs every scope.
+        assert_eq!(state_of(&r2).unwrap(), "");
+        seed_membership(&store, "h1", &registry, &"11".repeat(32), &r1, &"f1".repeat(32), MembershipState::Active, 1, 100);
+        assert_eq!(state_of(&r1).unwrap(), "h1");
+        assert_eq!(state_of(&r2).unwrap(), "h1", "a lone membership backs any application");
+
+        // A pending R2 beside it: R2's own record answers, R1's still answers R1.
+        seed_membership(&store, "h2", &registry, &"22".repeat(32), &r2, &"f2".repeat(32), MembershipState::Pending, 0, 100);
+        assert_eq!(state_of(&r2).unwrap(), "h2");
+        assert_eq!(state_of(&r1).unwrap(), "h1");
+        // A third scope with no record of its own: two usable? No — one usable
+        // (h1) and one pending, so h1 backs it.
+        assert_eq!(state_of(&r3).unwrap(), "h1");
+
+        // R2 refused by the gifter: its scope reads back the failed record.
+        store.update_cache("h2", |m| {
+            m.state = MembershipState::Failed;
+            m.failed_reason = Some("gifter_failed: credential already used".into());
+        }).unwrap();
+        assert_eq!(state_of(&r2).unwrap(), "h2", "a failed scoped registration is the scope's answer");
+        assert_eq!(state_of(&r1).unwrap(), "h1");
+
+        // A second live R2 record: ambiguous within the rank.
+        seed_membership(&store, "h2b", &registry, &"23".repeat(32), &r2, &"f3".repeat(32), MembershipState::Active, 2, 100);
+        assert_eq!(state_of(&r2).unwrap(), "h2b", "the live record beats the failed one");
+        seed_membership(&store, "h2c", &registry, &"24".repeat(32), &r2, &"f4".repeat(32), MembershipState::Pending, 0, 100);
+        assert!(state_of(&r2).unwrap_err().contains("registered under this scope"));
+        // R3 has no record: two usable memberships back it — ambiguous.
+        assert!(state_of(&r3).unwrap_err().contains("multiple memberships back this scope"));
+
+        // A registry-wide record outranks the any-usable fallback for R3.
+        seed_membership(&store, "hw", &registry, &"33".repeat(32), "", &"f5".repeat(32), MembershipState::Active, 3, 100);
+        assert_eq!(state_of(&r3).unwrap(), "hw");
+        assert_eq!(state_of(&r1).unwrap(), "h1", "an own record still wins over the registry-wide one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // While a provisioning pass works a registry, a scope whose only record
+    // is terminal reads unknown with the pass's step, not the stale verdict.
+    #[test]
+    fn a_terminal_record_reads_unknown_while_provisioning_runs() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-terminal-while-prov-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (imp, store) = imp_with_store(dir.clone());
+        store.unlock("pw").unwrap();
+        let registry = format!("logos:local:{}", "6d".repeat(32));
+        let canonical = registry_id::parse(&registry).unwrap().canonical;
+        let rid = "b1".repeat(32);
+        seed_membership(&store, "hf", &registry, &"44".repeat(32), "", &"f6".repeat(32), MembershipState::Failed, 0, 100);
+        store.update_cache("hf", |m| m.failed_reason = Some("gifter_failed: dead allocator".into())).unwrap();
+        {
+            let _pass = ensure::ActivePass::enter(&canonical);
+            ensure::mark_requested(&canonical);
+            let out = get_membership_state_impl(imp.store(), &registry, &rid).unwrap();
+            assert_eq!(out["state"], serde_json::json!("unknown"), "got: {out}");
+            assert!(out.get("provisioning").is_some(), "the pass's step rides along: {out}");
+        }
+        // With no pass the record itself answers (reaching the registry read,
+        // which the test environment cannot serve).
+        assert!(get_membership_state_impl(imp.store(), &registry, &rid).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Proof-time selection ranks like the state read: an own usable record
+    // shadows the registry-wide one, the registry-wide one shadows other
+    // scopes', and with neither every record backs the scope.
+    #[test]
+    fn proof_candidates_rank_own_then_registry_wide_then_any() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-candidates-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_imp, store) = imp_with_store(dir.clone());
+        store.unlock("pw").unwrap();
+        let registry = format!("logos:local:{}", "7b".repeat(32));
+        let scope = "c1".repeat(32);
+        seed_membership(&store, "own", &registry, &"51".repeat(32), &scope, &"e1".repeat(32), MembershipState::Active, 1, 100);
+        seed_membership(&store, "wide", &registry, &"52".repeat(32), "", &"e2".repeat(32), MembershipState::Active, 2, 100);
+        seed_membership(&store, "other", &registry, &"53".repeat(32), &"c2".repeat(32), &"e3".repeat(32), MembershipState::Active, 3, 100);
+        let canonical = registry_id::parse(&registry).unwrap().canonical;
+        let records = records_for_registry(&store, &registry_id::parse(&registry).unwrap());
+        let names = |v: Vec<MembershipRecord>| { let mut n: Vec<String> = v.into_iter().map(|r| r.hash).collect(); n.sort(); n };
+        assert_eq!(names(scope_candidates(&records, &scope)), ["own"]);
+        assert_eq!(names(scope_candidates(&records, &"c3".repeat(32))), ["wide"], "no own record: the registry-wide one");
+        store.update_cache("wide", |m| m.state = MembershipState::Failed).unwrap();
+        let records = records_for_registry(&store, &registry_id::parse(&registry).unwrap());
+        assert_eq!(names(scope_candidates(&records, &"c3".repeat(32))), ["other", "own", "wide"], "nothing of its own or wide: every record");
+        let _ = canonical;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A record the registry does not hold: one that was active is erased;
+    // one the cache never saw active (a lost sidecar) is failed, retryable.
+    #[test]
+    fn an_absent_record_is_erased_only_if_it_was_ever_on_the_registry() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-absent-verdict-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_imp, store) = imp_with_store(dir.clone());
+        store.unlock("pw").unwrap();
+        let registry = format!("logos:local:{}", "7c".repeat(32));
+        seed_membership(&store, "was", &registry, &"54".repeat(32), "", &"e4".repeat(32), MembershipState::Active, 1, 100);
+        seed_membership(&store, "never", &registry, &"55".repeat(32), "", &"e5".repeat(32), MembershipState::Unknown, 0, 100);
+        assert_eq!(poller::absent_verdict(&store.membership("was").unwrap()), (MembershipState::Erased, "removed_from_registry"));
+        assert_eq!(poller::absent_verdict(&store.membership("never").unwrap()), (MembershipState::Failed, "not_on_registry"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A locked keystore with an allocator: the pass says so and stops, instead
+    // of waiting for the funded path's wallet and funding for a gift that
+    // would have been free once unlocked.
+    #[test]
+    fn a_locked_keystore_stops_the_pass_before_the_funding_wait() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-locked-allocator-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_imp, _store) = imp_with_store(dir.clone());
+        let registry = format!("logos:local:{}", "7d".repeat(32));
+        let canonical = registry_id::parse(&registry).unwrap().canonical;
+        let allocator = DelegatedOptions::from_allocator_block(Some(&serde_json::json!({ "peer_id": "p", "multiaddr": "/m", "discover": false })), "x").unwrap();
+        ensure::run_with(vec![ensure::Provision { registry: canonical.clone(), rate_limit: 100, allocator }], ensure::supersede());
+        let step = ensure::progress(&canonical).expect("a step is recorded");
+        assert_eq!(step.step, ensure::Step::AwaitingFunding);
+        assert_eq!(step.detail, "keystore locked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Any registry's pending registration is every pass's nonce.
+    #[test]
+    fn a_pending_registration_anywhere_holds_the_next_submit() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-any-pending-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_imp, store) = imp_with_store(dir.clone());
+        store.unlock("pw").unwrap();
+        assert!(!ensure::any_pending_membership());
+        let registry = format!("logos:local:{}", "7e".repeat(32));
+        seed_membership(&store, "pb", &registry, &"56".repeat(32), "", &"e6".repeat(32), MembershipState::Pending, 0, 100);
+        assert!(ensure::any_pending_membership());
+        store.update_cache("pb", |m| m.state = MembershipState::Active).unwrap();
+        assert!(!ensure::any_pending_membership());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The pass's masking covers the allocator refusal it is acting on, not
+    // every terminal record: a gift the window gave up on reads through to
+    // the registry (the test environment cannot serve that read).
+    #[test]
+    fn only_an_allocator_refusal_is_masked_while_provisioning_runs() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-mask-window-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (imp, store) = imp_with_store(dir.clone());
+        store.unlock("pw").unwrap();
+        let registry = format!("logos:local:{}", "6e".repeat(32));
+        let canonical = registry_id::parse(&registry).unwrap().canonical;
+        let rid = "b2".repeat(32);
+        seed_membership(&store, "hw", &registry, &"45".repeat(32), "", &"f7".repeat(32), MembershipState::Failed, 0, 100);
+        store.update_cache("hw", |m| m.failed_reason = Some(WINDOW_ELAPSED.into())).unwrap();
+        let _pass = ensure::ActivePass::enter(&canonical);
+        ensure::mark_requested(&canonical);
+        assert!(get_membership_state_impl(imp.store(), &registry, &rid).is_err(), "window-failed: read through");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The submit replies land after the poller may already have confirmed
+    // the record from the registry: neither the funded estimate nor the
+    // gifter's leaf replaces the chain's, and a gift that arrives after the
+    // window failed its record re-opens it for the poller.
+    #[test]
+    fn late_submit_replies_respect_the_registry_and_reopen_a_window_failed_gift() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-late-reply-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_imp, store) = imp_with_store(dir.clone());
+        store.unlock("pw").unwrap();
+        let registry = format!("logos:local:{}", "6f".repeat(32));
+        let account = "6f".repeat(32);
+        // Confirmed by the poller: Active at the chain's leaf 7.
+        seed_membership(&store, "ha", &registry, &"46".repeat(32), "", &"f8".repeat(32), MembershipState::Active, 7, 100);
+        funded_submit_callback(Arc::downgrade(&store), "ha".into())(Ok(
+            r#"{"leaf_index":3,"pending":true,"tx_result":"{}"}"#.to_string(),
+        ));
+        let rec = store.membership("ha").unwrap();
+        assert_eq!((rec.cache.state, rec.cache.leaf_index), (MembershipState::Active, Some(7)), "funded estimate kept out");
+        delegated_submit_callback(Arc::downgrade(&store), "ha".into(), account.clone())(Ok(
+            format!(r#"{{"leaf_index":3,"gifterPeerId":"p","config_account":"{account}"}}"#),
+        ));
+        let rec = store.membership("ha").unwrap();
+        assert_eq!((rec.cache.state, rec.cache.leaf_index), (MembershipState::Active, Some(7)), "gifter leaf kept out");
+
+        // The window gave up on a gift; the grant arrives later.
+        seed_membership(&store, "hg", &registry, &"47".repeat(32), "", &"f9".repeat(32), MembershipState::Failed, 0, 100);
+        store.update_cache("hg", |m| { m.failed_reason = Some(WINDOW_ELAPSED.into()); m.retryable = Some(true); }).unwrap();
+        delegated_submit_callback(Arc::downgrade(&store), "hg".into(), account.clone())(Ok(
+            format!(r#"{{"leaf_index":9,"gifterPeerId":"p","discovered":true,"config_account":"{account}"}}"#),
+        ));
+        let rec = store.membership("hg").unwrap();
+        assert_eq!(rec.cache.state, MembershipState::Pending, "re-opened for the poller: {:?}", rec.cache.failed_reason);
+        assert_eq!(rec.cache.leaf_index, Some(9));
+        assert!(rec.cache.failed_reason.is_none() && rec.cache.retryable.is_none());
+        assert_eq!(lifecycle::granted_by("hg").as_deref(), Some("p (discovered)"));
+
+        // A record failed for another reason stays failed.
+        seed_membership(&store, "hf", &registry, &"48".repeat(32), "", &"fa".repeat(32), MembershipState::Failed, 0, 100);
+        store.update_cache("hf", |m| m.failed_reason = Some("gifter_failed: refused".into())).unwrap();
+        delegated_submit_callback(Arc::downgrade(&store), "hf".into(), account)(Ok(
+            r#"{"leaf_index":9,"gifterPeerId":"p"}"#.to_string(),
+        ));
+        assert_eq!(store.membership("hf").unwrap().cache.state, MembershipState::Failed);
+
+        // The poller's writes yield to a fresher writer.
+        seed_membership(&store, "hp", &registry, &"49".repeat(32), "", &"fb".repeat(32), MembershipState::Pending, 0, 100);
+        let written = poller::write_if_still("hp", MembershipState::Pending, |m| m.state = MembershipState::Active).unwrap();
+        assert_eq!(written, Some(MembershipState::Pending));
+        let yielded = poller::write_if_still("hp", MembershipState::Pending, |m| m.state = MembershipState::Failed).unwrap();
+        assert_eq!(yielded, None, "the snapshot was Pending, the record is Active: no write");
+        assert_eq!(store.membership("hp").unwrap().cache.state, MembershipState::Active);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // After stop() nothing may spawn: ensure_membership says so instead of
+    // recording a step no pass will ever advance.
+    #[test]
+    fn ensure_membership_after_stop_is_not_ready() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-ensure-stopped-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (imp, _store) = imp_with_store(dir.clone());
+        imp.stop().unwrap();
+        let registry = format!("logos:local:{}", "7a".repeat(32));
+        let e = ensure_membership_impl(imp.store(), &registry, "").unwrap_err();
+        assert_eq!(e.kind, ErrorKind::NotReady, "{}", e.message);
+        worker::reset_for_test();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Pins the error envelope's byte shape (alphabetical keys), including
@@ -3070,7 +3452,7 @@ mod tests {
     }
 
     // The path-cache miss/hit contract: cargo tests never link the real
-    // sibling module, so `get_merkle_proof` is a DEAD TRANSPORT (no lp
+    // lez module, so `get_merkle_proof` is a DEAD TRANSPORT (no lp
     // client) — provider_failure proves a registry read was attempted. A
     // pre-filled cache (synthetic zero-sibling depth-20 path) must let
     // generate_proof succeed with ZERO registry I/O.
@@ -3422,7 +3804,7 @@ mod tests {
     }
 
     // The common rate_limit key is optional: absent, the module applies
-    // DEFAULT_RATE_LIMIT (see the constant's TODO).
+    // DEFAULT_RATE_LIMIT.
     #[test]
     fn register_defaults_rate_limit_when_option_absent() {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
@@ -3436,7 +3818,7 @@ mod tests {
         let out = imp.register_membership(
             registry.clone(),
             "ef".repeat(32),
-            opts_arr(&[("funding_holding_account_id", &"cd".repeat(32))]),
+            opts_arr(&[]),
         );
         assert!(out.contains(r#""kind":"provider_failure""#), "dead transport: {out}");
         let listed = imp.get_memberships(registry);
@@ -3507,8 +3889,7 @@ mod tests {
         // and persisted in-module, then the funded submit fails against the
         // stub → provider_failure; the record remains (marked failed).
         let reg_a = format!("logos:local:{}", "ab".repeat(32));
-        let funding =
-            opts_arr(&[("rate_limit", "300"), ("funding_holding_account_id", &"cd".repeat(32))]);
+        let funding = opts_arr(&[("rate_limit", "300")]);
         let out = imp.register_membership(reg_a.clone(), rln_id.clone(), funding);
         assert!(out.contains(r#""kind":"provider_failure""#), "got: {out}");
         let listed = imp.get_memberships(reg_a);
@@ -3547,8 +3928,7 @@ mod tests {
         // registry is NOT the same scope: no short-circuit — register mints a
         // fresh credential for it (and then fails at the dead-transport
         // submit), leaving TWO records on the registry.
-        let funding =
-            opts_arr(&[("rate_limit", "300"), ("funding_holding_account_id", &"cd".repeat(32))]);
+        let funding = opts_arr(&[("rate_limit", "300")]);
         let out = imp.register_membership(reg_b.clone(), "aa".repeat(32), funding);
         assert!(out.contains(r#""kind":"provider_failure""#), "got: {out}");
         let listed = imp.get_memberships(reg_b);
@@ -3574,8 +3954,7 @@ mod tests {
         let (imp, store) = imp_with_store(dir.clone());
         assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
         let rln_id = "ef".repeat(32);
-        let funding =
-            opts_arr(&[("rate_limit", "300"), ("funding_holding_account_id", &"cd".repeat(32))]);
+        let funding = opts_arr(&[("rate_limit", "300")]);
 
         // An EXPIRED record for the scope: register must not short-circuit
         // to it.
@@ -3652,8 +4031,11 @@ mod tests {
         let registry = format!("logos:local:{}", "ab".repeat(32));
         let rln_id = "ef".repeat(32);
 
-        let out =
-            imp.register_membership(registry.clone(), rln_id.clone(), opts_arr(&[("delegated", "true")]));
+        let out = imp.register_membership(
+            registry.clone(),
+            rln_id.clone(),
+            opts_arr(&[("delegated", "true"), ("discover", "false")]),
+        );
         assert!(out.contains(r#""kind":"invalid_argument""#), "got: {out}");
         assert_eq!(
             imp.get_memberships(registry.clone()),
@@ -3784,11 +4166,121 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // start()'s allocator block becomes each registry's delegated options:
+    // the global one for every entry without a block, an entry's own one
+    // over it, null to opt out; a malformed block fails start().
+    #[test]
+    fn start_configures_the_allocator_per_registry() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let (a, b, c) = (
+            format!("logos:local:{}", "a7".repeat(32)),
+            format!("logos:local:{}", "b7".repeat(32)),
+            format!("logos:local:{}", "c7".repeat(32)),
+        );
+        let cfg = serde_json::json!({
+            "epoch_size_sec": 600, "provision": false,
+            "allocator": { "peer_id": "16Uiu2Peer", "multiaddr": "/ip4/127.0.0.1/tcp/1",
+                           "auth_type": "peer-any", "auth_payload": "026400000000000000" },
+            "registries": [
+                a,
+                { "registry_id": b, "epoch_size_sec": 10,
+                  "allocator": { "peer_id": "16Uiu2Other", "multiaddr": "/ip4/127.0.0.1/tcp/2" } },
+                { "registry_id": c, "allocator": null },
+            ],
+        });
+        let out = start_impl(&cfg.to_string()).unwrap();
+        assert_eq!(out["started"], serde_json::json!(true), "got: {out}");
+        let canonical = |r: &str| registry_id::parse(r).unwrap().canonical;
+        let a_alloc = allocator_for(&canonical(&a)).expect("a takes the global allocator");
+        assert_eq!(a_alloc.gifter_peer_id, "16Uiu2Peer");
+        assert_eq!(a_alloc.auth_type.as_deref(), Some("peer-any"));
+        assert_eq!(a_alloc.auth_payload.as_deref(), Some("026400000000000000"));
+        let b_alloc = allocator_for(&canonical(&b)).expect("b has its own");
+        assert_eq!(b_alloc.gifter_peer_id, "16Uiu2Other");
+        assert!(b_alloc.auth_type.is_none(), "an own block does not inherit the global auth");
+        assert!(allocator_for(&canonical(&c)).is_none(), "null opts out");
+
+        // The wire method's flat vocabulary decodes to the same options.
+        let (rate, flat) = parse_registry_options(
+            &serde_json::json!([
+                { "key": "rate_limit", "value": "42" },
+                { "key": "delegated", "value": "true" },
+                { "key": "gifter_peer_id", "value": "16Uiu2Peer" },
+                { "key": "gifter_multiaddr", "value": "/ip4/127.0.0.1/tcp/1" },
+                { "key": "auth_type", "value": "peer-any" },
+                { "key": "auth_payload", "value": "026400000000000000" },
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(rate, 42);
+        assert_eq!(DelegatedOptions::from_registry_options(&flat).unwrap(), Some(a_alloc));
+
+        for (bad, needle) in [
+            (serde_json::json!({ "multiaddr": "/ip4/1/tcp/1" }), "go together"),
+            (serde_json::json!({ "discover": false }), "needs discover or gifter_peer_id"),
+            (serde_json::json!({ "discover": "yes" }), "discover must be a boolean"),
+            (serde_json::json!({ "peer_id": "p", "multiaddr": "/m", "auth_payload": "00" }), "need auth_type"),
+            (serde_json::json!({ "peer_id": "p", "multiaddr": "/m", "auth_type": "t" }), "needs auth_payload or auth_provider"),
+            (serde_json::json!({ "peer_id": "p", "multiaddr": "/m", "auth_type": "t", "auth_payload": "zz" }), "hex"),
+            (serde_json::json!({ "peer_id": 7, "multiaddr": "/m" }), "must be a string"),
+            (serde_json::json!("16Uiu2Peer"), "must be an object"),
+        ] {
+            let cfg = serde_json::json!({ "epoch_size_sec": 600, "provision": false, "allocator": bad, "registries": [a] });
+            let e = start_impl(&cfg.to_string()).unwrap_err();
+            assert_eq!(e.kind, ErrorKind::InvalidArgument, "{bad}: {}", e.message);
+            assert!(e.message.contains(needle), "{bad}: {}", e.message);
+            assert!(e.message.starts_with("config_json.allocator"), "{bad}: {}", e.message);
+        }
+        stop_impl().unwrap();
+    }
+
+    // An allocator block without a pair is discovery alone: the request
+    // names no gifter and the options say so; a pair with discovery off
+    // dials that gifter only.
+    #[test]
+    fn an_allocator_block_without_a_pair_discovers() {
+        let d = DelegatedOptions::from_allocator_block(Some(&serde_json::json!({})), "x").unwrap().unwrap();
+        assert!(d.discover && d.gifter_peer_id.is_empty() && d.gifter_multiaddr.is_empty());
+        let v: serde_json::Value =
+            serde_json::from_str(&delegated_request_args(&d, "ab", 300, "cf")).unwrap();
+        assert_eq!(v["discover"], true, "got: {v}");
+        assert!(v.get("gifterPeerId").is_none() && v.get("gifterMultiaddr").is_none(), "got: {v}");
+        let flat = |pairs: serde_json::Value| {
+            let (_, flat) = parse_registry_options(&pairs.to_string()).unwrap();
+            DelegatedOptions::from_registry_options(&flat).unwrap()
+        };
+        assert_eq!(flat(serde_json::json!([{ "key": "delegated", "value": "true" }])), Some(d));
+
+        let d = DelegatedOptions::from_allocator_block(
+            Some(&serde_json::json!({ "discover": false, "peer_id": "p", "multiaddr": "/m" })),
+            "x",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!d.discover);
+        let v: serde_json::Value =
+            serde_json::from_str(&delegated_request_args(&d, "ab", 300, "cf")).unwrap();
+        assert_eq!(v["discover"], false, "got: {v}");
+        assert_eq!(v["gifterPeerId"], "p", "got: {v}");
+        assert_eq!(
+            flat(serde_json::json!([
+                { "key": "delegated", "value": "true" },
+                { "key": "discover", "value": "false" },
+                { "key": "gifter_peer_id", "value": "p" },
+                { "key": "gifter_multiaddr", "value": "/m" },
+            ])),
+            Some(d)
+        );
+        assert_eq!(flat(serde_json::json!([{ "key": "rate_limit", "value": "7" }])), None);
+    }
+
     // The gifter request args carry the auth selection verbatim, and an
     // unspecified vector stays ABSENT rather than defaulting here.
     #[test]
     fn delegated_request_args_pass_auth_selection_through_verbatim() {
         let mut d = DelegatedOptions {
+            discover: true,
             gifter_peer_id: "p".into(),
             gifter_multiaddr: "/ip4/127.0.0.1/tcp/1".into(),
             auth_type: None,
@@ -3797,16 +4289,19 @@ mod tests {
             auth_args: None,
         };
         let v: serde_json::Value =
-            serde_json::from_str(&delegated_request_args(&d, "ab", 300)).unwrap();
+            serde_json::from_str(&delegated_request_args(&d, "ab", 300, "cf")).unwrap();
         for key in ["authType", "authPayload", "authProvider", "authArgs"] {
             assert!(v.get(key).is_none(), "unset {key} must stay absent, got: {v}");
         }
+        assert_eq!(v["config"], "cf", "the scope's registry rides along: {v}");
+        assert_eq!(v["identityCommitment"], "ab", "got: {v}");
+        assert_eq!(v["rate"], 300, "got: {v}");
 
         d.auth_type = Some("voucher-v1".into());
         d.auth_provider = Some("voucher_module".into());
         d.auth_args = Some(r#"{"campaign":"launch"}"#.into());
         let v: serde_json::Value =
-            serde_json::from_str(&delegated_request_args(&d, "ab", 300)).unwrap();
+            serde_json::from_str(&delegated_request_args(&d, "ab", 300, "cf")).unwrap();
         assert_eq!(v["authType"], "voucher-v1", "got: {v}");
         assert_eq!(v["authProvider"], "voucher_module", "got: {v}");
         assert_eq!(v["authArgs"], r#"{"campaign":"launch"}"#, "got: {v}");
@@ -3816,7 +4311,7 @@ mod tests {
         d.auth_args = None;
         d.auth_payload = Some("deadbeef".into());
         let v: serde_json::Value =
-            serde_json::from_str(&delegated_request_args(&d, "ab", 300)).unwrap();
+            serde_json::from_str(&delegated_request_args(&d, "ab", 300, "cf")).unwrap();
         assert_eq!(v["authPayload"], "deadbeef", "got: {v}");
     }
 
@@ -3886,6 +4381,7 @@ mod tests {
                 retryable: Some(true),
                 tx_result: Some("tx-result-blob".to_string()),
                 first_active_at: None,
+                confirm_deadline: None,
             },
             alloc: rate_limit::AllocationState::default(),
             quarantined: false,

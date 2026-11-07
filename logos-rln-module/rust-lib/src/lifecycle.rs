@@ -2,6 +2,7 @@
 //! shared by the sealed store and its consumers.
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -101,6 +102,12 @@ pub struct CacheState {
     /// `failed` still remembers the membership was once on the registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_active_at: Option<u64>,
+    /// When an unconfirmed registration counts as failed (unix seconds); unset
+    /// = `submitted_at` + `CONFIRMATION_WINDOW_SECS`. A delegated registration
+    /// sets it past the gifter client's whole budget, so a slow gift is not
+    /// failed while the allocator may still answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_deadline: Option<u64>,
 }
 
 impl Default for CacheState {
@@ -114,6 +121,7 @@ impl Default for CacheState {
             retryable: None,
             tx_result: None,
             first_active_at: None,
+            confirm_deadline: None,
         }
     }
 }
@@ -156,6 +164,16 @@ fn has_been_active(record: &MembershipRecord) -> bool {
     record.cache.first_active_at.is_some() || record.cache.state.is_active_like()
 }
 
+/// The moment a still-unconfirmed registration counts as failed: the record's
+/// own deadline, else the funded window after submission (`submitted_at` 0 =
+/// unset behaves as maximally stale).
+pub fn confirmation_deadline(record: &MembershipRecord) -> u64 {
+    record
+        .cache
+        .confirm_deadline
+        .unwrap_or_else(|| record.identity.submitted_at.saturating_add(CONFIRMATION_WINDOW_SECS))
+}
+
 /// The spec's merged view, as a pure function: the registry's report
 /// (`Some(state)` / `None` = not present) overlaid on the local record.
 /// Callers persist any transition this implies (pending→failed, →erased).
@@ -169,8 +187,7 @@ pub fn merge_state(
         (_, Some(state)) => state,
         (Some(record), None) => {
             if record.cache.state == MembershipState::Pending {
-                // submitted_at 0 = unset behaves as maximally stale.
-                if now.saturating_sub(record.identity.submitted_at) > CONFIRMATION_WINDOW_SECS {
+                if now > confirmation_deadline(record) {
                     MembershipState::Failed
                 } else {
                     MembershipState::Pending
@@ -187,7 +204,7 @@ pub fn merge_state(
 /// The `membership_state_changed` event's args, or `None` when `new_state`
 /// equals the current state (re-observations — every poller tick and read —
 /// must NOT emit). `record` is the PRE-transition record, so `previous` is
-/// the state held just before the change; an empty (legacy) `rln_identifier`
+/// the state held just before the change; an empty `rln_identifier`
 /// carries through verbatim.
 pub fn transition_event(
     hash: &str,
@@ -213,6 +230,29 @@ pub fn transition_event(
         wire(new_state),
         wire(prior),
     ))
+}
+
+/// Fire `membership_state_changed` (module docs: LIDL events section) after
+/// a successful, change-gated store write; called with no store lock held.
+/// `record` is the pre-transition snapshot; nothing fires when `new_state`
+/// equals `prior` (see `transition_event`).
+pub(crate) fn emit_transition(
+    hash: &str,
+    record: &MembershipRecord,
+    prior: MembershipState,
+    new_state: MembershipState,
+) {
+    if let Some((registry_id, rln_identifier, membership_hash, state, previous)) =
+        transition_event(hash, record, prior, new_state)
+    {
+        crate::emit_membership_state_changed(
+            &registry_id,
+            &rln_identifier,
+            &membership_hash,
+            &state,
+            &previous,
+        );
+    }
 }
 
 // --------------------------------------------------------------- cache file
@@ -241,6 +281,30 @@ impl CacheFile {
 impl Default for CacheFile {
     fn default() -> CacheFile {
         CacheFile::new()
+    }
+}
+
+/// Which allocator granted each delegated record, by membership hash, as
+/// the gifter client reported it: the configured one, or one discovery
+/// found. The provisioning pass names it when the record settles.
+static GRANTED_BY: Mutex<Option<std::collections::HashMap<String, String>>> = Mutex::new(None);
+
+pub(crate) fn note_granted_by(hash: &str, reply: &serde_json::Value) {
+    let Some(peer) = reply.get("gifterPeerId").and_then(|p| p.as_str()) else { return };
+    let discovered = reply.get("discovered").and_then(|d| d.as_bool()).unwrap_or(false);
+    let who = if discovered { format!("{peer} (discovered)") } else { peer.to_string() };
+    crate::util::lock(&GRANTED_BY).get_or_insert_with(std::collections::HashMap::new).insert(hash.to_owned(), who);
+}
+
+/// The allocator that granted a delegated record, once its reply arrived.
+pub(crate) fn granted_by(hash: &str) -> Option<String> {
+    crate::util::lock(&GRANTED_BY).as_ref().and_then(|m| m.get(hash).cloned())
+}
+
+/// A record that went terminal no longer needs its granter remembered.
+pub(crate) fn forget_granted_by(hash: &str) {
+    if let Some(m) = crate::util::lock(&GRANTED_BY).as_mut() {
+        m.remove(hash);
     }
 }
 
@@ -280,6 +344,13 @@ mod tests {
         assert_eq!(merge_state(Some(&stale), None, now), Failed);
         let unset = rec(Pending, 0);
         assert_eq!(merge_state(Some(&unset), None, now), Failed);
+        // A record with its own deadline (a delegated registration) is not
+        // failed by the funded window while that deadline stands.
+        let mut gift = rec(Pending, now - CONFIRMATION_WINDOW_SECS - 1);
+        gift.cache.confirm_deadline = Some(now + 1);
+        assert_eq!(merge_state(Some(&gift), None, now), Pending);
+        gift.cache.confirm_deadline = Some(now - 1);
+        assert_eq!(merge_state(Some(&gift), None, now), Failed);
         assert_eq!(merge_state(Some(&stale), Some(GracePeriod), now), GracePeriod);
         let failed = rec(Failed, now - 1_000);
         assert_eq!(merge_state(Some(&failed), None, now), Failed);
@@ -340,5 +411,15 @@ mod tests {
         assert_eq!(fatal.state, Failed);
         assert_eq!(fatal.failed_reason.as_deref(), Some("submit_failed: boom"));
         assert_eq!(fatal.retryable, Some(false));
+    }
+
+    #[test]
+    fn grant_log_names_whoever_the_gifter_client_reported() {
+        note_granted_by("h1", &serde_json::json!({ "gifterPeerId": "16Uiu2Found", "discovered": true }));
+        note_granted_by("h2", &serde_json::json!({ "gifterPeerId": "16Uiu2Fixed", "discovered": false }));
+        note_granted_by("h3", &serde_json::json!({ "leaf_index": 1 }));
+        assert_eq!(granted_by("h1").as_deref(), Some("16Uiu2Found (discovered)"));
+        assert_eq!(granted_by("h2").as_deref(), Some("16Uiu2Fixed"));
+        assert!(granted_by("h3").is_none());
     }
 }

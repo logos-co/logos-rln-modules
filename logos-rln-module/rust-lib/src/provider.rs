@@ -1,16 +1,15 @@
 //! Registry provider layer: the spec's provider interface as a Rust trait,
 //! namespace → provider routing, and the lez-rln provider — a client of the
-//! sibling `liblogos_lez_rln_module` through the SDK's generated typed
-//! client (`modules().liblogos_lez_rln_module`), plus a `PluginProxy` to the
-//! gifter module.
+//! lez module (`liblogos_lez_rln_module`) through the SDK's generated typed
+//! client (`modules().liblogos_lez_rln_module`), plus the generated client of
+//! the gifter module (`RlnGifterModuleClient`), a declared dependency too.
 //!
 //! Every outbound call carries its own timeout (`READ_TIMEOUT`,
 //! `REGISTER_TIMEOUT`, `GIFTER_REQUEST_TIMEOUT`) through the SDK's
-//! `*_with_timeout` entry points; the raw `lp_*` C ABI this file used to bind
-//! for that purpose is gone with logos-rust-sdk 80d028ab.
+//! `*_with_timeout` entry points.
 //!
 //! Threading contract. Handlers run on `concurrency:"multi"` worker threads
-//! and reach the sibling through the ASYNC twins plus a channel wait
+//! and reach the lez module through the ASYNC twins plus a channel wait
 //! (`await_reply`): the SDK delivers the callback from the module's Qt event
 //! loop once the reply lands, so the worker only ever blocks on its channel
 //! and the loop stays free for every other call. Never use the synchronous
@@ -32,19 +31,21 @@ use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use logos_rust_sdk::{LogosError, LogosModuleSDK, PluginProxy};
+use logos_rust_sdk::LogosError;
 
 use crate::liblogos_lez_rln_module::LiblogosLezRlnModuleClient;
+use crate::rln_gifter_module::RlnGifterModuleClient;
 use crate::lifecycle::MembershipState;
 use crate::registry_id::CanonicalRegistryId;
-use crate::{lock, ApiError, ErrorKind};
+use crate::util::lock;
+use crate::error::{ApiError, ErrorKind};
 
 const TARGET_MODULE: &str = "liblogos_lez_rln_module";
-/// The sibling's reads run up to 60s against the wallet; add hop margin.
+/// The lez module's reads run up to 60s against the wallet; add hop margin.
 const READ_TIMEOUT: Duration = Duration::from_secs(70);
-/// The sibling's register_member submits with a 180s tx timeout.
+/// The lez module's register_member submits with a 180s tx timeout.
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(190);
-/// The sibling bounds its getFeeState round trip at 5s connect + 10s I/O.
+/// the lez module bounds its getFeeState round trip at 5s connect + 10s I/O.
 /// Shorter than READ_TIMEOUT because the funding wait asks on every balance
 /// read, and a stalled quote only means falling back to the fixed reserve.
 const FEE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -55,7 +56,7 @@ const REPLY_MARGIN: Duration = Duration::from_secs(10);
 // ------------------------------------------------------------ shared clients
 
 static LEZ_CLIENT: Mutex<Option<Arc<LiblogosLezRlnModuleClient>>> = Mutex::new(None);
-static GIFTER_CLIENT: Mutex<Option<Arc<PluginProxy>>> = Mutex::new(None);
+static GIFTER_CLIENT: Mutex<Option<Arc<RlnGifterModuleClient>>> = Mutex::new(None);
 
 /// Warm the process-lifetime clients. Called from `on_context_ready` on the
 /// host's main Qt thread so the one-time construction happens at load rather
@@ -65,7 +66,7 @@ pub(crate) fn init_client() {
     let _ = gifter_client();
 }
 
-/// The shared typed client to the sibling, created on first use. The lock is
+/// The shared typed client to the lez module, created on first use. The lock is
 /// released before the caller makes any SDK call.
 fn lez_client() -> Arc<LiblogosLezRlnModuleClient> {
     let mut slot = lock(&LEZ_CLIENT);
@@ -81,7 +82,7 @@ fn forget_lez_client() {
 /// Run one bounded async call from a worker and wait for its reply. `start`
 /// receives the completion callback to hand to the SDK's `*_async_with_timeout`
 /// twin. A transport failure, a dispatch refusal, or a silent callback all
-/// collapse to the sibling's provider_failure (logged), so callers just `?`.
+/// collapse to the lez module's provider_failure (logged), so callers just `?`.
 fn await_reply<T: Send + 'static>(
     method: &str,
     timeout: Duration,
@@ -111,8 +112,8 @@ fn is_no_client(e: &LogosError) -> bool {
     matches!(e, LogosError::Other(msg) if msg.starts_with("Failed to create protocol client"))
 }
 
-/// One read of the sibling: its QString reply, where an empty reply is the
-/// sibling's own ""-means-error convention and so a provider_failure.
+/// One read of the lez module: its QString reply, where an empty reply is the
+/// lez module's own ""-means-error convention and so a provider_failure.
 fn read_reply(method: &str, reply: Result<String, ApiError>) -> Result<String, ApiError> {
     let value = reply?;
     if value.is_empty() {
@@ -134,7 +135,7 @@ fn fold_reply(method: &str, result: Result<String, LogosError>) -> Result<String
     }
 }
 
-/// Fire-and-record dispatch, keeping the contract the raw ABI had: a
+/// Fire-and-record dispatch: a
 /// submission the SDK cannot even dispatch (no client, unencodable
 /// arguments) is a SYNCHRONOUS `Err` here — the SDK reports that case from
 /// the callback before `*_async_with_timeout` returns — so the record's owner
@@ -192,9 +193,9 @@ fn dispatch_recorded(
 
 // ----------------------------------------------------------- network gate
 
-/// What the sibling said about serving a network, per CAIP-2 reference. Only
+/// What the lez module said about serving a network, per CAIP-2 reference. Only
 /// definitive answers are kept: an accepted network stays accepted and a
-/// refused one stays refused for the life of the process (the sibling never
+/// refused one stays refused for the life of the process (the lez module never
 /// re-points a wallet home), while a "not yet" is asked again next time.
 static NETWORK_GATE: std::sync::LazyLock<Mutex<HashMap<String, Result<(), String>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -203,7 +204,7 @@ static NETWORK_GATE: std::sync::LazyLock<Mutex<HashMap<String, Result<(), String
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Gate {
     Accepted,
-    /// Final; the sibling's reason.
+    /// Final; the lez module's reason.
     Refused(String),
     /// Not answerable yet (its wallet home is not resolved), or a reply that
     /// did not say — ask again.
@@ -255,9 +256,9 @@ fn network_refused(registry: &CanonicalRegistryId, detail: &str) -> ApiError {
     )
 }
 
-/// Make sure the sibling's wallet serves the network this registry's id
+/// Make sure the lez module's wallet serves the network this registry's id
 /// names — binding an unconfigured wallet to it, the first time one is asked.
-/// A refusal is `unknown_registry`; a wallet home the sibling has not resolved
+/// A refusal is `unknown_registry`; a wallet home the lez module has not resolved
 /// yet is `not_ready`; a sibling that does not answer is `provider_failure`
 /// (and is asked again next time).
 pub(crate) fn ensure_network(registry: &CanonicalRegistryId) -> Result<(), ApiError> {
@@ -305,12 +306,12 @@ fn networks_in_order(tracked: &[String]) -> Vec<CanonicalRegistryId> {
     out
 }
 
-/// Put the configured networks to the sibling in configuration order, so the
+/// Put the configured networks to the lez module in configuration order, so the
 /// FIRST registry id binds an unconfigured wallet — deterministically, rather
 /// than whichever registry the root refresher or provisioning happens to
 /// reach first. A registry on a different network is then refused and says
 /// so through `get_membership_state`; nothing here fails `start()`. A network
-/// the sibling cannot answer for yet is asked again by the next provider call.
+/// the lez module cannot answer for yet is asked again by the next provider call.
 pub(crate) fn select_networks(tracked: &[String]) {
     for registry in networks_in_order(tracked) {
         match ensure_network(&registry) {
@@ -326,19 +327,18 @@ pub(crate) fn select_networks(tracked: &[String]) {
 // ------------------------------------------------------------ gifter delegate
 
 /// The delegated-registration executor (RLN Membership Allocation Protocol):
-/// the co-located gifter client module. NOT declared in metadata.json
-/// dependencies — deployments without a gifter module must still load, so it
-/// is reached through an untyped `PluginProxy` rather than a generated client.
-const GIFTER_MODULE: &str = "rln_gifter_module";
+/// the co-located gifter client module, a declared dependency (its generated
+/// client; logoscore loads it, and libp2p_module through it, before this
+/// module).
 /// The gifter request budget: client-side payload production by the vector's
 /// provider module (≤120s — keycard capture with a slow tap sets the bar)
 /// plus the dial and the server-side on-chain register (≤205s), with
 /// dispatch margin.
-const GIFTER_REQUEST_TIMEOUT: Duration = Duration::from_secs(340);
+pub(crate) const GIFTER_REQUEST_TIMEOUT: Duration = Duration::from_secs(340);
 
-fn gifter_client() -> Arc<PluginProxy> {
+fn gifter_client() -> Arc<RlnGifterModuleClient> {
     let mut slot = lock(&GIFTER_CLIENT);
-    Arc::clone(slot.get_or_insert_with(|| Arc::new(LogosModuleSDK::new().plugin(GIFTER_MODULE))))
+    Arc::clone(slot.get_or_insert_with(|| Arc::new(RlnGifterModuleClient::new())))
 }
 
 /// Fire the gifter module's `request` with the module-generated commitment and
@@ -351,27 +351,18 @@ pub(crate) fn gifter_request_async(
     on_done: RegisterCallback,
 ) -> Result<(), ApiError> {
     let client = gifter_client();
-    let args = serde_json::json!([args_json]);
+    let args_json = args_json.to_string();
     dispatch_recorded("request", on_done, |done| {
-        client.call_json_async_with_timeout("request", &args, GIFTER_REQUEST_TIMEOUT, move |result| {
-            // The gifter answers a QString like the sibling does; anything
-            // else is its failure value.
-            done(result.map(|v| match v {
-                serde_json::Value::String(s) => s,
-                _ => String::new(),
-            }))
-        })
+        client.request_async_with_timeout(&args_json, GIFTER_REQUEST_TIMEOUT, done)
     })
 }
 
 // ----------------------------------------------------------- provider trait
 
-/// The registry's view of one commitment (the spec provider's
+/// The registry's view of one commitment it holds (the spec provider's
 /// `get_membership` return: state + authoritative leaf_index/rate_limit).
 pub(crate) struct ProviderMembership {
-    pub(crate) registered: bool,
-    /// active | grace_period | expired (meaningful only when registered;
-    /// `Unknown` placeholder otherwise, never read while `!registered`).
+    /// active | grace_period | expired.
     pub(crate) state: MembershipState,
     pub(crate) leaf_index: u64,
     pub(crate) rate_limit: u64,
@@ -387,7 +378,7 @@ pub(crate) trait RegistryProvider: Send + Sync {
         &self,
         registry: &CanonicalRegistryId,
         id_commitment_hex: &str,
-    ) -> Result<ProviderMembership, ApiError>;
+    ) -> Result<Option<ProviderMembership>, ApiError>;
 
     /// Submit a registration without blocking: `on_done` receives the
     /// submission reply (acceptance, NOT application — confirmation is the
@@ -396,7 +387,6 @@ pub(crate) trait RegistryProvider: Send + Sync {
     fn register_async(
         &self,
         registry: &CanonicalRegistryId,
-        options_json: &str,
         id_commitment_hex: &str,
         rate_limit: u64,
         on_done: RegisterCallback,
@@ -412,7 +402,7 @@ pub(crate) trait RegistryProvider: Send + Sync {
         -> Result<Vec<String>, ApiError>;
 
     /// The registry's parameters (spec RegistryParameters — max_rate_limit and
-    /// friends) as the sibling's raw bounds object. Backs the quota read.
+    /// friends) as the lez module's raw bounds object. Backs the quota read.
     fn get_registry_bounds(
         &self,
         registry: &CanonicalRegistryId,
@@ -439,7 +429,7 @@ pub(crate) trait RegistryProvider: Send + Sync {
     fn fee_state(&self) -> Result<serde_json::Value, ApiError>;
 
     /// Whether the registry is deployed on the chain the provider reads, as
-    /// the sibling's raw check object (`{status, detail?, sequencer?,
+    /// the lez module's raw check object (`{status, detail?, sequencer?,
     /// chain_head?}`). An error means the question could not be asked.
     fn check_registry(&self, registry: &CanonicalRegistryId) -> Result<serde_json::Value, ApiError>;
 }
@@ -479,7 +469,7 @@ fn registry_problem_from(canonical: &str, check: &serde_json::Value) -> Option<S
 }
 
 /// A failed registry read, explained when the registry itself is the cause:
-/// an empty reply from the sibling says nothing, so ask it whether the
+/// an empty reply from the lez module says nothing, so ask it whether the
 /// registry is there at all and, if not, say that instead.
 fn explained(
     prov: &dyn RegistryProvider,
@@ -495,7 +485,7 @@ fn explained(
     }
 }
 
-/// Turn a sibling `get_valid_roots` reply into roots at the prover's circuit
+/// Turn a lez module `get_valid_roots` reply into roots at the prover's circuit
 /// depth.
 ///
 /// A registry may be shallower than the circuit — ours is depth 9 against a
@@ -505,32 +495,24 @@ fn explained(
 /// it made itself. The lift belongs here because this is the one place every
 /// consumer of these roots goes through.
 ///
-/// `{"depth":N,"valid_roots":[…]}` is the current shape. A bare array is a
-/// pre-3.1 sibling that cannot say how deep its tree is; those roots are
-/// passed through, which is right only when the registry already matches the
-/// circuit.
+/// The reply is `{"depth":N,"valid_roots":[…]}`; any other shape is a
+/// `ProviderFailure`.
 fn lift_roots_reply(parsed: &serde_json::Value) -> Result<Vec<String>, ApiError> {
     let bad = |what: &str| {
         ApiError::new(ErrorKind::ProviderFailure, &format!("roots reply {what}"))
     };
-    let (depth, roots) = match parsed {
-        serde_json::Value::Array(a) => (crate::proof::RLN_TREE_DEPTH, a),
-        serde_json::Value::Object(o) => {
-            let depth = o
-                .get("depth")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| bad("has no depth"))? as usize;
-            if depth == 0 || depth > crate::proof::RLN_TREE_DEPTH {
-                return Err(bad(&format!("declares an impossible depth {depth}")));
-            }
-            let roots = o
-                .get("valid_roots")
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| bad("has no valid_roots"))?;
-            (depth, roots)
-        }
-        _ => return Err(bad("is neither an array nor an object")),
-    };
+    let o = parsed.as_object().ok_or_else(|| bad("is not an object"))?;
+    let depth = o
+        .get("depth")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| bad("has no depth"))? as usize;
+    if depth == 0 || depth > crate::proof::RLN_TREE_DEPTH {
+        return Err(bad(&format!("declares an impossible depth {depth}")));
+    }
+    let roots = o
+        .get("valid_roots")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| bad("has no valid_roots"))?;
     Ok(roots
         .iter()
         .filter_map(serde_json::Value::as_str)
@@ -552,7 +534,7 @@ pub(crate) fn provider_for(namespace: &str) -> Option<&'static dyn RegistryProvi
 // ---------------------------------------------------------- lez-rln provider
 
 /// The `logos` namespace: lez-rln registries, anchored on the registration
-/// program's config PDA, reached through the sibling liblogos_lez_rln_module.
+/// program's config PDA, reached through the lez module liblogos_lez_rln_module.
 struct LezRlnProvider;
 
 fn provider_failure(method: &str) -> ApiError {
@@ -562,7 +544,7 @@ fn provider_failure(method: &str) -> ApiError {
     )
 }
 
-/// Decode a `get_membership` reply. Every field the sibling promises is
+/// Decode a `get_membership` reply. Every field the lez module promises is
 /// required: a missing one is a provider fault, never a defaultable value.
 /// `registered` most of all — the poller treats an authoritative "not
 /// registered" as proof a live membership was erased and acts destructively,
@@ -570,7 +552,7 @@ fn provider_failure(method: &str) -> ApiError {
 /// leaves the record untouched. (`leaf_index` has the same hazard from the
 /// other side: leaf 0 is a VALID leaf, so defaulting would prove against the
 /// wrong membership.)
-fn parse_membership_reply(raw: &str) -> Result<ProviderMembership, ApiError> {
+fn parse_membership_reply(raw: &str) -> Result<Option<ProviderMembership>, ApiError> {
     let fault = |msg: String| ApiError::new(ErrorKind::ProviderFailure, &msg);
     let v: serde_json::Value = serde_json::from_str(raw)
         .map_err(|e| fault(format!("get_membership reply parse: {e}")))?;
@@ -579,27 +561,21 @@ fn parse_membership_reply(raw: &str) -> Result<ProviderMembership, ApiError> {
         .and_then(|x| x.as_bool())
         .ok_or_else(|| fault("get_membership: reply carries no registered flag".to_string()))?;
     if !registered {
-        return Ok(ProviderMembership {
-            registered: false,
-            state: MembershipState::Unknown,
-            leaf_index: 0,
-            rate_limit: 0,
-        });
+        return Ok(None);
     }
     let required = |key: &str| {
         v.get(key)
             .and_then(|x| x.as_u64())
             .ok_or_else(|| fault(format!("get_membership: registered member missing {key}")))
     };
-    Ok(ProviderMembership {
-        registered: true,
+    Ok(Some(ProviderMembership {
         state: serde_json::from_value::<MembershipState>(
             v.get("state").cloned().unwrap_or(serde_json::Value::Null),
         )
         .map_err(|_| fault("get_membership: unrecognized state".to_string()))?,
         leaf_index: required("leaf_index")?,
         rate_limit: required("rate_limit")?,
-    })
+    }))
 }
 
 impl RegistryProvider for LezRlnProvider {
@@ -607,7 +583,7 @@ impl RegistryProvider for LezRlnProvider {
         &self,
         registry: &CanonicalRegistryId,
         id_commitment_hex: &str,
-    ) -> Result<ProviderMembership, ApiError> {
+    ) -> Result<Option<ProviderMembership>, ApiError> {
         ensure_network(registry)?;
         let client = lez_client();
         let raw = read_reply(
@@ -628,41 +604,11 @@ impl RegistryProvider for LezRlnProvider {
     fn register_async(
         &self,
         registry: &CanonicalRegistryId,
-        options_json: &str,
         id_commitment_hex: &str,
         rate_limit: u64,
         on_done: RegisterCallback,
     ) -> Result<(), ApiError> {
-        // options_json is still parsed, so a malformed one is still a caller
-        // error — but nothing in it selects who pays any more. Since
-        // liblogos_lez_rln_module 4.0.0 the registry takes the native asset
-        // and the provider pays from its own account, so this module has
-        // nothing to name: it is registry-agnostic and holds no account ids.
-        let options: serde_json::Value = if options_json.trim().is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::from_str(options_json).map_err(|e| {
-                ApiError::new(ErrorKind::InvalidArgument, &format!("options_json: {e}"))
-            })?
-        };
-        // Accepted and ignored rather than rejected. It was MANDATORY until
-        // 0.8.0 and every shipped caller still sends it — the membership UI,
-        // delivery's conf key, Basecamp's chat conf, the nim consumer — from
-        // repos that release on their own schedule. Making a stale conf a
-        // permanent registration failure buys nothing when the key is inert.
-        // Said once per call, because the account it names is no longer the
-        // account that pays, and a caller relying on that needs to know.
-        if options
-            .get("funding_holding_account_id")
-            .and_then(|x| x.as_str())
-            .is_some_and(|s| !s.is_empty())
-        {
-            eprintln!(
-                "register_membership: funding_holding_account_id is ignored since 0.8.0 — \
-                 the registry module pays from its own account"
-            );
-        }
-        // The wire carries `int`; a rate the sibling could not even receive
+        // The wire carries `int`; a rate the lez module could not even receive
         // is the caller's error, not a submission to be recorded.
         let rate_limit = i64::try_from(rate_limit).map_err(|_| {
             ApiError::new(ErrorKind::InvalidArgument, "rate_limit exceeds the wire's i64")
@@ -884,12 +830,9 @@ mod lp_test_transport {
 mod tests {
     /// A registry shallower than the circuit must come back LIFTED.
     ///
-    /// This is the regression for a node rejecting proofs it generated
-    /// itself: `generate_proof` lifts its root to the circuit's depth, and
-    /// the valid-root window is what `validate_proof` compares against. While
-    /// the refresher installed raw depth-9 roots, the two could never match,
-    /// and every proof went invalid roughly ten seconds after the path cache
-    /// last refreshed the window behind its back.
+    /// `generate_proof` lifts its root to the circuit's depth and
+    /// `validate_proof` compares against the valid-root window, so the window
+    /// must hold lifted roots too, or every proof is invalid.
     #[test]
     fn a_shallow_registry_reports_roots_at_circuit_depth() {
         let root = "11".repeat(32);
@@ -916,15 +859,6 @@ mod tests {
         assert_eq!(super::lift_roots_reply(&reply).expect("full-depth reply"), vec![root]);
     }
 
-    /// A pre-3.1 sibling answers a bare array and cannot say how deep its tree
-    /// is. Pass those through rather than guess a depth.
-    #[test]
-    fn a_bare_array_reply_is_still_accepted() {
-        let root = "33".repeat(32);
-        let reply = serde_json::json!([root.clone()]);
-        assert_eq!(super::lift_roots_reply(&reply).expect("legacy reply"), vec![root]);
-    }
-
     #[test]
     fn a_reply_with_no_depth_or_an_absurd_one_is_refused() {
         let root = "44".repeat(32);
@@ -933,6 +867,7 @@ mod tests {
             serde_json::json!({ "depth": 0, "valid_roots": [root.clone()] }),
             serde_json::json!({ "depth": 99, "valid_roots": [root.clone()] }),
             serde_json::json!("not a reply"),
+            serde_json::json!([root.clone()]),
         ] {
             assert!(super::lift_roots_reply(&bad).is_err(), "accepted {bad}");
         }
@@ -982,18 +917,16 @@ mod tests {
         let Ok(pm) = parse_membership_reply(r#"{"registered":false}"#) else {
             panic!("an explicit registered:false is a valid answer");
         };
-        assert!(!pm.registered);
-        assert_eq!(pm.state, MembershipState::Unknown);
+        assert!(pm.is_none());
     }
 
     #[test]
     fn a_registered_member_needs_every_contract_field() {
-        let Ok(pm) = parse_membership_reply(
+        let Ok(Some(pm)) = parse_membership_reply(
             r#"{"registered":true,"state":"active","leaf_index":0,"rate_limit":100}"#,
         ) else {
             panic!("a complete reply must decode");
         };
-        assert!(pm.registered);
         assert_eq!(pm.leaf_index, 0, "leaf 0 is a valid leaf");
         assert_eq!(pm.rate_limit, 100);
 
@@ -1027,7 +960,6 @@ mod tests {
         let err = provider
             .register_async(
                 &registry,
-                &format!(r#"{{"funding_holding_account_id":"{}"}}"#, "cd".repeat(32)),
                 &"11".repeat(32),
                 300,
                 Box::new(move |_| {
@@ -1039,54 +971,17 @@ mod tests {
         assert!(!*lock(&fired), "a synchronous failure must not also reach on_done");
     }
 
-    /// Until 0.8.0 this was `register_requires_funding_option` and asserted
-    /// `InvalidArgument` — the logos namespace refused a register without
-    /// `funding_holding_account_id`. The registry takes the native asset now
-    /// and the sibling pays from its own account, so there is nothing for a
-    /// caller to name and the option is inert.
-    ///
-    /// Reaching `ProviderFailure` is the assertion: that is the dead-transport
-    /// error from the neighbouring test, so the call got PAST validation. An
-    /// `InvalidArgument` here would mean the old gate survived.
+    /// The logos namespace needs nothing from the caller to name a payer:
+    /// `ProviderFailure` is the dead-transport error from the neighbouring
+    /// test, so reaching it means the call got past argument validation.
     #[test]
-    fn register_without_a_funding_option_gets_past_validation() {
+    fn a_register_gets_past_validation() {
         let registry = registry_id::parse(&format!("logos:local:{}", "ab".repeat(32))).unwrap();
         let provider = provider_for("logos").unwrap();
         let err = provider
-            .register_async(&registry, "{}", &"11".repeat(32), 300, Box::new(|_| {}))
+            .register_async(&registry, &"11".repeat(32), 300, Box::new(|_| {}))
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ProviderFailure);
-    }
-
-    /// A caller that has not been rebuilt still sends the key. It must not
-    /// become a permanent registration failure — that is the whole reason it
-    /// is ignored rather than rejected.
-    #[test]
-    fn register_ignores_a_stale_funding_option() {
-        let registry = registry_id::parse(&format!("logos:local:{}", "ab".repeat(32))).unwrap();
-        let provider = provider_for("logos").unwrap();
-        let err = provider
-            .register_async(
-                &registry,
-                &format!(r#"{{"funding_holding_account_id":"{}"}}"#, "cd".repeat(32)),
-                &"11".repeat(32),
-                300,
-                Box::new(|_| {}),
-            )
-            .unwrap_err();
-        assert_eq!(err.kind, ErrorKind::ProviderFailure);
-    }
-
-    /// Malformed options_json is still the caller's error: relaxing which
-    /// keys matter did not relax whether the document parses.
-    #[test]
-    fn register_still_rejects_unparseable_options() {
-        let registry = registry_id::parse(&format!("logos:local:{}", "ab".repeat(32))).unwrap();
-        let provider = provider_for("logos").unwrap();
-        let err = provider
-            .register_async(&registry, "{not json", &"11".repeat(32), 300, Box::new(|_| {}))
-            .unwrap_err();
-        assert_eq!(err.kind, ErrorKind::InvalidArgument);
     }
 
     #[test]
@@ -1125,7 +1020,7 @@ mod tests {
     }
 
     /// The first registry id binds an unconfigured wallet, so the order the
-    /// networks are put to the sibling is the order `start()` named them.
+    /// networks are put to the lez module is the order `start()` named them.
     #[test]
     fn networks_are_selected_in_configuration_order() {
         let a = "aa".repeat(32);

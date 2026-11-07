@@ -14,7 +14,8 @@ use std::sync::Mutex;
 
 use crate::provider::RegistryProvider;
 use crate::registry_id::CanonicalRegistryId;
-use crate::{lock, ApiError, ErrorKind};
+use crate::util::lock;
+use crate::error::{ApiError, ErrorKind};
 
 struct CachedPath {
     path_elements_hex: Vec<String>,
@@ -25,24 +26,20 @@ struct CachedPath {
 static PATHS: Mutex<Option<HashMap<String, CachedPath>>> = Mutex::new(None);
 
 
-/// Decode one field of a provider `get_merkle_proof` reply, so a cache hit
+/// A provider `get_merkle_proof` reply, decoded in one place so a cache hit
 /// and a cache miss build identically-shaped witnesses.
-fn json_str_array(v: &serde_json::Value, key: &str) -> Result<Vec<String>, ApiError> {
-    v.get(key)
-        .and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|e| e.as_str().map(String::from)).collect())
-        .ok_or_else(|| {
-            ApiError::new(ErrorKind::ProviderFailure, &format!("merkle proof missing {key}"))
-        })
+#[derive(serde::Deserialize)]
+struct MerkleProofReply {
+    path_elements: Vec<String>,
+    path_indices: Vec<u8>,
+    depth: Option<u64>,
+    valid_roots: Option<Vec<String>>,
 }
 
-fn json_u8_array(v: &serde_json::Value, key: &str) -> Result<Vec<u8>, ApiError> {
-    v.get(key)
-        .and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|e| e.as_u64().map(|n| n as u8)).collect())
-        .ok_or_else(|| {
-            ApiError::new(ErrorKind::ProviderFailure, &format!("merkle proof missing {key}"))
-        })
+fn decode_merkle_proof(merkle: serde_json::Value) -> Result<MerkleProofReply, ApiError> {
+    serde_json::from_value(merkle).map_err(|e| {
+        ApiError::new(ErrorKind::ProviderFailure, &format!("merkle proof reply: {e}"))
+    })
 }
 
 /// The cached path for `hash`, or `None` on a cold cache or a leaf_index
@@ -64,22 +61,19 @@ pub(crate) fn fill_path_cache(
     prov: &dyn RegistryProvider,
 ) -> Result<(), ApiError> {
     let merkle = prov.get_merkle_proof(registry, leaf_index)?;
-    let mut path_elements_hex = json_str_array(&merkle, "path_elements")?;
-    let mut path_indices = json_u8_array(&merkle, "path_indices")?;
+    let MerkleProofReply { path_elements: mut path_elements_hex, mut path_indices, depth, valid_roots } =
+        decode_merkle_proof(merkle)?;
 
     // The registry's tree is shallower than the circuit, so its path and every
     // root it reports are lifted to the circuit's depth together — see
     // `proof::depth_bridge`. The reply carries the depth it was built at; a
     // registry that already matches the circuit is padded by nothing.
-    let depth = merkle
-        .get("depth")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(path_elements_hex.len() as u64) as usize;
+    let depth = depth.unwrap_or(path_elements_hex.len() as u64) as usize;
     crate::proof::depth_bridge::pad_path(&mut path_elements_hex, &mut path_indices, depth);
 
     // Adopt the snapshot's valid_roots into the root window (see
     // roots::adopt); older providers may omit the field.
-    if let Ok(roots_hex) = json_str_array(&merkle, "valid_roots") {
+    if let Some(roots_hex) = valid_roots {
         let roots: Vec<[u8; 32]> = roots_hex
             .iter()
             .map(|h| crate::proof::depth_bridge::fold_root(h, depth))
@@ -110,6 +104,25 @@ pub(crate) fn set_path_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_malformed_merkle_proof_is_a_provider_failure() {
+        let ok = decode_merkle_proof(serde_json::json!({
+            "path_elements": ["ab"], "path_indices": [1], "depth": 1
+        }))
+        .expect("a well-formed reply decodes");
+        assert_eq!(ok.path_indices, vec![1]);
+        assert!(ok.valid_roots.is_none());
+
+        for bad in [
+            serde_json::json!({ "path_elements": ["ab"], "path_indices": [256] }),
+            serde_json::json!({ "path_elements": ["ab", 7], "path_indices": [1, 0] }),
+            serde_json::json!({ "path_elements": ["ab"] }),
+        ] {
+            let err = decode_merkle_proof(bad).err().expect("refused");
+            assert_eq!(err.kind, ErrorKind::ProviderFailure);
+        }
+    }
 
     #[test]
     fn cold_hash_misses() {

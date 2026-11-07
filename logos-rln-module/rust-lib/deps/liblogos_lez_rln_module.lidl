@@ -4,23 +4,28 @@
 ; update BOTH files in the same PR when either side changes. Wired via
 ; metadata.json dependency_overrides; logos-lidl-gen turns it into the typed
 ; LiblogosLezRlnModuleClient — unused at runtime (provider.rs speaks raw lp_*
-; for per-call timeouts, like the sibling's wallet path) but the client
+; for per-call timeouts, like the lez module's wallet path) but the client
 ; documents the consumed wire.
 module liblogos_lez_rln_module {
-  version "5.1.0"
+  version "6.1.0"
 
   ; All replies are compact JSON strings; "" is the error value.
 
   ; Idempotent on-chain registration; {"leaf_index":N,"pending":true,
-  ; "tx_result":…} (leaf_index is a pre-submit ESTIMATE) or
-  ; {"already_registered":true,"leaf_index":N}.
+  ; "rate_limit":N,"tx_result":s} (leaf_index is a pre-submit ESTIMATE;
+  ; tx_result is the send result as JSON text {"error","success","tx_hash"})
+  ; or {"already_registered":true,"leaf_index":N}. A registration the program
+  ; would refuse is not submitted: {"error":"<kind>: <reason>"} with kind
+  ; invalid_commitment, invalid_rate_limit, registry_full, tree_full,
+  ; insufficient_balance or treasury_missing; a send the wallet could not make
+  ; is {"error":"send_failed: <why>"}, nothing submitted. "" is a config or
+  ; chain read that failed. A reverted or never-included registration is
+  ; re-sent by the module; this consumer watches get_membership.
   ;
-  ; Since v4.0.0 parameter 2 is the PAYER, not a token holding: it signs the
-  ; tx, pays rate_limit x price_per_unit of NATIVE balance and pays the fee.
-  ; "" selects the provider's own payer, which is what this consumer passes —
-  ; it is registry-agnostic and holds no account ids. The arity did not change,
-  ; so a stale caller compiles and silently pays from the wrong slot; that is
-  ; why the parameter was renamed rather than removed.
+  ; Parameter 2 is the PAYER: it signs the tx, pays rate_limit x
+  ; price_per_unit of NATIVE balance and pays the fee. "" selects the
+  ; provider's own payer, which is what this consumer passes — it is
+  ; registry-agnostic and holds no account ids.
   method register_member(config_account_id: tstr, payer_account_id: tstr, id_commitment_hex: tstr, rate_limit: int) -> tstr
 
   ; Membership PDA read + state from chain time (the head block's timestamp

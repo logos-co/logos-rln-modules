@@ -14,6 +14,11 @@
     # Not path:../ — a relative input resolves against the store root once a
     # consumer walks the chain transitively, and evaluation fails.
     liblogos_lez_rln_module.url = "git+https://github.com/logos-co/logos-rln-modules?ref=main&dir=logos-lez-rln-module";
+    # The allocator client (RLN Membership Allocation Protocol); its LIDL is
+    # the committed copy under rust-lib/deps, the input only resolves the
+    # name. It declares libp2p_module itself, so logoscore loads both before
+    # this module.
+    rln_gifter_module.url = "git+https://github.com/logos-co/logos-rln-gifter?ref=refactor/auth-vector-pipeline&dir=rust/rln-gifter-module";
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:
@@ -100,6 +105,7 @@
                 --concurrency multi \
                 --protocol-version ${protocolVersion} \
                 --dep liblogos_lez_rln_module="$root/rust-lib/deps/liblogos_lez_rln_module.lidl" \
+                --dep rln_gifter_module="$root/rust-lib/deps/rln_gifter_module.lidl" \
                 -o "$root/rust-lib/generated/provider_gen.rs"
               echo "staging the SDK source at logos-rust-sdk-src/ ..."
               rm -rf "''${root:?}/logos-rust-sdk-src"

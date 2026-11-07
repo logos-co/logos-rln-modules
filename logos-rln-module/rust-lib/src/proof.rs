@@ -44,17 +44,15 @@ use crate::registry_id::{bytes_to_hex, hex_to_bytes32, hex_to_vec};
 /// The circuit's fixed Merkle depth; a supplied path MUST have this length or
 /// witness construction fails.
 ///
-/// Not zerokit's default of 20 any more. LEZ v0.2.5 meters a transaction by its
-/// gas limit at one gas per cycle and refuses anything over ten million, and an
-/// on-chain merkle insert costs ~902,000 cycles per level — so a depth-20 tree
-/// cannot be registered into at all. The registry is depth 9 now, and this is
-/// the smallest circuit zerokit publishes that can cover it.
+/// Below zerokit's default of 20: an on-chain merkle insert costs ~902,000
+/// cycles per level, so a depth-20 tree cannot be registered into within the
+/// transaction's cycle limit. The registry is depth 9; this is the smallest
+/// circuit zerokit publishes that covers it.
 pub(crate) const RLN_TREE_DEPTH: usize = 10;
 
 /// zerokit ships depth-10 artifacts in its repository but excludes them from
 /// the crates.io package to stay under the size limit, so they are vendored
-/// here. Verified identical in circuit version to the crate's embedded
-/// depth-20 pair, which matches the repository's byte for byte.
+/// here.
 const DEPTH_10_GRAPH: &[u8] = include_bytes!("../resources/tree_depth_10/graph.bin");
 const DEPTH_10_ZKEY: &[u8] = include_bytes!("../resources/tree_depth_10/rln_final.arkzkey");
 
@@ -414,8 +412,8 @@ fn secret_to_bytes32(secret: &SecretFr) -> [u8; 32] {
 /// Extend a registry's Merkle path and root to the circuit's depth.
 ///
 /// The on-chain tree is shallower than the circuit: an insert costs one
-/// Poseidon compression per level and LEZ v0.2.5 refuses a transaction needing
-/// more than ten million cycles, which bounds the registry's depth well below
+/// Poseidon compression per level and the transaction's cycle limit bounds the
+/// registry's depth well below
 /// the smallest circuit zerokit publishes. The circuit still demands exactly
 /// [`RLN_TREE_DEPTH`] siblings and folds them into the root it proves against.
 ///
@@ -784,11 +782,9 @@ mod tests {
     // "Hello, RLN!", zero-sibling all-left depth-10 path.
     // A change here breaks cross-node verification — never rebind silently.
     //
-    // REBOUND for the depth-10 circuit. `root` is the only value that moved,
-    // because the circuit folds the path to produce it and the path is now ten
-    // levels rather than twenty; every other value here is depth-independent
-    // and is unchanged, which is the evidence that nothing else shifted. Every
-    // verifier must ship the depth-10 artifacts for these to match.
+    // `root` depends on the path depth (ten levels); every other value is
+    // depth-independent. Every verifier must ship the depth-10 artifacts for
+    // these to match.
     #[test]
     fn frozen_interop_vectors() {
         // Identity derivation (zerokit seeded keygen, LE hex).

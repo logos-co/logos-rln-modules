@@ -20,7 +20,7 @@ use crate::sealed_store::format::{
 };
 use crate::sealed_store::fs;
 use crate::registry_id::{bytes_to_hex, hex_to_vec};
-use crate::{ApiError, ErrorKind};
+use crate::error::{ApiError, ErrorKind};
 
 // ------------------------------------------------------------------- opening
 
@@ -50,11 +50,11 @@ impl core::fmt::Display for OpenError {
 static CURRENT: Mutex<Weak<Store>> = Mutex::new(Weak::new());
 
 pub(crate) fn publish(store: Option<&Arc<Store>>) {
-    *crate::lock(&CURRENT) = store.map_or_else(Weak::new, Arc::downgrade);
+    *crate::util::lock(&CURRENT) = store.map_or_else(Weak::new, Arc::downgrade);
 }
 
 pub(crate) fn current() -> Option<Arc<Store>> {
-    crate::lock(&CURRENT).upgrade()
+    crate::util::lock(&CURRENT).upgrade()
 }
 
 /// The refusal every keystore op surfaces when no store was ever opened.
@@ -216,7 +216,7 @@ impl Store {
     /// credential nor hand out the password (the key material is zeroized now,
     /// not whenever the last Arc happens to drop).
     pub fn close(&self) {
-        let mut guard = crate::lock(&self.write);
+        let mut guard = crate::util::lock(&self.write);
         guard.lock.take();
         guard.session = None;
     }
@@ -227,7 +227,7 @@ impl Store {
     /// one KDF run follows, and the quarantine sets + session commit
     /// all-or-nothing.
     pub fn unlock(&self, password: &str) -> Result<usize, ApiError> {
-        let mut guard = crate::lock(&self.write);
+        let mut guard = crate::util::lock(&self.write);
         let inner = &mut *guard;
         ensure_open(inner)?;
 
@@ -368,13 +368,13 @@ impl Store {
     }
 
     pub fn lock(&self) {
-        crate::lock(&self.write).session = None;
+        crate::util::lock(&self.write).session = None;
     }
 
     /// The active session password, if unlocked — a Zeroizing clone for
     /// keychain persistence.
     pub fn session_password(&self) -> Option<Zeroizing<String>> {
-        crate::lock(&self.write).session.as_ref().map(|s| s.password.clone())
+        crate::util::lock(&self.write).session.as_ref().map(|s| s.password.clone())
     }
 
     /// True when the sealed file holds any credential entry, quarantined or
@@ -390,7 +390,7 @@ impl Store {
     }
 
     pub fn is_provisioned(&self) -> bool {
-        crate::lock(&self.write).sealed.is_some()
+        crate::util::lock(&self.write).sealed.is_some()
     }
 
     pub fn base_dir(&self) -> &Path {
@@ -419,7 +419,7 @@ impl Store {
         credential: &StoredCredential,
         rate_limit: u64,
     ) -> Result<(), ApiError> {
-        let mut guard = crate::lock(&self.write);
+        let mut guard = crate::util::lock(&self.write);
         let inner = &mut *guard;
         ensure_open(inner)?;
         if inner.session.is_none() {
@@ -478,7 +478,7 @@ impl Store {
     /// The AAD is recomputed from the CURRENT identity block, so a swapped
     /// identity header fails the AEAD.
     pub fn unseal_credential(&self, hash: &str) -> Result<StoredCredential, ApiError> {
-        let guard = crate::lock(&self.write);
+        let guard = crate::util::lock(&self.write);
         let inner = &*guard;
         if inner.census_quarantined.contains(hash) || inner.keyed_quarantined.contains(hash) {
             return Err(ApiError::internal("entry quarantined (metadata tamper)"));
@@ -578,7 +578,7 @@ impl Store {
         hash: &str,
         f: impl FnOnce(&mut CacheState),
     ) -> Result<MembershipState, ApiError> {
-        let mut guard = crate::lock(&self.write);
+        let mut guard = crate::util::lock(&self.write);
         let inner = &mut *guard;
         ensure_open(inner)?;
         if !inner.sealed.as_ref().is_some_and(|s| s.credentials.contains_key(hash)) {
@@ -588,7 +588,7 @@ impl Store {
         let prior = row.state;
         f(row);
         if row.first_active_at.is_none() && row.state.is_active_like() {
-            row.first_active_at = Some(crate::now_unix());
+            row.first_active_at = Some(crate::util::now_unix());
         }
         write_cache(&self.dir, inner)?;
         self.swap_snapshot(inner);
@@ -609,7 +609,7 @@ impl Store {
         rate_limit: u64,
         epoch_size_sec: u64,
     ) -> Result<u64, ApiError> {
-        let mut guard = crate::lock(&self.write);
+        let mut guard = crate::util::lock(&self.write);
         let inner = &mut *guard;
         ensure_open(inner)?;
         // Unlock-gated: report Locked before the entry-state guards, so a locked
@@ -670,7 +670,7 @@ impl Store {
         rate_limit: u64,
         epoch_size_sec: u64,
     ) -> Result<u64, ApiError> {
-        let guard = crate::lock(&self.write);
+        let guard = crate::util::lock(&self.write);
         let inner = &*guard;
         if !inner.sealed.as_ref().is_some_and(|f| f.credentials.contains_key(hash)) {
             return Ok(0);
@@ -688,11 +688,11 @@ impl Store {
     // ----------------------------------------------------------- helpers
 
     fn snapshot_arc(&self) -> Arc<Snapshot> {
-        crate::lock(&self.snapshot).clone()
+        crate::util::lock(&self.snapshot).clone()
     }
 
     fn swap_snapshot(&self, inner: &Inner) {
-        *crate::lock(&self.snapshot) = Arc::new(build_snapshot(inner));
+        *crate::util::lock(&self.snapshot) = Arc::new(build_snapshot(inner));
     }
 }
 
@@ -799,7 +799,7 @@ fn floor_refusal() -> ApiError {
 /// Move a corrupt file aside as `.bad.<unix-ts>` evidence (left in place if
 /// the rename fails).
 fn quarantine_file(dir: &Path, file_name: &str, why: &str) {
-    let bad = dir.join(format!("{file_name}.bad.{}", crate::now_unix()));
+    let bad = dir.join(format!("{file_name}.bad.{}", crate::util::now_unix()));
     eprintln!(
         "sealed store: {file_name} corrupt ({why}); attempting to move aside to {}",
         bad.display()
@@ -1179,7 +1179,7 @@ mod tests {
             registry_id: registry.to_string(),
             rln_identifier: String::new(),
             identity_commitment: registry_id::bytes_to_hex(commitment),
-            submitted_at: crate::now_unix(),
+            submitted_at: crate::util::now_unix(),
         }
     }
 
@@ -1219,7 +1219,7 @@ mod tests {
 
     #[test]
     fn reservation_floor_and_epoch_size_survive_restart() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("floor");
         let registry = format!("logos:local:{}", "aa".repeat(32));
         let commitment = [0x66u8; 32];
@@ -1254,7 +1254,7 @@ mod tests {
 
     #[test]
     fn locked_cache_updates_do_not_invalidate() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("locked-cache");
         let registry = format!("logos:local:{}", "cc".repeat(32));
         let commitment = [0x61u8; 32];
@@ -1286,7 +1286,7 @@ mod tests {
 
     #[test]
     fn census_and_unlock_matrix() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("census");
         let registry = format!("logos:local:{}", "cd".repeat(32));
         let commitment_a = [0x51u8; 32];
@@ -1343,7 +1343,7 @@ mod tests {
 
     #[test]
     fn tampered_allocations_matrix() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("alloc-tamper");
         let registry = format!("logos:local:{}", "bb".repeat(32));
         let commitment_a = [0x51u8; 32];
@@ -1447,7 +1447,7 @@ mod tests {
 
     #[test]
     fn reservation_refuses_growth_past_the_write_row_cap() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("row-cap");
         let registry = format!("logos:local:{}", "cc".repeat(32));
         let store = Store::open(dir.clone()).unwrap();
@@ -1471,7 +1471,7 @@ mod tests {
 
     #[test]
     fn second_open_is_refused_while_the_first_holds_the_lock() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("dir-lock");
         let first = Store::open(dir.clone()).unwrap();
         let second = Store::open(dir.clone());
@@ -1483,7 +1483,7 @@ mod tests {
 
     #[test]
     fn a_closed_store_refuses_writes() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("closed-writes");
         let store = Store::open(dir.clone()).unwrap();
         store.unlock("pw").unwrap();
@@ -1500,7 +1500,7 @@ mod tests {
     fn all_quarantined_store_is_not_fresh() {
         // Auto-unlock must never invent a secret it cannot verify: a store
         // whose every entry is quarantined still HAS credentials.
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("not-fresh");
         let registry = format!("logos:local:{}", "ef".repeat(32));
         let store = Store::open(dir.clone()).unwrap();
@@ -1518,7 +1518,7 @@ mod tests {
 
     #[test]
     fn empty_store_verifier_flow() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("verifier");
         let registry = format!("logos:local:{}", "ee".repeat(32));
         let commitment = [0x42u8; 32];
@@ -1555,7 +1555,7 @@ mod tests {
 
     #[test]
     fn insert_orphans_and_reinsert() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("orphans");
         let registry = format!("logos:local:{}", "ab".repeat(32));
         let commitment_a = [0x51u8; 32];
@@ -1599,8 +1599,8 @@ mod tests {
     }
 
     #[test]
-    fn old_format_refusal() {
-        let _serial = crate::lock(&SERIAL);
+    fn old_keystore_file_refuses_open_only_without_a_new_store() {
+        let _serial = crate::util::lock(&SERIAL);
 
         let dir = test_dir("oldfmt-only");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1631,7 +1631,7 @@ mod tests {
 
     #[test]
     fn locked_structural_gates() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("locked-gates");
         let registry = format!("logos:local:{}", "de".repeat(32));
         let commitment_a = [0x51u8; 32];
@@ -1664,7 +1664,7 @@ mod tests {
 
     #[test]
     fn cache_corruption_heals() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("cache-heal");
         let registry = format!("logos:local:{}", "ef".repeat(32));
         let commitment = [0x44u8; 32];
@@ -1692,7 +1692,7 @@ mod tests {
 
     #[test]
     fn identity_field_tamper_matrix() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("aad-tamper");
         let registry = format!("logos:local:{}", "fa".repeat(32));
         let commitment_a = [0x53u8; 32];
@@ -1749,7 +1749,7 @@ mod tests {
     #[test]
     fn persist_failure_wastes_slot_never_reissues() {
         use std::os::unix::fs::PermissionsExt;
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("persist-fail");
         let registry = format!("logos:local:{}", "fc".repeat(32));
         let commitment = [0x55u8; 32];
@@ -1774,7 +1774,7 @@ mod tests {
 
     #[test]
     fn concurrent_storm_holds_the_one_write_mutex_rule() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("storm");
         let registry = format!("logos:local:{}", "fd".repeat(32));
         let commitment = [0x56u8; 32];
@@ -1823,7 +1823,7 @@ mod tests {
 
     #[test]
     fn overcap_allocations_file_quarantines_all() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("overcap-alloc");
         let registry = format!("logos:local:{}", "fe".repeat(32));
         let commitment_a = [0x57u8; 32];
@@ -1872,7 +1872,7 @@ mod tests {
 
     #[test]
     fn overcap_cache_file_degrades_to_defaults() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("overcap-cache");
         let registry = format!("logos:local:{}", "df".repeat(32));
         let commitment = [0x5du8; 32];
@@ -1898,7 +1898,7 @@ mod tests {
 
     #[test]
     fn oversize_sealed_file_refuses_open() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("oversize-sealed");
         let registry = format!("logos:local:{}", "ea".repeat(32));
         let commitment = [0x5eu8; 32];
@@ -1928,7 +1928,7 @@ mod tests {
 
     #[test]
     fn overcount_sealed_credentials_starts_fresh() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("overcount-sealed");
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -1968,7 +1968,7 @@ mod tests {
 
     #[test]
     fn insert_crash_windows_are_inert_or_healed() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("crash-windows");
         let registry = format!("logos:local:{}", "da".repeat(32));
         let commitment_a = [0x59u8; 32];
@@ -2013,7 +2013,7 @@ mod tests {
     #[test]
     fn snapshot_reads_stay_consistent_during_persist() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("snapshot-reads");
         let registry = format!("logos:local:{}", "db".repeat(32));
         let commitment = [0x5bu8; 32];
@@ -2066,7 +2066,7 @@ mod tests {
 
     #[test]
     fn cache_updates_never_touch_covered_bytes() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("cache-bytes");
         let registry = format!("logos:local:{}", "dc".repeat(32));
         let commitment = [0x5cu8; 32];
@@ -2094,7 +2094,7 @@ mod tests {
 
     #[test]
     fn first_active_at_is_monotone_through_update_cache() {
-        let _serial = crate::lock(&SERIAL);
+        let _serial = crate::util::lock(&SERIAL);
         let dir = test_dir("first-active");
         let registry = format!("logos:local:{}", "dd".repeat(32));
         let commitment = [0x5fu8; 32];

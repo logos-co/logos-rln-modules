@@ -98,7 +98,7 @@ pub(crate) fn wait_tick_or_nudge(my_gen: u64, dur: Duration) -> bool {
 }
 
 fn wait(my_gen: u64, dur: Duration, honor_nudge: bool) -> bool {
-    let guard = crate::lock(&SUP);
+    let guard = crate::util::lock(&SUP);
     let entry_nudges = guard.nudges;
     let (sup, timeout) = CVAR
         .wait_timeout_while(guard, dur, |s| {
@@ -117,25 +117,25 @@ fn wait(my_gen: u64, dur: Duration, honor_nudge: bool) -> bool {
 /// The raw wake for the subscribed tick loops ([`wait_tick_or_nudge`]);
 /// callers rate-limit themselves (see roots::nudge).
 pub(crate) fn nudge() {
-    crate::lock(&SUP).nudges += 1;
+    crate::util::lock(&SUP).nudges += 1;
     CVAR.notify_all();
 }
 
 #[cfg(test)]
 pub(crate) fn nudges_for_test() -> u64 {
-    crate::lock(&SUP).nudges
+    crate::util::lock(&SUP).nudges
 }
 
 #[cfg(test)]
 pub(crate) fn generation_for_test() -> u64 {
-    crate::lock(&SUP).generation
+    crate::util::lock(&SUP).generation
 }
 
 /// Spawn `body(generation)` into `slot` if permitted and not already alive.
 /// A slot whose previous worker has returned is reaped (instant join) and
 /// respawned; a live worker makes this a no-op.
 fn ensure(slot: fn(&mut Supervisor) -> &mut Slot, name: &'static str, body: fn(u64)) {
-    let mut sup = crate::lock(&SUP);
+    let mut sup = crate::util::lock(&SUP);
     if sup.state == WorkerState::Stopped {
         return;
     }
@@ -174,12 +174,12 @@ fn spawn_into(
         .spawn(move || {
             body();
             {
-                let mut sup = crate::lock(&SUP);
+                let mut sup = crate::util::lock(&SUP);
                 if sup.generation == gen {
                     sup.running = sup.running.saturating_sub(1);
                 }
             }
-            // Past the SUP section: the flag now truthfully means "instant
+            // Past the SUP section: the flag means "instant
             // join" for a reaper holding SUP. Only the wake — which needs no
             // lock — and the thread's own teardown remain.
             done_in.store(true, Ordering::SeqCst);
@@ -205,7 +205,7 @@ pub(crate) fn ensure_refresher() {
 /// kept, only the warm pass respawns.
 pub(crate) fn start(warm: impl FnOnce() + Send + 'static) {
     {
-        let mut sup = crate::lock(&SUP);
+        let mut sup = crate::util::lock(&SUP);
         if sup.state == WorkerState::Stopped {
             sup.generation += 1;
         }
@@ -215,7 +215,7 @@ pub(crate) fn start(warm: impl FnOnce() + Send + 'static) {
     CVAR.notify_all();
     ensure_poller();
     ensure_refresher();
-    let mut sup = crate::lock(&SUP);
+    let mut sup = crate::util::lock(&SUP);
     if let Some((handle, done)) = sup.warm.take() {
         // A previous warm pass that finished is reaped; one still in flight
         // is detached — its body bails on the stopped/generation checks.
@@ -244,12 +244,12 @@ pub(crate) fn start(warm: impl FnOnce() + Send + 'static) {
 /// next run keeps — no leak, no double-count on restart.
 pub(crate) fn stop() {
     {
-        let mut sup = crate::lock(&SUP);
+        let mut sup = crate::util::lock(&SUP);
         sup.state = WorkerState::Stopped;
         STOPPED.store(true, Ordering::SeqCst);
     }
     CVAR.notify_all();
-    let guard = crate::lock(&SUP);
+    let guard = crate::util::lock(&SUP);
     let (mut sup, _) = CVAR
         .wait_timeout_while(guard, GRACE, |s| s.running > 0)
         .unwrap_or_else(|p| p.into_inner());
@@ -269,7 +269,7 @@ pub(crate) fn stop() {
 
 #[cfg(test)]
 pub(crate) fn live_worker_count() -> usize {
-    crate::lock(&SUP).running
+    crate::util::lock(&SUP).running
 }
 
 /// Reset to a fresh NeverStarted supervisor; the generation bump makes any
@@ -277,7 +277,7 @@ pub(crate) fn live_worker_count() -> usize {
 /// hold the crate's global-state test lock.
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
-    let mut sup = crate::lock(&SUP);
+    let mut sup = crate::util::lock(&SUP);
     sup.state = WorkerState::NeverStarted;
     sup.generation += 1;
     sup.poller = None;
@@ -296,7 +296,7 @@ pub(crate) fn reset_for_test() {
 /// superseded and never touches `running`).
 #[cfg(test)]
 pub(crate) fn spawn_blocking_for_test(gate: Arc<(Mutex<bool>, Condvar)>, exited: Arc<AtomicBool>) {
-    let mut sup = crate::lock(&SUP);
+    let mut sup = crate::util::lock(&SUP);
     let gen = sup.generation;
     sup.poller = Some(spawn_into("rln-test-blocker", gen, move || {
         let (m, cv) = &*gate;
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn nudge_wakes_only_the_subscribed_loop() {
-        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
         let gen = generation_for_test();
 
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn stop_joins_workers_quickly() {
-        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
         ensure_poller();
         ensure_refresher();
@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn start_after_stop_respawns_with_new_generation() {
-        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
         start(|| {});
         let g1 = generation_for_test();
@@ -391,7 +391,7 @@ mod tests {
 
     #[test]
     fn spawn_is_forbidden_while_stopped_but_interest_is_recorded() {
-        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
         stop();
         crate::poller::ensure_running();
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn on_demand_spawn_before_start_is_idempotent() {
-        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
         crate::poller::ensure_running();
         assert_eq!(live_worker_count(), 1);
@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn stop_detaches_blocked_worker_without_duplicating_it() {
-        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let exited = Arc::new(AtomicBool::new(false));

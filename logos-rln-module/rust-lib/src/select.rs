@@ -14,7 +14,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::lifecycle::MembershipRecord;
-use crate::{lock, ApiError, ErrorKind};
+use crate::util::lock;
+use crate::error::{ApiError, ErrorKind};
 
 pub(crate) enum Selector {
     None,

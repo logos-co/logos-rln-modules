@@ -105,10 +105,7 @@ pub fn load_json<T: serde::de::DeserializeOwned + Default>(
     match serde_json::from_str::<T>(&raw) {
         Ok(file) => Ok(file),
         Err(e) => {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let ts = crate::util::now_unix();
             let bad = dir.join(format!("{file_name}.bad.{ts}"));
             eprintln!(
                 "keystore: {file_name} unparseable ({e}); attempting to move aside to {}",

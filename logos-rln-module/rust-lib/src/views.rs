@@ -116,6 +116,13 @@ pub(crate) struct MembershipStateView {
     provisioning: Option<ProvisioningView>,
     registry_id: String,
     state: MembershipState,
+    /// Why a `failed` or `erased` record is what it is, and whether a fresh
+    /// registration may be attempted (spec: a failed submission SHALL report
+    /// whether it is retryable). Present only on those states.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failed_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retryable: Option<bool>,
 }
 
 /// The provisioning task's current step, a human-readable detail, and — on
@@ -129,6 +136,10 @@ pub(crate) struct ProvisioningView {
     balance: Option<String>,
     #[serde(skip_serializing_if = "str::is_empty")]
     detail: String,
+    /// Why the allocator the registry was configured with did not deliver,
+    /// while the funded fallback runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fee_reserve: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,12 +156,18 @@ impl ProvisioningView {
         ProvisioningView {
             balance: None,
             detail,
+            fallback_reason: None,
             fee_reserve: None,
             payer: None,
             price: None,
             required: None,
             step,
         }
+    }
+
+    pub(crate) fn with_fallback_reason(mut self, reason: Option<String>) -> Self {
+        self.fallback_reason = reason;
+        self
     }
 
     /// Attach the funding snapshot's fields.
@@ -180,7 +197,16 @@ impl MembershipStateView {
             provisioning: None,
             registry_id: registry_id.to_string(),
             state: MembershipState::Unknown,
+            failed_reason: None,
+            retryable: None,
         }
+    }
+
+    /// Attach a terminal record's reason and retryability.
+    pub(crate) fn with_failure(mut self, reason: Option<String>, retryable: Option<bool>) -> Self {
+        self.failed_reason = reason;
+        self.retryable = retryable;
+        self
     }
 
     /// Attach provisioning progress, if any is recorded for this registry.
@@ -203,6 +229,8 @@ impl MembershipStateView {
             rate_limit: Some(rate_limit),
             registry_id: registry_id.to_string(),
             state,
+            failed_reason: None,
+            retryable: None,
         }
     }
 }

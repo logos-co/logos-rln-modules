@@ -56,7 +56,7 @@ type RegistryLog = HashMap<u64, EpochBucket>;
 
 /// canonical registry id → epoch → nullifier → the first accepted proof's
 /// shares. `Option` so the map is `const`-initializable (`HashMap::new` is
-/// not `const`); reached only through the poison-recovering [`crate::lock`].
+/// not `const`); reached only through the poison-recovering [`crate::util::lock`].
 static LOG: Mutex<Option<HashMap<String, RegistryLog>>> = Mutex::new(None);
 
 /// Record a proof that has ALREADY passed validity + root-window checks, and
@@ -81,7 +81,7 @@ pub(crate) fn record_verified(
     share_y: [u8; 32],
     retain_floor: u64,
 ) -> RecordOutcome {
-    let mut guard = crate::lock(&LOG);
+    let mut guard = crate::util::lock(&LOG);
     let log = guard.get_or_insert_with(HashMap::new);
     let epochs = log.entry(registry.to_string()).or_default();
     epochs.retain(|&e, _| e >= retain_floor);
@@ -98,7 +98,7 @@ pub(crate) fn record_verified(
 
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
-    *crate::lock(&LOG) = None;
+    *crate::util::lock(&LOG) = None;
 }
 
 #[cfg(test)]
@@ -112,7 +112,7 @@ mod tests {
     // under that lock.
     #[test]
     fn fresh_then_duplicate_then_collision() {
-        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
         let n = [0xa1u8; 32];
         let (x1, y1) = ([0x11u8; 32], [0x21u8; 32]);
@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn prunes_below_retain_floor() {
-        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
         let n = [0xb2u8; 32];
         let (x1, y1) = ([0x31u8; 32], [0x41u8; 32]);
@@ -148,7 +148,7 @@ mod tests {
     // slow one's nullifiers.
     #[test]
     fn prune_is_per_registry() {
-        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
         reset_for_test();
         let slow = "logos:local:d";
         let fast = "logos:local:m";

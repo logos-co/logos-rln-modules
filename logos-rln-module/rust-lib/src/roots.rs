@@ -13,7 +13,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::registry_id::{hex_to_bytes32, CanonicalRegistryId};
-use crate::{lock, provider, ApiError, ErrorKind};
+use crate::util::lock;
+use crate::error::{ApiError, ErrorKind};
+use crate::provider;
 
 /// Refresh cadence. Roots rotate over seconds–minutes and the window carries
 /// few historical roots (lez-rln ROOT_HISTORY_SIZE = 4); 10s keeps proofs
@@ -33,7 +35,7 @@ static WINDOWS: Mutex<Option<HashMap<String, Window>>> = Mutex::new(None);
 static TRACKED: Mutex<Option<HashMap<String, CanonicalRegistryId>>> = Mutex::new(None);
 
 /// On-demand refresh floor: a stream of invalid proofs must never become
-/// registry-read spam. Matches the sibling stacks' minimum refresh interval.
+/// registry-read spam. Matches the lez module's minimum refresh interval.
 const NUDGE_MIN_INTERVAL_SECS: u64 = 2;
 
 static LAST_NUDGE_UNIX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -46,7 +48,7 @@ static LAST_NUDGE_UNIX: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// interval to roughly one provider round-trip.
 pub(crate) fn nudge() {
     use std::sync::atomic::Ordering;
-    let now = crate::now_unix();
+    let now = crate::util::now_unix();
     let last = LAST_NUDGE_UNIX.load(Ordering::Relaxed);
     if now.saturating_sub(last) < NUDGE_MIN_INTERVAL_SECS {
         return;
@@ -69,7 +71,7 @@ pub(crate) fn adopt(canonical: &str, roots: Vec<[u8; 32]>) {
     }
     lock(&WINDOWS).get_or_insert_with(HashMap::new).insert(
         canonical.to_string(),
-        Window { roots, updated_at: crate::now_unix() },
+        Window { roots, updated_at: crate::util::now_unix() },
     );
 }
 
@@ -92,7 +94,7 @@ pub(crate) fn track(registry: &CanonicalRegistryId) {
 pub(crate) fn window(canonical: &str) -> Option<Vec<[u8; 32]>> {
     let guard = lock(&WINDOWS);
     let w = guard.as_ref()?.get(canonical)?;
-    if crate::now_unix().saturating_sub(w.updated_at) > STALE_AFTER_SECS {
+    if crate::util::now_unix().saturating_sub(w.updated_at) > STALE_AFTER_SECS {
         return None;
     }
     Some(w.roots.clone())
@@ -107,17 +109,14 @@ pub(crate) fn ensure_refresher() {
 
 /// The refresher worker body, owned by the supervisor: an interruptible tick
 /// loop that exits when its run is superseded (`stop()`, or a restart's
-/// generation bump); each tick is wrapped so a transient failure never kills
-/// the worker. The one nudge subscriber ([`nudge`] asks for exactly this
-/// loop's work).
+/// generation bump). The one nudge subscriber ([`nudge`] asks for exactly
+/// this loop's work).
 pub(crate) fn run_loop(my_gen: u64) {
     loop {
         if !crate::worker::wait_tick_or_nudge(my_gen, REFRESH_INTERVAL) {
             return;
         }
-        if let Err(payload) = std::panic::catch_unwind(refresh_all) {
-            eprintln!("roots refresher: refresh panicked: {payload:?}");
-        }
+        refresh_all();
     }
 }
 
@@ -164,7 +163,7 @@ fn refresh_one(registry: &CanonicalRegistryId) -> Result<(), ApiError> {
         registry.canonical.clone(),
         Window {
             roots,
-            updated_at: crate::now_unix(),
+            updated_at: crate::util::now_unix(),
         },
     );
     Ok(())
@@ -203,7 +202,7 @@ mod tests {
 
     #[test]
     fn nudge_is_rate_limited() {
-        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
         reset_nudge_for_test();
         let before = crate::worker::nudges_for_test();
         nudge();
@@ -218,7 +217,7 @@ mod tests {
     #[test]
     fn fresh_window_is_served_stale_window_is_cold() {
         let canonical = "logos:local:roots-test";
-        let now = crate::now_unix();
+        let now = crate::util::now_unix();
         set_window_for_test(canonical, vec![[1u8; 32], [2u8; 32]], now);
         let served = window(canonical).expect("fresh window served");
         assert_eq!(served, vec![[1u8; 32], [2u8; 32]]);

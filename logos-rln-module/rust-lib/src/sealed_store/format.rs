@@ -14,7 +14,7 @@ use crate::sealed_store::crypto::KdfParams;
 pub const SEALED_FILE: &str = "rln_sealed.json";
 pub const ALLOCATIONS_FILE: &str = "rln_allocations.json";
 pub const CACHE_FILE: &str = "rln_cache.json";
-// Never rename: pre-0.6.0 and current binaries must contend on one lock.
+// Never rename: every binary version must contend on this one lock file.
 pub const LOCK_FILE: &str = "rln_keystore.lock";
 pub const OLD_FORMAT_FILE: &str = "rln_keystore.json";
 

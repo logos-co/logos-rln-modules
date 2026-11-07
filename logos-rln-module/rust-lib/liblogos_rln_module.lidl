@@ -8,10 +8,10 @@
 ; generation with persisted per-epoch message_id allocation; verification
 ; from a locally maintained valid-root window (no registry access on the
 ; hot path). Every call is scoped by (registry_id, rln_identifier); the
-; lez-rln provider ("logos" namespace) is a wire client of the sibling
+; lez-rln provider ("logos" namespace) is a wire client of the lez module
 ; liblogos_lez_rln_module, and delegated registration drives rln_gifter_module.
 ;
-; Reply conventions (this module only — the sibling keeps its ""-on-error).
+; Reply conventions (this module only — the lez module keeps its ""-on-error).
 ; Two dialects, split by declared return type:
 ; - `result` methods (the RLN-API rate-limiting + lifecycle surface: start,
 ;   stop, generate_proof, validate_proof, get_registry_parameters) return a
@@ -41,10 +41,10 @@
 ; Events are a third channel, pushed over the lp event stream rather than
 ; returned from a call — see the events section below.
 module liblogos_rln_module {
-  version "0.14.2"
+  version "0.16.0"
   description "RLN Membership Management Module"
   category "blockchain"
-  depends [liblogos_lez_rln_module]
+  depends [liblogos_lez_rln_module, rln_gifter_module]
 
   ; --- data shapes ---
   ; Contract documentation, not code generation: no method here declares a
@@ -106,7 +106,7 @@ module liblogos_rln_module {
   ; resolved for THIS registry (its start() override when one was
   ; configured, else the module default); the registry-declared bounds are
   ; present only when the registry read returned them. price_per_unit is
-  ; passed through opaquely (the sibling documents it as a decimal STRING;
+  ; passed through opaquely (the lez module documents it as a decimal STRING;
   ; this contract makes no assumption about its shape).
   type RegistryParameters {
     epoch_size_sec: int
@@ -151,17 +151,25 @@ module liblogos_rln_module {
   ; invalid_argument; duplicate keys too). The common key "rate_limit"
   ; (decimal string) requests the per-epoch rate; absent, the module
   ; applies its default (the registry declares none yet — a lez-rln
-  ; follow-up). "funding_holding_account_id" was MANDATORY for the logos
-  ; namespace until 0.8.0 and is now accepted and ignored: the registry takes
-  ; the native asset and the registry module pays from its own account, so
-  ; nothing here selects a payer. Ignored rather than rejected because every
-  ; shipped caller still sends it; the break is semantic, one layer down,
-  ; where the account it names no longer pays. Logos-namespace keys:
-  ; "delegated":"true" +
-  ; "gifter_peer_id"/"gifter_multiaddr" and the optional "auth_type"/
+  ; follow-up). Logos-namespace keys:
+  ; "delegated":"true" + the optional "discover" ("true" unless given),
+  ; "gifter_peer_id"/"gifter_multiaddr" (together, or neither), "auth_type"/
   ; "auth_payload"/"auth_provider"/"auth_args" — delegated registration via
   ; the RLN Membership Allocation Protocol: register drives
-  ; rln_gifter_module.request with the module-generated commitment. auth_type
+  ; rln_gifter_module.request with the module-generated commitment and the
+  ; scope's registry (its config account). Since 0.16.0 the gifter client
+  ; asks the allocators advertising the (registry, auth_type) pair through
+  ; libp2p service discovery first ("discover"; this node's libp2p_module
+  ; must have discovery mounted, else that step reports itself unavailable)
+  ; and the configured pair after them; "discover":"false" dials the pair
+  ; alone, and neither is invalid_argument. A gifter that does not serve
+  ; that registry refuses at once ("registry not served") and a grant on
+  ; another registry fails the record, instead of the confirmation window.
+  ; Since 0.16.0 a delegated registration's confirmation window is the gifter
+  ; client's budget (340 s) plus the funded one (300 s), so a slow gift is
+  ; not failed while the allocator may still answer, and a grant that lands
+  ; after the window closed re-opens the record for the poller to confirm.
+  ; auth_type
   ; names the gifter auth vector verbatim (open vocabulary); its payload is
   ; auth_payload (hex) or produced by the auth_provider module (an
   ; rln_auth_vector producer, auth_args forwarded verbatim — e.g.
@@ -169,7 +177,7 @@ module liblogos_rln_module {
   ; the registry's bounds fails permanent BEFORE a credential is minted (soft
   ; pre-check: an unreadable registry skips it and lets the registry enforce
   ; at submission). Idempotent PER SCOPE (spec): a live membership registered
-  ; under this rln_identifier — or a pre-scope legacy record, which backs
+  ; under this rln_identifier — or a record with no rln_identifier, which backs
   ; every application — short-circuits; a DIFFERENT application registering
   ; on the same registry gets its own membership (isolated slashing blast
   ; radius), while a lone membership still backs any application at proof
@@ -207,25 +215,35 @@ module liblogos_rln_module {
   ; scoped registration and belongs to register_membership. internal when
   ; the host provided no persistence path.
   ; The provisioning object, on get_membership_state and here: {"step":
-  ; "waiting_for_wallet"|"awaiting_funding"|"registering"|"done"|"refused",
-  ; "detail":<human sentence, omitted when empty>} and, on awaiting_funding
-  ; only, the numbers behind the sentence as decimal strings: "payer" (hex64
-  ; account to fund), "required" (price + fee reserve), "price",
-  ; "fee_reserve", and "balance" once the first balance read happened. A UI
-  ; renders "send <required> to <payer>" — or hands the pair to a wallet
-  ; app — from the fields, never from the sentence.
+  ; "delegating"|"waiting_for_wallet"|"awaiting_funding"|"registering"|
+  ; "done"|"refused", "detail":<human sentence, omitted when empty>,
+  ; "fallback_reason"?:<why the registry's allocator did not deliver, on
+  ; every step of the funded fallback that follows it>} and, on
+  ; awaiting_funding only, the numbers behind the sentence as decimal
+  ; strings: "payer" (hex64 account to fund), "required" (price + fee
+  ; reserve), "price", "fee_reserve", and "balance" once the first balance
+  ; read happened. A UI renders "send <required> to <payer>" — or hands the
+  ; pair to a wallet app — from the fields, never from the sentence. The
+  ; registry's allocator (start()'s "allocator") is asked first here too.
   method ensure_membership(registry_id: tstr, options_json: tstr) -> tstr
 
-  ; Spec get_membership_state(scope). Resolves the membership BACKING the
-  ; scope: records registered under this rln_identifier (or carrying none —
-  ; legacy) first; with no usable match, any of the registry's records. The
-  ; live registry read overlaid on the local record: an in-window unconfirmed
+  ; Spec get_membership_state(scope). Resolves the record answering the
+  ; scope by rank: the scope's OWN records (its live one; with none live,
+  ; its latest terminal one — a refused registration reads back "failed"
+  ; here, whatever else the registry holds), then the registry-wide records
+  ; (no rln_identifier, as start() provisions them), then any usable
+  ; membership on the registry (a lone membership backs every application).
+  ; The live registry read overlaid on that record: an in-window unconfirmed
   ; submission reports "pending" (not "unknown"), a vanished previously-active
-  ; membership reports "erased". No candidate → "unknown"; more than one
-  ; → ambiguous_selection. {"registry_id":…,"state":"pending"|"failed"|
+  ; membership reports "erased". No record → "unknown"; more than one live
+  ; record at the winning rank → ambiguous_selection. While a provisioning
+  ; pass works the registry, a scope whose answer would be a terminal record
+  ; (an allocator's refusal the funded fallback follows) reads "unknown"
+  ; with the pass's provisioning object instead. {"registry_id":…,"state":"pending"|"failed"|
   ; "active"|"grace_period"|"expired"|"erased_awaits_withdrawal"|"slashed"|
   ; "erased"|"unknown"} plus membership_hash / leaf_index / rate_limit when
-  ; known. (erased_awaits_withdrawal and slashed complete the spec
+  ; known, and on "failed"/"erased" the record's "failed_reason" and
+  ; "retryable" (since 0.16.0). (erased_awaits_withdrawal and slashed complete the spec
   ; vocabulary; the logos registry does not expose those removal causes, so
   ; this module never emits them today.) "unknown" carries "provisioning"
   ; while start()/ensure_membership provisioning works on the registry —
@@ -268,7 +286,7 @@ module liblogos_rln_module {
   ; stamps on the message. The proof's epoch derives from it (epoch =
   ; timestamp / epoch_size_sec), NOT this module's clock, so the epoch always
   ; agrees with the message timestamp a receiver validates against — the two
-  ; independent clocks can no longer disagree on an epoch boundary. Picks the
+  ; independent clocks cannot disagree on an epoch boundary. Picks the
   ; scope's sole usable (active|grace_period) membership, decrypts its
   ; credential IN-MODULE (requires an unlocked keystore — the secret never
   ; crosses this wire), reserves and durably persists the next message_id,
@@ -410,7 +428,7 @@ module liblogos_rln_module {
   ; keystore dir — the module-owned marker; self-provisioned secrets
   ; always land here), then the macOS login keychain (service
   ; org.logos.rln-membership.keystore, account = sha256 of the verbatim
-  ; persistence dir — the UI-owned / legacy marker, and
+  ; persistence dir — the UI-owned marker, and
   ; remember_keystore_password's target; its item carries
   ; -T /usr/bin/security, dev trust level). Unlocks through the NORMAL
   ; verification seam; with no stored secret and a NEVER-PROVISIONED
@@ -467,12 +485,38 @@ module liblogos_rln_module {
   ; rate-limiting methods — generate_proof, validate_proof, get_epoch_quota —
   ; fail not_ready), "max_epoch_gap"?:N (default 1),
   ; "rate_limit"?:N (default 100, the rate provisioning registers at),
-  ; "provision"?:bool (default true), "registries"?:[…] (root windows are
-  ; warmed immediately). A registries entry is either a "<caip10>" string or
-  ; an object {"registry_id":"<caip10>","epoch_size_sec"?:N,
-  ; "max_epoch_gap"?:N,"rate_limit"?:N} (spec: epoch size and gap are
+  ; "provision"?:bool (default true), "allocator"?:{…} (below),
+  ; "registries"?:[…] (root windows are warmed immediately). A registries
+  ; entry is either a "<caip10>" string or an object
+  ; {"registry_id":"<caip10>","epoch_size_sec"?:N,"max_epoch_gap"?:N,
+  ; "rate_limit"?:N,"allocator"?:{…}|null} (spec: epoch size and gap are
   ; per-registry configuration; the rate-limiting methods resolve them per
-  ; registry). Since 0.14.2 a call sets the registries it names and leaves
+  ; registry).
+  ; Since 0.14.4 "allocator" names the membership allocator (RLN Membership
+  ; Allocation Protocol, rln_gifter_module + libp2p_module on this node)
+  ; provisioning asks FIRST: {"discover"?:bool (default true),
+  ; "peer_id"?:"<PeerId>","multiaddr"?:"<ma>" (together),
+  ; "auth_type"?:"<scheme>-<authoriser>","auth_payload"?:hex |
+  ; "auth_provider"?:"<module>","auth_args"?:str} — the same vocabulary as
+  ; register_membership's delegated options, validated the same way (a bad
+  ; block fails start() invalid_argument; {} is discovery alone). Since
+  ; 0.16.0 the allocators advertising the (registry, auth_type) pair
+  ; through libp2p service discovery are asked first, in turn while none
+  ; has read the request, then the configured pair; discovery needs this
+  ; node's libp2p_module started with discovery mounted and bootstrap
+  ; peers, which the host arranges (a node without it goes straight to the
+  ; pair, or to the funded fallback). The top-level block applies to
+  ; every registry this call names; an entry's own block replaces it for
+  ; that registry, and an entry's null opts the registry out. The request
+  ; names the registry, so one allocator serving several registries covers
+  ; them all. Provisioning then runs "delegating" (asking the allocator;
+  ; the record settles active via the registry read-back or failed via the
+  ; gifter's reply) and, when nothing was granted — the gifter module not
+  ; loaded, no allocator found or reachable, its refusal, a registry it does
+  ; not serve — falls back to the funded registration below, with that
+  ; reason in the provisioning object's "fallback_reason". Without an
+  ; allocator block, provisioning is the funded registration alone, as
+  ; before. Since 0.14.2 a call sets the registries it names and leaves
   ; every other registry's configuration in force: an object entry sets its
   ; registry's values (absent fields take this call's defaults); a plain
   ; string pins this call's defaults for a registry nothing has configured
@@ -512,7 +556,7 @@ module liblogos_rln_module {
   ; a membership's registry-observed state CHANGES (pending->active,
   ; pending->failed, active->grace_period/expired, observed->erased) — never
   ; for a mere re-observation of the same state. rln_identifier is the
-  ; registering scope's (empty for a pre-scope legacy record); consumers
+  ; registering scope's (empty for a registry-wide record); consumers
   ; filter on (registry_id, membership_hash). previous is the state the
   ; record held before the transition.
   event membership_state_changed(registry_id: tstr, rln_identifier: tstr, membership_hash: tstr, state: tstr, previous: tstr)

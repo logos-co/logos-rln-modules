@@ -6,11 +6,8 @@
 //! waiting for it to be funded, pricing the registration, submitting it — is
 //! this module's work, not the caller's.
 //!
-//! Before registration became single-asset this could not have lived here: it
-//! needed a holding account derived in a sibling's wallet, a faucet claim, a
-//! second balance to watch and a deployment policy that said whether the
-//! faucet existed at all. One account and one asset is what makes it short
-//! enough to be worth doing automatically.
+//! One account and one asset keeps this short enough to do automatically: no
+//! derived holding account, faucet claim, second balance or deployment policy.
 //!
 //! ## Why it runs detached
 //!
@@ -31,8 +28,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::lifecycle::{granted_by, MembershipState};
+use crate::error::{ApiError, ErrorKind};
 use crate::{
-    ApiError, ErrorKind, provider_of, records_for_registry, register_scoped, registry_id, worker,
+    provider_of, records_for_registry, register_scoped, registry_id, worker,
+    DelegatedOptions,
 };
 
 /// A registry-wide membership: the credential is stored with no
@@ -56,15 +56,42 @@ const TICK: Duration = Duration::from_secs(5);
 /// past it the pass moves on and the next submit takes its chances.
 const CONFIRM_HOLD: Duration = Duration::from_secs(900);
 
+/// Slack `DELEGATE_HOLD` keeps past a delegated record's confirmation
+/// deadline, so the poller fails an unseen record before the pass stops
+/// waiting for it.
+const DELEGATE_HOLD_MARGIN: Duration = Duration::from_secs(80);
+
+/// How long a delegated registration may stay `pending` before the pass
+/// falls back to a funded one. Longer than a delegated record's own
+/// confirmation deadline (the gifter client's whole budget plus the
+/// confirmation window), so a live poller has already settled the record
+/// when it expires; it bounds the wait only if the poller is not running.
+/// A still-pending record short-circuits the funded register (one live
+/// record per scope).
+const DELEGATE_HOLD: Duration = crate::provider::GIFTER_REQUEST_TIMEOUT
+    .saturating_add(Duration::from_secs(crate::lifecycle::CONFIRMATION_WINDOW_SECS))
+    .saturating_add(DELEGATE_HOLD_MARGIN);
+/// How long a granted gift waits for the allocator's reply to name the
+/// granter after the registry already confirmed it.
+const ATTRIBUTION_HOLD: Duration = Duration::from_secs(20);
+
+/// One registry's provisioning order: its allocator first, when `start()`
+/// configured one, then the funded registration.
+#[derive(Clone, Debug)]
+pub(crate) struct Provision {
+    pub(crate) registry: String,
+    pub(crate) rate_limit: u64,
+    pub(crate) allocator: Option<DelegatedOptions>,
+}
+
 /// Which provisioning pass is the current one.
 ///
 /// `worker::start()` spawns a fresh warm task and DETACHES any still in
 /// flight — the worker API hands that body no generation of its own, and a
 /// repeated `start()` (which is every `configureRln`, so every delivery
 /// bring-up) never sets the stopped flag. So a superseded pass has nothing to
-/// notice, and since the funding wait lost its deadline it would otherwise
-/// poll for the rest of the process's life, one more each time. The deadline
-/// used to hide this by killing such a task within fifteen minutes.
+/// notice, and, the funding wait having no deadline, it would otherwise
+/// poll for the rest of the process's life, one more each time.
 ///
 /// Every pass takes a ticket on entry and both waits check it, so exactly one
 /// pass is ever live and the newest wins — which is the right one, because it
@@ -73,9 +100,16 @@ const CONFIRM_HOLD: Duration = Duration::from_secs(900);
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Should this pass stop — because the module stopped, or because a later
-/// `start()` superseded it?
-fn superseded(mine: u64) -> bool {
+/// `start()` or `stop()` superseded it?
+pub(crate) fn superseded(mine: u64) -> bool {
     worker::is_stopped() || EPOCH.load(Ordering::SeqCst) != mine
+}
+
+/// Take the next ticket: every pass in flight is superseded from here on.
+/// `start()` and `stop()` both call it, whether or not a pass follows — a
+/// pass parked across a stop and a `start({"provision":false})` must end too.
+pub(crate) fn supersede() -> u64 {
+    EPOCH.fetch_add(1, Ordering::SeqCst) + 1
 }
 
 /// How often to READ the payer's balance, given how long the wait has run.
@@ -95,7 +129,7 @@ fn read_interval(waited: Duration) -> Duration {
     }
 }
 
-/// The execution gas limit the sibling's wallet declares for a registration:
+/// The execution gas limit the lez module's wallet declares for a registration:
 /// `GAS_LIMIT` in logos-lez-rln-module/rust-lib/src/wallet.rs, written into
 /// every home it provisions. A registration costs ~9.1M cycles, so the stock
 /// 2,000,000 default cannot be what an adopted home declares either.
@@ -119,12 +153,9 @@ const ASSUMED_DATA_BYTES: u128 = 100_000;
 /// to the actual fee — while under-reserving fails the Register on chain.
 const BASE_FEE_HEADROOM: u128 = 2;
 
-/// The reserve when no fee quote can be had — an older sibling without
-/// `get_fee_state` (or one before lez 5.0.0 on an https sequencer: its quote
-/// read spoke plain http only), a transport error or an unparsable
-/// reply: the wallet's own declared cap, `(gas_limit + ASSUMED_DATA_BYTES) x
-/// ASSUMED_BASE_FEE (64)`, ~646M. It is what every release before 0.10.0
-/// waited for, so an older sibling keeps working exactly as it did.
+/// The reserve when the lez module gives no fee quote (no `get_fee_state`,
+/// unreachable, malformed reply): the wallet's own declared cap,
+/// `(gas_limit + ASSUMED_DATA_BYTES) x ASSUMED_BASE_FEE (64)`, ~646M.
 const FALLBACK_FEE_RESERVE: u128 = (DECLARED_GAS_LIMIT + ASSUMED_DATA_BYTES) * 64;
 
 /// Where a reserve came from, so the log can say when it changes.
@@ -155,7 +186,7 @@ fn fee_reserve_from(quote: &serde_json::Value) -> Option<u128> {
     )
 }
 
-/// The reserve from the sibling's live quote, or `FALLBACK_FEE_RESERVE`.
+/// The reserve from the lez module's live quote, or `FALLBACK_FEE_RESERVE`.
 fn fee_reserve(quote: Result<serde_json::Value, ApiError>) -> (u128, ReserveBasis) {
     let computed = quote.ok().and_then(|q| {
         let height = q.get("height").and_then(serde_json::Value::as_u64).unwrap_or(0);
@@ -164,9 +195,103 @@ fn fee_reserve(quote: Result<serde_json::Value, ApiError>) -> (u128, ReserveBasi
     computed.unwrap_or((FALLBACK_FEE_RESERVE, ReserveBasis::Fallback))
 }
 
+/// How a delegated registration ended, for the pass to act on.
+enum Delegated {
+    /// The allocator's membership is live on the registry; the pass is done.
+    Granted,
+    /// The keystore is locked: no credential can be minted for a gift or a
+    /// funded registration alike, so the funded fallback would only wait for
+    /// a payer to be funded for nothing.
+    Locked(String),
+    /// Nothing was granted; `provision_one` falls back to a funded registration.
+    Refused(String),
+    Superseded,
+}
+
+/// Ask the registry's allocator for a membership through the wire method's
+/// own delegated path (`register_scoped`: the in-flight guard, the poller and
+/// the registry cross-check come along), then hold until the record settles:
+/// `Active` via the poller's registry read-back, `Failed` via the gifter
+/// client's reply (`gifter_failed: …`) or the confirmation window.
+fn delegate_one(
+    registry: &registry_id::CanonicalRegistryId,
+    rate_limit: u64,
+    allocator: &DelegatedOptions,
+    mine: u64,
+) -> Delegated {
+    let who = match (allocator.discover, allocator.gifter_peer_id.is_empty()) {
+        (true, true) => format!("a discovered allocator for {}", registry.canonical),
+        (true, false) => format!(
+            "a discovered allocator for {}, else allocator {} at {}",
+            registry.canonical, allocator.gifter_peer_id, allocator.gifter_multiaddr
+        ),
+        (false, _) => format!("allocator {} at {}", allocator.gifter_peer_id, allocator.gifter_multiaddr),
+    };
+    record(&registry.canonical, Step::Delegating, &format!("asking {who}"));
+    let store = crate::sealed_store::store::current_or_uninit();
+    let reply = match register_scoped(store, registry, REGISTRY_WIDE, rate_limit, Some(allocator.clone())) {
+        Ok(v) => v,
+        Err(e) if e.kind == ErrorKind::Locked => return Delegated::Locked(format!("{who}: {}", e.message)),
+        // Not sent: the gifter module missing, options the registry refuses.
+        Err(e) => return Delegated::Refused(format!("{who}: {}", e.message)),
+    };
+    let hash = reply.get("membership_hash").and_then(|h| h.as_str()).unwrap_or_default().to_string();
+    let started = Instant::now();
+    let mut attribution_wait = Duration::ZERO;
+    loop {
+        if superseded(mine) {
+            return Delegated::Superseded;
+        }
+        let record_now = crate::sealed_store::store::current()
+            .and_then(|s| records_for_registry(&s, registry).into_iter().find(|r| r.hash == hash));
+        match record_now {
+            Some(r) if r.cache.state.is_usable() => {
+                // The registry can confirm the gift before the allocator's
+                // reply names who granted it: give that reply a few ticks.
+                let by = match granted_by(&hash) {
+                    Some(peer) => format!("allocator {peer}"),
+                    None if attribution_wait < ATTRIBUTION_HOLD => {
+                        attribution_wait += TICK;
+                        std::thread::sleep(TICK);
+                        continue;
+                    }
+                    None => "an allocator".to_string(),
+                };
+                record(
+                    &registry.canonical,
+                    Step::Done,
+                    &format!("gifted by {by} at leaf {}", r.cache.leaf_index.unwrap_or(0)),
+                );
+                eprintln!(
+                    "provision {}: {by} registered a registry-wide membership at rate {rate_limit}",
+                    registry.canonical
+                );
+                return Delegated::Granted;
+            }
+            Some(r) if r.cache.state == MembershipState::Pending => {}
+            Some(r) => {
+                let why = r.cache.failed_reason.clone().unwrap_or_else(|| format!("record went {:?}", r.cache.state));
+                return Delegated::Refused(format!("{who}: {why}"));
+            }
+            // The store was republished under the pass; keep looking until the hold ends.
+            None => {}
+        }
+        if started.elapsed() >= DELEGATE_HOLD {
+            return Delegated::Refused(format!(
+                "{who}: no answer within {}s",
+                DELEGATE_HOLD.as_secs()
+            ));
+        }
+        std::thread::sleep(TICK);
+    }
+}
+
 /// What the task is waiting on, for `get_membership_state` to surface.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Step {
+    /// Asking the registry's allocator (the RLN Membership Allocation
+    /// Protocol) for a gifted membership.
+    Delegating,
     WaitingForWallet,
     AwaitingFunding,
     Registering,
@@ -178,6 +303,7 @@ pub(crate) enum Step {
 impl Step {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Step::Delegating => "delegating",
             Step::WaitingForWallet => "waiting_for_wallet",
             Step::AwaitingFunding => "awaiting_funding",
             Step::Registering => "registering",
@@ -193,22 +319,25 @@ impl Step {
 /// Errors are logged and abandoned per registry rather than propagated: this
 /// runs detached, there is nobody to return to, and one unreachable registry
 /// must not stop the others.
-pub(crate) fn run(registries: Vec<(String, u64)>) {
-    let mine = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
-    run_as(registries, mine)
+///
+/// Runs under a ticket `start()` already took (`supersede`), so the pass
+/// is the one that call started and nothing between the two superseded it.
+pub(crate) fn run_with(registries: Vec<Provision>, ticket: u64) {
+    run_as(registries, ticket)
 }
 
-/// `run` for one registry asked for OUTSIDE `start()` — `ensure_membership`
+/// `run_with` for one registry asked for OUTSIDE `start()` — `ensure_membership`
 /// from a UI. It adopts the ticket in force instead of taking a new one, so
 /// it supersedes nothing: a `start()` pass parked on another registry's
 /// funding keeps waiting. The next `start()` ends it like any other pass, and
 /// `is_running` keeps two from working the same registry at once.
 pub(crate) fn run_alongside(registry: String, rate_limit: u64) {
-    run_as(vec![(registry, rate_limit)], EPOCH.load(Ordering::SeqCst))
+    let allocator = crate::allocator_for(&registry);
+    run_as(vec![Provision { registry, rate_limit, allocator }], EPOCH.load(Ordering::SeqCst))
 }
 
-fn run_as(registries: Vec<(String, u64)>, mine: u64) {
-    for (raw, rate_limit) in registries {
+fn run_as(registries: Vec<Provision>, mine: u64) {
+    for Provision { registry: raw, rate_limit, allocator } in registries {
         if superseded(mine) {
             return;
         }
@@ -219,11 +348,11 @@ fn run_as(registries: Vec<(String, u64)>, mine: u64) {
                 continue;
             }
         };
-        let _active = ActivePass::enter(&registry.canonical);
+        let _active = ActivePass::enter_with(&registry.canonical, mine);
         // Read per registry rather than captured once: this runs detached and
         // the store can be republished under it (on_context_ready re-opening
         // it), so a handle taken at spawn time could outlive its store.
-        match provision_one(&registry, rate_limit, mine) {
+        match provision_one(&registry, rate_limit, allocator.as_ref(), mine) {
             Ok(()) => wait_confirmed(&registry, mine),
             Err(e) => {
                 record(&registry.canonical, Step::Refused, &e.message);
@@ -261,6 +390,28 @@ pub(crate) fn wait_confirmed(registry: &registry_id::CanonicalRegistryId, mine: 
     }
 }
 
+/// Whether any registry holds a registration the chain has not confirmed:
+/// every pass submits from the one payer, so one pass's pending registration
+/// is every other pass's nonce.
+pub(crate) fn any_pending_membership() -> bool {
+    crate::sealed_store::store::current()
+        .map(|s| s.pending_records().iter().any(|r| !r.quarantined))
+        .unwrap_or(false)
+}
+
+/// `wait_confirmed` across every registry, before a submit: an
+/// `ensure_membership` pass beside a `start()` pass must not sign with the
+/// nonce the other one's registration has yet to consume.
+fn wait_confirmed_any(mine: u64) {
+    let started = Instant::now();
+    while any_pending_membership() {
+        if superseded(mine) || started.elapsed() >= CONFIRM_HOLD {
+            return;
+        }
+        std::thread::sleep(TICK);
+    }
+}
+
 /// The pass ticket in force — what a pass started now would hold.
 #[cfg(test)]
 pub(crate) fn ticket_in_force() -> u64 {
@@ -270,22 +421,14 @@ pub(crate) fn ticket_in_force() -> u64 {
 /// Does this node already have a membership on this registry — ANY
 /// membership, whatever scope it was registered under?
 ///
-/// Deliberately not `scope_matches(r, REGISTRY_WIDE)`, which is true only of
-/// a record carrying an empty identifier. Under that test a node that had
-/// registered explicitly for one application looked unprovisioned and got a
-/// SECOND membership: a second registration, a second slice of the registry's
-/// rate-limit budget, no new capability — and, because the extra insert moves
-/// the tree root, an invalidated proof for anything already in flight.
-/// Observed exactly that: a scenario registered, called start() to warm its
-/// root window, and validate_proof then rejected a proof it had just
-/// generated.
+/// Any live record counts, whatever its scope (not
+/// `scope_matches(r, REGISTRY_WIDE)`): a second registration splits the
+/// registry's rate budget and moves the tree root, invalidating proofs in
+/// flight.
 ///
-/// The question provisioning exists to answer is "can this node prove
-/// against this registry", and any live record answers it yes. Asked on
-/// entry AND again on every balance read and before the registration itself:
-/// the funding wait runs for hours, and a membership registered by hand
-/// (`register_membership` from a UI) while it waits is the same second
-/// registration arriving later.
+/// Re-asked on every balance read and before registering, since a hand
+/// registration (`register_membership` from a UI) can land during the
+/// funding wait.
 pub(crate) fn live_membership_present(registry: &registry_id::CanonicalRegistryId) -> bool {
     crate::sealed_store::store::current()
         .map(|s| {
@@ -296,14 +439,80 @@ pub(crate) fn live_membership_present(registry: &registry_id::CanonicalRegistryI
         .unwrap_or(false)
 }
 
+/// What a pass finds on a registry it is about to provision.
+enum Live {
+    /// A usable membership: nothing to do.
+    Usable,
+    /// A registration still pending past `DELEGATE_HOLD`: left to the poller.
+    StillPending,
+    /// The pending registration the pass waited on failed: provision anew,
+    /// with its reason as the fallback reason.
+    Failed(String),
+    Superseded,
+    None,
+}
+
+/// A pending registration on the registry is an earlier pass's work (a start
+/// superseded mid-gift, a register_membership call): wait for its verdict
+/// instead of calling the registry provisioned — a gift the allocator then
+/// refuses would otherwise leave the node with nothing and the step "done".
+fn settle_live(registry: &registry_id::CanonicalRegistryId, mine: u64) -> Live {
+    let started = Instant::now();
+    let mut saw_pending = false;
+    loop {
+        let Some(store) = crate::sealed_store::store::current() else { return Live::None };
+        let records: Vec<_> = records_for_registry(&store, registry).into_iter().filter(|r| !r.quarantined).collect();
+        if records.iter().any(|r| r.cache.state.is_usable()) {
+            return Live::Usable;
+        }
+        if !records.iter().any(|r| r.cache.state == MembershipState::Pending) {
+            if !saw_pending {
+                return Live::None;
+            }
+            let why = records
+                .iter()
+                .filter(|r| r.cache.state == MembershipState::Failed)
+                .max_by_key(|r| r.identity.submitted_at)
+                .and_then(|r| r.cache.failed_reason.clone())
+                .unwrap_or_else(|| "the pending registration failed".to_string());
+            return Live::Failed(why);
+        }
+        if !saw_pending {
+            saw_pending = true;
+            record(&registry.canonical, Step::Delegating, "waiting for an earlier registration to settle");
+        }
+        if superseded(mine) {
+            return Live::Superseded;
+        }
+        if started.elapsed() >= DELEGATE_HOLD {
+            return Live::StillPending;
+        }
+        std::thread::sleep(TICK);
+    }
+}
+
 fn provision_one(
     registry: &registry_id::CanonicalRegistryId,
     rate_limit: u64,
+    allocator: Option<&DelegatedOptions>,
     mine: u64,
 ) -> Result<(), ApiError> {
-    if live_membership_present(registry) {
-        record(&registry.canonical, Step::Done, "membership already present");
-        return Ok(());
+    clear_fallback(&registry.canonical);
+    match settle_live(registry, mine) {
+        Live::Usable => {
+            record(&registry.canonical, Step::Done, "membership already present");
+            return Ok(());
+        }
+        Live::StillPending => {
+            record(&registry.canonical, Step::Done, "membership pending");
+            return Ok(());
+        }
+        Live::Superseded => return Ok(()),
+        Live::Failed(why) => {
+            eprintln!("provision {}: earlier registration failed ({why}); provisioning anew", registry.canonical);
+            set_fallback(&registry.canonical, &why);
+        }
+        Live::None => {}
     }
     if let Some(s) = crate::sealed_store::store::current() {
         let records = records_for_registry(&s, registry);
@@ -337,23 +546,43 @@ fn provision_one(
         }
     }
 
+    // 0. The allocator, when one is configured: a gift costs this node
+    //    nothing and needs no wallet, so it is asked first; whatever stops it
+    //    — the gifter module not loaded, the allocator unreachable, its
+    //    refusal — is recorded as the fallback reason and the funded steps
+    //    below run as they always have.
+    if let Some(a) = allocator {
+        match delegate_one(registry, rate_limit, a, mine) {
+            Delegated::Granted | Delegated::Superseded => return Ok(()),
+            Delegated::Locked(why) => {
+                record(&registry.canonical, Step::AwaitingFunding, "keystore locked");
+                eprintln!(
+                    "provision {}: {why} — unlock the keystore and restart (or ensure_membership) to provision",
+                    registry.canonical
+                );
+                return Ok(());
+            }
+            Delegated::Refused(why) => {
+                eprintln!(
+                    "provision {}: {why}; falling back to a funded registration",
+                    registry.canonical
+                );
+                set_fallback(&registry.canonical, &why);
+            }
+        }
+    }
+
     let prov = provider_of(registry)?;
 
     // 1. The wallet.
     //
-    // This wait has NO deadline either, for the same reason the funding wait
-    // below has none. The commonest cause of a wallet that is not ready yet is
-    // an unreachable sequencer — opening one is a chain read — and that is an
-    // outage, not a verdict: the sibling now retries the open for as long as it
-    // takes and stays `pending` while it does. A deadline here could only stop
-    // watching, and stopping is permanent, because `run` records Refused and
-    // `ensure::run` is entered from `start()` and nowhere else. That is exactly
-    // how a node that booted during an outage used to stay dead for the rest of
-    // the process's life, long after the chain came back.
+    // No deadline, for the same reason as the funding wait. An unreachable
+    // sequencer is an outage, not a verdict: the lez module stays `pending` and
+    // retries the open, and stopping is permanent (`ensure::run_with` is
+    // entered from `start()` and nowhere else).
     //
-    // `failed` stays terminal: the sibling reserves it for the causes where
-    // waiting cannot help — no wallet home, no sequencer configured, a payer key
-    // it cannot import — and reports an unreachable chain as `pending`.
+    // `failed` is reserved for causes waiting cannot fix: no wallet home, no
+    // sequencer configured, an unimportable payer key.
     record(&registry.canonical, Step::WaitingForWallet, "");
     let began = Instant::now();
     let mut noticed = false;
@@ -374,7 +603,7 @@ fn provision_one(
                     ));
                 }
                 Some("pending") => {
-                    // Surface the sibling's own reason once the wait stops
+                    // Surface the lez module's own reason once the wait stops
                     // looking routine, so `get_membership_state` can say what
                     // is holding the node up rather than only that it waits.
                     let waited = began.elapsed();
@@ -436,22 +665,11 @@ fn provision_one(
         &format!("{payer} needs {required} native ({price} price + {reserve} fee reserve)"),
         Funding { payer: payer.clone(), required, price, fee_reserve: reserve, balance: None },
     );
-    // This wait has NO deadline, and that is the point of it.
-    //
-    // Nothing this module can do brings the money about — no program mints
-    // native balance — so a deadline cannot make funding happen sooner. All it
-    // can do is stop watching for it, and stopping is permanent: `run` records
-    // Refused, and `ensure::run` is entered from `start()` and nowhere else, so
-    // a node that timed out never registers again until something calls start()
-    // — which for a desktop app means relaunching it. Acquiring native balance
-    // is a bridge or an exchange, so the fifteen-minute deadline this replaces
-    // failed the ORDINARY case, not an edge one: fund at minute sixteen and the
-    // node was dead with no sign of it but a log line.
-    //
-    // What the deadline did buy was a bound on polling, so that is what backs
-    // off instead. The SLEEP stays at TICK whatever the read schedule says:
-    // `stop()` joins these workers on a short grace, and a thread parked for
-    // five minutes would hold shutdown open for five minutes.
+    // No deadline: acquiring native balance (a bridge, an exchange) takes
+    // arbitrary time, and giving up is permanent (`ensure::run_with` is entered
+    // from `start()` and nowhere else). Polling backs off instead; the SLEEP
+    // stays at TICK whatever the read schedule says, since `stop()` joins
+    // workers on a short grace.
     let mut waited = Duration::ZERO;
     let mut due = Duration::ZERO;
     let mut announced: Option<(u128, u128)> = None;
@@ -524,15 +742,23 @@ fn provision_one(
     // 4. Register. The same entry point the wire method uses, so the
     //    idempotency, the in-flight guard and the confirmation poller all
     //    come along. `register_scoped`'s own short-circuit only sees records
-    //    of ITS scope, so the any-scope check runs once more here.
+    //    of ITS scope, so the any-scope check runs once more here. A pass
+    //    superseded during the funding wait (a stop, a later start) submits
+    //    nothing: the registry is the newer pass's, or nobody's.
+    if superseded(mine) {
+        return Ok(());
+    }
+    wait_confirmed_any(mine);
+    if superseded(mine) {
+        return Ok(());
+    }
     if live_membership_present(registry) {
         record(&registry.canonical, Step::Done, "membership already present");
         return Ok(());
     }
     record(&registry.canonical, Step::Registering, "");
-    let options = format!(r#"[{{"key":"rate_limit","value":"{rate_limit}"}}]"#);
     let store = crate::sealed_store::store::current_or_uninit();
-    match register_scoped(store, registry, REGISTRY_WIDE, &options) {
+    match register_scoped(store, registry, REGISTRY_WIDE, rate_limit, None) {
         Ok(_) => {
             record(&registry.canonical, Step::Done, "submitted");
             eprintln!(
@@ -591,7 +817,7 @@ fn registration_price(
 // Progress, readable through get_membership_state
 // ---------------------------------------------------------------------------
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// The numbers behind an `awaiting_funding` step, as fields rather than only
@@ -614,25 +840,54 @@ pub(crate) struct Progress {
     pub(crate) detail: String,
     /// Only ever set with `Step::AwaitingFunding`.
     pub(crate) funding: Option<Funding>,
+    /// Why the registry's allocator did not deliver — set once the pass has
+    /// fallen back to the funded steps, cleared when a new pass begins.
+    pub(crate) fallback_reason: Option<String>,
 }
 
 static PROGRESS: Mutex<Option<HashMap<String, Progress>>> = Mutex::new(None);
+/// Per registry: the allocator's failure the current pass is working around.
+static FALLBACK: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+fn set_fallback(registry: &str, why: &str) {
+    crate::util::lock(&FALLBACK)
+        .get_or_insert_with(HashMap::new)
+        .insert(registry.to_owned(), why.to_owned());
+}
+
+fn clear_fallback(registry: &str) {
+    if let Some(m) = crate::util::lock(&FALLBACK).as_mut() {
+        m.remove(registry);
+    }
+}
+
+fn fallback_of(registry: &str) -> Option<String> {
+    crate::util::lock(&FALLBACK).as_ref().and_then(|m| m.get(registry).cloned())
+}
 
 fn record_progress(registry: &str, progress: Progress) {
-    let mut guard = crate::lock(&PROGRESS);
+    let mut guard = crate::util::lock(&PROGRESS);
     guard
         .get_or_insert_with(HashMap::new)
         .insert(registry.to_owned(), progress);
 }
 
 fn record(registry: &str, step: Step, detail: &str) {
-    record_progress(registry, Progress { step, detail: detail.to_owned(), funding: None });
+    record_progress(
+        registry,
+        Progress { step, detail: detail.to_owned(), funding: None, fallback_reason: None },
+    );
 }
 
 fn record_funding(registry: &str, detail: &str, funding: Funding) {
     record_progress(
         registry,
-        Progress { step: Step::AwaitingFunding, detail: detail.to_owned(), funding: Some(funding) },
+        Progress {
+            step: Step::AwaitingFunding,
+            detail: detail.to_owned(),
+            funding: Some(funding),
+            fallback_reason: None,
+        },
     );
 }
 
@@ -649,9 +904,10 @@ pub(crate) fn mark_requested(registry: &str) {
 /// the same answer for "this node was never given a membership" and "this
 /// node is three minutes into acquiring one".
 pub(crate) fn progress(registry: &str) -> Option<Progress> {
-    crate::lock(&PROGRESS)
+    crate::util::lock(&PROGRESS)
         .as_ref()
         .and_then(|m| m.get(registry).cloned())
+        .map(|p| Progress { fallback_reason: fallback_of(registry), ..p })
 }
 
 // ---------------------------------------------------------------------------
@@ -663,40 +919,72 @@ pub(crate) fn progress(registry: &str) -> Option<Progress> {
 // in PROGRESS does not mean anyone is still watching the balance. A caller
 // that wants to START a pass (ensure_membership) needs the live answer.
 
-static ACTIVE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Registry → the ticket of the pass working it. A newer pass takes the
+/// entry over; the older one's marker, dropped later, finds another ticket
+/// there and leaves it: a superseded pass must not make the live one look
+/// finished.
+static ACTIVE: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
-/// RAII marker for a registry's pass; dropped on every exit path of `run`'s
+/// RAII marker for a registry's pass; dropped on every exit path of `run_with`'s
 /// per-registry body, including a panic unwinding through it.
-pub(crate) struct ActivePass(String);
+pub(crate) struct ActivePass(String, u64);
 
 impl ActivePass {
+    /// A marker under the ticket in force.
+    #[cfg(test)]
     pub(crate) fn enter(registry: &str) -> Self {
-        crate::lock(&ACTIVE)
-            .get_or_insert_with(HashSet::new)
-            .insert(registry.to_owned());
-        ActivePass(registry.to_owned())
+        Self::enter_with(registry, EPOCH.load(Ordering::SeqCst))
+    }
+
+    pub(crate) fn enter_with(registry: &str, ticket: u64) -> Self {
+        crate::util::lock(&ACTIVE)
+            .get_or_insert_with(HashMap::new)
+            .insert(registry.to_owned(), ticket);
+        ActivePass(registry.to_owned(), ticket)
+    }
+
+    /// The marker, if no pass holds the registry: the check and the entry
+    /// under one lock, for a caller about to spawn a pass.
+    pub(crate) fn claim(registry: &str) -> Option<Self> {
+        let ticket = EPOCH.load(Ordering::SeqCst);
+        let mut guard = crate::util::lock(&ACTIVE);
+        let map = guard.get_or_insert_with(HashMap::new);
+        if map.contains_key(registry) {
+            return None;
+        }
+        map.insert(registry.to_owned(), ticket);
+        Some(ActivePass(registry.to_owned(), ticket))
     }
 }
 
 impl Drop for ActivePass {
     fn drop(&mut self) {
-        if let Some(set) = crate::lock(&ACTIVE).as_mut() {
-            set.remove(&self.0);
+        if let Some(map) = crate::util::lock(&ACTIVE).as_mut() {
+            if map.get(&self.0) == Some(&self.1) {
+                map.remove(&self.0);
+            }
         }
     }
 }
 
 /// Whether a provisioning pass is currently working on `registry`.
 pub(crate) fn is_running(registry: &str) -> bool {
-    crate::lock(&ACTIVE)
+    crate::util::lock(&ACTIVE)
         .as_ref()
-        .map(|set| set.contains(registry))
+        .map(|map| map.contains_key(registry))
         .unwrap_or(false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegate_hold_outlasts_a_delegated_records_confirmation_deadline() {
+        let submitted_at = 1_700_000_000;
+        let deadline = crate::delegated_confirm_deadline(submitted_at) - submitted_at;
+        assert!(DELEGATE_HOLD.as_secs() > deadline);
+    }
 
     /// Only one provisioning pass may be live. `start()` detaches a warm task
     /// still in flight and the worker API gives that body no generation to
@@ -788,9 +1076,8 @@ mod tests {
         assert_eq!(fee_reserve_from(&dearer), Some(unmargined * 2 * BASE_FEE_HEADROOM));
     }
 
-    /// No quote — an older sibling without get_fee_state, "", a transport
-    /// error, a reply that is not a quote — is the pre-0.10.0 behaviour
-    /// exactly: the wallet's fixed 646.4M cap.
+    /// No quote (no get_fee_state, "", a transport error, a reply that is not
+    /// a quote) reserves the wallet's fixed 646.4M cap.
     #[test]
     fn no_quote_falls_back_to_the_fixed_reserve() {
         assert_eq!(FALLBACK_FEE_RESERVE, 646_400_000);
@@ -822,8 +1109,7 @@ mod tests {
                 "if the reserve ever stops dwarfing the price, revisit this gate: \
                  reserve {reserve}, price {price}"
             );
-            // An account holding exactly the price is the case that used to
-            // pass a naive check and then fail on chain.
+            // An account holding exactly the price cannot pay the fee.
             assert!(price < price.saturating_add(reserve));
         }
     }
@@ -865,6 +1151,26 @@ mod tests {
         assert_eq!(progress(a).expect("a still has progress").step, Step::Done);
     }
 
+    /// The allocator's failure rides on every step the funded fallback
+    /// records after it, and a new pass starts clean.
+    #[test]
+    fn the_fallback_reason_outlives_the_steps_of_its_pass_only() {
+        let r = "logos:test:fallback-reason";
+        record(r, Step::Delegating, "asking allocator p at /m");
+        assert_eq!(progress(r).unwrap().step.as_str(), "delegating");
+        assert!(progress(r).unwrap().fallback_reason.is_none());
+        set_fallback(r, "allocator p at /m: gifter_failed: credential already used");
+        record(r, Step::WaitingForWallet, "");
+        assert_eq!(
+            progress(r).unwrap().fallback_reason.as_deref(),
+            Some("allocator p at /m: gifter_failed: credential already used")
+        );
+        record_funding(r, "x needs 1", Funding { payer: "x".into(), required: 1, price: 1, fee_reserve: 0, balance: None });
+        assert!(progress(r).unwrap().fallback_reason.is_some(), "the funding step keeps it");
+        clear_fallback(r);
+        assert!(progress(r).unwrap().fallback_reason.is_none(), "a new pass starts clean");
+    }
+
     /// The funding step carries its numbers as fields, and a later step
     /// drops them: a `done` reply must not keep advertising an amount to
     /// send.
@@ -897,6 +1203,25 @@ mod tests {
     /// `is_running` answers for the pass itself, not for what it last wrote:
     /// a finished pass leaves its step in PROGRESS for readers but must not
     /// look live to a caller deciding whether to start another.
+    // A newer pass on the same registry owns the marker: the superseded
+    // pass's drop leaves it, and only the owner's drop ends it. A claim is
+    // the check and the entry in one step.
+    #[test]
+    fn a_superseded_pass_cannot_end_the_newer_one() {
+        let r = "logos:test:two-passes";
+        let older = ActivePass::enter_with(r, 1);
+        let newer = ActivePass::enter_with(r, 2);
+        drop(older);
+        assert!(is_running(r), "the older marker's drop must not end the newer pass");
+        assert!(ActivePass::claim(r).is_none(), "a running pass refuses a claim");
+        drop(newer);
+        assert!(!is_running(r));
+        let claimed = ActivePass::claim(r).expect("free registry");
+        assert!(is_running(r));
+        drop(claimed);
+        assert!(!is_running(r));
+    }
+
     #[test]
     fn a_pass_is_running_only_while_its_marker_lives() {
         let r = "logos:test:active-marker";
@@ -923,27 +1248,14 @@ mod tests {
     /// Provisioning must stand down for a membership registered under ANY
     /// scope, not only the registry-wide one it would create itself.
     ///
-    /// This is a regression, not a hypothetical. The first version asked
-    /// `scope_matches(record, REGISTRY_WIDE)`, which is true only of a record
-    /// with an empty identifier — so a node that had registered explicitly for
-    /// one application looked unprovisioned, got a second membership, and the
-    /// extra tree insert invalidated a proof already in flight. The symptom
-    /// was a node rejecting a proof it had just generated.
-    ///
-    /// `scope_matches` is the wrong predicate here and this pins why: it
-    /// answers "does this record back that application", while provisioning
-    /// asks "can this node prove against this registry at all".
+    /// Provisioning counts a live record of any scope. `scope_matches` answers
+    /// a different question: does the record back that application.
     #[test]
     fn a_scoped_membership_counts_as_provisioned() {
         let scoped = "aa".repeat(32);
-        // What the old check did: only an empty identifier satisfied it.
+        // A scoped record is not registry-wide; `provision_one` filters on
+        // `is_live()` alone and never consults the scope.
         assert!(!crate::scope_matches_for_test(&scoped, REGISTRY_WIDE));
         assert!(crate::scope_matches_for_test("", REGISTRY_WIDE));
-        // The new check consults no scope at all — `provision_one` filters on
-        // `is_live()` alone. That cannot be asserted here without a store, so
-        // what this test pins is the contrast above: the predicate the old
-        // code used answers NO for a perfectly good membership, which is the
-        // whole defect. If someone reintroduces a scope filter, the first
-        // assertion is the one that should stop them.
     }
 }

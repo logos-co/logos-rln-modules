@@ -11,7 +11,7 @@
 //! sequencer_addr must not silently re-point a wallet.
 
 use crate::sealed_store::store as sealed;
-use crate::{ApiError, ErrorKind};
+use crate::error::{ApiError, ErrorKind};
 
 pub(crate) fn provision_impl(options_json: &str) -> Result<serde_json::Value, ApiError> {
     let raw = options_json.trim();
@@ -37,10 +37,8 @@ pub(crate) fn provision_impl(options_json: &str) -> Result<serde_json::Value, Ap
     let mut config_existed = config_path.exists();
     if !config_existed {
         let config = serde_json::json!({
-            // Every sequencer field shape, mirroring stage.sh: lez >= v0.3.1
-            // requires `sequencer`, v0.2.1-v0.3.0 `sequencers` (no serde
-            // default), the rc6-era wallet flat `sequencer_addr`; none denies
-            // unknown fields.
+            // Every sequencer field shape a wallet version may require (each
+            // version requires a different one; none denies unknown fields).
             "sequencer": { "sequencer_addr": sequencer },
             "sequencer_addr": sequencer,
             "sequencers": [{ "sequencer_addr": sequencer }],
@@ -54,7 +52,7 @@ pub(crate) fn provision_impl(options_json: &str) -> Result<serde_json::Value, Ap
             // the sequencer's per-transaction ceiling, the most a wallet may
             // ask for; unused gas is refunded, so a cheaper call pays less.
             "gas_limit": 10_000_000,
-            // v0.2.2 open calibrates each sequencer with calibration_limit
+            // Open calibrates each sequencer with calibration_limit
             // sequential probes when no statistics file exists (default 100 —
             // minutes against a slow chain, and open blocks the module's
             // dispatch the whole time). One sequencer, 3 probes.
@@ -125,7 +123,7 @@ mod tests {
 
     #[test]
     fn no_persistence_path_reports_internal() {
-        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
         sealed::publish(None);
         let err = provision_impl(r#"{"sequencer_addr":"https://seq.example/"}"#).unwrap_err();
         assert!(err.to_json().contains(r#""kind":"internal""#), "got: {}", err.to_json());
@@ -133,7 +131,7 @@ mod tests {
 
     #[test]
     fn provisions_once_and_never_rewrites_the_config() {
-        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
         let dir = temp_store_dir("once");
         let _store = crate::publish_test_store(dir.clone());
 
@@ -181,7 +179,7 @@ mod tests {
 
     #[test]
     fn storage_exists_reflects_the_file() {
-        let _serial = crate::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
         let dir = temp_store_dir("storage");
         let _store = crate::publish_test_store(dir.clone());
 

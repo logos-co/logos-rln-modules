@@ -1,7 +1,7 @@
 {
   "name": "liblogos_rln_module",
   "display_name": "RLN Module",
-  "version": "0.14.2",
+  "version": "0.16.0",
   "description": "Registry-agnostic RLN membership management (RLN-MEMBERSHIP-MANAGEMENT)",
   "author": "Logos Blockchain Team",
   "type": "core",
@@ -10,7 +10,8 @@
   "category": "blockchain",
   "main": "liblogos_rln_module_plugin",
   "dependencies": [
-    "liblogos_lez_rln_module"
+    "liblogos_lez_rln_module",
+    "rln_gifter_module"
   ],
   "include": [],
   "capabilities": [],
@@ -23,6 +24,9 @@
   "dependency_overrides": {
     "liblogos_lez_rln_module": {
       "file": "rust-lib/deps/liblogos_lez_rln_module.lidl"
+    },
+    "rln_gifter_module": {
+      "file": "rust-lib/deps/rln_gifter_module.lidl"
     }
   },
   "nix": {
