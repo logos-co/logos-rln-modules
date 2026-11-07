@@ -100,8 +100,11 @@ retryable).
 
 The **provisioning object** on an `"unknown"` state (`start()` and
 `ensure_membership` both drive it):
-`{"step":"waiting_for_wallet"|"awaiting_funding"|"registering"|"done"|"refused",
-"detail":str}` — `detail` is a human sentence, omitted when empty. On
+`{"step":"delegating"|"waiting_for_wallet"|"awaiting_funding"|"registering"|"done"|"refused",
+"detail":str, "fallback_reason"?:str}` — `detail` is a human sentence,
+omitted when empty; `delegating` is the registry's allocator (`start()`'s
+`allocator` block) being asked first, and `fallback_reason` says why it did
+not deliver on every step of the funded fallback that follows. On
 `awaiting_funding` only, the numbers behind the sentence travel as fields,
 decimal strings like every balance on this wire: `"payer"` (hex64 account to
 fund), `"required"` (price + fee reserve), `"price"`, `"fee_reserve"`, and
@@ -112,13 +115,19 @@ fields, never by parsing `detail`. A `done`/`refused` step carries no numbers.
 **Scope semantics.** `register` is idempotent **per scope** (spec): the scope's
 live membership short-circuits; a different application registering on the
 same registry mints its own membership (isolated slashing blast radius).
-`get_membership_state` / `generate_proof` / `get_registry_parameters` resolve
-the membership *backing* the scope: records registered under the scope's
-`rln_identifier` (or carrying none — pre-scope legacy records back every
-application) are preferred; with no usable match, any of the registry's
-memberships backs the scope, per the spec's "a membership MAY back any
-application whose scope names its registry". More than one candidate is
-`ambiguous_selection` — use `select_membership`.
+`get_membership_state` answers with the record resolved by rank: the scope's
+own records (its live one, else its latest terminal one — a refused
+registration reads back `failed` by its scope whatever else the registry
+holds), then the registry-wide records (no `rln_identifier`, as
+`start()` provisions them), then any usable membership on the
+registry, per the spec's "a membership MAY back any application whose scope
+names its registry"; more than one live record at the winning rank is
+`ambiguous_selection`. While a provisioning pass works the registry, a
+scope whose answer would be a terminal record reads `unknown` with the
+pass's provisioning object instead (the verdict the pass is acting on). `generate_proof` / `get_epoch_quota` resolve the
+membership *backing* the scope among usable records only: the scope's own
+or registry-wide ones first, else any of the registry's — more than one is
+`ambiguous_selection`, use `select_membership`.
 
 ### Time budgets
 
@@ -146,7 +155,7 @@ args.
 | `membership_state_changed` | `registry_id, rln_identifier, membership_hash, state, previous` | a membership's registry-observed state actually CHANGES — `pending`→`active`, `pending`→`failed`, `active`→`grace_period`/`expired`, observed→`erased` — never for a mere re-observation of the same state |
 
 - `rln_identifier` is the registering scope's `rln_identifier_hex`, empty for
-  a pre-scope legacy record; consumers filter on `(registry_id,
+  a registry-wide record; consumers filter on `(registry_id,
   membership_hash)`.
 - `previous` is the state the record held immediately before this
   transition — one of the `MembershipStatus` wire strings below.
@@ -315,21 +324,15 @@ ARRAY of `{"key": "<tstr>", "value": "<tstr>"}` entries — every value a
 string (`char*` pairs), a non-string value, a non-array `options_json`, or a
 duplicate key is `invalid_argument`. The common key `rate_limit` (decimal
 string) requests the per-epoch rate; ABSENT, the module applies
-`DEFAULT_RATE_LIMIT` (= 100) — the lez registry declares no default yet
-(planned as a registry-declared parameter in logos-lez-rln). The remaining
+`DEFAULT_RATE_LIMIT` (= 100) — the lez registry declares no default. The remaining
 keys are registry-specific:
 
 - **`logos` namespace, direct**: no key. The registry takes the native asset
   and `liblogos_lez_rln_module` pays from its own account, so nothing here
   selects a payer — this module is registry-agnostic and holds no account ids.
 
-  `funding_holding_account_id` was **mandatory** here until 0.8.0 and is now
-  accepted and ignored (one deprecation line per call). It is ignored rather
-  than rejected because every shipped caller still sends it and a stale conf
-  should not become a permanent registration failure. The break is semantic
-  and one layer down: the account that key names is no longer the account that
-  pays. A caller that needs to pay from a specific account names it on
-  `liblogos_lez_rln_module.register_member`'s `payer_account_id` instead.
+  A caller that needs to pay from a specific account names it on
+  `liblogos_lez_rln_module.register_member`'s `payer_account_id`.
 - **`logos` namespace, delegated** (RLN Membership Allocation Protocol):
   `delegated`=`"true"` plus `gifter_peer_id`, `gifter_multiaddr` and the
   optional `auth_type`/`auth_payload`/`auth_provider`/`auth_args` pairs.
@@ -387,7 +390,19 @@ after a host's `{"epoch_size_sec":600,"registries":["D",{"registry_id":"M","epoc
 leaves M at 10 s. To move a configured registry, name it with an object.
 Provisioning (on unless `"provision":false`) covers every registry in force,
 each at its own rate; a registry that already holds a membership stands the
-pass down at once. Registrations go out one registry at a time: the pass
+pass down at once. With an `allocator` block — top level for every registry
+the call names, or on an entry (`null` opts that registry out):
+`{"discover"?,"peer_id"?,"multiaddr"?,"auth_type"?,"auth_payload"?|"auth_provider"?,"auth_args"?}`,
+the delegated vocabulary of `register_membership` — the pass asks the
+allocators advertising the (registry, auth type) pair through libp2p
+service discovery first (`discover`, default true; `{}` is discovery alone,
+and it needs this node's `libp2p_module` up with discovery mounted and
+bootstrap peers, which the host arranges), then the configured
+`peer_id`+`multiaddr` pair (the RLN Membership Allocation Protocol through
+`rln_gifter_module` over this node's `libp2p_module`; the request names
+the registry, so one allocator covers both) and falls back to the funded
+registration when nothing was granted, recording why as
+`provisioning.fallback_reason`. Registrations go out one registry at a time: the pass
 holds until each has left `pending` before submitting the next, because two
 submits from one payer in flight together share a nonce and the second is
 dropped silently. There is no

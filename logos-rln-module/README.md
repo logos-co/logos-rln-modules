@@ -12,7 +12,7 @@ Identity credentials are generated inside the module at `register`,
 persisted encrypted, and used only inside `generate_proof` — the identity
 secret never crosses the module boundary. Proof crypto is zerokit `rln`
 (stateless) in-crate; the lez-rln registry provider (the `logos` CAIP-10
-namespace) stays a wire client of the sibling
+namespace) stays a wire client of the lez module
 [`../logos-lez-rln-module`](../logos-lez-rln-module) for chain access (PDA
 derivation, clock reads, tx submission, Merkle proofs, valid roots), and
 delegated registration drives `rln_gifter_module` with the module's own
@@ -63,7 +63,7 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   the module links it, and a C/Nim consumer links its `staticlib` + header
   to pre-hash for the `_prehashed` methods. `nix build .#rln-signal`.
 - `rust-lib/deps/liblogos_lez_rln_module.lidl` — hand-maintained dependency
-  contract (the consumed subset of the sibling's wire), wired via
+  contract (the consumed subset of the lez module's wire), wired via
   `dependency_overrides`. Same repo: update both files in the same PR.
 - `rust-lib/src/lib.rs` — module impl: dispatch glue, error envelope,
   register/proof orchestration, start/stop lifecycle.
@@ -93,7 +93,7 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   confirmation window, erased inference), change-gated transition events,
   submit-error recording policy.
 - `rust-lib/src/provider.rs` — the spec's Registry Provider Interface as a
-  trait + namespace routing; the lez-rln provider drives the sibling through
+  trait + namespace routing; the lez-rln provider drives the lez module through
   the SDK's generated typed client (`modules().liblogos_lez_rln_module`,
   `*_async_with_timeout` twins with explicit per-call timeouts; fire-and-record
   async submission), plus the `PluginProxy` gifter client
@@ -101,8 +101,8 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   module-generated commitment and the caller's auth-vector selection; the
   vector's producer module binds the auth payload to that commitment).
   Every registry call first passes the network gate (`ensure_network`): the
-  `logos` id's reference goes to the sibling's `use_network` (lez module
-  >= 4.1.0), which binds an unconfigured wallet to that network from its
+  `logos` id's reference goes to the lez module's `use_network`,
+  which binds an unconfigured wallet to that network from its
   built-in table; `start()` puts the configured networks to it in order
   (`select_networks`), and a registry on another network is refused
   `unknown_registry`.
@@ -199,7 +199,7 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   also feeds its `valid_roots` into the window.
 - **Wire conventions.** Every reply is a compact JSON object (alphabetical
   keys); failures are `{"error":{"class":…,"kind":…,"message":…}}` —
-  switch on `class`, log `kind`. The sibling module's `""`-on-error
+  switch on `class`, log `kind`. The lez module's `""`-on-error
   convention is NOT used here.
 - **Provisional leaf_index.** `register` returns the provider's pre-submit
   estimate; the authoritative value is re-read from the registry at the
