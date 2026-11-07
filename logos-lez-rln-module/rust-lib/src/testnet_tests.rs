@@ -13,8 +13,7 @@
 //! records: `<LEZ_RLN_CHECKOUT>/deployments/<name>/deployment.json`
 //! (checkout default: `../logos-lez-rln` next to this repo), `<name>` =
 //! `LEZ_RLN_TESTNET_DEPLOYMENT` (default `DEFAULT_DEPLOYMENT`, the last
-//! hosted-testnet deployment, made on LEZ v0.3: against an rc1 chain name a
-//! deployment provisioned there). The sequencer is reached over its public
+//! hosted-testnet deployment; name another when the chain differs).
 //! JSON-RPC (`getAccount` — the same read the wallet's `read_account` serves
 //! this module at runtime) via a `curl` subprocess, so the tests exercise the
 //! RPC shape the wallet library hides.
@@ -33,7 +32,7 @@ use rln::prelude::{
     CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, IdentityKeys, PoseidonHash,
 };
 
-use crate::hex_to_bytes32;
+use crate::hex::hex_to_bytes32;
 use crate::rln_core as native;
 use native::bytes_to_hex;
 
@@ -89,78 +88,11 @@ fn testnet() -> Option<Deployment> {
     };
     Some(Deployment {
         sequencer: field("sequencer"),
-        config_account: b58_decode32(&field("config_account")),
+        config_account: crate::base58::decode32(&field("config_account")).expect("base58"),
         tree_id_hex: field("tree_id"),
         registration_program_id_hex: field("registration_program_id"),
         merkle_program_id_hex: field("merkle_program_id"),
     })
-}
-
-// ------------------------------------------------------------------- base58
-//
-// The sequencer's getAccount takes base58 account ids (the wallet does this
-// conversion at runtime via account_id_from_base58).
-
-const B58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-fn b58_encode(input: &[u8; 32]) -> String {
-    let mut digits: Vec<usize> = vec![0];
-    for &byte in input.iter() {
-        let mut carry = byte as usize;
-        for digit in digits.iter_mut() {
-            carry += *digit << 8;
-            *digit = carry % 58;
-            carry /= 58;
-        }
-        while carry > 0 {
-            digits.push(carry % 58);
-            carry /= 58;
-        }
-    }
-    let mut out = String::new();
-    for &byte in input.iter() {
-        if byte == 0 {
-            out.push('1');
-        } else {
-            break;
-        }
-    }
-    for &digit in digits.iter().rev() {
-        out.push(B58[digit] as char);
-    }
-    out
-}
-
-fn b58_decode32(s: &str) -> [u8; 32] {
-    let mut bytes: Vec<u8> = vec![];
-    for c in s.chars() {
-        let value = B58
-            .iter()
-            .position(|&b| b as char == c)
-            .unwrap_or_else(|| panic!("invalid base58 char {c:?}")) as u32;
-        let mut carry = value;
-        for byte in bytes.iter_mut() {
-            carry += (*byte as u32) * 58;
-            *byte = (carry & 0xff) as u8;
-            carry >>= 8;
-        }
-        while carry > 0 {
-            bytes.push((carry & 0xff) as u8);
-            carry >>= 8;
-        }
-    }
-    for c in s.chars() {
-        if c == '1' {
-            bytes.push(0);
-        } else {
-            break;
-        }
-    }
-    bytes.reverse();
-    assert!(bytes.len() <= 32, "base58 value exceeds 32 bytes");
-    let mut out = [0u8; 32];
-    out[32 - bytes.len()..].copy_from_slice(&bytes);
-    out
 }
 
 // ------------------------------------------------------------------ JSON-RPC
@@ -206,7 +138,7 @@ fn rpc(sequencer: &str, method: &str, params: serde_json::Value) -> serde_json::
 /// account's data is kept per program, and the native balance is the native
 /// token program's (`[0; 32]`).
 fn get_actor_states(sequencer: &str, id: &[u8; 32]) -> Vec<([u8; 32], Vec<u8>)> {
-    let result = rpc(sequencer, "getAccount", serde_json::json!([b58_encode(id)]));
+    let result = rpc(sequencer, "getAccount", serde_json::json!([crate::base58::encode32(id)]));
     if result.is_null() {
         return Vec::new();
     }
@@ -222,7 +154,7 @@ fn get_actor_states(sequencer: &str, id: &[u8; 32]) -> Vec<([u8; 32], Vec<u8>)> 
                 .iter()
                 .map(|v| v.as_u64().expect("byte") as u8)
                 .collect();
-            (b58_decode32(program), data)
+            (crate::base58::decode32(program).expect("base58"), data)
         })
         .collect()
 }
@@ -482,24 +414,4 @@ fn testnet_fee_state_is_a_live_quote() {
     assert!(field("next_base_fee_stor_ceiling") >= field("next_base_fee_stor_floor"));
     assert!(field("height") > 0, "{raw}");
     eprintln!("{sequencer}: {raw}");
-}
-
-// Offline self-checks for the helpers this file leans on (always run).
-#[test]
-fn base58_roundtrip_matches_known_vector() {
-    let id: [u8; 32] = core::array::from_fn(|i| i as u8 * 7);
-    let encoded = b58_encode(&id);
-    assert_eq!(b58_decode32(&encoded), id);
-    // A fixed vector, not a live account: it pins the base58 alphabet and
-    // the leading-zero handling, and belongs to no deployment record.
-    assert_eq!(
-        bytes_to_hex(&b58_decode32("Ds9aBzioxnDf6yfUnCHGS7evBnpMnknyJgiMEJcV7uVG")),
-        "bf24f9e9f0440d7c7268cfc5ce6edb981feda003104c9d96ca276443ccc0a607"
-    );
-    let leading_zero = {
-        let mut id = [0u8; 32];
-        id[31] = 7;
-        id
-    };
-    assert_eq!(b58_decode32(&b58_encode(&leading_zero)), leading_zero);
 }

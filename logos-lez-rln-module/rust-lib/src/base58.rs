@@ -1,8 +1,7 @@
 //! Base58 account ids.
 //!
 //! The wallet speaks 32-byte account ids; humans, deployment descriptors and
-//! `LEZ_RLN_PAYER` all speak base58. `lez_core` used to do this conversion on
-//! the far side of an lp call. Now that the wallet is ours, it happens here.
+//! `LEZ_RLN_PAYER` all speak base58.
 //!
 //! No alphabet variants and no checksum: this is the plain Bitcoin alphabet
 //! over a fixed 32 bytes, which is what `AccountId`'s own `FromStr`/`Display`
@@ -103,6 +102,12 @@ mod tests {
     fn roundtrip_matches_a_known_vector() {
         assert_eq!(decode32(ID).unwrap(), hex32(HEX));
         assert_eq!(encode32(&hex32(HEX)), ID);
+        // A fixed vector, not a live account: it pins the alphabet and
+        // belongs to no deployment record.
+        let fixed = "Ds9aBzioxnDf6yfUnCHGS7evBnpMnknyJgiMEJcV7uVG";
+        let fixed_hex = "bf24f9e9f0440d7c7268cfc5ce6edb981feda003104c9d96ca276443ccc0a607";
+        assert_eq!(decode32(fixed).unwrap(), hex32(fixed_hex));
+        assert_eq!(encode32(&hex32(fixed_hex)), fixed);
     }
 
     #[test]

@@ -47,8 +47,12 @@
 ; the wallet storage is opened with LEE_WALLET_PASSWORD (empty = plaintext; a
 ; v0.3 storage with a Private entry no longer parses — re-mint). wallet_status
 ; gains payer_public_key.
+; v6.1.0: a send the wallet could not make is {"error":"send_failed: <why>"}
+; (nothing submitted); a never-included registration is re-sent; a payer that
+; cannot be resolved or saved fails bring-up; a negative rate_limit is
+; invalid_rate_limit; a pending reply carries rate_limit.
 module liblogos_lez_rln_module {
-  version "6.0.0"
+  version "6.1.0"
   description "RLN registry provider (LEZ chain reads + registration/funding txs)"
   category "blockchain"
 
@@ -66,13 +70,14 @@ module liblogos_lez_rln_module {
 
   ; leaf_indices_json is a JSON array of leaf indices. Returns a compact
   ; JSON array of proof objects, each augmented with "valid_roots", from a
-  ; stable tree snapshot (5 attempts, "" on sustained churn); "[]" for an
+  ; stable tree snapshot (one read, "" when it failed); "[]" for an
   ; empty index list, "" on error.
   method get_merkle_proofs(config_account_id: tstr, leaf_indices_json: tstr) -> tstr
 
   ; Idempotent on-chain registration. Existing membership PDA →
   ; {"already_registered":true,"leaf_index":N}; otherwise submits the
-  ; Register tx and returns {"leaf_index":N,"pending":true,"tx_result":s}
+  ; Register tx and returns {"leaf_index":N,"pending":true,"rate_limit":N,
+  ; "tx_result":s}
   ; without waiting for confirmation; "" on error. leaf_index is a pre-submit
   ; ESTIMATE (the tree assigns the slot); get_membership reports the real one.
   ; payer_account_id signs the tx, pays rate_limit x price_per_unit of NATIVE
@@ -86,10 +91,15 @@ module liblogos_lez_rln_module {
   ; tree_full, insufficient_balance (price + fee reserve at the next base
   ; fee ceiling) or, since 6.0.0, treasury_missing (the registry's treasury
   ; account does not exist on the chain; lez-rln's run_setup seeds it). ""
-  ; stays the answer for a config or chain read that failed.
+  ; stays the answer for a config or chain read that failed. A send the wallet
+  ; could not make (no signing key for the payer, no network) is
+  ; {"error":"send_failed: <why>"}: nothing was submitted, and a caller that
+  ; reserved something for this registration can release it.
   ; A transaction the program refuses after submission is still included in a
   ; block and charged; the module watches for the membership and re-sends a
-  ; reverted registration, dated by chain time again, up to five times.
+  ; reverted registration, dated by chain time again, up to five times; one
+  ; the sequencer never includes within 120 s (a nonce another send consumed)
+  ; is re-sent the same way.
   method register_member(config_account_id: tstr, payer_account_id: tstr, id_commitment_hex: tstr, rate_limit: int) -> tstr
 
   ; Live NATIVE balance of account_id as a decimal STRING (u128 exceeds JSON

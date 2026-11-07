@@ -1,14 +1,11 @@
 //! The wallet this module owns.
 //!
-//! Every registry read and every transaction used to go out over lp to the
-//! `lez_core` module. That module holds exactly one wallet handle per host,
-//! `open` and `create_new` both refuse while one is open, and there is no
-//! close — so whichever app opened first owned the only wallet, and the others
-//! inherited whatever config it was opened with. For this module that is not
-//! untidy but fatal: the gas limit a transaction declares comes from the
-//! wallet's config, a registration costs ~9.1M cycles against a stock default
-//! of 2,000,000, and `lez_core` exposes no way to read the limit back. Losing
-//! that race meant every registration refused with a bare "Incorrect fee".
+//! It cannot share `lez_core`'s wallet: that module holds exactly one wallet
+//! handle per host, so whichever app opened first owns it, and the gas limit a
+//! transaction declares comes from the wallet's config. A registration costs
+//! ~9.1M cycles against a stock default of 2,000,000, and `lez_core` exposes no
+//! way to read the limit back; a wallet opened with the stock config refuses
+//! every registration with a bare "Incorrect fee".
 //!
 //! So this module links LEZ's `core_ffi` itself and holds a handle of its own.
 //! That is the same prebuilt library `lez_core` links, resolved through
@@ -46,7 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::base58;
+use crate::lock;
 use crate::networks;
 use crate::rln_core::bytes_to_hex;
 
@@ -104,15 +101,15 @@ const PAYER_FILE: &str = "payer.json";
 /// would wedge the module under `concurrency:"multi"`.
 const READY_WAIT: Duration = Duration::from_secs(30);
 
-/// The wallet's execution gas limit, for a home we provision. Gas is cycles in
-/// v0.2.5 and a registration costs ~9.1M, so the wallet's own 2,000,000
+/// The wallet's execution gas limit, for a home we provision. Gas is cycles and
+/// a registration costs ~9.1M, so the wallet's own 2,000,000
 /// default refuses one outright. This is the per-transaction ceiling the
 /// sequencer allows; unused gas is refunded, so a cheaper call still pays less.
 pub(crate) const GAS_LIMIT: u64 = 10_000_000;
 
 #[allow(unsafe_code)]
 mod ffi {
-    //! Declarations for LEZ's `core_ffi` library (v0.4.0-rc1), mirrored field
+    //! Declarations for LEZ's `core_ffi` library, mirrored field
     //! for field from `core_ffi.h`. `#[allow(unsafe_code)]` is scoped to this
     //! module, as it is for the generated scaffold and the lp test transport:
     //! the crate keeps `deny(unsafe_code)` everywhere else.
@@ -418,8 +415,7 @@ struct State {
     payer_public_key: String,
     /// Shared for reads and sends, exclusive for deriving an account. Callers
     /// clone the `Arc` and drop the state lock before calling: holding it
-    /// across a sequencer round trip would serialize every handler, the wedge
-    /// the `single` -> `multi` concurrency bump was made to escape.
+    /// across a sequencer round trip would serialize every handler.
     wallet: Option<Arc<RwLock<Handle>>>,
 }
 
@@ -435,9 +431,8 @@ static STATE: Mutex<State> = Mutex::new(State {
 /// A transaction's nonce is read from confirmed on-chain state, not from a
 /// local counter, and it only advances once the transaction settles. Two
 /// submissions from one account that overlap that window therefore build with
-/// the same nonce and one is dropped. Before the registry took the native
-/// asset that needed a shared LEZ_RLN_PAYER to happen; now the signer IS the
-/// payer, so it is the ordinary case.
+/// the same nonce and one is dropped. The signer is the payer, so this is the
+/// ordinary case.
 ///
 /// `REG_IN_FLIGHT` does not cover this — it keys on the membership PDA, so
 /// two DIFFERENT memberships still race. Reads are deliberately outside: the
@@ -446,10 +441,6 @@ static SEND_LOCK: Mutex<()> = Mutex::new(());
 
 /// Signalled once bring-up settles, either way.
 static SETTLED: Condvar = Condvar::new();
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 // ------------------------------------------------------------ network choice
 
@@ -520,7 +511,7 @@ pub(crate) enum Plan {
 /// and re-pointing a wallet that holds registered memberships would strand
 /// them), then `LEZ_RLN_SEQUENCER` (optionally labelled by `LEZ_RLN_NETWORK`),
 /// then `LEZ_RLN_NETWORK` alone through the table, then nothing — which is not
-/// a failure since 4.1.0, because the consumer's registry id can still name
+/// a failure: the consumer's registry id can still name
 /// the network.
 pub(crate) fn plan_home(home: &Path, env: &EnvView) -> Plan {
     if home.join(CONFIG_FILE).exists() {
@@ -939,8 +930,7 @@ pub(crate) fn spawn_bring_up(persistence_path: &str) {
 fn start_bring_up(home: PathBuf) {
     // One bring-up per process, ever. It retries an unreachable sequencer
     // indefinitely, so a second call would leave two loops opening the same
-    // home against each other rather than the one wasted attempt it used to
-    // cost.
+    // home against each other.
     if BRINGUP_STARTED.swap(true, Ordering::SeqCst) {
         eprintln!("lez-rln wallet: bring-up already running, ignoring the repeat");
         return;
@@ -1005,6 +995,12 @@ fn bring_up(home: &Path) {
         }
     };
     let payer_public_key = public_key_of(&handle, &payer_hex);
+    if payer_public_key.is_empty() {
+        // A wallet that cannot sign for its payer sends nothing that the
+        // sequencer accepts; Ready would promise registrations it cannot make.
+        fail(&format!("the payer {payer_hex} has no signing key in this wallet"));
+        return;
+    }
 
     match sync(&handle) {
         Ok(head) => eprintln!("lez-rln wallet: synced to block {head}"),
@@ -1028,10 +1024,8 @@ fn bring_up(home: &Path) {
 /// client, which calibrates every configured endpoint and then drops any it has
 /// no statistics for — so on a fresh home an unreachable sequencer leaves the
 /// leader list empty and the open fails outright. That is the ordinary shape of
-/// a node started while the chain is down, and it used to be terminal: one
-/// failure latched `Failed`, nothing re-armed it, and the node never registered
-/// again however healthy the chain became. A node that gives up is a node that
-/// is still broken an hour after the outage ended.
+/// a node started while the chain is down. A node that gives up stays broken
+/// after the outage ends.
 ///
 /// So there is no attempt limit and no deadline, for the same reason
 /// `logos-rln-module`'s funding wait has none: nothing this module can do makes
@@ -1189,7 +1183,7 @@ fn open_or_create(config: &Path, storage: &Path) -> Result<Handle, OpenError> {
     let handle = Handle(out.wallet);
     // The new wallet lives in memory only until it is saved; the next open
     // must find the storage file.
-    save(&handle);
+    save(&handle).map_err(OpenError::Fatal)?;
     Ok(handle)
 }
 
@@ -1198,7 +1192,7 @@ fn open_or_create(config: &Path, storage: &Path) -> Result<Handle, OpenError> {
 /// this module sends would be accepted.
 #[allow(unsafe_code)]
 fn public_key_of(handle: &Handle, payer_hex: &str) -> String {
-    let Some(bytes) = crate::hex_to_bytes32(payer_hex) else {
+    let Some(bytes) = crate::hex::hex_to_bytes32(payer_hex) else {
         return String::new();
     };
     let id = ffi::Bytes32 { data: bytes };
@@ -1226,7 +1220,7 @@ fn import_payer_key(handle: &Handle) -> Result<(), String> {
     if raw.is_empty() {
         return Ok(());
     }
-    if crate::hex_to_bytes32(raw).is_none() {
+    if crate::hex::hex_to_bytes32(raw).is_none() {
         return Err(format!("{PAYER_KEY_ENV} is not 32-byte hex"));
     }
     let key = CString::new(raw).map_err(|e| e.to_string())?;
@@ -1235,9 +1229,37 @@ fn import_payer_key(handle: &Handle) -> Result<(), String> {
     if rc != ffi::SUCCESS {
         return Err(format!("{PAYER_KEY_ENV} import failed ({})", ffi::describe(rc)));
     }
-    save(handle);
+    save(handle)?;
     eprintln!("lez-rln wallet: imported the fee payer's key");
     Ok(())
+}
+
+/// The account that pays a transaction's fee, as 32-byte hex, or empty to let
+/// the wallet charge the signing account.
+///
+/// The fee is reserved from a *native* balance. A signer with none cannot pay
+/// it, and the registration is refused before it runs, with only "Incorrect
+/// fee" to say why.
+///
+/// `LEZ_RLN_PAYER` names a funded account the wallet already holds a key for —
+/// the same variable the host tools use. It accepts base58 or hex, since the
+/// tooling that mints the payer prints base58 and the wallet interface wants
+/// hex. Unset means self-pay, which is right wherever the signing account is
+/// itself funded.
+/// `LEZ_RLN_PAYER` as 64-hex: `Ok(None)` when unset or blank, `Err` when set to
+/// something that is no account id. Read at bring-up to decide the module's
+/// payer; `fee_payer_hex` is what every send actually uses.
+fn fee_payer_env_hex() -> Result<Option<String>, String> {
+    let Ok(raw) = std::env::var("LEZ_RLN_PAYER") else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    crate::hex::canonical_account_hex(raw).map(Some).ok_or_else(|| {
+        format!("LEZ_RLN_PAYER is neither 32-byte hex nor a base58 account id: {raw}")
+    })
 }
 
 /// The account this module signs and pays with, decided once at bring-up.
@@ -1251,23 +1273,28 @@ fn import_payer_key(handle: &Handle) -> Result<(), String> {
 /// operator, or the e2e harness, has to be able to send to it.
 #[allow(unsafe_code)]
 fn resolve_payer(handle: &Handle, home: &Path) -> Result<String, String> {
-    let configured = crate::fee_payer_env_hex();
-    if !configured.is_empty() {
+    if let Some(configured) = fee_payer_env_hex()? {
         eprintln!("lez-rln wallet: paying from the configured account {configured}");
         return Ok(configured);
     }
 
     let recorded = home.join(PAYER_FILE);
-    if let Ok(raw) = std::fs::read_to_string(&recorded) {
-        let id = raw.trim().trim_matches('"').to_ascii_lowercase();
-        if crate::hex_to_bytes32(&id).is_some() {
-            eprintln!("lez-rln wallet: paying from {id} (recorded)");
-            return Ok(id);
+    match std::fs::read_to_string(&recorded) {
+        Ok(raw) => {
+            let id = raw.trim().trim_matches('"').to_ascii_lowercase();
+            if crate::hex::hex_to_bytes32(&id).is_some() {
+                eprintln!("lez-rln wallet: paying from {id} (recorded)");
+                return Ok(id);
+            }
+            return Err(format!(
+                "{} does not contain a 32-byte hex account id",
+                recorded.display()
+            ));
         }
-        return Err(format!(
-            "{} does not contain a 32-byte hex account id",
-            recorded.display()
-        ));
+        // Only an absent record means "no payer yet": deriving over one that
+        // could not be read would replace the account that holds the funds.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("read {}: {e}", recorded.display())),
     }
 
     let mut out = ffi::Bytes32::default();
@@ -1278,7 +1305,7 @@ fn resolve_payer(handle: &Handle, home: &Path) -> Result<String, String> {
     }
     // Derivation alone does not persist; without this the account is gone on
     // the next open and nothing can sign for it.
-    save(handle);
+    save(handle)?;
     let id = bytes_to_hex(&out.data);
     std::fs::write(&recorded, &id)
         .map_err(|e| format!("write {}: {e}", recorded.display()))?;
@@ -1289,12 +1316,13 @@ fn resolve_payer(handle: &Handle, home: &Path) -> Result<String, String> {
 }
 
 #[allow(unsafe_code)]
-fn save(handle: &Handle) {
+fn save(handle: &Handle) -> Result<(), String> {
     // SAFETY: a live handle.
     let rc = unsafe { ffi::wallet_ffi_save(handle.0) };
     if rc != ffi::SUCCESS {
-        eprintln!("lez-rln wallet: save failed ({})", ffi::describe(rc));
+        return Err(format!("saving the wallet failed ({})", ffi::describe(rc)));
     }
+    Ok(())
 }
 
 /// Catch the wallet up to the head.
@@ -1328,9 +1356,8 @@ fn cstring(path: &Path) -> Result<CString, String> {
 /// readable here and vice versa.
 fn wallet_config_json(sequencer: &str) -> String {
     serde_json::json!({
-        // v0.3.1 and v0.4 read `sequencer`, v0.2.5-v0.3.0 `sequencers`, the
-        // rc6-era wallet the flat field. None denies unknown fields, so all
-        // ride along.
+        // Every sequencer field shape a wallet version may require (each version
+        // requires a different one; none denies unknown fields).
         "sequencer": { "sequencer_addr": sequencer },
         "sequencer_addr": sequencer,
         "sequencers": [{ "sequencer_addr": sequencer }],
@@ -1347,7 +1374,7 @@ fn wallet_config_json(sequencer: &str) -> String {
 }
 
 /// The wallet, once bring-up has settled. `None` means unusable, and the
-/// caller reports the same empty string `lez_core` used to return.
+/// caller reports an empty string.
 fn wallet(who: &str) -> Option<Arc<RwLock<Handle>>> {
     let mut state = lock(&STATE);
     loop {
@@ -1373,19 +1400,6 @@ fn wallet(who: &str) -> Option<Arc<RwLock<Handle>>> {
     // The state lock is released here, before the caller's call runs.
 }
 
-/// Decode a base58 account id to 64 hex chars; empty string on failure. Needs
-/// no wallet, so it answers before bring-up has finished — which matters,
-/// because the fee payer is resolved on the register path.
-pub(crate) fn account_id_from_base58(id: &str) -> String {
-    match base58::decode32(id.trim()) {
-        Some(bytes) => bytes_to_hex(&bytes),
-        None => {
-            eprintln!("account_id_from_base58: {id} is not a base58 account id");
-            String::new()
-        }
-    }
-}
-
 /// What a public account read answered.
 pub(crate) enum AccountRead {
     /// Every actor state on the account as `(program, bytes)`; the native
@@ -1401,7 +1415,7 @@ pub(crate) enum AccountRead {
 
 #[allow(unsafe_code)]
 pub(crate) fn read_account(account_id_hex: &str) -> AccountRead {
-    let Some(bytes) = crate::hex_to_bytes32(account_id_hex) else {
+    let Some(bytes) = crate::hex::hex_to_bytes32(account_id_hex) else {
         eprintln!("read_account: {account_id_hex} is not 32-byte hex");
         return AccountRead::Error;
     };
@@ -1505,46 +1519,77 @@ fn send_error(rc: i32) -> String {
     }
 }
 
+/// What the wallet reports for one send. It answers `success:false` for a
+/// send it could not make (no key for the payer, no network, a payer that
+/// cannot fund), and nothing was submitted then.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct SendResult {
+    error: String,
+    success: bool,
+    tx_hash: String,
+}
+
+impl SendResult {
+    /// Whether the sequencer accepted the transaction: `success` and a tx
+    /// hash. `Err(why)` otherwise.
+    pub(crate) fn accepted(&self) -> Result<(), String> {
+        if self.success && !self.tx_hash.is_empty() {
+            return Ok(());
+        }
+        if !self.error.is_empty() {
+            return Err(self.error.clone());
+        }
+        Err(if self.success { "no tx_hash in the send reply" } else { "send failed" }.to_string())
+    }
+
+    pub(crate) fn tx_hash(&self) -> &str {
+        &self.tx_hash
+    }
+
+    /// `{"error","success","tx_hash"}`, keys in that order: `register_member`
+    /// hands this text back as its `tx_result`.
+    pub(crate) fn to_json(&self) -> String {
+        serde_json::to_value(self).map(|v| v.to_string()).unwrap_or_default()
+    }
+}
+
 /// Submit a public transaction: `message` is delivered to the actor
-/// `mentions[root]` selects, and every mention is declared, in order. Answers
-/// the JSON `{success, tx_hash, error}` the module parses; "" when the
-/// arguments are unusable or the wallet is not up (logged).
+/// `mentions[root]` selects, and every mention is declared, in order. `None`
+/// when the arguments are unusable or the wallet is not up (logged).
 #[allow(unsafe_code)]
 pub(crate) fn send_generic_public_transaction(
     mentions: &[Mention],
     root: usize,
     message: &[u8],
     payer_account_id_hex: &str,
-) -> String {
+) -> Option<SendResult> {
     if root >= mentions.len() {
         eprintln!(
             "send_generic_public_transaction: root mention {root} is past the {} mentions",
             mentions.len()
         );
-        return String::new();
+        return None;
     }
     let ffi_mentions: Vec<ffi::AccountMention> = mentions.iter().map(Mention::to_ffi).collect();
 
-    // Empty means self-pay, matching the lez_core contract.
+    // Empty means self-pay.
     let payer = if payer_account_id_hex.trim().is_empty() {
         None
     } else {
-        match crate::hex_to_bytes32(payer_account_id_hex) {
+        match crate::hex::hex_to_bytes32(payer_account_id_hex) {
             Some(bytes) => Some(ffi::Bytes32 { data: bytes }),
             None => {
                 eprintln!(
                     "send_generic_public_transaction: payer {payer_account_id_hex} is not \
                      32-byte hex"
                 );
-                return String::new();
+                return None;
             }
         }
     };
     let payer_ptr = payer.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
 
-    let Some(wallet) = wallet("send_generic_public_transaction") else {
-        return String::new();
-    };
+    let wallet = wallet("send_generic_public_transaction")?;
     let guard = wallet.read().unwrap_or_else(|p| p.into_inner());
     let mut result = ffi::TransactionResult::default();
     // SAFETY: a live handle; mentions, message and payer all outlive the call;
@@ -1569,8 +1614,7 @@ pub(crate) fn send_generic_public_transaction(
         // SAFETY: freeing the out struct is the library's contract whether or
         // not the call filled it.
         unsafe { ffi::wallet_ffi_free_transaction_result(&raw mut result) };
-        return serde_json::json!({ "success": false, "tx_hash": "", "error": error })
-            .to_string();
+        return Some(SendResult { error, success: false, tx_hash: String::new() });
     }
     // SAFETY: on success tx_hash is null or a null-terminated string the
     // library owns until the free below.
@@ -1585,7 +1629,7 @@ pub(crate) fn send_generic_public_transaction(
     // SAFETY: the struct the call just filled, freed exactly once.
     unsafe { ffi::wallet_ffi_free_transaction_result(&raw mut result) };
 
-    serde_json::json!({ "error": "", "success": success, "tx_hash": tx_hash }).to_string()
+    Some(SendResult { error: String::new(), success, tx_hash })
 }
 
 /// Derive a fresh public account in this module's own wallet and persist it,
@@ -1610,13 +1654,13 @@ pub(crate) fn native_balance(account_hex: &str) -> Option<(String, u128)> {
     let id_hex = if account_hex.trim().is_empty() {
         payer_hex()
     } else {
-        account_hex.trim().to_ascii_lowercase()
+        crate::hex::canonical_account_hex(account_hex)?
     };
     if id_hex.is_empty() {
         eprintln!("native_balance: no account given and no payer resolved yet");
         return None;
     }
-    let bytes = crate::hex_to_bytes32(&id_hex)?;
+    let bytes = crate::hex::hex_to_bytes32(&id_hex)?;
     let wallet = wallet("native_balance")?;
     let guard = wallet.read().unwrap_or_else(|p| p.into_inner());
     let id = ffi::Bytes32 { data: bytes };
@@ -1729,9 +1773,12 @@ mod wallet_ffi_test_transport {
     #[no_mangle]
     pub extern "C" fn wallet_ffi_create_account_public(
         _h: *mut ffi::WalletHandle,
-        _o: *mut ffi::Bytes32,
+        o: *mut ffi::Bytes32,
     ) -> i32 {
-        ffi::NO_WALLET
+        // Derivation succeeds so a test reaches the save after it, which fails.
+        // SAFETY: the caller passes an out struct it owns.
+        unsafe { (*o).data = [7; 32] };
+        ffi::SUCCESS
     }
 
     #[no_mangle]
@@ -1794,13 +1841,13 @@ mod tests {
 
     #[test]
     fn a_base58_payer_resolves_without_a_wallet() {
-        // The conversion is local now, so it answers before bring-up — which
+        // The conversion is local, so it answers before bring-up — which
         // matters, because the fee payer is resolved on the register path.
         assert_eq!(
-            account_id_from_base58("FqNyaKjaeUxjMxJszC88Z6SUUL8pxBgN6qRHC4ZsJjgn"),
-            "dc6857ef4236ef416fb6357c1f9988a7c7558b07492d7284c411b3864a1fccf3"
+            crate::hex::canonical_account_hex("FqNyaKjaeUxjMxJszC88Z6SUUL8pxBgN6qRHC4ZsJjgn").as_deref(),
+            Some("dc6857ef4236ef416fb6357c1f9988a7c7558b07492d7284c411b3864a1fccf3")
         );
-        assert_eq!(account_id_from_base58("not an account"), "");
+        assert_eq!(crate::hex::canonical_account_hex("not an account"), None);
     }
 
     #[test]
@@ -1850,8 +1897,29 @@ mod tests {
     #[test]
     fn a_root_index_past_the_mentions_is_refused_before_any_call() {
         // Returns before touching the wallet, so it holds with none open.
-        assert_eq!(send_generic_public_transaction(&[signer([0xAB; 32])], 1, &[1, 2, 3], ""), "");
-        assert_eq!(send_generic_public_transaction(&[], 0, &[1], ""), "");
+        assert_eq!(send_generic_public_transaction(&[signer([0xAB; 32])], 1, &[1, 2, 3], ""), None);
+        assert_eq!(send_generic_public_transaction(&[], 0, &[1], ""), None);
+    }
+
+    // The wallet's own failure reply is not a submission: success:false (no
+    // key for the payer, no network) and a success without a hash both mean
+    // nothing reached the sequencer.
+    #[test]
+    fn a_failed_send_is_not_a_submission() {
+        let sent = |error: &str, success: bool, tx_hash: &str| SendResult {
+            error: error.into(),
+            success,
+            tx_hash: tx_hash.into(),
+        };
+        assert!(sent("", true, "ab12").accepted().is_ok());
+        assert_eq!(sent("key not found", false, "").accepted().unwrap_err(), "key not found");
+        assert_eq!(sent("", false, "").accepted().unwrap_err(), "send failed");
+        assert_eq!(sent("", true, "").accepted().unwrap_err(), "no tx_hash in the send reply");
+        assert_eq!(sent("", true, "ab12").to_json(), r#"{"error":"","success":true,"tx_hash":"ab12"}"#);
+        assert_eq!(
+            sent("key not found", false, "").to_json(),
+            r#"{"error":"key not found","success":false,"tx_hash":""}"#
+        );
     }
 
     #[test]
@@ -1886,6 +1954,44 @@ mod tests {
         assert!(send_error(ffi::KEY_NOT_FOUND).starts_with("no_signing_key: "));
         assert!(send_error(ffi::INVALID_ACCOUNT_ID).starts_with("pda_mismatch: "));
         assert_eq!(send_error(99), "wallet: code 99 (internal error)");
+    }
+
+    // ---------------------------------------------------- payer resolution
+
+    /// `LEZ_RLN_PAYER` is process-global; the tests that set it or need it
+    /// unset hold this lock.
+    static PAYER_ENV: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn an_invalid_env_payer_fails_resolution() {
+        let _env = lock(&PAYER_ENV);
+        let home = temp_home("payer-env");
+        std::env::set_var("LEZ_RLN_PAYER", "not an account");
+        let got = resolve_payer(&Handle(std::ptr::null_mut()), &home);
+        std::env::remove_var("LEZ_RLN_PAYER");
+        let err = got.unwrap_err();
+        assert!(err.contains("LEZ_RLN_PAYER"), "got {err}");
+        assert!(!home.join(PAYER_FILE).exists());
+    }
+
+    #[test]
+    fn an_unreadable_payer_record_is_an_error_not_a_new_payer() {
+        let _env = lock(&PAYER_ENV);
+        let home = temp_home("payer-unreadable");
+        // A directory where the record belongs: present, but not readable as one.
+        std::fs::create_dir(home.join(PAYER_FILE)).unwrap();
+        let err = resolve_payer(&Handle(std::ptr::null_mut()), &home).unwrap_err();
+        assert!(err.starts_with("read "), "got {err}");
+        assert!(err.contains(PAYER_FILE), "got {err}");
+    }
+
+    #[test]
+    fn a_failed_save_records_no_payer() {
+        let _env = lock(&PAYER_ENV);
+        let home = temp_home("payer-save");
+        let err = resolve_payer(&Handle(std::ptr::null_mut()), &home).unwrap_err();
+        assert!(err.contains("saving the wallet failed"), "got {err}");
+        assert!(!home.join(PAYER_FILE).exists());
     }
 
     // ---------------------------------------------------- network selection
@@ -2115,7 +2221,7 @@ mod tests {
     fn the_sequencer_is_read_from_either_config_shape() {
         let seq = devnet_sequencer();
         assert_eq!(sequencer_of_config(&wallet_config_json(&seq)), Some(seq.clone()));
-        // A flat-only config (the rc6-era shape) still names it.
+        // A flat-only config still names it.
         let flat = serde_json::json!({ "sequencer_addr": seq }).to_string();
         assert_eq!(sequencer_of_config(&flat), Some(seq));
         assert_eq!(sequencer_of_config(r#"{"sequencers":[]}"#), None);
@@ -2133,6 +2239,6 @@ mod tests {
     #[test]
     fn a_malformed_payer_is_refused_before_any_call() {
         let out = send_generic_public_transaction(&[signer([0xAB; 32])], 0, &[1, 2, 3], "not-hex");
-        assert_eq!(out, "");
+        assert_eq!(out, None);
     }
 }

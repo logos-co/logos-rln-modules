@@ -1,15 +1,14 @@
 //! The networks this module knows by name.
 //!
-//! A consumer names a registry as a CAIP-10 id, `logos:<reference>:<config>`,
-//! and until 4.1.0 only the config account reached this module — so a wallet
-//! home it provisioned itself had no way to learn which sequencer that
-//! registry lives on, and bring-up failed unless `LEZ_RLN_SEQUENCER` was set.
-//! The table maps a reference to its sequencer, which is what lets a consumer's
-//! registry id alone pick the chain (`wallet::use_network`).
+//! A consumer names a registry as a CAIP-10 id, `logos:<reference>:<config>`;
+//! the reference alone names a network. This table maps a reference
+//! to its sequencer, so a self-provisioned wallet home needs no
+//! `LEZ_RLN_SEQUENCER` and a consumer's registry id alone picks the chain
+//! (`wallet::use_network`).
 //!
 //! It is `networks.json` next to `Cargo.toml`, embedded at compile time: each
 //! module flake sees only its own directory, so the table cannot live anywhere
-//! a sibling could share it. Field names follow the logos-rln-e2e
+//! another module could share it. Field names follow the logos-rln-e2e
 //! `deployment.json` descriptor, and `tools/add-network.sh` appends one from
 //! such a descriptor.
 
@@ -168,7 +167,7 @@ mod tests {
                 seen.push(hex);
                 for id in [&r.tree_id, &r.registration_program_id, &r.merkle_program_id] {
                     assert!(
-                        crate::hex_to_bytes32(id).is_some(),
+                        crate::hex::hex_to_bytes32(id).is_some(),
                         "{}: {id} is not 32-byte hex",
                         r.deployment
                     );

@@ -11,7 +11,7 @@
 //! module (secrets never cross the module wire); this module only ever sees
 //! the public id_commitment.
 //!
-//! Concurrency is "multi" (metadata.json, since 2.1.0): handlers run on Qt
+//! Concurrency is "multi" (metadata.json): handlers run on Qt
 //! worker threads and overlap, so one round trip stuck in a slow sequencer
 //! read does not wedge every other call. The wallet's own lock is taken inside
 //! each `core_ffi` entry point and released before it returns; this crate
@@ -30,9 +30,11 @@ use std::time::{Duration, Instant};
 
 mod base58;
 mod fee_state;
+mod hex;
 mod networks;
 mod rln_core;
 mod wallet;
+use hex::{canonical_account_hex, hex_to_bytes32};
 use rln_core as native;
 use rln_core::{bytes_to_hex, RlnRegisterPlan};
 
@@ -54,7 +56,7 @@ pub(crate) use generated::*;
 
 /// Lock a mutex, recovering the guard from a poisoned lock (a panicked
 /// handler must not wedge every later one).
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -62,14 +64,14 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// membership PDA this session; callers after the first get the first
 /// submission's reply. Delivery fires register_member on two paths within
 /// seconds, the on-chain pre-check cannot see a submission still confirming
-/// (60-90s on testnet), and a duplicate Register submit poisons the gifter
+/// (60-90s on testnet), and a duplicate Register submit poisons the allocator
 /// wallet's nonce sequence for the whole confirmation window.
 ///
 /// The key is the membership PDA hex — the canonical `(tree_id,
 /// id_commitment)` identity — NOT the raw caller strings: equivalent but
 /// differently-formatted inputs (`0xAB..` vs `ab..`, base58 vs 64-hex) must
 /// land in the same slot.
-type RegInFlightMap = std::collections::HashMap<String, (String, Instant)>;
+type RegInFlightMap = std::collections::HashMap<String, (RegisterReply, Instant)>;
 
 static REG_IN_FLIGHT: std::sync::LazyLock<Mutex<RegInFlightMap>> =
     std::sync::LazyLock::new(|| Mutex::new(RegInFlightMap::new()));
@@ -143,55 +145,12 @@ mod lp_test_transport {
 
 // ------------------------------------------------------------------- helpers
 
-/// Trim whitespace and strip an optional 0x/0X prefix.
-fn strip_hex_prefix(s: &str) -> &str {
-    let trimmed = s.trim();
-    trimmed
-        .strip_prefix("0x")
-        .or_else(|| trimmed.strip_prefix("0X"))
-        .unwrap_or(trimmed)
-}
-
-/// Trims whitespace, strips an optional 0x/0X prefix, requires an even
-/// number of hex digits and (when expected_len is given) an exact decoded
-/// length.
-fn hex_to_bytes(hex: &str, expected_len: Option<usize>) -> Option<Vec<u8>> {
-    let digits = strip_hex_prefix(hex);
-    if !digits.len().is_multiple_of(2) {
-        return None;
-    }
-    let bytes = digits.as_bytes();
-    let mut out = Vec::with_capacity(digits.len() / 2);
-    for pair in bytes.chunks_exact(2) {
-        let hi = (pair[0] as char).to_digit(16)?;
-        let lo = (pair[1] as char).to_digit(16)?;
-        out.push(((hi << 4) | lo) as u8);
-    }
-    if let Some(expected) = expected_len {
-        if out.len() != expected {
-            return None;
-        }
-    }
-    Some(out)
-}
-
-fn hex_to_bytes32(hex: &str) -> Option<[u8; 32]> {
-    hex_to_bytes(hex, Some(32)).map(|v| {
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&v);
-        out
-    })
-}
-
-/// 64-hex (with optional 0x) passes through; anything else goes to the
-/// wallet's account_id_from_base58 with the ORIGINAL untrimmed id. Empty
-/// string on failure.
+/// `canonical_account_hex`, or "" (logged) when `id` is no account id.
 fn resolve_account_id(id: &str) -> String {
-    let stripped = strip_hex_prefix(id);
-    if stripped.len() == 64 {
-        return stripped.to_string();
-    }
-    wallet::account_id_from_base58(id)
+    canonical_account_hex(id).unwrap_or_else(|| {
+        eprintln!("{id} is neither 32-byte hex nor a base58 account id");
+        String::new()
+    })
 }
 
 /// The native token program's id: the actor whose state on an account is its
@@ -371,68 +330,30 @@ fn network_conflict(bound: Option<&str>, config_hex: &str) -> Option<String> {
     })
 }
 
-/// The account that pays a transaction's fee, as 32-byte hex, or empty to let
-/// the wallet charge the signing account.
-///
-/// v0.2.5 charges every public transaction, and the fee is reserved from a
-/// *native* balance. A freshly created holding has tokens and no native
-/// balance at all, so making the signer pay means a registration is refused
-/// before it runs, with only "Incorrect fee" to say why.
-///
-/// `LEZ_RLN_PAYER` names a funded account the wallet already holds a key for —
-/// the same variable the host tools use. It accepts base58 or hex, since the
-/// tooling that mints the payer prints base58 and the wallet interface wants
-/// hex. Unset means self-pay, which is right wherever the signing account is
-/// itself funded.
-/// `LEZ_RLN_PAYER` as 64-hex, or "" when unset. Read at bring-up to decide the
-/// module's payer; `fee_payer_hex` is what every send actually uses.
-pub(crate) fn fee_payer_env_hex() -> String {
-    let Ok(raw) = std::env::var("LEZ_RLN_PAYER") else {
-        return String::new();
-    };
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return String::new();
-    }
-    if hex_to_bytes32(raw).is_some() {
-        return raw.to_ascii_lowercase();
-    }
-    let resolved = wallet::account_id_from_base58(raw);
-    if resolved.is_empty() {
-        eprintln!("LEZ_RLN_PAYER is neither 32-byte hex nor a base58 account id: {raw}");
-    }
-    resolved
-}
-
-/// The account a transaction declares as its fee payer.
-///
-/// Empty used to mean "self-pay by the signer", which was right when the
-/// signer was a token holding that held no native balance and something else
-/// had to pay. The signer now IS the payer, so the fallback is the account the
-/// wallet resolved at bring-up — configured, imported or derived.
+/// The account a transaction declares as its fee payer: the one the wallet
+/// resolved at bring-up from LEZ_RLN_PAYER, the payer record, or derivation.
+/// A bring-up that resolves none never reaches Ready, so nothing is sent.
 fn fee_payer_hex() -> String {
-    let configured = fee_payer_env_hex();
-    if !configured.is_empty() {
-        return configured;
-    }
     wallet::payer_hex()
 }
 
 /// Submit one public transaction through the module's own wallet: `message`
-/// goes to the actor `mentions[root]` selects. `None` = failed, already logged.
+/// goes to the actor `mentions[root]` selects. `Err(why)` = the sequencer
+/// accepted nothing, already logged.
 fn send_generic_tx(
     who: &str,
     mentions: &[wallet::Mention],
     root: usize,
     message: &[u8],
     payer_hex: &str,
-) -> Option<String> {
-    let send_result = wallet::send_generic_public_transaction(mentions, root, message, payer_hex);
-    if send_result.is_empty() {
-        eprintln!("{who}: transaction failed");
-        return None;
+) -> Result<wallet::SendResult, String> {
+    let accepted = wallet::send_generic_public_transaction(mentions, root, message, payer_hex)
+        .ok_or_else(|| "no reply from the wallet".to_string())
+        .and_then(|sent| sent.accepted().map(|()| sent));
+    if let Err(why) = &accepted {
+        eprintln!("{who}: transaction failed: {why}");
     }
-    Some(send_result)
+    accepted
 }
 
 fn derive_register_plan(
@@ -528,7 +449,7 @@ fn roots_to_json_array(roots: &[[u8; 32]]) -> serde_json::Value {
 /// Serialize proofs plus the shared `valid_roots` array to the wire JSON.
 /// `serde_json::Value` objects are BTreeMaps, so keys serialize
 /// alphabetically — the frozen wire order (pinned by
-/// `augmented_proofs_match_legacy_string_roundtrip`).
+/// `augmented_proofs_match_json_roundtrip`).
 fn proofs_with_roots_json(proofs: &[native::ProofJson], roots_array: &serde_json::Value) -> String {
     let augmented: Vec<serde_json::Value> = proofs
         .iter()
@@ -544,16 +465,58 @@ fn proofs_with_roots_json(proofs: &[native::ProofJson], roots_array: &serde_json
     serde_json::Value::Array(augmented).to_string()
 }
 
-/// The `tx_hash` of a send reply (`{success, tx_hash, error}`), or "".
-fn tx_hash_of(send_result: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(send_result)
-        .ok()
-        .and_then(|v| v.get("tx_hash").and_then(|h| h.as_str()).map(str::to_owned))
-        .unwrap_or_default()
+/// Build and send one `Register`, dated by chain time read now. `Err(why)` =
+/// not submitted, already logged.
+/// A wire flag that is only ever `true`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Yes;
+
+impl serde::Serialize for Yes {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bool(true)
+    }
 }
 
-/// Build and send one `Register`, dated by chain time read now. `None` = not
-/// submitted, already logged.
+/// `register_member`'s answer when it has one ("" is a read failure).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(untagged)]
+enum RegisterReply {
+    /// In flight. The placeholder (no `tx_result`) and the accepted
+    /// submission share one shape, since the in-flight dedup hands either
+    /// back to a repeat caller. `tx_result` is the send result as JSON text.
+    Submitted {
+        leaf_index: u64,
+        pending: Yes,
+        rate_limit: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tx_result: Option<String>,
+    },
+    AlreadyRegistered { already_registered: Yes, leaf_index: u64 },
+    /// `"<kind>: <reason>"`.
+    Refused { error: String },
+}
+
+impl RegisterReply {
+    fn pending(leaf_index: u64, rate_limit: u64, sent: Option<&wallet::SendResult>) -> Self {
+        Self::Submitted {
+            leaf_index,
+            pending: Yes,
+            rate_limit,
+            tx_result: sent.map(wallet::SendResult::to_json),
+        }
+    }
+
+    fn refused(why: impl std::fmt::Display) -> Self {
+        Self::Refused { error: why.to_string() }
+    }
+
+    /// Through `serde_json::Value`, whose map orders keys alphabetically:
+    /// the key order consumers read.
+    fn to_json(&self) -> String {
+        serde_json::to_value(self).map(|v| v.to_string()).unwrap_or_default()
+    }
+}
+
 fn submit_register(
     ctx: &RlnConfigContext,
     plan: &RlnRegisterPlan,
@@ -561,20 +524,22 @@ fn submit_register(
     rate_limit: u64,
     payer_hex: &str,
     who: &str,
-) -> Option<String> {
+) -> Result<wallet::SendResult, String> {
     let Some(payer) = hex_to_bytes32(payer_hex) else {
         eprintln!("{who}: payer {payer_hex} is not 32-byte hex");
-        return None;
+        return Err(format!("payer {payer_hex} is not 32-byte hex"));
     };
     // The validity window opens at now_ms, so it is read last, just before
     // sending.
-    let now_ms = chain_time_ms(who)?.saturating_sub(CHAIN_TIME_SLACK_MS);
+    let now_ms = chain_time_ms(who)
+        .ok_or_else(|| "chain time unavailable".to_string())?
+        .saturating_sub(CHAIN_TIME_SLACK_MS);
     let message = match native::register_build_message(plan, id_commitment, rate_limit, &payer, now_ms)
     {
         Ok(bytes) => bytes,
         Err(e) => {
             eprintln!("{who}: register_build_message failed: {e}");
-            return None;
+            return Err(format!("register_build_message failed: {e}"));
         }
     };
     // Every actor the program touches while handling Register is declared:
@@ -606,6 +571,12 @@ fn submit_register(
 /// a later caller.
 const REG_WATCH_INTERVAL: Duration = Duration::from_secs(2);
 const REG_MAX_RESUBMITS: u32 = 5;
+/// How many consecutive polls a transaction the sequencer has never included
+/// gets before it counts as dropped (120 s; inclusion takes 60-90 s): a
+/// registration signed with a nonce another send consumed first is dropped
+/// at the door without a word and would otherwise stay "pending" until the
+/// watcher's deadline, never re-sent.
+const REG_DROPPED_POLLS: u32 = 60;
 
 struct RegisterWatch {
     config_account_id: String,
@@ -701,6 +672,7 @@ fn register_watch(mut w: RegisterWatch) {
     const WHO: &str = "register_member(watch)";
     let deadline = Instant::now() + REG_IN_FLIGHT_TTL;
     let mut resubmits = 0u32;
+    let mut not_included = 0u32;
     while Instant::now() < deadline {
         std::thread::sleep(REG_WATCH_INTERVAL);
         let Some(ctx) = resolve_config_context(&w.config_account_id, WHO) else {
@@ -721,8 +693,21 @@ fn register_watch(mut w: RegisterWatch) {
             }
             return;
         }
-        if fee_state::tx_included(&w.tx_hash) != Some(true) {
-            continue;
+        match fee_state::tx_included(&w.tx_hash) {
+            Some(true) => not_included = 0,
+            Some(false) => {
+                not_included += 1;
+                if not_included < REG_DROPPED_POLLS {
+                    continue;
+                }
+                not_included = 0;
+                eprintln!(
+                    "{WHO}: tx {} not included after {REG_DROPPED_POLLS} polls — dropped at the door; \
+                     re-sending",
+                    w.tx_hash
+                );
+            }
+            None => continue,
         }
         // Included: re-read once, in case it applied between the two reads.
         if landed().is_some() {
@@ -741,8 +726,7 @@ fn register_watch(mut w: RegisterWatch) {
         // pay) would revert, and be charged, on every re-send.
         if let Err(why) = preflight_register(&ctx, &plan, &w.id_commitment, w.rate_limit, &w.payer_hex) {
             eprintln!("{WHO}: tx {} reverted and a re-send would too — not re-sending: {why}", w.tx_hash);
-            let reply = serde_json::json!({ "error": why }).to_string();
-            reg_in_flight(|m| m.insert(w.reg_key.clone(), (reply, Instant::now())));
+            reg_in_flight(|m| m.insert(w.reg_key.clone(), (RegisterReply::refused(why), Instant::now())));
             return;
         }
         eprintln!(
@@ -751,20 +735,18 @@ fn register_watch(mut w: RegisterWatch) {
             w.tx_hash
         );
         resubmits += 1;
-        let Some(send_result) =
-            submit_register(&ctx, &plan, &w.id_commitment, w.rate_limit, &w.payer_hex, WHO)
-        else {
-            continue;
+        let send_result = match submit_register(&ctx, &plan, &w.id_commitment, w.rate_limit, &w.payer_hex, WHO) {
+            Ok(r) => r,
+            Err(_) => continue,
         };
-        w.tx_hash = tx_hash_of(&send_result);
-        let reply = serde_json::json!({
-            "leaf_index": plan.next_leaf_index as i64,
-            "tx_result": send_result,
-            "pending": true,
-        })
-        .to_string();
+        w.tx_hash = send_result.tx_hash().to_owned();
+        let reply = RegisterReply::pending(plan.next_leaf_index, w.rate_limit, Some(&send_result));
         reg_in_flight(|m| m.insert(w.reg_key.clone(), (reply, Instant::now())));
     }
+    // The entry goes with its watcher: a re-send refreshed its timestamp, so
+    // left alone it would answer "pending" for up to another TTL with nobody
+    // watching the chain for it.
+    reg_in_flight(|m| m.remove(&w.reg_key));
     eprintln!("{WHO}: no membership within {}s", REG_IN_FLIGHT_TTL.as_secs());
 }
 
@@ -920,6 +902,13 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         id_commitment_hex: String,
         rate_limit: i64,
     ) -> String {
+        let Ok(rate_limit) = u64::try_from(rate_limit) else {
+            eprintln!("register_member: negative rate_limit {rate_limit}");
+            return RegisterReply::refused(format!(
+                "invalid_rate_limit: {rate_limit} is negative"
+            ))
+            .to_json();
+        };
         let Some(id_commitment) = hex_to_bytes32(&id_commitment_hex) else {
             eprintln!("register_member: invalid id_commitment hex");
             return String::new();
@@ -963,28 +952,21 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
                 return String::new();
             };
             eprintln!("register_member: membership already exists at leaf {leaf} — skipping resubmit");
-            return serde_json::json!({
-                "leaf_index": leaf as i64,
-                "already_registered": true,
-            })
-            .to_string();
+            return RegisterReply::AlreadyRegistered { already_registered: Yes, leaf_index: leaf }
+                .to_json();
         }
 
         if let Err(why) =
-            preflight_register(&ctx, &plan, &id_commitment, rate_limit as u64, &payer_hex)
+            preflight_register(&ctx, &plan, &id_commitment, rate_limit, &payer_hex)
         {
             eprintln!("register_member: not submitting: {why}");
-            return serde_json::json!({ "error": why }).to_string();
+            return RegisterReply::refused(why).to_json();
         }
 
         // In-flight dedup (see REG_IN_FLIGHT): the first caller submits;
         // concurrent and repeat callers get the first submission's reply.
         let reg_key = membership_pda_hex.clone();
-        let placeholder = serde_json::json!({
-            "leaf_index": plan.next_leaf_index as i64,
-            "pending": true,
-        })
-        .to_string();
+        let placeholder = RegisterReply::pending(plan.next_leaf_index, rate_limit, None);
         let prior = reg_in_flight(|m| match m.get(&reg_key) {
             Some((reply, _)) => Some(reply.clone()),
             None => {
@@ -993,39 +975,51 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             }
         });
         if let Some(reply) = prior {
-            eprintln!(
-                "register_member: registration already submitted this session — returning prior reply"
-            );
-            return reply;
+            // One membership per commitment is the program's rule, so the
+            // first submission answers every caller; a caller that asked for
+            // another rate learns which one is on its way from the reply.
+            let prior_rate = match &reply {
+                RegisterReply::Submitted { rate_limit, .. } => Some(*rate_limit),
+                _ => None,
+            };
+            match prior_rate {
+                Some(r) if r != rate_limit => eprintln!(
+                    "register_member: registration already submitted this session at rate {r}, \
+                     not the requested {rate_limit} — returning prior reply"
+                ),
+                _ => eprintln!(
+                    "register_member: registration already submitted this session — returning prior reply"
+                ),
+            }
+            return reply.to_json();
         }
 
-        let Some(send_result) =
-            submit_register(&ctx, &plan, &id_commitment, rate_limit as u64, &payer_hex, "register_member")
-        else {
-            reg_in_flight(|m| m.remove(&reg_key));
-            return String::new();
+        // A send the wallet could not make (no signing key for the payer, no
+        // network, a payer that cannot fund) submitted nothing: the caller
+        // gets the refusal, not a "pending" it would wait out.
+        let send_result = match submit_register(&ctx, &plan, &id_commitment, rate_limit, &payer_hex, "register_member") {
+            Ok(r) => r,
+            Err(why) => {
+                reg_in_flight(|m| m.remove(&reg_key));
+                return RegisterReply::refused(format!("send_failed: {why}")).to_json();
+            }
         };
 
         // Return once the sequencer accepts the submission; don't block on
         // confirmation — next_leaf_index is only a pre-submit estimate.
         // Callers poll get_membership() for the authoritative leaf_index
         // from the membership PDA.
-        let reply = serde_json::json!({
-            "leaf_index": plan.next_leaf_index as i64,
-            "tx_result": send_result,
-            "pending": true,
-        })
-        .to_string();
+        let reply = RegisterReply::pending(plan.next_leaf_index, rate_limit, Some(&send_result));
         reg_in_flight(|m| m.insert(reg_key.clone(), (reply.clone(), Instant::now())));
         spawn_register_watch(RegisterWatch {
             config_account_id,
             payer_hex,
             id_commitment,
-            rate_limit: rate_limit as u64,
+            rate_limit,
             reg_key,
-            tx_hash: tx_hash_of(&send_result),
+            tx_hash: send_result.tx_hash().to_owned(),
         });
-        reply
+        reply.to_json()
     }
 
     fn get_membership(&self, config_account_id: String, id_commitment_hex: String) -> String {
@@ -1152,6 +1146,17 @@ pub extern "Rust" fn logos_module_install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hex::hex_to_bytes;
+
+    #[test]
+    fn an_account_id_has_one_canonical_form() {
+        let lower = "ab".repeat(32);
+        let canonical = canonical_account_hex(&lower);
+        assert_eq!(canonical.as_deref(), Some(lower.as_str()));
+        assert_eq!(canonical_account_hex(&format!("0x{}", "AB".repeat(32))), canonical);
+        assert_eq!(canonical_account_hex(&format!(" 0X{lower} ")), canonical);
+        assert_eq!(canonical_account_hex(&"zz".repeat(32)), None);
+    }
 
     #[test]
     fn hex_roundtrip_mirrors_cpp_hex_to_bytes() {
@@ -1163,6 +1168,42 @@ mod tests {
         assert!(hex_to_bytes32("zz").is_none());
         assert!(hex_to_bytes("abc", None).is_none());
         assert_eq!(hex_to_bytes(" 00ff ", None).unwrap(), vec![0x00, 0xff]);
+    }
+
+    // register_member's reply text, byte for byte: consumers (the
+    // membership module, the gifter) read these keys, and `tx_result` is a
+    // JSON string, not an object.
+    #[test]
+    fn register_replies_serialise_to_the_wire_text() {
+        let placeholder = RegisterReply::pending(5, 100, None);
+        assert_eq!(placeholder.to_json(), r#"{"leaf_index":5,"pending":true,"rate_limit":100}"#);
+        let submitted = RegisterReply::Submitted {
+            leaf_index: 5,
+            pending: Yes,
+            rate_limit: 100,
+            tx_result: Some(r#"{"error":"","success":true,"tx_hash":"ab12"}"#.into()),
+        };
+        assert_eq!(
+            submitted.to_json(),
+            r#"{"leaf_index":5,"pending":true,"rate_limit":100,"tx_result":"{\"error\":\"\",\"success\":true,\"tx_hash\":\"ab12\"}"}"#
+        );
+        let already = RegisterReply::AlreadyRegistered { already_registered: Yes, leaf_index: 7 };
+        assert_eq!(already.to_json(), r#"{"already_registered":true,"leaf_index":7}"#);
+        assert_eq!(
+            RegisterReply::refused("send_failed: key not found").to_json(),
+            r#"{"error":"send_failed: key not found"}"#
+        );
+    }
+
+    #[test]
+    fn a_negative_rate_is_refused_as_invalid_rate_limit() {
+        let reply = LogosLezRlnModuleImpl.register_member(
+            String::new(),
+            String::new(),
+            "00".repeat(32),
+            -1,
+        );
+        assert_eq!(reply, r#"{"error":"invalid_rate_limit: -1 is negative"}"#);
     }
 
     // TTL eviction: a stale entry (Failed registration awaiting retry) must
@@ -1178,12 +1219,12 @@ mod tests {
             return;
         };
         reg_in_flight(|m| {
-            m.insert(stale_key.clone(), ("stale".to_string(), back_dated));
-            m.insert(fresh_key.clone(), ("fresh".to_string(), Instant::now()));
+            m.insert(stale_key.clone(), (RegisterReply::refused("stale"), back_dated));
+            m.insert(fresh_key.clone(), (RegisterReply::refused("fresh"), Instant::now()));
         });
         reg_in_flight(|m| {
             assert!(!m.contains_key(&stale_key), "stale entry must be evicted");
-            assert_eq!(m.get(&fresh_key).map(|(r, _)| r.as_str()), Some("fresh"));
+            assert_eq!(m.get(&fresh_key).map(|(r, _)| r), Some(&RegisterReply::refused("fresh")));
             m.remove(&fresh_key);
         });
     }
@@ -1192,7 +1233,7 @@ mod tests {
     // round-trip (serialize → re-parse as Value → insert valid_roots →
     // re-serialize) that defines the frozen wire format.
     #[test]
-    fn augmented_proofs_match_legacy_string_roundtrip() {
+    fn augmented_proofs_match_json_roundtrip() {
         let proofs = vec![native::ProofJson {
             leaf: "aa".repeat(32),
             root: "bb".repeat(32),

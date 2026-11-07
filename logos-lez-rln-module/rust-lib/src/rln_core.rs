@@ -107,11 +107,8 @@ pub struct RlnRegisterPlan {
 /// `rln_layouts::ConfigState` field offsets (borsh: fixed-width fields in
 /// declaration order, no prefixes).
 ///
-/// These were once described as append-only and read against a MINIMUM size,
-/// so one module could serve a 240-byte and a 296-byte config at the same
-/// time. Registration becoming native-only removed six fields from the middle
-/// and the layout is now 160 bytes, which ends both claims: a field removed
-/// from the middle re-points every offset after it.
+/// The layout is 160 bytes and not append-only: a field removed from the
+/// middle re-points every offset after it.
 ///
 /// `ConfigState` carries no version discriminator, so nothing in the account
 /// distinguishes one layout from another — an old config read through these
@@ -253,10 +250,10 @@ pub fn get_valid_roots(data: &[u8]) -> Result<Vec<[u8; 32]>, RlnError> {
 
 /// Build a merkle proof for a single leaf from the tree's merkle shard.
 ///
-/// LEZ v0.3.0 keeps the whole tree in one shard of `tree_main`: the header,
+/// The whole tree is kept in one shard of `tree_main`: the header,
 /// then each level's default hash (root level first) at
 /// `OFFSET_CACHED_NODES`, then one sparse node map from `OFFSET_TREE_DATA`.
-/// There are no subtree accounts any more, so a proof is a read of one
+/// There are no subtree accounts, so a proof is a read of one
 /// account — which also makes it a consistent snapshot by construction.
 pub fn build_merkle_proof(main_data: &[u8], leaf_index: u64) -> Result<RlnMerkleProof, RlnError> {
     if main_data.len() < OFFSET_TREE_DATA {
@@ -442,9 +439,8 @@ pub fn registration_leaf(id_commitment: &[u8; 32], rate_limit: u64) -> Option<[u
 
 /// Where `leaf` sits in the tree, newest slot first, below `next_index`.
 ///
-/// On LEZ v0.3.0 the merkle program assigns the slot when a registration
-/// applies and the membership record no longer carries it, so the tree is
-/// the only place the index lives. Mirrors lez-rln's
+/// The merkle program assigns the slot when a registration applies and the
+/// membership record does not carry it, so the tree is the only place the index lives. Mirrors lez-rln's
 /// `merkle_tree::find_leaf_index`.
 pub fn find_leaf_index(main_data: &[u8], leaf: &[u8; 32]) -> Option<u64> {
     if main_data.len() < OFFSET_TREE_DATA || main_data[OFFSET_DEPTH] as usize != TREE_DEPTH {
@@ -557,8 +553,7 @@ mod tests {
     /// says which generation they are. Read through this offset table, a
     /// 296-byte pre-native config does not error — it yields a treasury id and
     /// a price that are plausible and wrong, and a registration would pay a
-    /// stranger. The predecessor of this guard was `CONFIG_STATE_MIN_SIZE =
-    /// 240`, a floor that admitted exactly that account.
+    /// stranger.
     ///
     /// Both sizes below are the real ones: 296 is the config with the payment
     /// and credit tokens, 240 its ancestor before the policy fields.
@@ -607,8 +602,7 @@ mod tests {
         assert_eq!(membership_status(1_000, 50, 51_000), "expired");
     }
 
-    /// The regression at the scale it was reported: a 30-day membership must
-    /// still be active an hour in.
+    /// A 30-day membership must still be active an hour in.
     #[test]
     fn a_thirty_day_membership_is_active_an_hour_in() {
         const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
