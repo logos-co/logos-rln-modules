@@ -33,8 +33,8 @@ use std::time::Duration;
 
 use logos_rust_sdk::LogosError;
 
-use crate::liblogos_lez_rln_module::LiblogosLezRlnModuleClient;
-use crate::rln_gifter_module::RlnGifterModuleClient;
+use crate::generated::liblogos_lez_rln_module::LiblogosLezRlnModuleClient;
+use crate::generated::rln_gifter_module::RlnGifterModuleClient;
 use crate::lifecycle::MembershipState;
 use crate::registry_id::CanonicalRegistryId;
 use crate::util::lock;

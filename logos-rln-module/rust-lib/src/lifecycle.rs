@@ -245,7 +245,7 @@ pub(crate) fn emit_transition(
     if let Some((registry_id, rln_identifier, membership_hash, state, previous)) =
         transition_event(hash, record, prior, new_state)
     {
-        crate::emit_membership_state_changed(
+        crate::generated::emit_membership_state_changed(
             &registry_id,
             &rln_identifier,
             &membership_hash,
@@ -421,5 +421,25 @@ mod tests {
         assert_eq!(granted_by("h1").as_deref(), Some("16Uiu2Found (discovered)"));
         assert_eq!(granted_by("h2").as_deref(), Some("16Uiu2Fixed"));
         assert!(granted_by("h3").is_none());
+    }
+
+    // Frozen cross-crate wire contract: every MembershipState variant MUST
+    // serialize to the exact string logos-lez-rln-module's
+    // rln_core::membership_status returns. No shared type — this pin is the
+    // single anchor forcing a coordinated rename on both sides.
+    #[test]
+    fn membership_state_wire_strings() {
+        assert_eq!(serde_json::to_value(MembershipState::Unknown).unwrap(), serde_json::json!("unknown"));
+        assert_eq!(serde_json::to_value(MembershipState::Pending).unwrap(), serde_json::json!("pending"));
+        assert_eq!(serde_json::to_value(MembershipState::Failed).unwrap(), serde_json::json!("failed"));
+        assert_eq!(serde_json::to_value(MembershipState::Active).unwrap(), serde_json::json!("active"));
+        assert_eq!(serde_json::to_value(MembershipState::GracePeriod).unwrap(), serde_json::json!("grace_period"));
+        assert_eq!(serde_json::to_value(MembershipState::Expired).unwrap(), serde_json::json!("expired"));
+        assert_eq!(
+            serde_json::to_value(MembershipState::ErasedAwaitsWithdrawal).unwrap(),
+            serde_json::json!("erased_awaits_withdrawal")
+        );
+        assert_eq!(serde_json::to_value(MembershipState::Erased).unwrap(), serde_json::json!("erased"));
+        assert_eq!(serde_json::to_value(MembershipState::Slashed).unwrap(), serde_json::json!("slashed"));
     }
 }

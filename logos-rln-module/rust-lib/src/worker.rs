@@ -45,7 +45,15 @@ enum WorkerState {
 
 /// A slot's handle plus the worker's own "I have returned" flag, so `stop()`
 /// can tell an instant join from a blocked worker without ever blocking.
-type Slot = Option<(JoinHandle<()>, Arc<AtomicBool>)>;
+type Held = Option<(JoinHandle<()>, Arc<AtomicBool>)>;
+
+/// The long-lived worker slots a respawn fills; the one-shot warm pass is
+/// `start()`'s own.
+#[derive(Clone, Copy)]
+pub(crate) enum Slot {
+    Poller,
+    Refresher,
+}
 
 struct Supervisor {
     state: WorkerState,
@@ -61,9 +69,9 @@ struct Supervisor {
     /// Live (spawned, not yet returned) workers — stop()'s join condition
     /// and the tests' observability seam.
     running: usize,
-    poller: Slot,
-    refresher: Slot,
-    warm: Slot,
+    poller: Held,
+    refresher: Held,
+    warm: Held,
 }
 
 static SUP: Mutex<Supervisor> = Mutex::new(Supervisor {
@@ -134,20 +142,26 @@ pub(crate) fn generation_for_test() -> u64 {
 /// Spawn `body(generation)` into `slot` if permitted and not already alive.
 /// A slot whose previous worker has returned is reaped (instant join) and
 /// respawned; a live worker makes this a no-op.
-fn ensure(slot: fn(&mut Supervisor) -> &mut Slot, name: &'static str, body: fn(u64)) {
+pub(crate) fn ensure(slot: Slot, name: &'static str, body: fn(u64)) {
+    fn held(s: &mut Supervisor, slot: Slot) -> &mut Held {
+        match slot {
+            Slot::Poller => &mut s.poller,
+            Slot::Refresher => &mut s.refresher,
+        }
+    }
     let mut sup = crate::util::lock(&SUP);
     if sup.state == WorkerState::Stopped {
         return;
     }
-    let alive = matches!(slot(&mut sup), Some((_, done)) if !done.load(Ordering::SeqCst));
+    let alive = matches!(held(&mut sup, slot), Some((_, done)) if !done.load(Ordering::SeqCst));
     if alive {
         return;
     }
-    if let Some((handle, _)) = slot(&mut sup).take() {
+    if let Some((handle, _)) = held(&mut sup, slot).take() {
         let _ = handle.join();
     }
     let gen = sup.generation;
-    *slot(&mut sup) = Some(spawn_into(name, gen, move || body(gen)));
+    *held(&mut sup, slot) = Some(spawn_into(name, gen, move || body(gen)));
     sup.running += 1;
 }
 
@@ -189,21 +203,12 @@ fn spawn_into(
     (handle, done)
 }
 
-/// Idempotently spawn the confirmation poller (no-op while stopped).
-pub(crate) fn ensure_poller() {
-    ensure(|s| &mut s.poller, "rln-poller", crate::poller::run_loop);
-}
-
-/// Idempotently spawn the valid-root refresher (no-op while stopped).
-pub(crate) fn ensure_refresher() {
-    ensure(|s| &mut s.refresher, "rln-roots", crate::roots::run_loop);
-}
-
-/// start(): permit + spawn maintenance, and run `warm` once in the
-/// background. A start after stop() bumps the generation (fresh workers,
-/// stale stragglers die); a repeated start is idempotent — live workers are
-/// kept, only the warm pass respawns.
-pub(crate) fn start(warm: impl FnOnce() + Send + 'static) {
+/// start(): permit + spawn maintenance (each `respawn` entry idempotently
+/// ensures one long-lived worker), and run `warm` once in the background. A
+/// start after stop() bumps the generation (fresh workers, stale stragglers
+/// die); a repeated start is idempotent — live workers are kept, only the
+/// warm pass respawns.
+pub(crate) fn start(warm: impl FnOnce() + Send + 'static, respawn: &'static [fn()]) {
     {
         let mut sup = crate::util::lock(&SUP);
         if sup.state == WorkerState::Stopped {
@@ -213,8 +218,9 @@ pub(crate) fn start(warm: impl FnOnce() + Send + 'static) {
         STOPPED.store(false, Ordering::SeqCst);
     }
     CVAR.notify_all();
-    ensure_poller();
-    ensure_refresher();
+    for ensure_worker in respawn {
+        ensure_worker();
+    }
     let mut sup = crate::util::lock(&SUP);
     if let Some((handle, done)) = sup.warm.take() {
         // A previous warm pass that finished is reaped; one still in flight
@@ -314,12 +320,14 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    const RESPAWN: &[fn()] = &[crate::poller::ensure_running, crate::roots::ensure_refresher];
+
     // The supervisor is process-global; every test here serializes on the
     // crate's designated global-state lock and starts from a clean reset.
 
     #[test]
     fn nudge_wakes_only_the_subscribed_loop() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         reset_for_test();
         let gen = generation_for_test();
 
@@ -357,10 +365,10 @@ mod tests {
 
     #[test]
     fn stop_joins_workers_quickly() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         reset_for_test();
-        ensure_poller();
-        ensure_refresher();
+        crate::poller::ensure_running();
+        crate::roots::ensure_refresher();
         assert_eq!(live_worker_count(), 2);
         let began = Instant::now();
         stop();
@@ -373,15 +381,15 @@ mod tests {
 
     #[test]
     fn start_after_stop_respawns_with_new_generation() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         reset_for_test();
-        start(|| {});
+        start(|| {}, RESPAWN);
         let g1 = generation_for_test();
         assert!(live_worker_count() >= 2);
         stop();
         assert_eq!(live_worker_count(), 0);
         assert!(is_stopped());
-        start(|| {});
+        start(|| {}, RESPAWN);
         assert!(generation_for_test() > g1);
         assert!(!is_stopped());
         assert!(live_worker_count() >= 2);
@@ -391,7 +399,7 @@ mod tests {
 
     #[test]
     fn spawn_is_forbidden_while_stopped_but_interest_is_recorded() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         reset_for_test();
         stop();
         crate::poller::ensure_running();
@@ -408,7 +416,7 @@ mod tests {
 
     #[test]
     fn on_demand_spawn_before_start_is_idempotent() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         reset_for_test();
         crate::poller::ensure_running();
         assert_eq!(live_worker_count(), 1);
@@ -420,7 +428,7 @@ mod tests {
 
     #[test]
     fn stop_detaches_blocked_worker_without_duplicating_it() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         reset_for_test();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let exited = Arc::new(AtomicBool::new(false));
@@ -449,7 +457,7 @@ mod tests {
         // A restart spawns exactly the fresh set — stop() closed the
         // generation and zeroed the count, so the detached straggler never
         // double-counts against the new run.
-        start(|| {});
+        start(|| {}, RESPAWN);
         assert_eq!(live_worker_count(), 3);
         stop();
         reset_for_test();

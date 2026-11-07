@@ -112,7 +112,7 @@ mod tests {
     // under that lock.
     #[test]
     fn fresh_then_duplicate_then_collision() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         reset_for_test();
         let n = [0xa1u8; 32];
         let (x1, y1) = ([0x11u8; 32], [0x21u8; 32]);
@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn prunes_below_retain_floor() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         reset_for_test();
         let n = [0xb2u8; 32];
         let (x1, y1) = ([0x31u8; 32], [0x41u8; 32]);
@@ -148,7 +148,7 @@ mod tests {
     // slow one's nullifiers.
     #[test]
     fn prune_is_per_registry() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         reset_for_test();
         let slow = "logos:local:d";
         let fast = "logos:local:m";

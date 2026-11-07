@@ -1,6 +1,6 @@
 //! Typed reply shapes: `#[derive(Serialize)]` mirrors of the wire objects
-//! `lib.rs` hands back. Each struct's doc comment names the `.lidl` record
-//! (or method-comment shape) it mirrors.
+//! the method handlers hand back. Each struct's doc comment names the
+//! `.lidl` record (or method-comment shape) it mirrors.
 //!
 //! Fields are declared in alphabetical order as a preview of the wire shape.
 //! Actual key order comes from `serde_json::to_value`: without the
@@ -92,6 +92,26 @@ impl MembershipView {
             tx_result: cache.tx_result.clone(),
         }
     }
+}
+
+/// The public Membership view (spec Membership minus secrets): the
+/// `credential` object exposes only the commitment; the identity secret
+/// never crosses this interface.
+pub(crate) fn public_membership(
+    hash: &str,
+    record: &MembershipRecord,
+    quarantined: bool,
+    rate_limit_mismatch: bool,
+    epoch_size_mismatch: bool,
+) -> serde_json::Value {
+    serde_json::to_value(MembershipView::new(
+        hash,
+        record,
+        quarantined,
+        rate_limit_mismatch,
+        epoch_size_mismatch,
+    ))
+    .unwrap_or(serde_json::Value::Null)
 }
 
 /// `get_membership_state`'s reply — mirrors the `.lidl` `MembershipState`
@@ -436,5 +456,69 @@ mod registry_parameters_tests {
         assert_eq!(serde_json::to_value(view).unwrap(), serde_json::json!({
             "epoch_size_sec": 10, "max_epoch_gap": 3
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lifecycle;
+    use crate::rate_limit;
+    use crate::sealed_store;
+
+    // Pins views::MembershipView's exact wire shape (alphabetical keys) with
+    // every optional field populated — the reply of register /
+    // select_membership / get_memberships.
+    #[test]
+    fn membership_view_serializes_alphabetical_keys() {
+        let commitment = "11".repeat(32);
+        let registry = format!("logos:local:{}", "ab".repeat(32));
+        let rln_identifier = "ef".repeat(32);
+        let record = MembershipRecord {
+            hash: "fixture-hash".to_string(),
+            identity: sealed_store::format::IdentityBlock {
+                registry_id: registry.clone(),
+                rln_identifier: rln_identifier.clone(),
+                identity_commitment: commitment.clone(),
+                submitted_at: 1_234_567_890,
+            },
+            cache: lifecycle::CacheState {
+                state: MembershipState::Failed,
+                leaf_index: Some(7),
+                rate_limit: Some(300),
+                failed_reason: Some("submit_failed: boom".to_string()),
+                retryable: Some(true),
+                tx_result: Some("tx-result-blob".to_string()),
+                first_active_at: None,
+                confirm_deadline: None,
+            },
+            alloc: rate_limit::AllocationState::default(),
+            quarantined: false,
+        };
+        let out = public_membership("fixture-hash", &record, false, true, false);
+        assert_eq!(
+            out.to_string(),
+            format!(
+                r#"{{"credential":{{"identity_commitment":"{commitment}"}},"failed_reason":"submit_failed: boom","leaf_index":7,"membership_hash":"fixture-hash","rate_limit":300,"rate_limit_mismatch":true,"registry_id":"{registry}","retryable":true,"rln_identifier":"{rln_identifier}","state":"failed","submitted_at":1234567890,"tx_result":"tx-result-blob"}}"#
+            )
+        );
+
+        // Quarantined forces state:"failed"/failed_reason:"metadata_tamper"
+        // and SUPPRESSES retryable — never "just retry" a tamper verdict.
+        // rate_limit_mismatch is only ever true or absent, never false.
+        let quarantined = public_membership("fixture-hash", &record, true, false, false);
+        assert_eq!(
+            quarantined.to_string(),
+            format!(
+                r#"{{"credential":{{"identity_commitment":"{commitment}"}},"failed_reason":"metadata_tamper","leaf_index":7,"membership_hash":"fixture-hash","rate_limit":300,"registry_id":"{registry}","rln_identifier":"{rln_identifier}","state":"failed","submitted_at":1234567890,"tx_result":"tx-result-blob"}}"#
+            )
+        );
+
+        // The absent case is pinned by the exact-shape asserts above.
+        let bound_elsewhere = public_membership("fixture-hash", &record, false, false, true);
+        assert!(
+            bound_elsewhere.to_string().contains(r#""epoch_size_mismatch":true"#),
+            "got: {bound_elsewhere}"
+        );
     }
 }

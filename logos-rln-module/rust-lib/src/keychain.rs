@@ -427,7 +427,7 @@ mod tests {
         }));
         let dir = std::env::temp_dir().join(format!("rln-ms-keychain-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let store = crate::publish_test_store(dir.clone());
+        let store = crate::test_support::publish_test_store(dir.clone());
         Fixture { items, fail_writes, fail_reads, dir, store }
     }
 
@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn fresh_create_writes_the_file_then_relaunch_reuses_it() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("fresh");
 
         let first = auto_unlock_impl().expect("fresh auto-unlock");
@@ -544,7 +544,7 @@ mod tests {
 
         // Relaunch: same dir, fresh store — the file is reused, not recreated.
         fixture.store.close();
-        let _relaunched = crate::publish_test_store(fixture.dir.clone());
+        let _relaunched = crate::test_support::publish_test_store(fixture.dir.clone());
         let second = auto_unlock_impl().expect("relaunch auto-unlock");
         assert_eq!(second["source"], "existing");
         assert!(
@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn file_secret_wins_over_keychain_item() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("file-wins");
         store_credential("pw-file");
         crate::sealed_store::fs::write_durable(&fixture.dir, AUTO_SECRET_FILE, b"pw-file")
@@ -579,7 +579,7 @@ mod tests {
 
     #[test]
     fn lazy_auto_unlock_provisions_resumes_and_respects_user_ownership() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("lazy");
 
         lazy_auto_unlock();
@@ -605,7 +605,7 @@ mod tests {
 
     #[test]
     fn existing_item_unlocks_a_matching_keystore() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("match");
         store_credential("pw-manual");
         seed_item(&fixture, "pw-manual");
@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn mismatched_item_is_bad_password_and_stays_locked() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("mismatch");
         store_credential("pw-real");
         seed_item(&fixture, "pw-wrong");
@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn missing_item_with_credentials_never_invents_a_secret() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("no-item");
         store_credential("pw-manual");
 
@@ -649,7 +649,7 @@ mod tests {
 
     #[test]
     fn foreign_payload_is_keychain_unavailable() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("foreign");
         let account = account_for_dir(&fixture.dir.to_string_lossy());
         crate::util::lock(&fixture.items)
@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn remember_requires_unlock_then_persists_and_overwrites() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("remember");
 
         let err = remember_impl().unwrap_err();
@@ -689,7 +689,7 @@ mod tests {
 
     #[test]
     fn no_store_reports_internal() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         reset_backend_for_tests();
         sealed::publish(None);
         let err = auto_unlock_impl().unwrap_err();
@@ -700,7 +700,7 @@ mod tests {
 
     #[test]
     fn keychain_read_failure_is_a_miss_not_a_stop() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("read-denied");
         fixture.fail_reads.store(true, Ordering::SeqCst);
 
@@ -722,7 +722,7 @@ mod tests {
 
     #[test]
     fn remember_write_denial_maps_to_keychain_unavailable() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("remember-denied");
         fixture.store.unlock("pw-one").unwrap();
         fixture.fail_writes.store(true, Ordering::SeqCst);
@@ -733,7 +733,7 @@ mod tests {
 
     #[test]
     fn unwritable_dir_fails_closed_before_unlock() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("no-write");
         #[cfg(unix)]
         {
@@ -752,7 +752,7 @@ mod tests {
 
     #[test]
     fn the_opt_out_env_var_binds_both_surfaces() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("opted-out");
         let env = EnvGuard::set();
 
@@ -786,7 +786,7 @@ mod tests {
 
     #[test]
     fn a_provisioned_but_empty_store_is_never_self_provisioned_over() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("provisioned-empty");
         fixture.store.unlock("pw-user").expect("user provisions the empty store");
         fixture.store.lock();
@@ -813,7 +813,7 @@ mod tests {
 
     #[test]
     fn a_bad_file_secret_is_quarantined_and_the_keychain_takes_over() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("bad-file");
         store_credential("pw-real");
         crate::sealed_store::fs::write_durable(&fixture.dir, AUTO_SECRET_FILE, b"pw-stale")
@@ -838,7 +838,7 @@ mod tests {
 
     #[test]
     fn a_bad_file_secret_never_bricks_the_documented_recovery() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("bad-file-only");
         store_credential("pw-real");
         crate::sealed_store::fs::write_durable(&fixture.dir, AUTO_SECRET_FILE, b"pw-stale")
@@ -864,7 +864,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_secret_file_is_diagnosed_and_never_provisioned_over() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("unreadable");
         std::fs::create_dir_all(fixture.dir.join(AUTO_SECRET_FILE)).expect("unreadable secret");
 
@@ -893,7 +893,7 @@ mod tests {
 
     #[test]
     fn the_recovery_hint_is_platform_honest() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("hint");
         store_credential("pw-manual");
 

@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     fn no_persistence_path_reports_internal() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         sealed::publish(None);
         let err = provision_impl(r#"{"sequencer_addr":"https://seq.example/"}"#).unwrap_err();
         assert!(err.to_json().contains(r#""kind":"internal""#), "got: {}", err.to_json());
@@ -131,9 +131,9 @@ mod tests {
 
     #[test]
     fn provisions_once_and_never_rewrites_the_config() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let dir = temp_store_dir("once");
-        let _store = crate::publish_test_store(dir.clone());
+        let _store = crate::test_support::publish_test_store(dir.clone());
 
         let first = provision_impl(r#"{"sequencer_addr":"https://seq.example/"}"#).unwrap();
         // Reply-shape pin: compact alphabetical keys, storage NOT created.
@@ -179,9 +179,9 @@ mod tests {
 
     #[test]
     fn storage_exists_reflects_the_file() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let dir = temp_store_dir("storage");
-        let _store = crate::publish_test_store(dir.clone());
+        let _store = crate::test_support::publish_test_store(dir.clone());
 
         let opts = r#"{"sequencer_addr":"https://seq.example/"}"#;
         assert_eq!(provision_impl(opts).unwrap()["storage_exists"], false);

@@ -104,7 +104,7 @@ pub(crate) fn window(canonical: &str) -> Option<Vec<[u8; 32]>> {
 /// the supervisor, so nothing spawns after `stop()`. The worker's provider
 /// calls are the async twins plus a channel wait, like every other caller's.
 pub(crate) fn ensure_refresher() {
-    crate::worker::ensure_refresher();
+    crate::worker::ensure(crate::worker::Slot::Refresher, "rln-roots", run_loop);
 }
 
 /// The refresher worker body, owned by the supervisor: an interruptible tick
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn nudge_is_rate_limited() {
-        let _serial = crate::util::lock(&crate::TEST_GLOBAL_LOCK);
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         reset_nudge_for_test();
         let before = crate::worker::nudges_for_test();
         nudge();

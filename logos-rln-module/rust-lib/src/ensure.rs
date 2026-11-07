@@ -30,10 +30,11 @@ use std::time::{Duration, Instant};
 
 use crate::lifecycle::{granted_by, MembershipState};
 use crate::error::{ApiError, ErrorKind};
-use crate::{
-    provider_of, records_for_registry, register_scoped, registry_id, worker,
-    DelegatedOptions,
-};
+use crate::delegated::DelegatedOptions;
+use crate::register::register_scoped;
+use crate::registry_id;
+use crate::scope::{backend_of, records_for_registry};
+use crate::worker;
 
 /// A registry-wide membership: the credential is stored with no
 /// `rln_identifier`, which `scope_matches` treats as backing every
@@ -332,7 +333,7 @@ pub(crate) fn run_with(registries: Vec<Provision>, ticket: u64) {
 /// funding keeps waiting. The next `start()` ends it like any other pass, and
 /// `is_running` keeps two from working the same registry at once.
 pub(crate) fn run_alongside(registry: String, rate_limit: u64) {
-    let allocator = crate::allocator_for(&registry);
+    let allocator = crate::config::allocator_for(&registry);
     run_as(vec![Provision { registry, rate_limit, allocator }], EPOCH.load(Ordering::SeqCst))
 }
 
@@ -572,7 +573,7 @@ fn provision_one(
         }
     }
 
-    let prov = provider_of(registry)?;
+    let prov = backend_of(registry)?;
 
     // 1. The wallet.
     //
@@ -978,11 +979,14 @@ pub(crate) fn is_running(registry: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ensure;
+    use crate::generated::LiblogosRlnModule;
+    use crate::test_support::{imp_with_store, seed_membership, TEST_GLOBAL_LOCK};
 
     #[test]
     fn delegate_hold_outlasts_a_delegated_records_confirmation_deadline() {
         let submitted_at = 1_700_000_000;
-        let deadline = crate::delegated_confirm_deadline(submitted_at) - submitted_at;
+        let deadline = crate::register::delegated_confirm_deadline(submitted_at) - submitted_at;
         assert!(DELEGATE_HOLD.as_secs() > deadline);
     }
 
@@ -1255,7 +1259,84 @@ mod tests {
         let scoped = "aa".repeat(32);
         // A scoped record is not registry-wide; `provision_one` filters on
         // `is_live()` alone and never consults the scope.
-        assert!(!crate::scope_matches_for_test(&scoped, REGISTRY_WIDE));
-        assert!(crate::scope_matches_for_test("", REGISTRY_WIDE));
+        assert!(!crate::scope::scope_matches_for_test(&scoped, REGISTRY_WIDE));
+        assert!(crate::scope::scope_matches_for_test("", REGISTRY_WIDE));
+    }
+
+    // A locked keystore with an allocator: the pass says so and stops, instead
+    // of waiting for the funded path's wallet and funding for a gift that
+    // would have been free once unlocked.
+    #[test]
+    fn a_locked_keystore_stops_the_pass_before_the_funding_wait() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-locked-allocator-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_imp, _store) = imp_with_store(dir.clone());
+        let registry = format!("logos:local:{}", "7d".repeat(32));
+        let canonical = registry_id::parse(&registry).unwrap().canonical;
+        let allocator = DelegatedOptions::from_allocator_block(Some(&serde_json::json!({ "peer_id": "p", "multiaddr": "/m", "discover": false })), "x").unwrap();
+        ensure::run_with(vec![ensure::Provision { registry: canonical.clone(), rate_limit: 100, allocator }], ensure::supersede());
+        let step = ensure::progress(&canonical).expect("a step is recorded");
+        assert_eq!(step.step, ensure::Step::AwaitingFunding);
+        assert_eq!(step.detail, "keystore locked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Any registry's pending registration is every pass's nonce.
+    #[test]
+    fn a_pending_registration_anywhere_holds_the_next_submit() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-any-pending-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_imp, store) = imp_with_store(dir.clone());
+        store.unlock("pw").unwrap();
+        assert!(!ensure::any_pending_membership());
+        let registry = format!("logos:local:{}", "7e".repeat(32));
+        seed_membership(&store, "pb", &registry, &"56".repeat(32), "", &"e6".repeat(32), MembershipState::Pending, 0, 100);
+        assert!(ensure::any_pending_membership());
+        store.update_cache("pb", |m| m.state = MembershipState::Active).unwrap();
+        assert!(!ensure::any_pending_membership());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // One payer, one nonce: the provisioning pass holds after a submit while
+    // the registry's registration is pending, and stands down at once when a
+    // later start() supersedes it.
+    #[test]
+    fn provisioning_holds_while_its_registration_is_pending() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-ms-hold-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (imp, store) = imp_with_store(dir.clone());
+        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+        let registry = format!("logos:local:{}", "7a".repeat(32));
+        let parsed = registry_id::parse(&registry).unwrap();
+        let hash = "hold-pending";
+        seed_membership(
+            &store,
+            hash,
+            &registry,
+            &"11".repeat(32),
+            "",
+            &"22".repeat(32),
+            MembershipState::Pending,
+            0,
+            100,
+        );
+        assert!(ensure::pending_membership_present(&parsed));
+
+        // A superseded pass does not wait on it.
+        let t0 = std::time::Instant::now();
+        ensure::wait_confirmed(&parsed, u64::MAX);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2), "a superseded pass must return at once");
+
+        // Confirmed: nothing to hold for, superseded or not.
+        store.update_cache(hash, |m| m.state = MembershipState::Active).unwrap();
+        assert!(!ensure::pending_membership_present(&parsed));
+        let t0 = std::time::Instant::now();
+        ensure::wait_confirmed(&parsed, ensure::ticket_in_force());
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+        drop(imp);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

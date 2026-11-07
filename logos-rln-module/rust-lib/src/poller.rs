@@ -44,7 +44,7 @@ const REFRESH_EVERY: u32 = 4;
 /// worker; later calls are no-ops. Spawn permission lives in the supervisor
 /// — nothing spawns after `stop()`.
 pub(crate) fn ensure_running() {
-    worker::ensure_poller();
+    worker::ensure(worker::Slot::Poller, "rln-poller", run_loop);
 }
 
 /// The poller worker body, owned by the supervisor: an interruptible tick
@@ -267,5 +267,29 @@ pub(crate) fn refresh_paths() {
         if crate::worker::is_stopped() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::lifecycle::MembershipState;
+    use crate::poller;
+    use crate::test_support::{imp_with_store, seed_membership, TEST_GLOBAL_LOCK};
+
+    // A record the registry does not hold: one that was active is erased;
+    // one the cache never saw active (a lost sidecar) is failed, retryable.
+    #[test]
+    fn an_absent_record_is_erased_only_if_it_was_ever_on_the_registry() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-absent-verdict-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_imp, store) = imp_with_store(dir.clone());
+        store.unlock("pw").unwrap();
+        let registry = format!("logos:local:{}", "7c".repeat(32));
+        seed_membership(&store, "was", &registry, &"54".repeat(32), "", &"e4".repeat(32), MembershipState::Active, 1, 100);
+        seed_membership(&store, "never", &registry, &"55".repeat(32), "", &"e5".repeat(32), MembershipState::Unknown, 0, 100);
+        assert_eq!(poller::absent_verdict(&store.membership("was").unwrap()), (MembershipState::Erased, "removed_from_registry"));
+        assert_eq!(poller::absent_verdict(&store.membership("never").unwrap()), (MembershipState::Failed, "not_on_registry"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
