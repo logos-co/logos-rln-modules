@@ -82,7 +82,7 @@ pub(crate) fn generate_proof_with(
 ) -> Result<serde_json::Value, ApiError> {
     let (registry, rln_identifier, rln_id_hex) =
         parse_scope(registry_id_raw, rln_identifier_hex)?;
-    let prov = backend_of(&registry)?;
+    let backend = backend_of(&registry)?;
     // Readiness gate FIRST (spec: not_ready before anything else). The epoch
     // derives from the CONSUMER's timestamp — the value stamped on the
     // message — so the receiver's timestamp->epoch check lines up by
@@ -128,7 +128,7 @@ pub(crate) fn generate_proof_with(
     let (path_elements_hex, path_indices) = match path_cache::hit(&hash, leaf_index) {
         Some(path) => path,
         None => {
-            path_cache::fill_path_cache(&registry, &hash, leaf_index, prov)?;
+            path_cache::fill_path_cache(&registry, &hash, leaf_index, backend.tree)?;
             path_cache::hit(&hash, leaf_index)
                 .ok_or_else(|| ApiError::internal("path cache: fetched path vanished before use"))?
         }
@@ -400,9 +400,9 @@ pub(crate) fn get_registry_parameters_impl(
     rln_identifier_hex: &str,
 ) -> Result<serde_json::Value, ApiError> {
     let (registry, _, _) = parse_scope(registry_id_raw, rln_identifier_hex)?;
-    let prov = backend_of(&registry)?;
+    let backend = backend_of(&registry)?;
 
-    let bounds = prov.get_registry_bounds(&registry)?;
+    let bounds = backend.registry.get_registry_bounds(&registry)?;
     let (epoch_size_sec, max_epoch_gap) = epoch_params_for(&registry.canonical)?;
     let view = views::RegistryParametersView::from_bounds(epoch_size_sec, max_epoch_gap, &bounds);
     ok_json(view)

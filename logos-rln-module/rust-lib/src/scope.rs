@@ -133,12 +133,12 @@ pub(crate) fn resolve_scope_state(records: &[MembershipRecord], rln_id_hex: &str
     }
 }
 
-/// The registry provider serving the registry's namespace; none is
+/// The backend serving the registry's namespace; none is
 /// `unknown_registry`.
 pub(crate) fn backend_of(
     registry: &registry_id::CanonicalRegistryId,
-) -> Result<&'static dyn provider::RegistryProvider, ApiError> {
-    provider::provider_for(&registry.namespace).ok_or_else(|| {
+) -> Result<provider::Backend, ApiError> {
+    provider::backend_for(&registry.namespace).ok_or_else(|| {
         ApiError::new(
             ErrorKind::UnknownRegistry,
             &format!("no registry provider for namespace {}", registry.namespace),

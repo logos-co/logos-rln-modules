@@ -331,7 +331,7 @@ pub(crate) fn register_scoped(
 ) -> Result<serde_json::Value, ApiError> {
     let registry = registry.clone();
     let rln_id_hex = rln_id_hex.to_string();
-    let prov = backend_of(&registry)?;
+    let backend = backend_of(&registry)?;
     // Claimed for the whole dispatch (RAII): the live-record scan below is
     // only sound while no other register for the same scope is in flight.
     let _claim = RegisterClaim::take(&registry.canonical, &rln_id_hex)?;
@@ -362,7 +362,7 @@ pub(crate) fn register_scoped(
     // credential (spec: above max_rate_limit SHALL fail). An unreadable
     // registry skips the pre-check — it enforces its own bounds at
     // submission.
-    match prov.get_registry_bounds(&registry) {
+    match backend.registry.get_registry_bounds(&registry) {
         Ok(bounds) => {
             let max = bounds.get("max_rate_limit").and_then(|x| x.as_u64());
             let min = bounds.get("min_rate_limit").and_then(|x| x.as_u64());
@@ -416,7 +416,7 @@ pub(crate) fn register_scoped(
             &delegated_request_args(d, &commitment_hex, rate_limit, &registry.account),
             delegated_submit_callback(Arc::downgrade(&store), hash.clone(), registry.account.clone()),
         ),
-        None => prov.register_async(
+        None => backend.registry.register_async(
             &registry,
             &commitment_hex,
             rate_limit,

@@ -12,10 +12,10 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::provider::RegistryProvider;
 use crate::registry_id::CanonicalRegistryId;
+use crate::tree::TreeSource;
 use crate::util::lock;
-use crate::error::{ApiError, ErrorKind};
+use crate::error::ApiError;
 
 struct CachedPath {
     path_elements_hex: Vec<String>,
@@ -25,22 +25,6 @@ struct CachedPath {
 
 static PATHS: Mutex<Option<HashMap<String, CachedPath>>> = Mutex::new(None);
 
-
-/// A provider `get_merkle_proof` reply, decoded in one place so a cache hit
-/// and a cache miss build identically-shaped witnesses.
-#[derive(serde::Deserialize)]
-struct MerkleProofReply {
-    path_elements: Vec<String>,
-    path_indices: Vec<u8>,
-    depth: Option<u64>,
-    valid_roots: Option<Vec<String>>,
-}
-
-fn decode_merkle_proof(merkle: serde_json::Value) -> Result<MerkleProofReply, ApiError> {
-    serde_json::from_value(merkle).map_err(|e| {
-        ApiError::new(ErrorKind::ProviderFailure, &format!("merkle proof reply: {e}"))
-    })
-}
 
 /// The cached path for `hash`, or `None` on a cold cache or a leaf_index
 /// mismatch (the stale-leaf guard). Miss fallback: [`fill_path_cache`].
@@ -58,29 +42,16 @@ pub(crate) fn fill_path_cache(
     registry: &CanonicalRegistryId,
     hash: &str,
     leaf_index: u64,
-    prov: &dyn RegistryProvider,
+    tree: &dyn TreeSource,
 ) -> Result<(), ApiError> {
-    let merkle = prov.get_merkle_proof(registry, leaf_index)?;
-    let MerkleProofReply { path_elements: mut path_elements_hex, mut path_indices, depth, valid_roots } =
-        decode_merkle_proof(merkle)?;
-
-    // The registry's tree is shallower than the circuit, so its path and every
-    // root it reports are lifted to the circuit's depth together — see
-    // `proof::depth_bridge`. The reply carries the depth it was built at; a
-    // registry that already matches the circuit is padded by nothing.
-    let depth = depth.unwrap_or(path_elements_hex.len() as u64) as usize;
-    crate::proof::depth_bridge::pad_path(&mut path_elements_hex, &mut path_indices, depth);
-
-    // Adopt the snapshot's valid_roots into the root window (see
-    // roots::adopt); older providers may omit the field.
-    if let Some(roots_hex) = valid_roots {
-        let roots: Vec<[u8; 32]> = roots_hex
-            .iter()
-            .map(|h| crate::proof::depth_bridge::fold_root(h, depth))
-            .filter_map(|h| crate::registry_id::hex_to_bytes32(&h))
-            .collect();
-        crate::roots::adopt(&registry.canonical, roots);
+    let witness = tree.merkle_proof(registry, leaf_index)?.lifted();
+    // A snapshot's roots become the window (see roots::adopt); a lone root
+    // joins it (see roots::admit).
+    match witness.window {
+        Some(window) => crate::roots::adopt(&registry.canonical, window),
+        None => crate::roots::admit(&registry.canonical, witness.root),
     }
+    let (path_elements_hex, path_indices) = (witness.path_elements_hex, witness.path_indices);
     lock(&PATHS).get_or_insert_with(HashMap::new).insert(
         hash.to_string(),
         CachedPath { path_elements_hex, path_indices, leaf_index },
@@ -105,23 +76,28 @@ pub(crate) fn set_path_for_test(
 mod tests {
     use super::*;
 
+    // A source without a snapshot window: the proof's root joins the window
+    // in front, and the window keeps its size.
     #[test]
-    fn a_malformed_merkle_proof_is_a_provider_failure() {
-        let ok = decode_merkle_proof(serde_json::json!({
-            "path_elements": ["ab"], "path_indices": [1], "depth": 1
-        }))
-        .expect("a well-formed reply decodes");
-        assert_eq!(ok.path_indices, vec![1]);
-        assert!(ok.valid_roots.is_none());
+    fn a_proof_without_valid_roots_admits_its_root() {
+        use crate::provider::fake::FakeTree;
+        let _serial = lock(&crate::test_support::TEST_GLOBAL_LOCK);
+        let registry = crate::registry_id::parse("fakens:local:admit-path").unwrap();
+        let proof = serde_json::json!({
+            "depth": 2, "leaf": "aa".repeat(32), "leaf_index": 3,
+            "path_elements": ["cc".repeat(32), "dd".repeat(32)], "path_indices": [1, 0],
+            "root": "bb".repeat(32),
+        });
+        let expected = crate::tree::MerkleProof::from_provider_json(&proof).unwrap().lifted().root;
+        let tree = FakeTree { proof: Some(proof), roots: None };
+        crate::roots::adopt(&registry.canonical, (1..=5).map(|n| [n; 32]).collect());
 
-        for bad in [
-            serde_json::json!({ "path_elements": ["ab"], "path_indices": [256] }),
-            serde_json::json!({ "path_elements": ["ab", 7], "path_indices": [1, 0] }),
-            serde_json::json!({ "path_elements": ["ab"] }),
-        ] {
-            let err = decode_merkle_proof(bad).err().expect("refused");
-            assert_eq!(err.kind, ErrorKind::ProviderFailure);
-        }
+        fill_path_cache(&registry, "path-cache-test-admit", 3, &tree).expect("proof cached");
+
+        let window = crate::roots::window(&registry.canonical).expect("window kept");
+        assert_eq!(window.len(), 5);
+        assert_eq!((window[0], window[1]), (expected, [1; 32]));
+        assert!(hit("path-cache-test-admit", 3).is_some());
     }
 
     #[test]

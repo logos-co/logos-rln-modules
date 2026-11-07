@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::ApiError;
 use crate::lifecycle::{MembershipState, StoredCredential};
+use crate::provider::Backend;
 use crate::sealed_store::{self, store::Store};
 use crate::util::now_unix;
 use crate::LogosRlnModuleImpl;
@@ -13,6 +14,15 @@ use crate::LogosRlnModuleImpl;
 /// the nullifier log, root windows, the path cache, the keychain backend,
 /// the published store slot, event emission) serialize on this.
 pub(crate) static TEST_GLOBAL_LOCK: Mutex<()> = Mutex::new(());
+
+/// The backend `provider::backend_for("fakens")` serves.
+pub(crate) static INSTALLED_BACKEND: Mutex<Option<Backend>> = Mutex::new(None);
+
+/// Serve `backend` under the `fakens` namespace. Callers hold
+/// `TEST_GLOBAL_LOCK`.
+pub(crate) fn install_backend(backend: Backend) {
+    *crate::util::lock(&INSTALLED_BACKEND) = Some(backend);
+}
 
 /// Open a store in `dir` and publish it in the worker-loop slot — the tests'
 /// stand-in for `on_context_ready`'s store wiring.

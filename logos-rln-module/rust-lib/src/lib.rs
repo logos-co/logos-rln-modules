@@ -76,6 +76,7 @@ mod scope;
 mod select;
 #[cfg(test)]
 mod test_support;
+mod tree;
 mod util;
 mod views;
 mod wallet_home;
@@ -504,19 +505,20 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
     fn get_merkle_proof(&self, registry_id: String, leaf_index: i64) -> String {
         reply((|| {
             let registry = parse_registry(&registry_id)?;
-            let prov = backend_of(&registry)?;
+            let backend = backend_of(&registry)?;
             if leaf_index < 0 {
                 return Err(ApiError::new(ErrorKind::InvalidArgument, "leaf_index must be non-negative"));
             }
-            prov.get_merkle_proof(&registry, leaf_index as u64)
+            Ok(backend.tree.merkle_proof(&registry, leaf_index as u64)?.to_wire())
         })())
     }
 
     fn get_valid_roots(&self, registry_id: String) -> String {
         reply((|| {
             let registry = parse_registry(&registry_id)?;
-            let prov = backend_of(&registry)?;
-            let roots = prov.get_valid_roots(&registry)?;
+            let backend = backend_of(&registry)?;
+            let roots: Vec<String> =
+                backend.tree.valid_roots(&registry)?.lifted().iter().map(|r| registry_id::bytes_to_hex(r)).collect();
             Ok(serde_json::json!({ "valid_roots": roots }))
         })())
     }

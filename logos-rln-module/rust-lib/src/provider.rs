@@ -1,6 +1,7 @@
-//! Registry provider layer: the spec's provider interface as a Rust trait,
-//! namespace → provider routing, and the lez-rln provider — a client of the
-//! lez module (`liblogos_lez_rln_module`) through the SDK's generated typed
+//! Registry provider layer: the spec's provider interface as the `Registry`
+//! and `Payer` traits beside `tree::TreeSource`, namespace → `Backend` routing,
+//! and the lez-rln provider — a client of the lez module
+//! (`liblogos_lez_rln_module`) through the SDK's generated typed
 //! client (`modules().liblogos_lez_rln_module`), plus the generated client of
 //! the gifter module (`RlnGifterModuleClient`), a declared dependency too.
 //!
@@ -37,6 +38,7 @@ use crate::generated::liblogos_lez_rln_module::LiblogosLezRlnModuleClient;
 use crate::generated::rln_gifter_module::RlnGifterModuleClient;
 use crate::lifecycle::MembershipState;
 use crate::registry_id::CanonicalRegistryId;
+use crate::tree::{MerkleProof, RootSet, TreeSource};
 use crate::util::lock;
 use crate::error::{ApiError, ErrorKind};
 
@@ -357,23 +359,25 @@ pub(crate) fn gifter_request_async(
     })
 }
 
-// ----------------------------------------------------------- provider trait
+// ---------------------------------------------------------- provider traits
 
 /// The registry's view of one commitment it holds (the spec provider's
 /// `get_membership` return: state + authoritative leaf_index/rate_limit).
 pub(crate) struct ProviderMembership {
     /// active | grace_period | expired.
     pub(crate) state: MembershipState,
-    pub(crate) leaf_index: u64,
+    /// None when the source does not know the leaf; the stored leaf stands.
+    pub(crate) leaf_index: Option<u64>,
     pub(crate) rate_limit: u64,
 }
 
 pub(crate) type RegisterCallback = Box<dyn FnOnce(Result<String, ApiError>) + Send>;
 
-/// The spec's Registry Provider Interface. One instance serves every
-/// registry of its namespace (the registry's anchor account travels in
+/// The registry's membership records and parameters: what a registration
+/// writes and what the poller confirms against. One instance serves every
+/// registry of its namespace (the anchor account travels in
 /// `CanonicalRegistryId`).
-pub(crate) trait RegistryProvider: Send + Sync {
+pub(crate) trait Registry: Send + Sync {
     fn get_membership(
         &self,
         registry: &CanonicalRegistryId,
@@ -392,15 +396,6 @@ pub(crate) trait RegistryProvider: Send + Sync {
         on_done: RegisterCallback,
     ) -> Result<(), ApiError>;
 
-    fn get_merkle_proof(
-        &self,
-        registry: &CanonicalRegistryId,
-        leaf_index: u64,
-    ) -> Result<serde_json::Value, ApiError>;
-
-    fn get_valid_roots(&self, registry: &CanonicalRegistryId)
-        -> Result<Vec<String>, ApiError>;
-
     /// The registry's parameters (spec RegistryParameters — max_rate_limit and
     /// friends) as the lez module's raw bounds object. Backs the quota read.
     fn get_registry_bounds(
@@ -408,6 +403,14 @@ pub(crate) trait RegistryProvider: Send + Sync {
         registry: &CanonicalRegistryId,
     ) -> Result<serde_json::Value, ApiError>;
 
+    /// Whether the registry is deployed on the chain the provider reads, as
+    /// the lez module's raw check object (`{status, detail?, sequencer?,
+    /// chain_head?}`). An error means the question could not be asked.
+    fn check_registry(&self, registry: &CanonicalRegistryId) -> Result<serde_json::Value, ApiError>;
+}
+
+/// The wallet that pays for a self-funded registration.
+pub(crate) trait Payer: Send + Sync {
     /// Whether the chain-access module's own wallet is usable, and which
     /// account it pays with: `{detail, payer, ready, state}`. Local to that
     /// module — it does not touch the chain, so it answers before a sync and
@@ -427,11 +430,14 @@ pub(crate) trait RegistryProvider: Send + Sync {
     /// older chain-access module without the method included — and the
     /// caller falls back to a fixed reserve.
     fn fee_state(&self) -> Result<serde_json::Value, ApiError>;
+}
 
-    /// Whether the registry is deployed on the chain the provider reads, as
-    /// the lez module's raw check object (`{status, detail?, sequencer?,
-    /// chain_head?}`). An error means the question could not be asked.
-    fn check_registry(&self, registry: &CanonicalRegistryId) -> Result<serde_json::Value, ApiError>;
+/// The three sources of truth serving one namespace.
+#[derive(Clone, Copy)]
+pub(crate) struct Backend {
+    pub tree: &'static dyn TreeSource,
+    pub registry: &'static dyn Registry,
+    pub payer: &'static dyn Payer,
 }
 
 /// The registry statuses that mean "this registry cannot work here", as
@@ -444,7 +450,7 @@ const REGISTRY_PROBLEMS: [&str; 5] =
 /// version, the wrong network. None when it is fine or the check could not
 /// be made — a transient outage must not read as a missing registry.
 pub(crate) fn registry_problem(
-    prov: &dyn RegistryProvider,
+    prov: &dyn Registry,
     registry: &CanonicalRegistryId,
 ) -> Option<String> {
     let check = prov.check_registry(registry).ok()?;
@@ -472,7 +478,7 @@ fn registry_problem_from(canonical: &str, check: &serde_json::Value) -> Option<S
 /// an empty reply from the lez module says nothing, so ask it whether the
 /// registry is there at all and, if not, say that instead.
 fn explained(
-    prov: &dyn RegistryProvider,
+    prov: &dyn Registry,
     registry: &CanonicalRegistryId,
     e: ApiError,
 ) -> ApiError {
@@ -485,48 +491,15 @@ fn explained(
     }
 }
 
-/// Turn a lez module `get_valid_roots` reply into roots at the prover's circuit
-/// depth.
-///
-/// A registry may be shallower than the circuit — ours is depth 9 against a
-/// depth-10 circuit — and `generate_proof` lifts its path and root to the
-/// circuit's depth. The valid-root window has to hold the same shape or the
-/// comparison in `validate_proof` can never match, and a node rejects proofs
-/// it made itself. The lift belongs here because this is the one place every
-/// consumer of these roots goes through.
-///
-/// The reply is `{"depth":N,"valid_roots":[…]}`; any other shape is a
-/// `ProviderFailure`.
-fn lift_roots_reply(parsed: &serde_json::Value) -> Result<Vec<String>, ApiError> {
-    let bad = |what: &str| {
-        ApiError::new(ErrorKind::ProviderFailure, &format!("roots reply {what}"))
-    };
-    let o = parsed.as_object().ok_or_else(|| bad("is not an object"))?;
-    let depth = o
-        .get("depth")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| bad("has no depth"))? as usize;
-    if depth == 0 || depth > crate::proof::RLN_TREE_DEPTH {
-        return Err(bad(&format!("declares an impossible depth {depth}")));
-    }
-    let roots = o
-        .get("valid_roots")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| bad("has no valid_roots"))?;
-    Ok(roots
-        .iter()
-        .filter_map(serde_json::Value::as_str)
-        .map(|h| crate::proof::depth_bridge::fold_root(h, depth))
-        .collect())
-}
-
 static LEZ_RLN: LezRlnProvider = LezRlnProvider;
 
 /// Namespace routing (spec MUST). Unknown namespaces are the caller's
 /// `unknown_registry` error.
-pub(crate) fn provider_for(namespace: &str) -> Option<&'static dyn RegistryProvider> {
+pub(crate) fn backend_for(namespace: &str) -> Option<Backend> {
     match namespace {
-        "logos" => Some(&LEZ_RLN),
+        "logos" => Some(Backend { tree: &LEZ_RLN, registry: &LEZ_RLN, payer: &LEZ_RLN }),
+        #[cfg(test)]
+        "fakens" => *lock(&crate::test_support::INSTALLED_BACKEND),
         _ => None,
     }
 }
@@ -573,12 +546,12 @@ fn parse_membership_reply(raw: &str) -> Result<Option<ProviderMembership>, ApiEr
             v.get("state").cloned().unwrap_or(serde_json::Value::Null),
         )
         .map_err(|_| fault("get_membership: unrecognized state".to_string()))?,
-        leaf_index: required("leaf_index")?,
+        leaf_index: Some(required("leaf_index")?),
         rate_limit: required("rate_limit")?,
     }))
 }
 
-impl RegistryProvider for LezRlnProvider {
+impl Registry for LezRlnProvider {
     fn get_membership(
         &self,
         registry: &CanonicalRegistryId,
@@ -631,59 +604,6 @@ impl RegistryProvider for LezRlnProvider {
         })
     }
 
-    fn get_merkle_proof(
-        &self,
-        registry: &CanonicalRegistryId,
-        leaf_index: u64,
-    ) -> Result<serde_json::Value, ApiError> {
-        ensure_network(registry)?;
-        let client = lez_client();
-        let indices = format!("[{leaf_index}]");
-        let raw = read_reply(
-            "get_merkle_proofs",
-            await_reply("get_merkle_proofs", READ_TIMEOUT, |done| {
-                client.get_merkle_proofs_async_with_timeout(
-                    &registry.account,
-                    &indices,
-                    READ_TIMEOUT,
-                    done,
-                )
-            }),
-        )
-        .map_err(|e| explained(self, registry, e))?;
-        let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-            ApiError::new(ErrorKind::ProviderFailure, &format!("proofs reply parse: {e}"))
-        })?;
-        v.as_array()
-            .and_then(|arr| arr.first())
-            .cloned()
-            .ok_or_else(|| {
-                ApiError::new(
-                    ErrorKind::ProviderFailure,
-                    "empty proof array (leaf out of range?)",
-                )
-            })
-    }
-
-    fn get_valid_roots(
-        &self,
-        registry: &CanonicalRegistryId,
-    ) -> Result<Vec<String>, ApiError> {
-        ensure_network(registry)?;
-        let client = lez_client();
-        let raw = read_reply(
-            "get_valid_roots",
-            await_reply("get_valid_roots", READ_TIMEOUT, |done| {
-                client.get_valid_roots_async_with_timeout(&registry.account, READ_TIMEOUT, done)
-            }),
-        )
-        .map_err(|e| explained(self, registry, e))?;
-        let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-            ApiError::new(ErrorKind::ProviderFailure, &format!("roots reply parse: {e}"))
-        })?;
-        lift_roots_reply(&parsed)
-    }
-
     fn get_registry_bounds(
         &self,
         registry: &CanonicalRegistryId,
@@ -702,6 +622,22 @@ impl RegistryProvider for LezRlnProvider {
         })
     }
 
+    fn check_registry(&self, registry: &CanonicalRegistryId) -> Result<serde_json::Value, ApiError> {
+        ensure_network(registry)?;
+        let client = lez_client();
+        let raw = read_reply(
+            "check_registry",
+            await_reply("check_registry", READ_TIMEOUT, |done| {
+                client.check_registry_async_with_timeout(&registry.account, READ_TIMEOUT, done)
+            }),
+        )?;
+        serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
+            ApiError::new(ErrorKind::ProviderFailure, &format!("check_registry parse: {e}"))
+        })
+    }
+}
+
+impl Payer for LezRlnProvider {
     fn wallet_status(&self) -> Result<serde_json::Value, ApiError> {
         let client = lez_client();
         let raw = read_reply(
@@ -753,19 +689,152 @@ impl RegistryProvider for LezRlnProvider {
             ApiError::new(ErrorKind::ProviderFailure, &format!("fee state parse: {e}"))
         })
     }
+}
 
-    fn check_registry(&self, registry: &CanonicalRegistryId) -> Result<serde_json::Value, ApiError> {
+impl TreeSource for LezRlnProvider {
+    fn merkle_proof(
+        &self,
+        registry: &CanonicalRegistryId,
+        leaf_index: u64,
+    ) -> Result<MerkleProof, ApiError> {
+        ensure_network(registry)?;
+        let client = lez_client();
+        let indices = format!("[{leaf_index}]");
+        let raw = read_reply(
+            "get_merkle_proofs",
+            await_reply("get_merkle_proofs", READ_TIMEOUT, |done| {
+                client.get_merkle_proofs_async_with_timeout(
+                    &registry.account,
+                    &indices,
+                    READ_TIMEOUT,
+                    done,
+                )
+            }),
+        )
+        .map_err(|e| explained(self, registry, e))?;
+        let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            ApiError::new(ErrorKind::ProviderFailure, &format!("proofs reply parse: {e}"))
+        })?;
+        let first = v.as_array().and_then(|arr| arr.first()).ok_or_else(|| {
+            ApiError::new(ErrorKind::ProviderFailure, "empty proof array (leaf out of range?)")
+        })?;
+        MerkleProof::from_provider_json(first)
+    }
+
+    fn valid_roots(&self, registry: &CanonicalRegistryId) -> Result<RootSet, ApiError> {
         ensure_network(registry)?;
         let client = lez_client();
         let raw = read_reply(
-            "check_registry",
-            await_reply("check_registry", READ_TIMEOUT, |done| {
-                client.check_registry_async_with_timeout(&registry.account, READ_TIMEOUT, done)
+            "get_valid_roots",
+            await_reply("get_valid_roots", READ_TIMEOUT, |done| {
+                client.get_valid_roots_async_with_timeout(&registry.account, READ_TIMEOUT, done)
             }),
-        )?;
-        serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
-            ApiError::new(ErrorKind::ProviderFailure, &format!("check_registry parse: {e}"))
-        })
+        )
+        .map_err(|e| explained(self, registry, e))?;
+        let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            ApiError::new(ErrorKind::ProviderFailure, &format!("roots reply parse: {e}"))
+        })?;
+        RootSet::from_provider_json(&parsed)
+    }
+}
+
+// ------------------------------------------------------------------ fakes
+
+/// In-memory sources for tests, served under the `fakens` namespace once
+/// installed with `test_support::install_backend`.
+#[cfg(test)]
+pub(crate) mod fake {
+    use super::*;
+
+    fn unanswered(what: &str) -> ApiError {
+        ApiError::new(ErrorKind::ProviderFailure, &format!("fake {what}: no answer configured"))
+    }
+
+    /// Serves its proof and roots replies through the same decoders the lez
+    /// provider uses.
+    #[derive(Default)]
+    pub(crate) struct FakeTree {
+        pub proof: Option<serde_json::Value>,
+        pub roots: Option<serde_json::Value>,
+    }
+
+    impl TreeSource for FakeTree {
+        fn merkle_proof(&self, _: &CanonicalRegistryId, _: u64) -> Result<MerkleProof, ApiError> {
+            MerkleProof::from_provider_json(self.proof.as_ref().ok_or_else(|| unanswered("merkle_proof"))?)
+        }
+
+        fn valid_roots(&self, _: &CanonicalRegistryId) -> Result<RootSet, ApiError> {
+            RootSet::from_provider_json(self.roots.as_ref().ok_or_else(|| unanswered("valid_roots"))?)
+        }
+    }
+
+    /// `membership`: None = no answer, Some(None) = not registered,
+    /// Some(Some((state, leaf_index, rate_limit))) = registered.
+    #[derive(Default)]
+    pub(crate) struct FakeRegistry {
+        pub membership: Option<Option<(MembershipState, Option<u64>, u64)>>,
+        pub bounds: Option<serde_json::Value>,
+    }
+
+    impl Registry for FakeRegistry {
+        fn get_membership(
+            &self,
+            _: &CanonicalRegistryId,
+            _: &str,
+        ) -> Result<Option<ProviderMembership>, ApiError> {
+            let answer = self.membership.ok_or_else(|| unanswered("get_membership"))?;
+            Ok(answer.map(|(state, leaf_index, rate_limit)| ProviderMembership {
+                state,
+                leaf_index,
+                rate_limit,
+            }))
+        }
+
+        fn register_async(
+            &self,
+            _: &CanonicalRegistryId,
+            _: &str,
+            _: u64,
+            _: RegisterCallback,
+        ) -> Result<(), ApiError> {
+            Err(unanswered("register_async"))
+        }
+
+        fn get_registry_bounds(&self, _: &CanonicalRegistryId) -> Result<serde_json::Value, ApiError> {
+            self.bounds.clone().ok_or_else(|| unanswered("get_registry_bounds"))
+        }
+
+        fn check_registry(&self, _: &CanonicalRegistryId) -> Result<serde_json::Value, ApiError> {
+            Ok(serde_json::json!({ "status": "ok" }))
+        }
+    }
+
+    #[derive(Default)]
+    pub(crate) struct FakePayer {
+        pub balance: Option<u128>,
+    }
+
+    impl Payer for FakePayer {
+        fn wallet_status(&self) -> Result<serde_json::Value, ApiError> {
+            Ok(serde_json::json!({ "detail": "", "payer": "fake", "ready": true, "state": "ready" }))
+        }
+
+        fn payer_balance(&self) -> Result<u128, ApiError> {
+            self.balance.ok_or_else(|| unanswered("payer_balance"))
+        }
+
+        fn fee_state(&self) -> Result<serde_json::Value, ApiError> {
+            Err(unanswered("fee_state"))
+        }
+    }
+
+    /// A backend over leaked fakes, for `test_support::install_backend`.
+    pub(crate) fn backend(tree: FakeTree, registry: FakeRegistry, payer: FakePayer) -> Backend {
+        Backend {
+            tree: Box::leak(Box::new(tree)),
+            registry: Box::leak(Box::new(registry)),
+            payer: Box::leak(Box::new(payer)),
+        }
     }
 }
 
@@ -828,51 +897,6 @@ mod lp_test_transport {
 
 #[cfg(test)]
 mod tests {
-    /// A registry shallower than the circuit must come back LIFTED.
-    ///
-    /// `generate_proof` lifts its root to the circuit's depth and
-    /// `validate_proof` compares against the valid-root window, so the window
-    /// must hold lifted roots too, or every proof is invalid.
-    #[test]
-    fn a_shallow_registry_reports_roots_at_circuit_depth() {
-        let root = "11".repeat(32);
-        let reply = serde_json::json!({ "depth": 9, "valid_roots": [root.clone()] });
-        let lifted = super::lift_roots_reply(&reply).expect("depth-9 reply");
-        assert_eq!(lifted.len(), 1);
-        assert_ne!(lifted[0], root, "a depth-9 root must not pass through unlifted");
-        assert_eq!(
-            lifted[0],
-            crate::proof::depth_bridge::fold_root(&root, 9),
-            "the window must hold exactly what generate_proof folds to"
-        );
-    }
-
-    /// A registry already at the circuit's depth needs no lift, and must not
-    /// get one — folding it again would invent a root nothing can prove.
-    #[test]
-    fn a_full_depth_registry_passes_through() {
-        let root = "22".repeat(32);
-        let reply = serde_json::json!({
-            "depth": crate::proof::RLN_TREE_DEPTH,
-            "valid_roots": [root.clone()],
-        });
-        assert_eq!(super::lift_roots_reply(&reply).expect("full-depth reply"), vec![root]);
-    }
-
-    #[test]
-    fn a_reply_with_no_depth_or_an_absurd_one_is_refused() {
-        let root = "44".repeat(32);
-        for bad in [
-            serde_json::json!({ "valid_roots": [root.clone()] }),
-            serde_json::json!({ "depth": 0, "valid_roots": [root.clone()] }),
-            serde_json::json!({ "depth": 99, "valid_roots": [root.clone()] }),
-            serde_json::json!("not a reply"),
-            serde_json::json!([root.clone()]),
-        ] {
-            assert!(super::lift_roots_reply(&bad).is_err(), "accepted {bad}");
-        }
-    }
-
     use super::*;
     use crate::registry_id;
 
@@ -927,7 +951,7 @@ mod tests {
         ) else {
             panic!("a complete reply must decode");
         };
-        assert_eq!(pm.leaf_index, 0, "leaf 0 is a valid leaf");
+        assert_eq!(pm.leaf_index, Some(0), "leaf 0 is a valid leaf");
         assert_eq!(pm.rate_limit, 100);
 
         for raw in [
@@ -947,17 +971,18 @@ mod tests {
     #[test]
     fn stubbed_transport_degrades_to_provider_failure() {
         let registry = registry_id::parse(&format!("logos:local:{}", "ab".repeat(32))).unwrap();
-        let provider = provider_for("logos").unwrap();
-        assert!(provider.get_membership(&registry, &"11".repeat(32)).is_err());
-        assert!(provider.get_merkle_proof(&registry, 0).is_err());
-        assert!(provider.get_valid_roots(&registry).is_err());
-        assert!(provider.fee_state().is_err());
+        let backend = backend_for("logos").unwrap();
+        assert!(backend.registry.get_membership(&registry, &"11".repeat(32)).is_err());
+        assert!(backend.tree.merkle_proof(&registry, 0).is_err());
+        assert!(backend.tree.valid_roots(&registry).is_err());
+        assert!(backend.payer.fee_state().is_err());
         // Fire-and-record: a submission the SDK cannot dispatch (no client)
         // is a synchronous provider_failure, and the callback is NOT also
         // invoked — the record's owner handles the failure exactly once.
         let fired = Arc::new(Mutex::new(false));
         let seen = Arc::clone(&fired);
-        let err = provider
+        let err = backend
+            .registry
             .register_async(
                 &registry,
                 &"11".repeat(32),
@@ -977,8 +1002,9 @@ mod tests {
     #[test]
     fn a_register_gets_past_validation() {
         let registry = registry_id::parse(&format!("logos:local:{}", "ab".repeat(32))).unwrap();
-        let provider = provider_for("logos").unwrap();
-        let err = provider
+        let backend = backend_for("logos").unwrap();
+        let err = backend
+            .registry
             .register_async(&registry, &"11".repeat(32), 300, Box::new(|_| {}))
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ProviderFailure);
@@ -1051,9 +1077,9 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::UnknownRegistry);
         assert!(err.message.contains("bound to devnet"), "{}", err.message);
         // And every provider method that takes the registry refuses with it.
-        let provider = provider_for("logos").unwrap();
+        let backend = backend_for("logos").unwrap();
         assert_eq!(
-            provider.get_valid_roots(&registry).unwrap_err().kind,
+            backend.tree.valid_roots(&registry).err().expect("refused").kind,
             ErrorKind::UnknownRegistry
         );
         lock(&NETWORK_GATE).remove(&registry.reference);
@@ -1061,6 +1087,6 @@ mod tests {
 
     #[test]
     fn unknown_namespace_has_no_provider() {
-        assert!(provider_for("eip155").is_none());
+        assert!(backend_for("eip155").is_none());
     }
 }

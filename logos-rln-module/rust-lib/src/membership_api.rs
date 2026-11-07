@@ -46,7 +46,7 @@ pub(crate) fn get_membership_state_impl(
     rln_identifier_hex: &str,
 ) -> Result<serde_json::Value, ApiError> {
     let (registry, _, rln_id_hex) = parse_scope(registry_id_raw, rln_identifier_hex)?;
-    let prov = backend_of(&registry)?;
+    let backend = backend_of(&registry)?;
 
     // A missing store (no persistence path) degrades to no local records,
     // which the empty-candidates arm below answers as `unknown`.
@@ -86,7 +86,7 @@ pub(crate) fn get_membership_state_impl(
     let record = &record;
     let hash = &record.hash;
 
-    let pm = prov.get_membership(&registry, &record.identity.identity_commitment)?;
+    let pm = backend.registry.get_membership(&registry, &record.identity.identity_commitment)?;
     let registry_state = pm.as_ref().map(|p| p.state);
     let merged = lifecycle::merge_state(Some(record), registry_state, now_unix());
 
@@ -104,7 +104,9 @@ pub(crate) fn get_membership_state_impl(
             m.state = merged;
             if let Some(pm) = &pm {
                 // The pending→active re-read (spec MUST).
-                m.leaf_index = Some(pm.leaf_index);
+                if let Some(l) = pm.leaf_index {
+                    m.leaf_index = Some(l);
+                }
                 m.rate_limit = Some(pm.rate_limit);
                 m.failed_reason = None;
                 m.retryable = None;
@@ -130,7 +132,7 @@ pub(crate) fn get_membership_state_impl(
     }
 
     let (leaf_index, rate_limit) = match &pm {
-        Some(pm) => (pm.leaf_index, pm.rate_limit),
+        Some(pm) => (pm.leaf_index.or(record.cache.leaf_index).unwrap_or(0), pm.rate_limit),
         None => (record.cache.leaf_index.unwrap_or(0), record.cache.rate_limit.unwrap_or(0)),
     };
     let mut view = views::MembershipStateView::resolved(
@@ -289,7 +291,7 @@ mod tests {
     use crate::test_support::{imp_with_store, no_store, opts_arr, seed_membership, TEST_GLOBAL_LOCK};
     use crate::proof;
     use crate::sealed_store;
-    use crate::proof_api::validate_proof_impl;
+    use crate::proof_api::{generate_proof_impl, validate_proof_impl};
 
     // While a provisioning pass works a registry, a scope whose only record
     // is terminal reads unknown with the pass's step, not the stale verdict.
@@ -435,6 +437,54 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::Internal, "got: {}", err.message);
         assert!(!ensure::is_running(&canonical));
         assert!(ensure::progress(&canonical).is_none(), "nothing may be recorded for it");
+    }
+
+    // A source that does not know the leaf: the view shows 0 for a record
+    // that never had one, a stored leaf survives the read, and a record with
+    // no leaf still refuses to prove.
+    #[test]
+    fn an_active_membership_without_a_leaf_keeps_the_stored_one() {
+        use crate::provider::fake::{self, FakePayer, FakeRegistry, FakeTree};
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        crate::test_support::install_backend(fake::backend(
+            FakeTree::default(),
+            FakeRegistry { membership: Some(Some((MembershipState::Active, None, 300))), bounds: None },
+            FakePayer::default(),
+        ));
+        crate::start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
+        let dir = std::env::temp_dir().join(format!("rln-no-leaf-read-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (imp, store) = imp_with_store(dir.clone());
+        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+        let rln_id_hex = "ef".repeat(32);
+
+        let fresh = "fakens:local:fresh";
+        let (commitment_hex, secret_hex) = proof::generate_identity().expect("test identity");
+        let commitment = registry_id::hex_to_bytes32(&commitment_hex).unwrap();
+        let hash = registry_id::membership_hash(fresh, &commitment);
+        seed_membership(&store, &hash, fresh, &commitment_hex, &rln_id_hex, &secret_hex, MembershipState::Pending, 0, 300);
+        store.update_cache(&hash, |m| m.leaf_index = None).unwrap();
+        let out = get_membership_state_impl(imp.store(), fresh, &rln_id_hex).unwrap();
+        assert_eq!(out["state"], serde_json::json!("active"), "got: {out}");
+        assert_eq!(out["leaf_index"], serde_json::json!(0), "got: {out}");
+        let rec = store.membership(&hash).unwrap();
+        assert_eq!((rec.cache.state, rec.cache.leaf_index), (MembershipState::Active, None));
+        let err = generate_proof_impl(imp.store(), fresh, &rln_id_hex, "aa", &now_unix().to_string())
+            .expect_err("no leaf, no proof");
+        assert!(err.message.contains("leaf_index"), "got: {}", err.message);
+
+        let known = "fakens:local:known";
+        let (commitment_hex, secret_hex) = proof::generate_identity().expect("test identity");
+        let commitment = registry_id::hex_to_bytes32(&commitment_hex).unwrap();
+        let hash = registry_id::membership_hash(known, &commitment);
+        seed_membership(&store, &hash, known, &commitment_hex, &rln_id_hex, &secret_hex, MembershipState::Pending, 7, 300);
+        let out = get_membership_state_impl(imp.store(), known, &rln_id_hex).unwrap();
+        assert_eq!(out["leaf_index"], serde_json::json!(7), "got: {out}");
+        let rec = store.membership(&hash).unwrap();
+        assert_eq!((rec.cache.state, rec.cache.leaf_index), (MembershipState::Active, Some(7)));
+
+        sealed_store::store::publish(None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // A live membership of ANY scope answers "provisioned": the reply is that

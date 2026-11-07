@@ -573,7 +573,7 @@ fn provision_one(
         }
     }
 
-    let prov = backend_of(registry)?;
+    let backend = backend_of(registry)?;
 
     // 1. The wallet.
     //
@@ -593,7 +593,7 @@ fn provision_one(
         }
         // An Err is the module not answering calls yet — indistinguishable
         // from "pending" this early, and worth the same wait.
-        if let Ok(status) = prov.wallet_status() {
+        if let Ok(status) = backend.payer.wallet_status() {
             match status.get("state").and_then(|x| x.as_str()) {
                 Some("ready") => break,
                 Some("failed") => {
@@ -642,21 +642,22 @@ fn provision_one(
     // the funding wait runs: a reset network, a registry from another program
     // version. Say so now, instead of failing later on an empty read or
     // waiting for funds that would buy nothing.
-    if let Some(msg) = crate::provider::registry_problem(prov, registry) {
+    if let Some(msg) = crate::provider::registry_problem(backend.registry, registry) {
         return Err(ApiError::new(ErrorKind::UnknownRegistry, &msg));
     }
 
     // 2. The price and the fee reserve. Read before the funding wait so the
     //    log can name the number being waited for.
-    let price = registration_price(prov, registry, rate_limit)?;
-    let (mut reserve, mut basis) = fee_reserve(prov.fee_state());
+    let price = registration_price(backend.registry, registry, rate_limit)?;
+    let (mut reserve, mut basis) = fee_reserve(backend.payer.fee_state());
     log_basis(&registry.canonical, reserve, basis);
     let mut required = price.saturating_add(reserve);
 
     // 3. Funding. Nothing this module can do brings it about — no program
     //    mints native balance — so this waits rather than acts, and says
     //    which account to send to.
-    let payer = prov
+    let payer = backend
+        .payer
         .wallet_status()
         .ok()
         .and_then(|s| s.get("payer").and_then(|p| p.as_str()).map(str::to_owned))
@@ -690,14 +691,14 @@ fn provision_one(
             // is re-quoted with every balance read but the first, which the
             // quote above just served.
             if waited > Duration::ZERO {
-                let (r, b) = fee_reserve(prov.fee_state());
+                let (r, b) = fee_reserve(backend.payer.fee_state());
                 if std::mem::discriminant(&b) != std::mem::discriminant(&basis) {
                     log_basis(&registry.canonical, r, b);
                 }
                 (reserve, basis) = (r, b);
                 required = price.saturating_add(reserve);
             }
-            match prov.payer_balance() {
+            match backend.payer.payer_balance() {
                 Ok(balance) if balance >= required => break,
                 Ok(balance) => {
                     // Announce only when a number MOVES. A wait of hours then
@@ -798,11 +799,11 @@ fn log_basis(registry: &str, reserve: u128, basis: ReserveBasis) {
 
 /// `rate_limit x price_per_unit`, from the registry's own bounds.
 fn registration_price(
-    prov: &dyn crate::provider::RegistryProvider,
+    registry_source: &dyn crate::provider::Registry,
     registry: &registry_id::CanonicalRegistryId,
     rate_limit: u64,
 ) -> Result<u128, ApiError> {
-    let bounds = prov.get_registry_bounds(registry)?;
+    let bounds = registry_source.get_registry_bounds(registry)?;
     // A decimal string on the wire, for the same reason the balance is.
     let price_per_unit = bounds
         .get("price_per_unit")

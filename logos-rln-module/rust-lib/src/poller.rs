@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use crate::lifecycle::{self, confirmation_deadline, MembershipRecord, MembershipState};
 use crate::path_cache;
-use crate::provider::{provider_for, ProviderMembership};
+use crate::provider::{backend_for, ProviderMembership, Registry};
 use crate::registry_id;
 use crate::sealed_store::store as sealed;
 use crate::worker;
@@ -76,8 +76,15 @@ fn observe(record: &MembershipRecord) -> Option<Option<ProviderMembership>> {
             return None;
         }
     };
-    let provider = provider_for(&registry.namespace)?;
-    match provider.get_membership(&registry, &record.identity.identity_commitment) {
+    observe_with(record, &registry, backend_for(&registry.namespace)?.registry)
+}
+
+fn observe_with(
+    record: &MembershipRecord,
+    registry: &registry_id::CanonicalRegistryId,
+    source: &dyn Registry,
+) -> Option<Option<ProviderMembership>> {
+    match source.get_membership(registry, &record.identity.identity_commitment) {
         Ok(pm) => Some(pm),
         Err(e) => {
             eprintln!(
@@ -130,7 +137,9 @@ fn apply_observed(
 ) -> Result<Option<MembershipState>, crate::error::ApiError> {
     write_if_still(hash, expected, |m| {
         m.state = pm.state;
-        m.leaf_index = Some(pm.leaf_index);
+        if let Some(l) = pm.leaf_index {
+            m.leaf_index = Some(l);
+        }
         m.rate_limit = Some(pm.rate_limit);
         m.failed_reason = None;
         m.retryable = None;
@@ -158,7 +167,7 @@ fn tick(refresh_states: bool) {
                 Ok(Some(prior)) => {
                     lifecycle::emit_transition(hash, &record, prior, pm.state);
                     eprintln!(
-                        "membership poller: {hash} confirmed {:?} at leaf {}",
+                        "membership poller: {hash} confirmed {:?} at leaf {:?}",
                         pm.state, pm.leaf_index
                     )
                 }
@@ -248,7 +257,7 @@ pub(crate) fn refresh_paths() {
                 continue;
             }
         };
-        let Some(provider) = provider_for(&registry.namespace) else { continue };
+        let Some(backend) = backend_for(&registry.namespace) else { continue };
         // Leaf 0 is a VALID leaf, so a usable row without one cannot be
         // defaulted — that would cache the wrong membership's path. The cache
         // is deliberately unauthenticated (see lifecycle.rs), so this pairing
@@ -257,7 +266,7 @@ pub(crate) fn refresh_paths() {
             eprintln!("membership poller: {hash} is usable but carries no leaf_index — path refresh skipped");
             continue;
         };
-        if let Err(e) = path_cache::fill_path_cache(&registry, hash, leaf_index, provider) {
+        if let Err(e) = path_cache::fill_path_cache(&registry, hash, leaf_index, backend.tree) {
             // Keep the previous cache entry — a slightly-stale but still
             // verifiable path beats none.
             eprintln!("membership poller: {hash} path refresh failed: {}", e.message);
@@ -275,6 +284,42 @@ mod tests {
     use crate::lifecycle::MembershipState;
     use crate::poller;
     use crate::test_support::{imp_with_store, seed_membership, TEST_GLOBAL_LOCK};
+
+    // A pending record the registry holds is confirmed with the registry's
+    // leaf; a read that names no leaf keeps the stored one.
+    #[test]
+    fn a_pending_record_is_confirmed_through_the_registry() {
+        use crate::provider::fake::{self, FakePayer, FakeRegistry, FakeTree};
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-poller-confirm-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_imp, store) = imp_with_store(dir.clone());
+        store.unlock("pw").unwrap();
+        let registry = "fakens:local:confirm";
+        seed_membership(&store, "conf", registry, &"56".repeat(32), "", &"e6".repeat(32), MembershipState::Pending, 0, 100);
+        store.update_cache("conf", |m| m.leaf_index = None).unwrap();
+
+        let install = |leaf: Option<u64>| {
+            crate::test_support::install_backend(fake::backend(
+                FakeTree::default(),
+                FakeRegistry { membership: Some(Some((MembershipState::Active, leaf, 100))), bounds: None },
+                FakePayer::default(),
+            ))
+        };
+        install(Some(4));
+        poller::tick(false);
+        let rec = store.membership("conf").unwrap();
+        assert_eq!((rec.cache.state, rec.cache.leaf_index), (MembershipState::Active, Some(4)));
+
+        install(None);
+        store.update_cache("conf", |m| m.state = MembershipState::Pending).unwrap();
+        poller::tick(false);
+        let rec = store.membership("conf").unwrap();
+        assert_eq!((rec.cache.state, rec.cache.leaf_index), (MembershipState::Active, Some(4)));
+
+        crate::sealed_store::store::publish(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // A record the registry does not hold: one that was active is erased;
     // one the cache never saw active (a lost sidecar) is failed, retryable.
