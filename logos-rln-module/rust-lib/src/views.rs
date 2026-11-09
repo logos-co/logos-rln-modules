@@ -20,38 +20,40 @@ use crate::lifecycle::{MembershipRecord, MembershipState};
 /// shape inside the `.lidl` `Membership` record. Exposes only the
 /// commitment; no method releases the identity secret across this
 /// interface.
+// OWNERSHIP: short-lived serialisation view over a record the caller holds.
 #[derive(Serialize)]
-pub(crate) struct CredentialView {
-    identity_commitment: String,
+pub(crate) struct CredentialView<'a> {
+    identity_commitment: &'a str,
 }
 
 /// The public Membership view (spec Membership minus secrets) — mirrors the
 /// `.lidl` `Membership` record. Shared by `register`, `select_membership`,
 /// and `get_memberships`.
+// OWNERSHIP: short-lived serialisation view over a record the caller holds.
 #[derive(Serialize)]
-pub(crate) struct MembershipView {
-    credential: CredentialView,
+pub(crate) struct MembershipView<'a> {
+    credential: CredentialView<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     epoch_size_mismatch: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    failed_reason: Option<String>,
+    failed_reason: Option<&'a str>,
     leaf_index: u64,
-    membership_hash: String,
+    membership_hash: &'a str,
     rate_limit: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     rate_limit_mismatch: Option<bool>,
-    registry_id: String,
+    registry_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     retryable: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    rln_identifier: Option<String>,
+    rln_identifier: Option<&'a str>,
     state: MembershipState,
     submitted_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tx_result: Option<String>,
+    tx_result: Option<&'a str>,
 }
 
-impl MembershipView {
+impl<'a> MembershipView<'a> {
     /// `quarantined` (metadata tamper-check failed) forces `state:"failed"`
     /// and `failed_reason:"metadata_tamper"` and suppresses `retryable` — a
     /// tamper verdict is never retriable. `rate_limit_mismatch` and
@@ -60,8 +62,8 @@ impl MembershipView {
     /// to a different epoch size than the module's current configuration
     /// (its reservations will fail Permanent until re-registered).
     pub(crate) fn new(
-        hash: &str,
-        record: &MembershipRecord,
+        hash: &'a str,
+        record: &'a MembershipRecord,
         quarantined: bool,
         rate_limit_mismatch: bool,
         epoch_size_mismatch: bool,
@@ -69,34 +71,34 @@ impl MembershipView {
         let cache = &record.cache;
         let identity = &record.identity;
         let (failed_reason, retryable) = if quarantined {
-            (Some("metadata_tamper".to_string()), None)
+            (Some("metadata_tamper"), None)
         } else {
             (
-                cache.failed_reason.clone(),
+                cache.failed_reason.as_deref(),
                 cache.failed_reason.as_ref().and(cache.retryable),
             )
         };
         MembershipView {
             credential: CredentialView {
-                identity_commitment: identity.identity_commitment.clone(),
+                identity_commitment: &identity.identity_commitment,
             },
             epoch_size_mismatch: epoch_size_mismatch.then_some(true),
             failed_reason,
             leaf_index: cache.leaf_index.unwrap_or(0),
-            membership_hash: hash.to_string(),
+            membership_hash: hash,
             rate_limit: cache.rate_limit.unwrap_or(0),
             rate_limit_mismatch: rate_limit_mismatch.then_some(true),
-            registry_id: identity.registry_id.clone(),
+            registry_id: &identity.registry_id,
             retryable,
             rln_identifier: (!identity.rln_identifier.is_empty())
-                .then(|| identity.rln_identifier.clone()),
+                .then_some(identity.rln_identifier.as_str()),
             state: if quarantined {
                 MembershipState::Failed
             } else {
                 cache.state
             },
             submitted_at: identity.submitted_at,
-            tx_result: cache.tx_result.clone(),
+            tx_result: cache.tx_result.as_deref(),
         }
     }
 }
@@ -126,12 +128,13 @@ pub(crate) fn public_membership(
 /// `leaf_index` / `rate_limit` only once a single membership resolves for
 /// the scope. `state:"unknown"` when none does; more than one candidate is
 /// an `ambiguous_selection` error, not this shape.
+// OWNERSHIP: short-lived serialisation view over a record the caller holds.
 #[derive(Serialize)]
-pub(crate) struct MembershipStateView {
+pub(crate) struct MembershipStateView<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     leaf_index: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    membership_hash: Option<String>,
+    membership_hash: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rate_limit: Option<u64>,
     /// What automatic provisioning is doing, when it is doing anything.
@@ -141,7 +144,7 @@ pub(crate) struct MembershipStateView {
     /// into acquiring one", and those want different reactions.
     #[serde(skip_serializing_if = "Option::is_none")]
     provisioning: Option<ProvisioningView>,
-    registry_id: String,
+    registry_id: &'a str,
     state: MembershipState,
     /// Why a `failed` or `erased` record is what it is, and whether a fresh
     /// registration may be attempted (spec: a failed submission SHALL report
@@ -215,14 +218,14 @@ impl ProvisioningView {
     }
 }
 
-impl MembershipStateView {
-    pub(crate) fn unknown(registry_id: &str) -> Self {
+impl<'a> MembershipStateView<'a> {
+    pub(crate) fn unknown(registry_id: &'a str) -> Self {
         MembershipStateView {
             leaf_index: None,
             membership_hash: None,
             rate_limit: None,
             provisioning: None,
-            registry_id: registry_id.to_string(),
+            registry_id,
             state: MembershipState::Unknown,
             failed_reason: None,
             retryable: None,
@@ -243,8 +246,8 @@ impl MembershipStateView {
     }
 
     pub(crate) fn resolved(
-        hash: &str,
-        registry_id: &str,
+        hash: &'a str,
+        registry_id: &'a str,
         state: MembershipState,
         leaf_index: u64,
         rate_limit: u64,
@@ -252,9 +255,9 @@ impl MembershipStateView {
         MembershipStateView {
             provisioning: None,
             leaf_index: Some(leaf_index),
-            membership_hash: Some(hash.to_string()),
+            membership_hash: Some(hash),
             rate_limit: Some(rate_limit),
-            registry_id: registry_id.to_string(),
+            registry_id,
             state,
             failed_reason: None,
             retryable: None,
@@ -373,15 +376,16 @@ pub(crate) struct VerdictReply {
     external_nullifier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recovered_secret: Option<String>,
-    verdict: String,
+    // OWNERSHIP: every verdict is a string literal.
+    verdict: &'static str,
 }
 
 impl VerdictReply {
-    pub(crate) fn verdict(verdict: &str) -> Self {
+    pub(crate) fn verdict(verdict: &'static str) -> Self {
         VerdictReply {
             external_nullifier: None,
             recovered_secret: None,
-            verdict: verdict.to_string(),
+            verdict,
         }
     }
 
@@ -389,7 +393,7 @@ impl VerdictReply {
         VerdictReply {
             external_nullifier: None,
             recovered_secret: Some(recovered_secret),
-            verdict: "rate_limit_violation".to_string(),
+            verdict: "rate_limit_violation",
         }
     }
 
@@ -559,6 +563,46 @@ mod tests {
                 .to_string()
                 .contains(r#""epoch_size_mismatch":true"#),
             "got: {bound_elsewhere}"
+        );
+    }
+
+    // Pins MembershipStateView's and VerdictReply's exact bytes with every
+    // field populated: serialized directly (declaration order) and through
+    // `to_value` (the wire's alphabetical order).
+    #[test]
+    fn state_and_verdict_views_serialize_every_field() {
+        let state =
+            MembershipStateView::resolved("h-1", "logos:local:r", MembershipState::Failed, 7, 300)
+                .with_failure(Some("confirmation_window_elapsed".into()), Some(true))
+                .with_provisioning(Some(ProvisioningView::new(
+                    "registering",
+                    "step detail".into(),
+                )));
+        assert_eq!(
+            serde_json::to_string(&state).unwrap(),
+            r#"{"leaf_index":7,"membership_hash":"h-1","rate_limit":300,"provisioning":{"detail":"step detail","step":"registering"},"registry_id":"logos:local:r","state":"failed","failed_reason":"confirmation_window_elapsed","retryable":true}"#
+        );
+        assert_eq!(
+            serde_json::to_value(&state).unwrap().to_string(),
+            r#"{"failed_reason":"confirmation_window_elapsed","leaf_index":7,"membership_hash":"h-1","provisioning":{"detail":"step detail","step":"registering"},"rate_limit":300,"registry_id":"logos:local:r","retryable":true,"state":"failed"}"#
+        );
+
+        let (secret, nullifier) = ("5e".repeat(32), "e7".repeat(32));
+        let expected = format!(
+            r#"{{"external_nullifier":"{nullifier}","recovered_secret":"{secret}","verdict":"rate_limit_violation"}}"#
+        );
+        let violation =
+            VerdictReply::rate_limit_violation(secret).with_external_nullifier(nullifier);
+        assert_eq!(serde_json::to_string(&violation).unwrap(), expected);
+        assert_eq!(
+            serde_json::to_value(&violation).unwrap().to_string(),
+            expected
+        );
+        assert_eq!(
+            serde_json::to_value(VerdictReply::verdict("duplicate"))
+                .unwrap()
+                .to_string(),
+            r#"{"verdict":"duplicate"}"#
         );
     }
 }
