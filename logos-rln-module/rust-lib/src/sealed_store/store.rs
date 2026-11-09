@@ -78,7 +78,7 @@ pub(crate) const UNINIT_MSG: &str =
 pub(crate) fn current_or_cause() -> Result<Arc<Store>, ApiError> {
     match &*STORE
         .read()
-        .expect("invariant: no holder of the store cell panics (panic = \"abort\")")
+        .expect("invariant: no holder of the store cell runs code that can panic")
     {
         // OWNERSHIP: cheap Arc handle clone, taken out of the read lock.
         StoreCell::Ready(store) => Ok(Arc::clone(store)),
@@ -110,7 +110,7 @@ pub(crate) fn current_or_uninit() -> Result<Arc<Store>, ApiError> {
 pub(crate) fn open_current(dir: PathBuf) {
     let mut cell = STORE
         .write()
-        .expect("invariant: no holder of the store cell panics (panic = \"abort\")");
+        .expect("invariant: no holder of the store cell runs code that can panic");
     if let StoreCell::Ready(prev) = &*cell {
         prev.close();
     }
@@ -130,7 +130,7 @@ pub(crate) fn open_current(dir: PathBuf) {
 pub(crate) fn close_current(cause: String) {
     let mut cell = STORE
         .write()
-        .expect("invariant: no holder of the store cell panics (panic = \"abort\")");
+        .expect("invariant: no holder of the store cell runs code that can panic");
     if let StoreCell::Ready(prev) = &*cell {
         prev.close();
     }
