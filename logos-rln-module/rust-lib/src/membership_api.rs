@@ -179,16 +179,18 @@ pub(crate) fn select_membership_impl(
 
     let store = store?;
     let records = records_for_registry(&store, &registry);
-    let hash = select::select_hash(
+    let record = select::select(
         &records,
         (&registry.canonical, &rln_identifier_hex),
         &selector,
     )?;
-    let record = records
-        .iter()
-        .find(|r| r.hash == hash)
-        .ok_or_else(|| ApiError::internal("selected record vanished"))?;
-    Ok(views::public_membership(&hash, record, false, false, false))
+    Ok(views::public_membership(
+        &record.hash,
+        record,
+        false,
+        false,
+        false,
+    ))
 }
 
 /// ensure_membership(registry): `start()`'s provisioning for one registry,

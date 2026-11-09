@@ -103,12 +103,17 @@ pub(crate) fn generate_proof_with(
     // requires a single candidate (AmbiguousSelection otherwise).
     let store = store?;
     let records = records_for_registry(&store, &registry);
-    let hash = select::select_hash(
-        &scope_candidates(&records, &rln_id_hex),
+    let candidates = scope_candidates(&records, &rln_id_hex);
+    let selected = select::select(
+        &candidates,
         (&registry.canonical, &rln_id_hex),
         &select::Selector::None,
     )?;
-    let record = store.membership(&hash).ok_or_else(|| {
+    let hash = selected.hash.as_str();
+    // Re-read by hash for the freshest leaf_index and rate_limit: a poller
+    // write, a concurrent reservation or a registration may have swapped the
+    // store's snapshot since `records` was taken.
+    let record = store.membership(hash).ok_or_else(|| {
         ApiError::new(ErrorKind::UnknownMembership, "selected membership vanished")
     })?;
     // Leaf 0 is a VALID leaf: defaulting here would prove against the wrong
@@ -124,17 +129,17 @@ pub(crate) fn generate_proof_with(
     let rate_limit = record.cache.rate_limit.unwrap_or(0);
 
     // Decrypt the credential in-module (requires an unlocked keystore).
-    let mut credential = store.unseal_credential(&hash)?;
+    let mut credential = store.unseal_credential(hash)?;
 
     // Fetch the Merkle path first — it can fail without spending a slot. A
     // cache hit is ZERO registry I/O; a miss falls back to the on-demand
     // fetch, which also fills the cache. A cached entry is only trusted
     // when its leaf_index still matches — see path_cache.rs.
-    let (path_elements_hex, path_indices) = match path_cache::hit(&hash, leaf_index) {
+    let (path_elements_hex, path_indices) = match path_cache::hit(hash, leaf_index) {
         Some(path) => path,
         None => {
-            path_cache::fill_path_cache(&registry, &hash, leaf_index, backend.tree)?;
-            path_cache::hit(&hash, leaf_index)
+            path_cache::fill_path_cache(&registry, hash, leaf_index, backend.tree)?;
+            path_cache::hit(hash, leaf_index)
                 .ok_or_else(|| ApiError::internal("path cache: fetched path vanished before use"))?
         }
     };
@@ -145,7 +150,7 @@ pub(crate) fn generate_proof_with(
     // may be pruned or served.
     let retain_floor = now_epoch.saturating_sub(gap);
     let message_id =
-        store.reserve_message_id(&hash, &rln_id_hex, epoch, retain_floor, rate_limit, size)?;
+        store.reserve_message_id(hash, &rln_id_hex, epoch, retain_floor, rate_limit, size)?;
 
     // OWNERSHIP: the secret moves out of the credential (`mem::take`: its
     // Drop forbids a field move) into the material; both wipe on drop.

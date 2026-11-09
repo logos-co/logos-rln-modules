@@ -65,30 +65,29 @@ pub(crate) fn scope_matches_for_test(record_rln_id: &str, scope_rln_id: &str) ->
 /// every record backs it. A scope whose own membership is active beside a
 /// start()-provisioned registry-wide one proves with its own — the state
 /// read answers that record, and so must the proof.
-pub(crate) fn scope_candidates(
-    records: &[MembershipRecord],
+// OWNERSHIP: the candidates borrow from the caller's `records`.
+pub(crate) fn scope_candidates<'a>(
+    records: &'a [MembershipRecord],
     rln_id_hex: &str,
-) -> Vec<MembershipRecord> {
+) -> Vec<&'a MembershipRecord> {
     let usable = |r: &&MembershipRecord| !r.quarantined && r.cache.state.is_usable();
-    let own: Vec<MembershipRecord> = records
+    let own: Vec<&MembershipRecord> = records
         .iter()
         .filter(usable)
         .filter(|r| r.identity.rln_identifier == rln_id_hex)
-        .cloned()
         .collect();
     if !own.is_empty() {
         return own;
     }
-    let wide: Vec<MembershipRecord> = records
+    let wide: Vec<&MembershipRecord> = records
         .iter()
         .filter(usable)
         .filter(|r| r.identity.rln_identifier.is_empty())
-        .cloned()
         .collect();
     if !wide.is_empty() {
         return wide;
     }
-    records.to_vec()
+    records.iter().collect()
 }
 
 /// Which record answers a `get_membership_state(scope)` read.
@@ -347,8 +346,10 @@ mod tests {
         );
         let canonical = registry_id::parse(&registry).unwrap().canonical;
         let records = records_for_registry(&store, &registry_id::parse(&registry).unwrap());
-        let names = |v: Vec<MembershipRecord>| {
-            let mut n: Vec<String> = v.into_iter().map(|r| r.hash).collect();
+        let names = |v: Vec<&MembershipRecord>| {
+            // OWNERSHIP: owned names, so the closure's result does not
+            // borrow from its argument.
+            let mut n: Vec<String> = v.into_iter().map(|r| r.hash.clone()).collect();
             n.sort();
             n
         };

@@ -10,6 +10,7 @@
 //! poller-refreshed caches (≤60s stale — the spec's accepted staleness
 //! class for candidate sets).
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -55,20 +56,22 @@ pub(crate) fn parse_selector(selector_json: &str) -> Result<Selector, ApiError> 
 static ROUND_ROBIN: Mutex<Option<HashMap<(String, String), String>>> = Mutex::new(None);
 
 /// Resolve the record to use. `records` is the registry's full local list of
-/// [`MembershipRecord`]s; `scope` = (canonical registry_id,
-/// lowercase rln_identifier hex).
-pub(crate) fn select_hash(
-    records: &[MembershipRecord],
+/// [`MembershipRecord`]s (owned, borrowed or shared); `scope` = (canonical
+/// registry_id, lowercase rln_identifier hex).
+// OWNERSHIP: the selected record borrows from the caller's `records`.
+pub(crate) fn select<'a, R: Borrow<MembershipRecord>>(
+    records: &'a [R],
     scope: (&str, &str),
     selector: &Selector,
-) -> Result<String, ApiError> {
-    let mut candidates: Vec<(&str, u64)> = records
+) -> Result<&'a MembershipRecord, ApiError> {
+    let rate = |r: &MembershipRecord| r.cache.rate_limit.unwrap_or(0);
+    let mut candidates: Vec<&'a MembershipRecord> = records
         .iter()
+        .map(Borrow::borrow)
         .filter(|r| !r.quarantined && r.cache.state.is_usable())
-        .map(|r| (r.hash.as_str(), r.cache.rate_limit.unwrap_or(0)))
         .collect();
     // Hash order makes every strategy deterministic and churn-stable.
-    candidates.sort_by(|a, b| a.0.cmp(b.0));
+    candidates.sort_by(|a, b| a.hash.cmp(&b.hash));
     if candidates.is_empty() {
         return Err(ApiError::new(
             ErrorKind::NoUsableMembership,
@@ -79,8 +82,8 @@ pub(crate) fn select_hash(
     match selector {
         Selector::ByHash(wanted) => candidates
             .iter()
-            .find(|(hash, _)| hash == wanted)
-            .map(|(hash, _)| hash.to_string())
+            .find(|r| r.hash == *wanted)
+            .copied()
             .ok_or_else(|| {
                 ApiError::new(
                     ErrorKind::UnknownMembership,
@@ -89,7 +92,7 @@ pub(crate) fn select_hash(
             }),
         Selector::None => {
             if candidates.len() == 1 {
-                Ok(candidates[0].0.to_string())
+                Ok(candidates[0])
             } else {
                 Err(ApiError::new(
                     ErrorKind::AmbiguousSelection,
@@ -100,10 +103,9 @@ pub(crate) fn select_hash(
         Selector::HighestRateLimit => Ok(candidates
             .iter()
             // Highest rate; ties break to the LOWEST hash (deterministic).
-            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))
-            .expect("non-empty candidates")
-            .0
-            .to_string()),
+            .max_by(|a, b| rate(a).cmp(&rate(b)).then(b.hash.cmp(&a.hash)))
+            .copied()
+            .expect("non-empty candidates")),
         Selector::RoundRobin => {
             let key = (scope.0.to_string(), scope.1.to_string());
             let mut guard = lock(&ROUND_ROBIN);
@@ -111,17 +113,17 @@ pub(crate) fn select_hash(
             // Next = first candidate strictly after the cursor in hash
             // order, wrapping — stable when the candidate set churns.
             let next = match map.get(&key) {
-                Some(last) => {
-                    candidates
-                        .iter()
-                        .find(|(hash, _)| *hash > last.as_str())
-                        .unwrap_or(&candidates[0])
-                        .0
-                }
-                None => candidates[0].0,
+                Some(last) => candidates
+                    .iter()
+                    .find(|r| r.hash.as_str() > last.as_str())
+                    .copied()
+                    .unwrap_or(candidates[0]),
+                None => candidates[0],
             };
-            map.insert(key, next.to_string());
-            Ok(next.to_string())
+            // OWNERSHIP: the cursor map owns its copy of the hash; the
+            // record stays borrowed from the caller.
+            map.insert(key, next.hash.clone());
+            Ok(next)
         }
     }
 }
@@ -165,20 +167,24 @@ mod tests {
             record("c3", MembershipState::Expired, 300, false),
             record("d4", MembershipState::Active, 300, true), // quarantined
         ];
-        let err = select_hash(&records, SCOPE, &Selector::None).unwrap_err();
+        let err = select(&records, SCOPE, &Selector::None)
+            .map(|r| &r.hash)
+            .unwrap_err();
         assert_eq!(err.kind, ErrorKind::NoUsableMembership);
     }
 
     #[test]
     fn sole_candidate_is_returned_multiple_require_selector() {
         let one = vec![record("a1", MembershipState::Active, 300, false)];
-        assert_eq!(select_hash(&one, SCOPE, &Selector::None).unwrap(), "a1");
+        assert_eq!(select(&one, SCOPE, &Selector::None).unwrap().hash, "a1");
 
         let two = vec![
             record("a1", MembershipState::Active, 300, false),
             record("b2", MembershipState::GracePeriod, 300, false),
         ];
-        let err = select_hash(&two, SCOPE, &Selector::None).unwrap_err();
+        let err = select(&two, SCOPE, &Selector::None)
+            .map(|r| &r.hash)
+            .unwrap_err();
         assert_eq!(err.kind, ErrorKind::AmbiguousSelection);
     }
 
@@ -189,10 +195,14 @@ mod tests {
             record("b2", MembershipState::Failed, 300, false),
         ];
         assert_eq!(
-            select_hash(&records, SCOPE, &Selector::ByHash("a1".into())).unwrap(),
+            select(&records, SCOPE, &Selector::ByHash("a1".into()))
+                .unwrap()
+                .hash,
             "a1"
         );
-        let err = select_hash(&records, SCOPE, &Selector::ByHash("b2".into())).unwrap_err();
+        let err = select(&records, SCOPE, &Selector::ByHash("b2".into()))
+            .map(|r| &r.hash)
+            .unwrap_err();
         assert_eq!(
             err.kind,
             ErrorKind::UnknownMembership,
@@ -208,7 +218,9 @@ mod tests {
             record("b2", MembershipState::Active, 200, false),
         ];
         assert_eq!(
-            select_hash(&records, SCOPE, &Selector::HighestRateLimit).unwrap(),
+            select(&records, SCOPE, &Selector::HighestRateLimit)
+                .unwrap()
+                .hash,
             "a1"
         );
     }
@@ -224,16 +236,22 @@ mod tests {
         let scope_y = ("logos:local:aa", "bbbb2222");
 
         assert_eq!(
-            select_hash(&records, scope_x, &Selector::RoundRobin).unwrap(),
+            select(&records, scope_x, &Selector::RoundRobin)
+                .unwrap()
+                .hash,
             "a1"
         );
         assert_eq!(
-            select_hash(&records, scope_x, &Selector::RoundRobin).unwrap(),
+            select(&records, scope_x, &Selector::RoundRobin)
+                .unwrap()
+                .hash,
             "b2"
         );
         // A different rln_identifier rotates independently.
         assert_eq!(
-            select_hash(&records, scope_y, &Selector::RoundRobin).unwrap(),
+            select(&records, scope_y, &Selector::RoundRobin)
+                .unwrap()
+                .hash,
             "a1"
         );
         // Candidate churn: b2 vanishes while the cursor sits on it.
@@ -242,11 +260,15 @@ mod tests {
             record("c3", MembershipState::Active, 300, false),
         ];
         assert_eq!(
-            select_hash(&churned, scope_x, &Selector::RoundRobin).unwrap(),
+            select(&churned, scope_x, &Selector::RoundRobin)
+                .unwrap()
+                .hash,
             "c3"
         );
         assert_eq!(
-            select_hash(&churned, scope_x, &Selector::RoundRobin).unwrap(),
+            select(&churned, scope_x, &Selector::RoundRobin)
+                .unwrap()
+                .hash,
             "a1"
         );
     }
