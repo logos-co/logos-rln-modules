@@ -27,7 +27,6 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-
 mod base58;
 mod fee_state;
 mod hex;
@@ -86,7 +85,6 @@ fn reg_in_flight<R>(f: impl FnOnce(&mut RegInFlightMap) -> R) -> R {
     map.retain(|_, (_, inserted_at)| inserted_at.elapsed() < REG_IN_FLIGHT_TTL);
     f(&mut map)
 }
-
 
 /// The unit-test binary links no logos-protocol archive, yet the SDK's client
 /// path references the `lp_*` symbols by name. Define the ones that path can
@@ -361,13 +359,14 @@ fn derive_register_plan(
     id_commitment: &[u8; 32],
     who: &str,
 ) -> Option<RlnRegisterPlan> {
-    let tree_main_hex = match native::tree_main_account_id(&ctx.config_data, &ctx.registration_program) {
-        Ok(id) => bytes_to_hex(&id),
-        Err(e) => {
-            eprintln!("{who}: derive tree main failed: {e}");
-            return None;
-        }
-    };
+    let tree_main_hex =
+        match native::tree_main_account_id(&ctx.config_data, &ctx.registration_program) {
+            Ok(id) => bytes_to_hex(&id),
+            Err(e) => {
+                eprintln!("{who}: derive tree main failed: {e}");
+                return None;
+            }
+        };
     let tree_main_data = fetch_shard(&tree_main_hex, &ctx.merkle_program, who)?;
     match native::register_plan(
         &ctx.config_data,
@@ -491,7 +490,10 @@ enum RegisterReply {
         #[serde(skip_serializing_if = "Option::is_none")]
         tx_result: Option<String>,
     },
-    AlreadyRegistered { already_registered: Yes, leaf_index: u64 },
+    AlreadyRegistered {
+        already_registered: Yes,
+        leaf_index: u64,
+    },
     /// `"<kind>: <reason>"`.
     Refused { error: String },
 }
@@ -507,13 +509,17 @@ impl RegisterReply {
     }
 
     fn refused(why: impl std::fmt::Display) -> Self {
-        Self::Refused { error: why.to_string() }
+        Self::Refused {
+            error: why.to_string(),
+        }
     }
 
     /// Through `serde_json::Value`, whose map orders keys alphabetically:
     /// the key order consumers read.
     fn to_json(&self) -> String {
-        serde_json::to_value(self).map(|v| v.to_string()).unwrap_or_default()
+        serde_json::to_value(self)
+            .map(|v| v.to_string())
+            .unwrap_or_default()
     }
 }
 
@@ -534,21 +540,25 @@ fn submit_register(
     let now_ms = chain_time_ms(who)
         .ok_or_else(|| "chain time unavailable".to_string())?
         .saturating_sub(CHAIN_TIME_SLACK_MS);
-    let message = match native::register_build_message(plan, id_commitment, rate_limit, &payer, now_ms)
-    {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            eprintln!("{who}: register_build_message failed: {e}");
-            return Err(format!("register_build_message failed: {e}"));
-        }
-    };
+    let message =
+        match native::register_build_message(plan, id_commitment, rate_limit, &payer, now_ms) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("{who}: register_build_message failed: {e}");
+                return Err(format!("register_build_message failed: {e}"));
+            }
+        };
     // Every actor the program touches while handling Register is declared:
     // the config (the message's receiver), the membership it writes for the
     // first time (admitted by its PDA seed), the tree it inserts into, and the
     // two native balances the payment moves between. The payer signs; the
     // treasury must already exist, which preflight_register checks.
     use wallet::MentionKind::{NoSign, Pda, Signer};
-    let mention = |account: [u8; 32], program: [u8; 32], kind| wallet::Mention { account, program, kind };
+    let mention = |account: [u8; 32], program: [u8; 32], kind| wallet::Mention {
+        account,
+        program,
+        kind,
+    };
     let mentions = [
         mention(plan.config_account_id, ctx.registration_program, NoSign),
         mention(
@@ -606,8 +616,15 @@ fn preflight_register(
     rate_limit: u64,
     payer_hex: &str,
 ) -> Result<(), String> {
-    native::check_register(&ctx.config_data, plan.next_leaf_index, id_commitment, rate_limit)?;
-    if let wallet::AccountRead::Absent = wallet::read_account(&bytes_to_hex(&plan.treasury_account_id)) {
+    native::check_register(
+        &ctx.config_data,
+        plan.next_leaf_index,
+        id_commitment,
+        rate_limit,
+    )?;
+    if let wallet::AccountRead::Absent =
+        wallet::read_account(&bytes_to_hex(&plan.treasury_account_id))
+    {
         return Err(format!(
             "treasury_missing: the registry's treasury {} does not exist on this chain; run_setup \
              seeds it",
@@ -622,8 +639,10 @@ fn preflight_register(
             .and_then(serde_json::Value::as_u64)
             .map(u128::from)
     };
-    let (Some(exec), Some(stor)) = (ceiling("next_base_fee_exec_ceiling"), ceiling("next_base_fee_stor_ceiling"))
-    else {
+    let (Some(exec), Some(stor)) = (
+        ceiling("next_base_fee_exec_ceiling"),
+        ceiling("next_base_fee_stor_ceiling"),
+    ) else {
         return Ok(());
     };
     let Some((_, balance)) = wallet::native_balance(payer_hex) else {
@@ -724,9 +743,19 @@ fn register_watch(mut w: RegisterWatch) {
         // A revert that a fresh now_ms cannot fix (an argument the program
         // refuses, a full registry, a missing treasury, a payer that cannot
         // pay) would revert, and be charged, on every re-send.
-        if let Err(why) = preflight_register(&ctx, &plan, &w.id_commitment, w.rate_limit, &w.payer_hex) {
-            eprintln!("{WHO}: tx {} reverted and a re-send would too — not re-sending: {why}", w.tx_hash);
-            reg_in_flight(|m| m.insert(w.reg_key.clone(), (RegisterReply::refused(why), Instant::now())));
+        if let Err(why) =
+            preflight_register(&ctx, &plan, &w.id_commitment, w.rate_limit, &w.payer_hex)
+        {
+            eprintln!(
+                "{WHO}: tx {} reverted and a re-send would too — not re-sending: {why}",
+                w.tx_hash
+            );
+            reg_in_flight(|m| {
+                m.insert(
+                    w.reg_key.clone(),
+                    (RegisterReply::refused(why), Instant::now()),
+                )
+            });
             return;
         }
         eprintln!(
@@ -735,7 +764,14 @@ fn register_watch(mut w: RegisterWatch) {
             w.tx_hash
         );
         resubmits += 1;
-        let send_result = match submit_register(&ctx, &plan, &w.id_commitment, w.rate_limit, &w.payer_hex, WHO) {
+        let send_result = match submit_register(
+            &ctx,
+            &plan,
+            &w.id_commitment,
+            w.rate_limit,
+            &w.payer_hex,
+            WHO,
+        ) {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -747,7 +783,10 @@ fn register_watch(mut w: RegisterWatch) {
     // left alone it would answer "pending" for up to another TTL with nobody
     // watching the chain for it.
     reg_in_flight(|m| m.remove(&w.reg_key));
-    eprintln!("{WHO}: no membership within {}s", REG_IN_FLIGHT_TTL.as_secs());
+    eprintln!(
+        "{WHO}: no membership within {}s",
+        REG_IN_FLIGHT_TTL.as_secs()
+    );
 }
 
 // ------------------------------------------------------------- method bodies
@@ -781,8 +820,7 @@ fn get_valid_roots_impl(rln_account_id_hex: &str) -> String {
         }
     };
 
-    serde_json::json!({ "depth": depth, "valid_roots": roots_to_json_array(&roots) })
-        .to_string()
+    serde_json::json!({ "depth": depth, "valid_roots": roots_to_json_array(&roots) }).to_string()
 }
 
 fn get_merkle_proofs_impl(config_account_id: &str, leaf_indices_json: &str) -> String {
@@ -904,10 +942,8 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
     ) -> String {
         let Ok(rate_limit) = u64::try_from(rate_limit) else {
             eprintln!("register_member: negative rate_limit {rate_limit}");
-            return RegisterReply::refused(format!(
-                "invalid_rate_limit: {rate_limit} is negative"
-            ))
-            .to_json();
+            return RegisterReply::refused(format!("invalid_rate_limit: {rate_limit} is negative"))
+                .to_json();
         };
         let Some(id_commitment) = hex_to_bytes32(&id_commitment_hex) else {
             eprintln!("register_member: invalid id_commitment hex");
@@ -951,14 +987,17 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             let Some(leaf) = membership_leaf_index(&ctx, &membership, "register_member") else {
                 return String::new();
             };
-            eprintln!("register_member: membership already exists at leaf {leaf} — skipping resubmit");
-            return RegisterReply::AlreadyRegistered { already_registered: Yes, leaf_index: leaf }
-                .to_json();
+            eprintln!(
+                "register_member: membership already exists at leaf {leaf} — skipping resubmit"
+            );
+            return RegisterReply::AlreadyRegistered {
+                already_registered: Yes,
+                leaf_index: leaf,
+            }
+            .to_json();
         }
 
-        if let Err(why) =
-            preflight_register(&ctx, &plan, &id_commitment, rate_limit, &payer_hex)
-        {
+        if let Err(why) = preflight_register(&ctx, &plan, &id_commitment, rate_limit, &payer_hex) {
             eprintln!("register_member: not submitting: {why}");
             return RegisterReply::refused(why).to_json();
         }
@@ -997,7 +1036,14 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         // A send the wallet could not make (no signing key for the payer, no
         // network, a payer that cannot fund) submitted nothing: the caller
         // gets the refusal, not a "pending" it would wait out.
-        let send_result = match submit_register(&ctx, &plan, &id_commitment, rate_limit, &payer_hex, "register_member") {
+        let send_result = match submit_register(
+            &ctx,
+            &plan,
+            &id_commitment,
+            rate_limit,
+            &payer_hex,
+            "register_member",
+        ) {
             Ok(r) => r,
             Err(why) => {
                 reg_in_flight(|m| m.remove(&reg_key));
@@ -1153,7 +1199,10 @@ mod tests {
         let lower = "ab".repeat(32);
         let canonical = canonical_account_hex(&lower);
         assert_eq!(canonical.as_deref(), Some(lower.as_str()));
-        assert_eq!(canonical_account_hex(&format!("0x{}", "AB".repeat(32))), canonical);
+        assert_eq!(
+            canonical_account_hex(&format!("0x{}", "AB".repeat(32))),
+            canonical
+        );
         assert_eq!(canonical_account_hex(&format!(" 0X{lower} ")), canonical);
         assert_eq!(canonical_account_hex(&"zz".repeat(32)), None);
     }
@@ -1176,7 +1225,10 @@ mod tests {
     #[test]
     fn register_replies_serialise_to_the_wire_text() {
         let placeholder = RegisterReply::pending(5, 100, None);
-        assert_eq!(placeholder.to_json(), r#"{"leaf_index":5,"pending":true,"rate_limit":100}"#);
+        assert_eq!(
+            placeholder.to_json(),
+            r#"{"leaf_index":5,"pending":true,"rate_limit":100}"#
+        );
         let submitted = RegisterReply::Submitted {
             leaf_index: 5,
             pending: Yes,
@@ -1187,8 +1239,14 @@ mod tests {
             submitted.to_json(),
             r#"{"leaf_index":5,"pending":true,"rate_limit":100,"tx_result":"{\"error\":\"\",\"success\":true,\"tx_hash\":\"ab12\"}"}"#
         );
-        let already = RegisterReply::AlreadyRegistered { already_registered: Yes, leaf_index: 7 };
-        assert_eq!(already.to_json(), r#"{"already_registered":true,"leaf_index":7}"#);
+        let already = RegisterReply::AlreadyRegistered {
+            already_registered: Yes,
+            leaf_index: 7,
+        };
+        assert_eq!(
+            already.to_json(),
+            r#"{"already_registered":true,"leaf_index":7}"#
+        );
         assert_eq!(
             RegisterReply::refused("send_failed: key not found").to_json(),
             r#"{"error":"send_failed: key not found"}"#
@@ -1219,12 +1277,21 @@ mod tests {
             return;
         };
         reg_in_flight(|m| {
-            m.insert(stale_key.clone(), (RegisterReply::refused("stale"), back_dated));
-            m.insert(fresh_key.clone(), (RegisterReply::refused("fresh"), Instant::now()));
+            m.insert(
+                stale_key.clone(),
+                (RegisterReply::refused("stale"), back_dated),
+            );
+            m.insert(
+                fresh_key.clone(),
+                (RegisterReply::refused("fresh"), Instant::now()),
+            );
         });
         reg_in_flight(|m| {
             assert!(!m.contains_key(&stale_key), "stale entry must be evicted");
-            assert_eq!(m.get(&fresh_key).map(|(r, _)| r), Some(&RegisterReply::refused("fresh")));
+            assert_eq!(
+                m.get(&fresh_key).map(|(r, _)| r),
+                Some(&RegisterReply::refused("fresh"))
+            );
             m.remove(&fresh_key);
         });
     }

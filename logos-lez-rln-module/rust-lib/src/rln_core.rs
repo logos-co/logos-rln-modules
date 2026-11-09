@@ -3,14 +3,12 @@
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use rln_layouts::{
-    config_seed, main_seed, membership_seed,
-    MembershipState, TreeMainLayout, ROOT_HISTORY_SIZE,
-    OFFSET_CACHED_NODES, OFFSET_DEPTH, OFFSET_ROOT, OFFSET_TREE_DATA, TREE_DEPTH,
-    read_sparse_node,
+    config_seed, main_seed, membership_seed, read_sparse_node, MembershipState, TreeMainLayout,
+    OFFSET_CACHED_NODES, OFFSET_DEPTH, OFFSET_ROOT, OFFSET_TREE_DATA, ROOT_HISTORY_SIZE,
+    TREE_DEPTH,
 };
 use serde::Serialize;
-use sha2::{Sha256, Digest};
-
+use sha2::{Digest, Sha256};
 
 /// The BN254 scalar field modulus, big-endian. The guest reads a commitment
 /// as a little-endian field element and panics on one >= this.
@@ -43,9 +41,11 @@ pub fn check_register(
         return Err("invalid_commitment: the identity commitment is zero".into());
     }
     if !is_field_element_le(id_commitment) {
-        return Err("invalid_commitment: the identity commitment is not a BN254 field element \
+        return Err(
+            "invalid_commitment: the identity commitment is not a BN254 field element \
                     (as little-endian bytes it is >= the modulus)"
-            .into());
+                .into(),
+        );
     }
     let min = config_field_u64(config_data, CONFIG_OFFSET_MIN_RATE_LIMIT);
     let max = config_field_u64(config_data, CONFIG_OFFSET_MAX_RATE_LIMIT);
@@ -62,7 +62,10 @@ pub fn check_register(
         ));
     }
     if next_index >= 1u64 << TREE_DEPTH {
-        return Err(format!("tree_full: all {} leaves are taken", 1u64 << TREE_DEPTH));
+        return Err(format!(
+            "tree_full: all {} leaves are taken",
+            1u64 << TREE_DEPTH
+        ));
     }
     Ok(())
 }
@@ -285,7 +288,12 @@ pub fn build_merkle_proof(main_data: &[u8], leaf_index: u64) -> Result<RlnMerkle
         .collect();
     let tree_data = &main_data[OFFSET_TREE_DATA..];
     let fetch_node = |level: usize, node_index: u64| -> [u8; 32] {
-        read_sparse_node(tree_data, level, node_index as usize, &cached_defaults[level])
+        read_sparse_node(
+            tree_data,
+            level,
+            node_index as usize,
+            &cached_defaults[level],
+        )
     };
 
     let leaf = fetch_node(depth, leaf_index);
@@ -351,7 +359,10 @@ pub(crate) fn bytes_to_hex(data: &[u8]) -> String {
 
 /// Build all proofs from one read of the tree's merkle shard, as typed proof
 /// objects (the caller serializes them together with `valid_roots`).
-pub fn merkle_proofs_exec(main_data: &[u8], leaf_indices: &[u64]) -> Result<Vec<ProofJson>, RlnError> {
+pub fn merkle_proofs_exec(
+    main_data: &[u8],
+    leaf_indices: &[u64],
+) -> Result<Vec<ProofJson>, RlnError> {
     let mut proofs = Vec::with_capacity(leaf_indices.len());
     for &leaf_index in leaf_indices {
         let proof = build_merkle_proof(main_data, leaf_index)?;
@@ -446,7 +457,9 @@ pub fn find_leaf_index(main_data: &[u8], leaf: &[u8; 32]) -> Option<u64> {
     if main_data.len() < OFFSET_TREE_DATA || main_data[OFFSET_DEPTH] as usize != TREE_DEPTH {
         return None;
     }
-    let next = TreeMainLayout::parse(main_data).next_index().min(1u64 << TREE_DEPTH);
+    let next = TreeMainLayout::parse(main_data)
+        .next_index()
+        .min(1u64 << TREE_DEPTH);
     let default: [u8; 32] = main_data
         [OFFSET_CACHED_NODES + TREE_DEPTH * 32..OFFSET_CACHED_NODES + (TREE_DEPTH + 1) * 32]
         .try_into()
@@ -479,7 +492,11 @@ pub fn decode_membership(account_data: &[u8]) -> Result<MembershipState, RlnErro
 /// ST_EXPIRED consts (logos-rln-module). The two crates are
 /// deliberately decoupled — no shared type — and the contract is pinned by
 /// that crate's `membership_state_wire_strings` test.
-pub fn membership_status(grace_start_ms: u64, grace_duration_sec: u32, now_ms: u64) -> &'static str {
+pub fn membership_status(
+    grace_start_ms: u64,
+    grace_duration_sec: u32,
+    now_ms: u64,
+) -> &'static str {
     let grace_ms = rln_layouts::secs_to_millis(grace_duration_sec);
     if rln_layouts::is_expired(grace_start_ms, grace_ms, now_ms) {
         "expired"
@@ -489,7 +506,6 @@ pub fn membership_status(grace_start_ms: u64, grace_duration_sec: u32, now_ms: u
         "active"
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -521,13 +537,22 @@ mod tests {
     fn config_offsets_match_shared_layout() {
         let bytes = make_config_state();
         assert_eq!(config_field_32(&bytes, CONFIG_OFFSET_TREE_ID), [0x42; 32]);
-        assert_eq!(config_field_32(&bytes, CONFIG_OFFSET_TREASURY_ACCOUNT_ID), [0x33; 32]);
+        assert_eq!(
+            config_field_32(&bytes, CONFIG_OFFSET_TREASURY_ACCOUNT_ID),
+            [0x33; 32]
+        );
         assert_eq!(
             config_field_u128(&bytes, CONFIG_OFFSET_PRICE_PER_UNIT),
             77_000_000_000_000_000_000
         );
-        assert_eq!(config_field_u64(&bytes, CONFIG_OFFSET_TOTAL_REGISTRATIONS), 12_345);
-        assert_eq!(config_field_u64(&bytes, CONFIG_OFFSET_MAX_TOTAL_RATE_LIMIT), 1_000_000);
+        assert_eq!(
+            config_field_u64(&bytes, CONFIG_OFFSET_TOTAL_REGISTRATIONS),
+            12_345
+        );
+        assert_eq!(
+            config_field_u64(&bytes, CONFIG_OFFSET_MAX_TOTAL_RATE_LIMIT),
+            1_000_000
+        );
         assert_eq!(
             config_field_u64(&bytes, CONFIG_OFFSET_CURRENT_TOTAL_RATE_LIMIT),
             4_242
@@ -610,9 +635,18 @@ mod tests {
         let start_ms = registered_ms + 30 * DAY_MS;
         let grace_sec = 7 * 24 * 60 * 60;
 
-        assert_eq!(membership_status(start_ms, grace_sec, registered_ms + 3_600_000), "active");
-        assert_eq!(membership_status(start_ms, grace_sec, registered_ms + 31 * DAY_MS), "grace_period");
-        assert_eq!(membership_status(start_ms, grace_sec, registered_ms + 38 * DAY_MS), "expired");
+        assert_eq!(
+            membership_status(start_ms, grace_sec, registered_ms + 3_600_000),
+            "active"
+        );
+        assert_eq!(
+            membership_status(start_ms, grace_sec, registered_ms + 31 * DAY_MS),
+            "grace_period"
+        );
+        assert_eq!(
+            membership_status(start_ms, grace_sec, registered_ms + 38 * DAY_MS),
+            "expired"
+        );
     }
 
     /// An initialized, empty tree shard: header at depth TREE_DEPTH, each
@@ -677,7 +711,10 @@ mod tests {
         );
         let mut shard = make_tree_shard(0);
         shard[OFFSET_DEPTH] = (TREE_DEPTH - 1) as u8;
-        assert_eq!(build_merkle_proof(&shard, 0).err(), Some(RlnError::InvalidConfig));
+        assert_eq!(
+            build_merkle_proof(&shard, 0).err(),
+            Some(RlnError::InvalidConfig)
+        );
         let shard = make_tree_shard(0);
         assert_eq!(
             build_merkle_proof(&shard, 1u64 << TREE_DEPTH).err(),
@@ -695,7 +732,10 @@ mod tests {
         assert!(!is_field_element_le(&bad));
         let mut r = BN254_R_BE;
         r.reverse();
-        assert!(!is_field_element_le(&r), "the modulus itself is not an element");
+        assert!(
+            !is_field_element_le(&r),
+            "the modulus itself is not an element"
+        );
         let mut below = BN254_R_BE;
         below[31] = 0x00;
         below.reverse();
@@ -714,19 +754,29 @@ mod tests {
         assert!(check_register(&config, 0, &good, max_rate).is_ok());
         let mut bad = [0x01u8; 32];
         bad[31] = 0xff;
-        assert!(check_register(&config, 0, &bad, min_rate).unwrap_err().starts_with("invalid_commitment"));
-        assert!(check_register(&config, 0, &[0u8; 32], min_rate).unwrap_err().starts_with("invalid_commitment"));
+        assert!(check_register(&config, 0, &bad, min_rate)
+            .unwrap_err()
+            .starts_with("invalid_commitment"));
+        assert!(check_register(&config, 0, &[0u8; 32], min_rate)
+            .unwrap_err()
+            .starts_with("invalid_commitment"));
         assert_eq!(
             check_register(&config, 0, &good, min_rate - 1).unwrap_err(),
             "invalid_rate_limit: 99 is outside the registry's 100..=600"
         );
-        assert!(check_register(&config, 0, &good, max_rate + 1).unwrap_err().starts_with("invalid_rate_limit"));
-        assert!(check_register(&config, 1u64 << TREE_DEPTH, &good, min_rate).unwrap_err().starts_with("tree_full"));
+        assert!(check_register(&config, 0, &good, max_rate + 1)
+            .unwrap_err()
+            .starts_with("invalid_rate_limit"));
+        assert!(check_register(&config, 1u64 << TREE_DEPTH, &good, min_rate)
+            .unwrap_err()
+            .starts_with("tree_full"));
         let mut full = config.clone();
         let max = config_field_u64(&full, CONFIG_OFFSET_MAX_TOTAL_RATE_LIMIT);
         full[CONFIG_OFFSET_CURRENT_TOTAL_RATE_LIMIT..CONFIG_OFFSET_CURRENT_TOTAL_RATE_LIMIT + 8]
             .copy_from_slice(&max.to_le_bytes());
-        assert!(check_register(&full, 0, &good, min_rate).unwrap_err().starts_with("registry_full"));
+        assert!(check_register(&full, 0, &good, min_rate)
+            .unwrap_err()
+            .starts_with("registry_full"));
     }
 
     /// The bounds are the registry's own, not a constant of this module.
@@ -740,7 +790,9 @@ mod tests {
         let good = [0x01u8; 32];
         assert!(check_register(&config, 0, &good, 20).is_ok());
         assert!(check_register(&config, 0, &good, 100).is_ok());
-        assert!(check_register(&config, 0, &good, 19).unwrap_err().starts_with("invalid_rate_limit"));
+        assert!(check_register(&config, 0, &good, 19)
+            .unwrap_err()
+            .starts_with("invalid_rate_limit"));
         assert_eq!(
             check_register(&config, 0, &good, 101).unwrap_err(),
             "invalid_rate_limit: 101 is outside the registry's 20..=100"
@@ -764,7 +816,10 @@ mod tests {
         );
         assert_eq!(
             plan.membership_account_id,
-            derive_pda(&program, &combine_seeds(&[&label_seed("membership"), &tree_id, &[0x77; 32]]))
+            derive_pda(
+                &program,
+                &combine_seeds(&[&label_seed("membership"), &tree_id, &[0x77; 32]])
+            )
         );
         assert_eq!(
             plan.tree_main_account_id,
@@ -797,19 +852,37 @@ mod tests {
         assert_eq!(bytes[0], 2, "Register variant discriminant");
         assert_eq!(&bytes[1..33], &[0xABu8; 32], "tree_id");
         assert_eq!(&bytes[33..65], &[0xCDu8; 32], "id_commitment");
-        assert_eq!(&bytes[65..73], &[2, 0, 0, 0, 1, 0, 0, 0], "rate_limit u64 LE");
+        assert_eq!(
+            &bytes[65..73],
+            &[2, 0, 0, 0, 1, 0, 0, 0],
+            "rate_limit u64 LE"
+        );
         assert_eq!(&bytes[73..105], &[0xEEu8; 32], "payer");
-        assert_eq!(&bytes[105..113], &[0x0B, 0x0A, 0, 0, 0, 0, 0, 0], "now_ms u64 LE");
+        assert_eq!(
+            &bytes[105..113],
+            &[0x0B, 0x0A, 0, 0, 0, 0, 0, 0],
+            "now_ms u64 LE"
+        );
     }
 
     // The guest decodes what this encodes, so the two must round-trip.
     #[test]
     fn register_message_round_trips_through_borsh() {
-        let plan = register_plan(&make_config_state(), &make_tree_shard(5), &[0xAA; 32], &[0xCD; 32])
-            .unwrap();
+        let plan = register_plan(
+            &make_config_state(),
+            &make_tree_shard(5),
+            &[0xAA; 32],
+            &[0xCD; 32],
+        )
+        .unwrap();
         let bytes = register_build_message(&plan, &[0xCD; 32], 200, &[0xEE; 32], 9_999).unwrap();
-        let rln_layouts::Message::Register { tree_id, id_commitment, rate_limit, payer, now_ms } =
-            rln_layouts::Message::try_from_slice(&bytes).expect("decodes")
+        let rln_layouts::Message::Register {
+            tree_id,
+            id_commitment,
+            rate_limit,
+            payer,
+            now_ms,
+        } = rln_layouts::Message::try_from_slice(&bytes).expect("decodes")
         else {
             panic!("expected a Register message");
         };
@@ -829,9 +902,17 @@ mod tests {
         set_node(&mut shard, TREE_DEPTH, 1, [0x22; 32]);
         set_node(&mut shard, TREE_DEPTH, 2, [0x11; 32]);
         set_node(&mut shard, TREE_DEPTH, 3, [0x33; 32]);
-        assert_eq!(find_leaf_index(&shard, &[0x11; 32]), Some(2), "newest first");
+        assert_eq!(
+            find_leaf_index(&shard, &[0x11; 32]),
+            Some(2),
+            "newest first"
+        );
         assert_eq!(find_leaf_index(&shard, &[0x22; 32]), Some(1));
-        assert_eq!(find_leaf_index(&shard, &[0x33; 32]), None, "at next_index, not below it");
+        assert_eq!(
+            find_leaf_index(&shard, &[0x33; 32]),
+            None,
+            "at next_index, not below it"
+        );
         assert_eq!(find_leaf_index(&shard, &[0x44; 32]), None);
     }
 
@@ -843,6 +924,9 @@ mod tests {
         let a = registration_leaf(&id, 100).expect("canonical commitment");
         assert_ne!(a, registration_leaf(&id, 200).unwrap());
         assert_eq!(a, registration_leaf(&id, 100).unwrap());
-        assert!(registration_leaf(&[0xFF; 32], 100).is_none(), "non-canonical field element");
+        assert!(
+            registration_leaf(&[0xFF; 32], 100).is_none(),
+            "non-canonical field element"
+        );
     }
 }

@@ -75,7 +75,9 @@ pub(crate) fn fetch(sequencer: &str) -> Result<String, String> {
 /// asked. Same transport and sequencer as `get_fee_state`.
 pub(crate) fn chain_head() -> Option<u64> {
     let sequencer = wallet::sequencer_addr()?;
-    rpc_result(&sequencer, HEAD_REQUEST, MAX_REPLY).ok()?.as_u64()
+    rpc_result(&sequencer, HEAD_REQUEST, MAX_REPLY)
+        .ok()?
+        .as_u64()
 }
 
 /// Chain time in milliseconds: the head block's timestamp. `None` when it
@@ -162,8 +164,11 @@ fn post_capped(url: &str, body: &str, cap: u64) -> Result<String, String> {
         .send_string(body)
         .map_err(|e| e.to_string())?;
     let mut text = String::new();
-    std::io::Read::read_to_string(&mut std::io::Read::take(reply.into_reader(), cap), &mut text)
-        .map_err(|e| format!("read: {e}"))?;
+    std::io::Read::read_to_string(
+        &mut std::io::Read::take(reply.into_reader(), cap),
+        &mut text,
+    )
+    .map_err(|e| format!("read: {e}"))?;
     Ok(text)
 }
 
@@ -244,7 +249,9 @@ mod tests {
 
     #[test]
     fn only_http_and_https_sequencers_are_asked() {
-        assert!(post("ftp://seq.local/", REQUEST).unwrap_err().contains("not an http(s)"));
+        assert!(post("ftp://seq.local/", REQUEST)
+            .unwrap_err()
+            .contains("not an http(s)"));
         assert!(post("209.38.241.182:3140", REQUEST).is_err());
     }
 
@@ -277,7 +284,8 @@ mod tests {
             let (mut conn, _) = listener.accept().unwrap();
             let mut chunk = [0u8; 4096];
             let _ = conn.read(&mut chunk).unwrap();
-            conn.write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n").unwrap();
+            conn.write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n")
+                .unwrap();
         });
         assert!(fetch(&format!("http://127.0.0.1:{port}/")).is_err());
         server.join().unwrap();
@@ -306,7 +314,11 @@ mod tests {
     #[test]
     fn nothing_listening_is_an_error_not_a_hang() {
         // Bind then drop: the port is closed for the moment the test needs.
-        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         assert!(fetch(&format!("http://127.0.0.1:{port}/")).is_err());
     }
 
@@ -328,8 +340,16 @@ mod tests {
         let block = borsh_block(1_700_000_000_123);
         assert_eq!(block_header_timestamp(&block), Some(1_700_000_000_123));
         assert_eq!(BLOCK_HEADER_SIZE, 80);
-        assert_eq!(block_header_timestamp(&block[..79]), None, "shorter than a header");
-        assert_eq!(block_header_timestamp(&borsh_block(0)), None, "a zero timestamp is no time");
+        assert_eq!(
+            block_header_timestamp(&block[..79]),
+            None,
+            "shorter than a header"
+        );
+        assert_eq!(
+            block_header_timestamp(&borsh_block(0)),
+            None,
+            "a zero timestamp is no time"
+        );
     }
 
     /// getLastBlockId, then getBlock for that id, decoded from base64 borsh.
@@ -341,7 +361,8 @@ mod tests {
             let (mut conn, _) = listener.accept().unwrap();
             let first = read_request(&mut conn);
             assert!(first.ends_with(HEAD_REQUEST), "{first}");
-            conn.write_all(&ok_reply(r#"{"jsonrpc":"2.0","id":1,"result":41}"#)).unwrap();
+            conn.write_all(&ok_reply(r#"{"jsonrpc":"2.0","id":1,"result":41}"#))
+                .unwrap();
             drop(conn);
             let (mut conn, _) = listener.accept().unwrap();
             let second = read_request(&mut conn);
@@ -349,8 +370,10 @@ mod tests {
             assert!(second.contains(r#""params":[41]"#), "{second}");
             let encoded =
                 base64::engine::general_purpose::STANDARD.encode(borsh_block(1_700_000_000_123));
-            conn.write_all(&ok_reply(&format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{encoded}"}}"#)))
-                .unwrap();
+            conn.write_all(&ok_reply(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"result":"{encoded}"}}"#
+            )))
+            .unwrap();
         });
         let timestamp = fetch_head_timestamp(&format!("http://127.0.0.1:{port}/")).unwrap();
         server.join().unwrap();
@@ -368,13 +391,17 @@ mod tests {
             let server = std::thread::spawn(move || {
                 let (mut conn, _) = listener.accept().unwrap();
                 read_request(&mut conn);
-                conn.write_all(&ok_reply(r#"{"jsonrpc":"2.0","id":1,"result":3}"#)).unwrap();
+                conn.write_all(&ok_reply(r#"{"jsonrpc":"2.0","id":1,"result":3}"#))
+                    .unwrap();
                 drop(conn);
                 let (mut conn, _) = listener.accept().unwrap();
                 read_request(&mut conn);
                 conn.write_all(&ok_reply(&reply)).unwrap();
             });
-            assert!(fetch_head_timestamp(&format!("http://127.0.0.1:{port}/")).is_err(), "{result}");
+            assert!(
+                fetch_head_timestamp(&format!("http://127.0.0.1:{port}/")).is_err(),
+                "{result}"
+            );
             server.join().unwrap();
         }
     }

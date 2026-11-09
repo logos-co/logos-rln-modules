@@ -524,20 +524,26 @@ pub(crate) fn plan_home(home: &Path, env: &EnvView) -> Plan {
         let binding = if env.network.is_empty() {
             Binding::Operator
         } else {
-            Binding::Recorded { network: env.network.clone(), source: Source::Env }
+            Binding::Recorded {
+                network: env.network.clone(),
+                source: Source::Env,
+            }
         };
-        return Plan::Provision { sequencer: env.sequencer.clone(), binding };
+        return Plan::Provision {
+            sequencer: env.sequencer.clone(),
+            binding,
+        };
     }
     if !env.network.is_empty() {
         return match networks::network(&env.network) {
             Some(n) => Plan::Provision {
                 sequencer: n.sequencer.clone(),
-                binding: Binding::Recorded { network: n.reference.clone(), source: Source::Table },
+                binding: Binding::Recorded {
+                    network: n.reference.clone(),
+                    source: Source::Table,
+                },
             },
-            None => Plan::Failed(format!(
-                "{NETWORK_ENV}: {}",
-                unknown_network(&env.network)
-            )),
+            None => Plan::Failed(format!("{NETWORK_ENV}: {}", unknown_network(&env.network))),
         };
     }
     Plan::AwaitSelection
@@ -560,9 +566,12 @@ fn read_marker(home: &Path) -> Result<Option<Binding>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
-    let doc: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
-    let network = doc.get("network").and_then(|v| v.as_str()).unwrap_or_default();
+    let doc: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
+    let network = doc
+        .get("network")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     let source = match doc.get("source").and_then(|v| v.as_str()) {
         Some("table") => Source::Table,
         Some("env") => Source::Env,
@@ -571,7 +580,10 @@ fn read_marker(home: &Path) -> Result<Option<Binding>, String> {
     if network.is_empty() {
         return Err(format!("{} names no network", path.display()));
     }
-    Ok(Some(Binding::Recorded { network: network.to_owned(), source }))
+    Ok(Some(Binding::Recorded {
+        network: network.to_owned(),
+        source,
+    }))
 }
 
 /// Write a home's config and marker. The marker goes first: a crash between
@@ -658,7 +670,10 @@ fn apply_plan(sel: &mut Selector, home: PathBuf, plan: Plan) -> Action {
     match plan {
         Plan::Adopt(binding) => {
             log_binding("adopting", &home, &binding);
-            sel.selection = Selection::Bound { home: home.clone(), binding };
+            sel.selection = Selection::Bound {
+                home: home.clone(),
+                binding,
+            };
             Action::Start(home)
         }
         Plan::Provision { sequencer, binding } => {
@@ -667,7 +682,10 @@ fn apply_plan(sel: &mut Selector, home: PathBuf, plan: Plan) -> Action {
                 return Action::Fail(e);
             }
             log_binding(&format!("provisioned for {sequencer}"), &home, &binding);
-            sel.selection = Selection::Bound { home: home.clone(), binding };
+            sel.selection = Selection::Bound {
+                home: home.clone(),
+                binding,
+            };
             Action::Start(home)
         }
         Plan::AwaitSelection => {
@@ -684,7 +702,10 @@ fn apply_plan(sel: &mut Selector, home: PathBuf, plan: Plan) -> Action {
 
 fn log_binding(what: &str, home: &Path, binding: &Binding) {
     match binding {
-        Binding::Operator => eprintln!("lez-rln wallet: {what} {} (operator-configured)", home.display()),
+        Binding::Operator => eprintln!(
+            "lez-rln wallet: {what} {} (operator-configured)",
+            home.display()
+        ),
         Binding::Recorded { network, source } => eprintln!(
             "lez-rln wallet: {what} {} (network {network}, from {})",
             home.display(),
@@ -709,7 +730,13 @@ struct NetworkReply {
 
 impl NetworkReply {
     fn refused(detail: String, network: &str) -> Self {
-        Self { accepted: false, detail, network: network.to_owned(), retry: false, source: "" }
+        Self {
+            accepted: false,
+            detail,
+            network: network.to_owned(),
+            retry: false,
+            source: "",
+        }
     }
 
     fn to_json(&self) -> String {
@@ -749,7 +776,10 @@ fn select_network(sel: &mut Selector, reference: &str) -> (NetworkReply, Action)
             )
         }
         Selection::Bound { home, binding } => {
-            return (answer_bound(home, binding, &reference, &mut sel.operator_noted), Action::None)
+            return (
+                answer_bound(home, binding, &reference, &mut sel.operator_noted),
+                Action::None,
+            )
         }
         Selection::Awaiting(home) => home.clone(),
     };
@@ -757,10 +787,17 @@ fn select_network(sel: &mut Selector, reference: &str) -> (NetworkReply, Action)
     // Re-checked under the lock: a home someone configured since bring-up
     // looked is adopted as it stands, never overwritten.
     if home.join(CONFIG_FILE).exists() {
-        let action = apply_plan(sel, home.clone(), plan_home(&home, &EnvView {
-            sequencer: String::new(),
-            network: String::new(),
-        }));
+        let action = apply_plan(
+            sel,
+            home.clone(),
+            plan_home(
+                &home,
+                &EnvView {
+                    sequencer: String::new(),
+                    network: String::new(),
+                },
+            ),
+        );
         let reply = match &sel.selection {
             Selection::Bound { home, binding } => {
                 answer_bound(home, binding, &reference, &mut sel.operator_noted)
@@ -774,13 +811,22 @@ fn select_network(sel: &mut Selector, reference: &str) -> (NetworkReply, Action)
     }
 
     let Some(network) = networks::network(&reference) else {
-        return (NetworkReply::refused(unknown_network(&reference), ""), Action::None);
+        return (
+            NetworkReply::refused(unknown_network(&reference), ""),
+            Action::None,
+        );
     };
-    let binding = Binding::Recorded { network: network.reference.clone(), source: Source::Table };
+    let binding = Binding::Recorded {
+        network: network.reference.clone(),
+        source: Source::Table,
+    };
     let action = apply_plan(
         sel,
         home,
-        Plan::Provision { sequencer: network.sequencer.clone(), binding },
+        Plan::Provision {
+            sequencer: network.sequencer.clone(),
+            binding,
+        },
     );
     let reply = match &action {
         Action::Fail(e) => NetworkReply::refused(e.clone(), ""),
@@ -857,9 +903,10 @@ pub(crate) fn use_network(reference: &str) -> String {
 /// unbound or operator-configured.
 pub(crate) fn bound_network() -> Option<String> {
     match &lock(&SELECTION).selection {
-        Selection::Bound { binding: Binding::Recorded { network, .. }, .. } => {
-            Some(network.clone())
-        }
+        Selection::Bound {
+            binding: Binding::Recorded { network, .. },
+            ..
+        } => Some(network.clone()),
         _ => None,
     }
 }
@@ -998,7 +1045,9 @@ fn bring_up(home: &Path) {
     if payer_public_key.is_empty() {
         // A wallet that cannot sign for its payer sends nothing that the
         // sequencer accepts; Ready would promise registrations it cannot make.
-        fail(&format!("the payer {payer_hex} has no signing key in this wallet"));
+        fail(&format!(
+            "the payer {payer_hex} has no signing key in this wallet"
+        ));
         return;
     }
 
@@ -1199,7 +1248,8 @@ fn public_key_of(handle: &Handle, payer_hex: &str) -> String {
     let mut out = ffi::PublicAccountKey::default();
     // SAFETY: a live handle, an id we own alive across the call, and an out
     // struct we own.
-    let rc = unsafe { ffi::wallet_ffi_get_public_account_key(handle.0, &raw const id, &raw mut out) };
+    let rc =
+        unsafe { ffi::wallet_ffi_get_public_account_key(handle.0, &raw const id, &raw mut out) };
     if rc != ffi::SUCCESS {
         eprintln!(
             "lez-rln wallet: no signing key for the payer {payer_hex} ({}) — it cannot sign a \
@@ -1227,7 +1277,10 @@ fn import_payer_key(handle: &Handle) -> Result<(), String> {
     // SAFETY: a live handle and a valid null-terminated hex string.
     let rc = unsafe { ffi::wallet_ffi_import_public_account(handle.0, key.as_ptr()) };
     if rc != ffi::SUCCESS {
-        return Err(format!("{PAYER_KEY_ENV} import failed ({})", ffi::describe(rc)));
+        return Err(format!(
+            "{PAYER_KEY_ENV} import failed ({})",
+            ffi::describe(rc)
+        ));
     }
     save(handle)?;
     eprintln!("lez-rln wallet: imported the fee payer's key");
@@ -1257,9 +1310,11 @@ fn fee_payer_env_hex() -> Result<Option<String>, String> {
     if raw.is_empty() {
         return Ok(None);
     }
-    crate::hex::canonical_account_hex(raw).map(Some).ok_or_else(|| {
-        format!("LEZ_RLN_PAYER is neither 32-byte hex nor a base58 account id: {raw}")
-    })
+    crate::hex::canonical_account_hex(raw)
+        .map(Some)
+        .ok_or_else(|| {
+            format!("LEZ_RLN_PAYER is neither 32-byte hex nor a base58 account id: {raw}")
+        })
 }
 
 /// The account this module signs and pays with, decided once at bring-up.
@@ -1301,14 +1356,16 @@ fn resolve_payer(handle: &Handle, home: &Path) -> Result<String, String> {
     // SAFETY: a live handle and an out struct we own.
     let rc = unsafe { ffi::wallet_ffi_create_account_public(handle.0, &raw mut out) };
     if rc != ffi::SUCCESS {
-        return Err(format!("deriving a payer account failed ({})", ffi::describe(rc)));
+        return Err(format!(
+            "deriving a payer account failed ({})",
+            ffi::describe(rc)
+        ));
     }
     // Derivation alone does not persist; without this the account is gone on
     // the next open and nothing can sign for it.
     save(handle)?;
     let id = bytes_to_hex(&out.data);
-    std::fs::write(&recorded, &id)
-        .map_err(|e| format!("write {}: {e}", recorded.display()))?;
+    std::fs::write(&recorded, &id).map_err(|e| format!("write {}: {e}", recorded.display()))?;
     eprintln!(
         "lez-rln wallet: derived the payer {id} — it holds nothing until something transfers to it"
     );
@@ -1539,7 +1596,12 @@ impl SendResult {
         if !self.error.is_empty() {
             return Err(self.error.clone());
         }
-        Err(if self.success { "no tx_hash in the send reply" } else { "send failed" }.to_string())
+        Err(if self.success {
+            "no tx_hash in the send reply"
+        } else {
+            "send failed"
+        }
+        .to_string())
     }
 
     pub(crate) fn tx_hash(&self) -> &str {
@@ -1549,7 +1611,9 @@ impl SendResult {
     /// `{"error","success","tx_hash"}`, keys in that order: `register_member`
     /// hands this text back as its `tx_result`.
     pub(crate) fn to_json(&self) -> String {
-        serde_json::to_value(self).map(|v| v.to_string()).unwrap_or_default()
+        serde_json::to_value(self)
+            .map(|v| v.to_string())
+            .unwrap_or_default()
     }
 }
 
@@ -1614,7 +1678,11 @@ pub(crate) fn send_generic_public_transaction(
         // SAFETY: freeing the out struct is the library's contract whether or
         // not the call filled it.
         unsafe { ffi::wallet_ffi_free_transaction_result(&raw mut result) };
-        return Some(SendResult { error, success: false, tx_hash: String::new() });
+        return Some(SendResult {
+            error,
+            success: false,
+            tx_hash: String::new(),
+        });
     }
     // SAFETY: on success tx_hash is null or a null-terminated string the
     // library owns until the free below.
@@ -1629,7 +1697,11 @@ pub(crate) fn send_generic_public_transaction(
     // SAFETY: the struct the call just filled, freed exactly once.
     unsafe { ffi::wallet_ffi_free_transaction_result(&raw mut result) };
 
-    Some(SendResult { error: String::new(), success, tx_hash })
+    Some(SendResult {
+        error: String::new(),
+        success,
+        tx_hash,
+    })
 }
 
 /// Derive a fresh public account in this module's own wallet and persist it,
@@ -1669,7 +1741,10 @@ pub(crate) fn native_balance(account_hex: &str) -> Option<(String, u128)> {
     // is true because a balance a program can charge is a public one.
     let rc = unsafe { ffi::wallet_ffi_get_balance(guard.0, &raw const id, true, &raw mut out) };
     if rc != ffi::SUCCESS {
-        eprintln!("native_balance: {id_hex} read failed ({})", ffi::describe(rc));
+        eprintln!(
+            "native_balance: {id_hex} read failed ({})",
+            ffi::describe(rc)
+        );
         return None;
     }
     Some((id_hex, u128::from_le_bytes(out)))
@@ -1844,7 +1919,8 @@ mod tests {
         // The conversion is local, so it answers before bring-up — which
         // matters, because the fee payer is resolved on the register path.
         assert_eq!(
-            crate::hex::canonical_account_hex("FqNyaKjaeUxjMxJszC88Z6SUUL8pxBgN6qRHC4ZsJjgn").as_deref(),
+            crate::hex::canonical_account_hex("FqNyaKjaeUxjMxJszC88Z6SUUL8pxBgN6qRHC4ZsJjgn")
+                .as_deref(),
             Some("dc6857ef4236ef416fb6357c1f9988a7c7558b07492d7284c411b3864a1fccf3")
         );
         assert_eq!(crate::hex::canonical_account_hex("not an account"), None);
@@ -1891,13 +1967,20 @@ mod tests {
     }
 
     fn signer(account: [u8; 32]) -> Mention {
-        Mention { account, program: [0; 32], kind: MentionKind::Signer }
+        Mention {
+            account,
+            program: [0; 32],
+            kind: MentionKind::Signer,
+        }
     }
 
     #[test]
     fn a_root_index_past_the_mentions_is_refused_before_any_call() {
         // Returns before touching the wallet, so it holds with none open.
-        assert_eq!(send_generic_public_transaction(&[signer([0xAB; 32])], 1, &[1, 2, 3], ""), None);
+        assert_eq!(
+            send_generic_public_transaction(&[signer([0xAB; 32])], 1, &[1, 2, 3], ""),
+            None
+        );
         assert_eq!(send_generic_public_transaction(&[], 0, &[1], ""), None);
     }
 
@@ -1912,10 +1995,19 @@ mod tests {
             tx_hash: tx_hash.into(),
         };
         assert!(sent("", true, "ab12").accepted().is_ok());
-        assert_eq!(sent("key not found", false, "").accepted().unwrap_err(), "key not found");
+        assert_eq!(
+            sent("key not found", false, "").accepted().unwrap_err(),
+            "key not found"
+        );
         assert_eq!(sent("", false, "").accepted().unwrap_err(), "send failed");
-        assert_eq!(sent("", true, "").accepted().unwrap_err(), "no tx_hash in the send reply");
-        assert_eq!(sent("", true, "ab12").to_json(), r#"{"error":"","success":true,"tx_hash":"ab12"}"#);
+        assert_eq!(
+            sent("", true, "").accepted().unwrap_err(),
+            "no tx_hash in the send reply"
+        );
+        assert_eq!(
+            sent("", true, "ab12").to_json(),
+            r#"{"error":"","success":true,"tx_hash":"ab12"}"#
+        );
         assert_eq!(
             sent("key not found", false, "").to_json(),
             r#"{"error":"key not found","success":false,"tx_hash":""}"#
@@ -1927,7 +2019,10 @@ mod tests {
         let pda = Mention {
             account: [0xAA; 32],
             program: [0xBB; 32],
-            kind: MentionKind::Pda { program: [0xCC; 32], seed: [0xDD; 32] },
+            kind: MentionKind::Pda {
+                program: [0xCC; 32],
+                seed: [0xDD; 32],
+            },
         }
         .to_ffi();
         assert_eq!(pda.identity.kind, ffi::KIND_PUBLIC_PDA);
@@ -1942,8 +2037,12 @@ mod tests {
         assert_eq!(signs.identity.authority.data, [0; 32]);
         assert!(signs.authorizes);
 
-        let declared =
-            Mention { account: [1; 32], program: [0; 32], kind: MentionKind::NoSign }.to_ffi();
+        let declared = Mention {
+            account: [1; 32],
+            program: [0; 32],
+            kind: MentionKind::NoSign,
+        }
+        .to_ffi();
         assert_eq!(declared.identity.kind, ffi::KIND_PUBLIC_NO_SIGN);
         assert!(!declared.authorizes);
     }
@@ -1998,19 +2097,24 @@ mod tests {
 
     /// A fresh, empty directory per test; removed first so a rerun starts clean.
     fn temp_home(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("lez-rln-wallet-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lez-rln-wallet-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
     fn env(sequencer: &str, network: &str) -> EnvView {
-        EnvView { sequencer: sequencer.to_owned(), network: network.to_owned() }
+        EnvView {
+            sequencer: sequencer.to_owned(),
+            network: network.to_owned(),
+        }
     }
 
     fn selector(selection: Selection) -> Selector {
-        Selector { selection, operator_noted: false }
+        Selector {
+            selection,
+            operator_noted: false,
+        }
     }
 
     fn devnet_sequencer() -> String {
@@ -2025,11 +2129,17 @@ mod tests {
             plan_home(&home, &env("http://elsewhere/", "devnet")),
             Plan::Adopt(Binding::Operator)
         );
-        std::fs::write(home.join(NETWORK_FILE), r#"{"network":"devnet","source":"table"}"#)
-            .unwrap();
+        std::fs::write(
+            home.join(NETWORK_FILE),
+            r#"{"network":"devnet","source":"table"}"#,
+        )
+        .unwrap();
         assert_eq!(
             plan_home(&home, &env("", "")),
-            Plan::Adopt(Binding::Recorded { network: "devnet".into(), source: Source::Table })
+            Plan::Adopt(Binding::Recorded {
+                network: "devnet".into(),
+                source: Source::Table
+            })
         );
         // A marker that does not parse must not read as "operator": that
         // would switch the network check off without a word.
@@ -2043,13 +2153,19 @@ mod tests {
         let home = temp_home("plan-seq");
         assert_eq!(
             plan_home(&home, &env("http://seq/", "")),
-            Plan::Provision { sequencer: "http://seq/".into(), binding: Binding::Operator }
+            Plan::Provision {
+                sequencer: "http://seq/".into(),
+                binding: Binding::Operator
+            }
         );
         assert_eq!(
             plan_home(&home, &env("http://seq/", "testnet")),
             Plan::Provision {
                 sequencer: "http://seq/".into(),
-                binding: Binding::Recorded { network: "testnet".into(), source: Source::Env },
+                binding: Binding::Recorded {
+                    network: "testnet".into(),
+                    source: Source::Env
+                },
             }
         );
         let _ = std::fs::remove_dir_all(&home);
@@ -2062,14 +2178,20 @@ mod tests {
             plan_home(&home, &env("", "devnet")),
             Plan::Provision {
                 sequencer: devnet_sequencer(),
-                binding: Binding::Recorded { network: "devnet".into(), source: Source::Table },
+                binding: Binding::Recorded {
+                    network: "devnet".into(),
+                    source: Source::Table
+                },
             }
         );
         let Plan::Failed(reason) = plan_home(&home, &env("", "nosuch")) else {
             panic!("an unknown network must fail");
         };
         assert!(reason.contains("unknown network 'nosuch'"), "{reason}");
-        assert!(reason.contains("devnet"), "the refusal lists what is known: {reason}");
+        assert!(
+            reason.contains("devnet"),
+            "the refusal lists what is known: {reason}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2081,7 +2203,10 @@ mod tests {
         let home = temp_home("plan-await");
         assert_eq!(plan_home(&home, &env("", "")), Plan::AwaitSelection);
         let mut sel = selector(Selection::Unresolved);
-        assert_eq!(apply_plan(&mut sel, home.clone(), Plan::AwaitSelection), Action::Await);
+        assert_eq!(
+            apply_plan(&mut sel, home.clone(), Plan::AwaitSelection),
+            Action::Await
+        );
         assert!(matches!(sel.selection, Selection::Awaiting(_)));
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -2091,14 +2216,20 @@ mod tests {
         let home = temp_home("env-marker");
         let mut sel = selector(Selection::Unresolved);
         let plan = plan_home(&home, &env("http://seq/", "devnet"));
-        assert_eq!(apply_plan(&mut sel, home.clone(), plan), Action::Start(home.clone()));
+        assert_eq!(
+            apply_plan(&mut sel, home.clone(), plan),
+            Action::Start(home.clone())
+        );
         assert_eq!(
             std::fs::read_to_string(home.join(CONFIG_FILE)).unwrap(),
             wallet_config_json("http://seq/")
         );
         assert_eq!(
             read_marker(&home).unwrap(),
-            Some(Binding::Recorded { network: "devnet".into(), source: Source::Env })
+            Some(Binding::Recorded {
+                network: "devnet".into(),
+                source: Source::Env
+            })
         );
         let (reply, _) = select_network(&mut sel, "devnet");
         assert!(reply.accepted);
@@ -2137,7 +2268,10 @@ mod tests {
         );
         assert_eq!(
             read_marker(&home).unwrap(),
-            Some(Binding::Recorded { network: "devnet".into(), source: Source::Table })
+            Some(Binding::Recorded {
+                network: "devnet".into(),
+                source: Source::Table
+            })
         );
         // Bound now: a repeat is accepted and starts nothing new.
         let (again, action) = select_network(&mut sel, "devnet");
@@ -2152,12 +2286,23 @@ mod tests {
         let mut sel = selector(Selection::Awaiting(home.clone()));
         let (reply, action) = select_network(&mut sel, "nosuch");
         assert!(!reply.accepted && !reply.retry, "{reply:?}");
-        assert!(reply.detail.contains("unknown network 'nosuch' (known: devnet"), "{}", reply.detail);
-        assert!(reply.detail.contains("LEZ_RLN_SEQUENCER or LEE_WALLET_HOME_DIR"));
+        assert!(
+            reply
+                .detail
+                .contains("unknown network 'nosuch' (known: devnet"),
+            "{}",
+            reply.detail
+        );
+        assert!(reply
+            .detail
+            .contains("LEZ_RLN_SEQUENCER or LEE_WALLET_HOME_DIR"));
         assert_eq!(action, Action::None);
         assert!(!home.join(CONFIG_FILE).exists());
         assert!(!home.join(NETWORK_FILE).exists());
-        assert!(matches!(sel.selection, Selection::Awaiting(_)), "still selectable");
+        assert!(
+            matches!(sel.selection, Selection::Awaiting(_)),
+            "still selectable"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2170,7 +2315,9 @@ mod tests {
         assert!(!reply.accepted && !reply.retry);
         assert_eq!(reply.network, "devnet");
         assert!(
-            reply.detail.contains("is bound to network devnet; refusing to re-point it to testnet"),
+            reply
+                .detail
+                .contains("is bound to network devnet; refusing to re-point it to testnet"),
             "{}",
             reply.detail
         );
@@ -2180,7 +2327,10 @@ mod tests {
     #[test]
     fn an_operator_home_accepts_any_network() {
         let home = temp_home("select-operator");
-        let mut sel = selector(Selection::Bound { home: home.clone(), binding: Binding::Operator });
+        let mut sel = selector(Selection::Bound {
+            home: home.clone(),
+            binding: Binding::Operator,
+        });
         for reference in ["devnet", "testnet", "anything"] {
             let (reply, action) = select_network(&mut sel, reference);
             assert!(reply.accepted, "{reference}: {reply:?}");
@@ -2204,7 +2354,10 @@ mod tests {
         assert!(reply.accepted);
         assert_eq!(reply.source, "operator");
         assert_eq!(action, Action::Start(home.clone()));
-        assert_eq!(std::fs::read_to_string(home.join(CONFIG_FILE)).unwrap(), staged);
+        assert_eq!(
+            std::fs::read_to_string(home.join(CONFIG_FILE)).unwrap(),
+            staged
+        );
         assert!(!home.join(NETWORK_FILE).exists());
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -2220,7 +2373,10 @@ mod tests {
     #[test]
     fn the_sequencer_is_read_from_either_config_shape() {
         let seq = devnet_sequencer();
-        assert_eq!(sequencer_of_config(&wallet_config_json(&seq)), Some(seq.clone()));
+        assert_eq!(
+            sequencer_of_config(&wallet_config_json(&seq)),
+            Some(seq.clone())
+        );
         // A flat-only config still names it.
         let flat = serde_json::json!({ "sequencer_addr": seq }).to_string();
         assert_eq!(sequencer_of_config(&flat), Some(seq));

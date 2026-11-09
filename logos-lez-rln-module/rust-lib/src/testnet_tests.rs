@@ -64,17 +64,23 @@ const DEFAULT_DEPLOYMENT: &str = "testnet-faucet-260908";
 /// Gate + deployment loader. `None` = skip (gate unset).
 fn testnet() -> Option<Deployment> {
     if std::env::var("LEZ_RLN_TESTNET_TESTS").ok().as_deref() != Some("1") {
-        eprintln!("testnet test skipped: set LEZ_RLN_TESTNET_TESTS=1 to run against the live registry");
+        eprintln!(
+            "testnet test skipped: set LEZ_RLN_TESTNET_TESTS=1 to run against the live registry"
+        );
         return None;
     }
-    let name = std::env::var("LEZ_RLN_TESTNET_DEPLOYMENT").unwrap_or_else(|_| DEFAULT_DEPLOYMENT.to_string());
+    let name = std::env::var("LEZ_RLN_TESTNET_DEPLOYMENT")
+        .unwrap_or_else(|_| DEFAULT_DEPLOYMENT.to_string());
     // Deployment descriptors live with the programs in logos-co/logos-lez-rln;
     // LEZ_RLN_CHECKOUT points at that checkout (default: a sibling of this
     // repo).
-    let checkout = std::env::var("LEZ_RLN_CHECKOUT").map(PathBuf::from).unwrap_or_else(|_| {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../logos-lez-rln")
-    });
-    let path = checkout.join("deployments").join(&name).join("deployment.json");
+    let checkout = std::env::var("LEZ_RLN_CHECKOUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../logos-lez-rln"));
+    let path = checkout
+        .join("deployments")
+        .join(&name)
+        .join("deployment.json");
     let doc: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("deployment record {}: {e}", path.display())),
@@ -138,7 +144,11 @@ fn rpc(sequencer: &str, method: &str, params: serde_json::Value) -> serde_json::
 /// account's data is kept per program, and the native balance is the native
 /// token program's (`[0; 32]`).
 fn get_actor_states(sequencer: &str, id: &[u8; 32]) -> Vec<([u8; 32], Vec<u8>)> {
-    let result = rpc(sequencer, "getAccount", serde_json::json!([crate::base58::encode32(id)]));
+    let result = rpc(
+        sequencer,
+        "getAccount",
+        serde_json::json!([crate::base58::encode32(id)]),
+    );
     if result.is_null() {
         return Vec::new();
     }
@@ -176,7 +186,11 @@ fn fetch_config(dep: &Deployment) -> (Vec<u8>, [u8; 32]) {
         .into_iter()
         .filter(|(p, data)| *p != [0u8; 32] && !data.is_empty())
         .collect();
-    assert_eq!(program_shards.len(), 1, "the config holds exactly one program's state");
+    assert_eq!(
+        program_shards.len(),
+        1,
+        "the config holds exactly one program's state"
+    );
     let (program, data) = program_shards.remove(0);
     (data, program)
 }
@@ -185,7 +199,11 @@ fn merkle_program(config_data: &[u8]) -> [u8; 32] {
     native::config_field_32(config_data, native::CONFIG_OFFSET_MERKLE_PROGRAM_ID)
 }
 
-fn fetch_tree(dep: &Deployment, config_data: &[u8], registration: &[u8; 32]) -> ([u8; 32], Vec<u8>) {
+fn fetch_tree(
+    dep: &Deployment,
+    config_data: &[u8],
+    registration: &[u8; 32],
+) -> ([u8; 32], Vec<u8>) {
     let main = native::tree_main_account_id(config_data, registration).unwrap();
     let data = get_shard(&dep.sequencer, &main, &merkle_program(config_data))
         .expect("derived tree-main PDA must hold the merkle program's shard");
@@ -223,9 +241,15 @@ fn testnet_config_account_matches_deployment_and_bounds_decode() {
         dep.registration_program_id_hex,
         "the config's shard is the registration program's"
     );
-    assert_eq!(bytes_to_hex(&merkle_program(&data)), dep.merkle_program_id_hex);
     assert_eq!(
-        bytes_to_hex(&native::config_field_32(&data, native::CONFIG_OFFSET_TREE_ID)),
+        bytes_to_hex(&merkle_program(&data)),
+        dep.merkle_program_id_hex
+    );
+    assert_eq!(
+        bytes_to_hex(&native::config_field_32(
+            &data,
+            native::CONFIG_OFFSET_TREE_ID
+        )),
         dep.tree_id_hex
     );
 
@@ -237,9 +261,15 @@ fn testnet_config_account_matches_deployment_and_bounds_decode() {
     let grace = native::config_field_u32(&data, native::CONFIG_OFFSET_GRACE_DURATION);
     let min_rate = native::config_field_u64(&data, native::CONFIG_OFFSET_MIN_RATE_LIMIT);
     let max_rate = native::config_field_u64(&data, native::CONFIG_OFFSET_MAX_RATE_LIMIT);
-    assert!(0 < min_rate && min_rate <= max_rate, "registry bounds {min_rate}..={max_rate}");
+    assert!(
+        0 < min_rate && min_rate <= max_rate,
+        "registry bounds {min_rate}..={max_rate}"
+    );
     assert!(max_total >= min_rate, "capacity fits at least one member");
-    assert!(current <= max_total, "used {current} within capacity {max_total}");
+    assert!(
+        current <= max_total,
+        "used {current} within capacity {max_total}"
+    );
     assert!(price > 0, "priced registration");
     assert!(active > 0 && grace > 0, "nonzero lifecycle durations");
     eprintln!(
@@ -258,14 +288,16 @@ fn testnet_register_plan_derives_the_deployed_accounts() {
     let (config_data, owner) = fetch_config(&dep);
     let (main, tree_main_data) = fetch_tree(&dep, &config_data, &owner);
 
-    let plan =
-        native::register_plan(&config_data, &tree_main_data, &owner, &[0x11; 32]).unwrap();
+    let plan = native::register_plan(&config_data, &tree_main_data, &owner, &[0x11; 32]).unwrap();
     assert_eq!(
         plan.config_account_id, dep.config_account,
         "config PDA re-derivation must round-trip to the deployed account"
     );
     assert_eq!(plan.tree_main_account_id, main);
-    assert_eq!(bytes_to_hex(&plan.merkle_program_id), dep.merkle_program_id_hex);
+    assert_eq!(
+        bytes_to_hex(&plan.merkle_program_id),
+        dep.merkle_program_id_hex
+    );
     assert!(
         plan.next_leaf_index < (1u64 << rln_layouts::TREE_DEPTH),
         "leaf index inside TREE_DEPTH"
@@ -303,7 +335,11 @@ fn testnet_valid_roots_come_from_the_live_tree() {
     assert!(!roots.is_empty());
     assert!(roots.len() <= 1 + rln_layouts::ROOT_HISTORY_SIZE);
     assert_ne!(roots[0], [0u8; 32], "current root");
-    eprintln!("live roots: {} in window, current {}", roots.len(), bytes_to_hex(&roots[0]));
+    eprintln!(
+        "live roots: {} in window, current {}",
+        roots.len(),
+        bytes_to_hex(&roots[0])
+    );
 }
 
 // Full cryptographic round-trip against DEPLOYED tree data: build a proof
@@ -340,7 +376,10 @@ fn testnet_merkle_proof_recomputes_the_live_root() {
         };
     }
     let recomputed = bytes_to_hex(&fr_to_bytes_le(&node));
-    assert_eq!(recomputed, proof.root, "path must hash back to the tree root");
+    assert_eq!(
+        recomputed, proof.root,
+        "path must hash back to the tree root"
+    );
 
     let roots = native::get_valid_roots(&tree_main_data).unwrap();
     assert!(
@@ -375,8 +414,14 @@ fn testnet_membership_read_absent_or_decodes_with_live_state() {
             let membership = native::decode_membership(&data).unwrap();
             assert_eq!(membership.id_commitment, id_commitment);
             let cfg = &config_data;
-            assert!(membership.rate_limit >= native::config_field_u64(cfg, native::CONFIG_OFFSET_MIN_RATE_LIMIT));
-            assert!(membership.rate_limit <= native::config_field_u64(cfg, native::CONFIG_OFFSET_MAX_RATE_LIMIT));
+            assert!(
+                membership.rate_limit
+                    >= native::config_field_u64(cfg, native::CONFIG_OFFSET_MIN_RATE_LIMIT)
+            );
+            assert!(
+                membership.rate_limit
+                    <= native::config_field_u64(cfg, native::CONFIG_OFFSET_MAX_RATE_LIMIT)
+            );
             let state = native::membership_status(
                 membership.grace_period_start_timestamp_ms,
                 membership.grace_period_duration_sec,
@@ -398,17 +443,25 @@ fn testnet_membership_read_absent_or_decodes_with_live_state() {
 #[test]
 fn testnet_fee_state_is_a_live_quote() {
     if std::env::var("LEZ_RLN_TESTNET_TESTS").ok().as_deref() != Some("1") {
-        eprintln!("testnet test skipped: set LEZ_RLN_TESTNET_TESTS=1 to run against the live registry");
+        eprintln!(
+            "testnet test skipped: set LEZ_RLN_TESTNET_TESTS=1 to run against the live registry"
+        );
         return;
     }
     let sequencer = std::env::var("LEZ_RLN_TESTNET_FEE_SEQUENCER").unwrap_or_else(|_| {
-        crate::networks::network("testnet").expect("testnet is in the table").sequencer.clone()
+        crate::networks::network("testnet")
+            .expect("testnet is in the table")
+            .sequencer
+            .clone()
     });
     let raw = crate::fee_state::fetch(&sequencer)
         .unwrap_or_else(|e| panic!("getFeeState against {sequencer}: {e}"));
     let quote: serde_json::Value = serde_json::from_str(&raw).expect("the quote is JSON");
     let field = |key: &str| {
-        quote.get(key).and_then(|v| v.as_u64()).unwrap_or_else(|| panic!("{key} missing: {raw}"))
+        quote
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| panic!("{key} missing: {raw}"))
     };
     assert!(field("next_base_fee_exec_ceiling") >= field("next_base_fee_exec_floor"));
     assert!(field("next_base_fee_stor_ceiling") >= field("next_base_fee_stor_floor"));
