@@ -402,7 +402,26 @@ bootstrap peers, which the host arranges), then the configured
 `rln_gifter_module` over this node's `libp2p_module`; the request names
 the registry, so one allocator covers both) and falls back to the funded
 registration when nothing was granted, recording why as
-`provisioning.fallback_reason`. Registrations go out one registry at a time: the pass
+`provisioning.fallback_reason`.
+
+A discovery miss — the gifter's `no allocator advertises <registry>/<type>`
+(peers connected, no record names the pair) or `discovery not joined: no
+connected peer after 20s` — does not end the asking, when `discover` is on.
+The pass probes the gifter's `discover` (a lookup; no credential is created
+and no request sent) every 60 s (`DISCOVERY_RETRY_SECS`) while the payer
+account is unfunded, and, when funds are already there, once at the 60 s
+mark before paying. A credential is created and the allocator asked only
+when a probe lists a candidate; a grant ends the pass and clears
+`fallback_reason`. While no probe lists one, `fallback_reason` carries the
+gifter's text, or `discovery not joined (N peers)` when the probe reports
+the node joined nobody, or `discovery: no allocator yet (N peers)` when it
+joined `N` peers and found none (each prefixed with the allocator's
+description, `a discovered allocator for <registry>[, else allocator <peer id>
+at <multiaddr>]`). `discovery unavailable: <msg>`
+(this node cannot discover) turns the probing off for the pass, as does any
+refusal that is not a discovery miss (a verifier's refusal, an unsent
+request); a probe that could not be made is repeated at the next interval.
+A pinned pair with `discover:false` is never probed. Registrations go out one registry at a time: the pass
 holds until each has left `pending` before submitting the next, because two
 submits from one payer in flight together share a nonce and the second is
 dropped silently. There is no
