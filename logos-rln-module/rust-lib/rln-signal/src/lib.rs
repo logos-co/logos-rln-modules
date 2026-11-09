@@ -131,8 +131,14 @@ mod tests {
     #[test]
     fn ffi_entry_refuses_null_pointers() {
         let signal = b"x";
-        assert_eq!(unsafe { rln_signal_hash(signal.as_ptr(), 1, core::ptr::null_mut()) }, 1);
+        assert_eq!(
+            unsafe { rln_signal_hash(signal.as_ptr(), 1, core::ptr::null_mut()) },
+            1
+        );
         let mut out = [0u8; 32];
-        assert_eq!(unsafe { rln_signal_hash(core::ptr::null(), 1, out.as_mut_ptr()) }, 2);
+        assert_eq!(
+            unsafe { rln_signal_hash(core::ptr::null(), 1, out.as_mut_ptr()) },
+            2
+        );
     }
 }
