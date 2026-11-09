@@ -513,7 +513,7 @@ pub(crate) enum Plan {
 /// then `LEZ_RLN_NETWORK` alone through the table, then nothing — which is not
 /// a failure: the consumer's registry id can still name
 /// the network.
-pub(crate) fn plan_home(home: &Path, env: &EnvView) -> Plan {
+pub(crate) fn plan_home(home: &Path, env: EnvView) -> Plan {
     if home.join(CONFIG_FILE).exists() {
         return match read_marker(home) {
             Ok(binding) => Plan::Adopt(binding.unwrap_or(Binding::Operator)),
@@ -525,12 +525,12 @@ pub(crate) fn plan_home(home: &Path, env: &EnvView) -> Plan {
             Binding::Operator
         } else {
             Binding::Recorded {
-                network: env.network.clone(),
+                network: env.network,
                 source: Source::Env,
             }
         };
         return Plan::Provision {
-            sequencer: env.sequencer.clone(),
+            sequencer: env.sequencer,
             binding,
         };
     }
@@ -661,7 +661,7 @@ fn perform(action: Action) {
         Action::None => {}
         Action::Start(home) => start_bring_up(home),
         Action::Await => pending(AWAIT_DETAIL),
-        Action::Fail(reason) => fail(&reason),
+        Action::Fail(reason) => fail(reason),
     }
 }
 
@@ -792,7 +792,7 @@ fn select_network(sel: &mut Selector, reference: &str) -> (NetworkReply, Action)
             home.clone(),
             plan_home(
                 &home,
-                &EnvView {
+                EnvView {
                     sequencer: String::new(),
                     network: String::new(),
                 },
@@ -961,14 +961,15 @@ pub(crate) fn spawn_bring_up(persistence_path: &str) {
                     "no instance_persistence_path from the host and no {HOME_ENV} — the wallet \
                      has nowhere to live"
                 );
+                // OWNERSHIP: two owners — the selection and the readiness each keep the reason.
                 sel.selection = Selection::Failed(reason.clone());
-                fail(&reason);
+                fail(reason);
                 return;
             }
             PathBuf::from(persistence_path).join("wallet-home")
         }
     };
-    let plan = plan_home(&home, &EnvView::from_env());
+    let plan = plan_home(&home, EnvView::from_env());
     let action = apply_plan(&mut sel, home, plan);
     perform(action);
 }
@@ -988,17 +989,17 @@ fn start_bring_up(home: PathBuf) {
         .map(|_| ())
         .unwrap_or_else(|e| {
             BRINGUP_STARTED.store(false, Ordering::SeqCst);
-            fail(&format!("cannot spawn the wallet bring-up thread: {e}"));
+            fail(format!("cannot spawn the wallet bring-up thread: {e}"));
         });
 }
 
 /// Guards `spawn_bring_up` against a second entry; see there.
 static BRINGUP_STARTED: AtomicBool = AtomicBool::new(false);
 
-fn fail(reason: &str) {
+fn fail(reason: String) {
     eprintln!("lez-rln wallet: {reason}");
     let mut state = lock(&STATE);
-    state.readiness = Readiness::Failed(reason.to_owned());
+    state.readiness = Readiness::Failed(reason);
     SETTLED.notify_all();
 }
 
@@ -1007,14 +1008,14 @@ fn fail(reason: &str) {
 /// Deliberately does not notify `SETTLED`: nothing has settled, and waking
 /// every waiting handler to tell it to keep waiting would only spin them
 /// against `READY_WAIT`.
-fn pending(detail: &str) {
+fn pending(detail: impl Into<String>) {
     let mut state = lock(&STATE);
-    state.readiness = Readiness::Pending(detail.to_owned());
+    state.readiness = Readiness::Pending(detail.into());
 }
 
 fn bring_up(home: &Path) {
     if let Err(e) = std::fs::create_dir_all(home) {
-        fail(&format!("create {}: {e}", home.display()));
+        fail(format!("create {}: {e}", home.display()));
         return;
     }
     // The config is in place by now: `plan_home` adopted it or wrote it.
@@ -1024,20 +1025,20 @@ fn bring_up(home: &Path) {
     let handle = match open_with_retry(&config_path, &storage_path) {
         Ok(h) => h,
         Err(e) => {
-            fail(&e);
+            fail(e);
             return;
         }
     };
 
     if let Err(e) = import_payer_key(&handle) {
-        fail(&e);
+        fail(e);
         return;
     }
 
     let payer_hex = match resolve_payer(&handle, home) {
         Ok(p) => p,
         Err(e) => {
-            fail(&e);
+            fail(e);
             return;
         }
     };
@@ -1045,7 +1046,7 @@ fn bring_up(home: &Path) {
     if payer_public_key.is_empty() {
         // A wallet that cannot sign for its payer sends nothing that the
         // sequencer accepts; Ready would promise registrations it cannot make.
-        fail(&format!(
+        fail(format!(
             "the payer {payer_hex} has no signing key in this wallet"
         ));
         return;
@@ -1128,7 +1129,7 @@ fn open_with_retry(config: &Path, storage: &Path) -> Result<Handle, String> {
                 if attempt == 1 || waited >= LATCH_AFTER {
                     eprintln!("lez-rln wallet: {detail}");
                 }
-                pending(&detail);
+                pending(detail);
                 sleep_in_slices(open_retry_interval(waited));
             }
         }
@@ -1465,22 +1466,18 @@ pub(crate) enum AccountRead {
     /// No such account on the chain. Quiet: a membership before it registers
     /// and a treasury nobody seeded both read this way, and both are answers.
     Absent,
-    /// The question could not be answered (no wallet, a malformed id, the
-    /// sequencer did not reply); logged.
+    /// The question could not be answered (no wallet, or the sequencer did
+    /// not reply); logged.
     Error,
 }
 
 #[allow(unsafe_code)]
-pub(crate) fn read_account(account_id_hex: &str) -> AccountRead {
-    let Some(bytes) = crate::hex::hex_to_bytes32(account_id_hex) else {
-        eprintln!("read_account: {account_id_hex} is not 32-byte hex");
-        return AccountRead::Error;
-    };
+pub(crate) fn read_account(account_id: &[u8; 32]) -> AccountRead {
     let Some(wallet) = wallet("read_account") else {
         return AccountRead::Error;
     };
     let guard = wallet.read().unwrap_or_else(|p| p.into_inner());
-    let id = ffi::Bytes32 { data: bytes };
+    let id = ffi::Bytes32 { data: *account_id };
     let mut account = ffi::Account::default();
     // SAFETY: a live handle, a stack id alive across the call, and an out
     // struct we own.
@@ -1490,7 +1487,11 @@ pub(crate) fn read_account(account_id_hex: &str) -> AccountRead {
         return AccountRead::Absent;
     }
     if rc != ffi::SUCCESS {
-        eprintln!("read_account({account_id_hex}): {}", ffi::describe(rc));
+        eprintln!(
+            "read_account({}): {}",
+            bytes_to_hex(account_id),
+            ffi::describe(rc)
+        );
         return AccountRead::Error;
     }
     // SAFETY: on success the library hands back an actor-state array it owns,
@@ -1587,14 +1588,14 @@ pub(crate) struct SendResult {
 }
 
 impl SendResult {
-    /// Whether the sequencer accepted the transaction: `success` and a tx
-    /// hash. `Err(why)` otherwise.
-    pub(crate) fn accepted(&self) -> Result<(), String> {
+    /// The result itself when the sequencer accepted the transaction
+    /// (`success` and a tx hash); `Err(why)` otherwise.
+    pub(crate) fn accepted(self) -> Result<Self, String> {
         if self.success && !self.tx_hash.is_empty() {
-            return Ok(());
+            return Ok(self);
         }
         if !self.error.is_empty() {
-            return Err(self.error.clone());
+            return Err(self.error);
         }
         Err(if self.success {
             "no tx_hash in the send reply"
@@ -1604,8 +1605,8 @@ impl SendResult {
         .to_string())
     }
 
-    pub(crate) fn tx_hash(&self) -> &str {
-        &self.tx_hash
+    pub(crate) fn into_tx_hash(self) -> String {
+        self.tx_hash
     }
 
     /// `{"error","success","tx_hash"}`, keys in that order: `register_member`
@@ -2126,7 +2127,7 @@ mod tests {
         let home = temp_home("plan-adopt");
         std::fs::write(home.join(CONFIG_FILE), "{}").unwrap();
         assert_eq!(
-            plan_home(&home, &env("http://elsewhere/", "devnet")),
+            plan_home(&home, env("http://elsewhere/", "devnet")),
             Plan::Adopt(Binding::Operator)
         );
         std::fs::write(
@@ -2135,7 +2136,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            plan_home(&home, &env("", "")),
+            plan_home(&home, env("", "")),
             Plan::Adopt(Binding::Recorded {
                 network: "devnet".into(),
                 source: Source::Table
@@ -2144,7 +2145,7 @@ mod tests {
         // A marker that does not parse must not read as "operator": that
         // would switch the network check off without a word.
         std::fs::write(home.join(NETWORK_FILE), "garbage").unwrap();
-        assert!(matches!(plan_home(&home, &env("", "")), Plan::Failed(_)));
+        assert!(matches!(plan_home(&home, env("", "")), Plan::Failed(_)));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2152,14 +2153,14 @@ mod tests {
     fn plan_provisions_from_the_sequencer_labelled_or_not() {
         let home = temp_home("plan-seq");
         assert_eq!(
-            plan_home(&home, &env("http://seq/", "")),
+            plan_home(&home, env("http://seq/", "")),
             Plan::Provision {
                 sequencer: "http://seq/".into(),
                 binding: Binding::Operator
             }
         );
         assert_eq!(
-            plan_home(&home, &env("http://seq/", "testnet")),
+            plan_home(&home, env("http://seq/", "testnet")),
             Plan::Provision {
                 sequencer: "http://seq/".into(),
                 binding: Binding::Recorded {
@@ -2175,7 +2176,7 @@ mod tests {
     fn plan_looks_a_bare_network_up_in_the_table() {
         let home = temp_home("plan-net");
         assert_eq!(
-            plan_home(&home, &env("", "devnet")),
+            plan_home(&home, env("", "devnet")),
             Plan::Provision {
                 sequencer: devnet_sequencer(),
                 binding: Binding::Recorded {
@@ -2184,7 +2185,7 @@ mod tests {
                 },
             }
         );
-        let Plan::Failed(reason) = plan_home(&home, &env("", "nosuch")) else {
+        let Plan::Failed(reason) = plan_home(&home, env("", "nosuch")) else {
             panic!("an unknown network must fail");
         };
         assert!(reason.contains("unknown network 'nosuch'"), "{reason}");
@@ -2201,7 +2202,7 @@ mod tests {
     #[test]
     fn plan_with_nothing_configured_awaits_selection() {
         let home = temp_home("plan-await");
-        assert_eq!(plan_home(&home, &env("", "")), Plan::AwaitSelection);
+        assert_eq!(plan_home(&home, env("", "")), Plan::AwaitSelection);
         let mut sel = selector(Selection::Unresolved);
         assert_eq!(
             apply_plan(&mut sel, home.clone(), Plan::AwaitSelection),
@@ -2215,7 +2216,7 @@ mod tests {
     fn a_sequencer_labelled_with_a_network_writes_the_marker() {
         let home = temp_home("env-marker");
         let mut sel = selector(Selection::Unresolved);
-        let plan = plan_home(&home, &env("http://seq/", "devnet"));
+        let plan = plan_home(&home, env("http://seq/", "devnet"));
         assert_eq!(
             apply_plan(&mut sel, home.clone(), plan),
             Action::Start(home.clone())

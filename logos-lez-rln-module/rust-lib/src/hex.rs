@@ -48,7 +48,11 @@ pub(crate) fn hex_to_bytes32(hex: &str) -> Option<[u8; 32]> {
 /// ignored. `None` when it is neither. Needs no wallet, so it answers before
 /// bring-up has finished; the fee payer is resolved on the register path.
 pub(crate) fn canonical_account_hex(raw: &str) -> Option<String> {
-    hex_to_bytes32(raw)
-        .or_else(|| base58::decode32(raw.trim()))
-        .map(|bytes| bytes_to_hex(&bytes))
+    account_id_bytes(raw).map(|bytes| bytes_to_hex(&bytes))
+}
+
+/// The 32 bytes an account id names, in either form `canonical_account_hex`
+/// accepts; `None` when it is neither.
+pub(crate) fn account_id_bytes(raw: &str) -> Option<[u8; 32]> {
+    hex_to_bytes32(raw).or_else(|| base58::decode32(raw.trim()))
 }

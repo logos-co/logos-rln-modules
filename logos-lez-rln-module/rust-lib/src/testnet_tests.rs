@@ -103,7 +103,7 @@ fn testnet() -> Option<Deployment> {
 
 // ------------------------------------------------------------------ JSON-RPC
 
-fn rpc(sequencer: &str, method: &str, params: serde_json::Value) -> serde_json::Value {
+fn rpc(sequencer: &str, method: &str, params: &serde_json::Value) -> serde_json::Value {
     let body = serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": method, "params": params
     })
@@ -147,7 +147,7 @@ fn get_actor_states(sequencer: &str, id: &[u8; 32]) -> Vec<([u8; 32], Vec<u8>)> 
     let result = rpc(
         sequencer,
         "getAccount",
-        serde_json::json!([crate::base58::encode32(id)]),
+        &serde_json::json!([crate::base58::encode32(id)]),
     );
     if result.is_null() {
         return Vec::new();
