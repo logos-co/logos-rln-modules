@@ -52,7 +52,7 @@
 ; cannot be resolved or saved fails bring-up; a negative rate_limit is
 ; invalid_rate_limit; a pending reply carries rate_limit.
 module liblogos_lez_rln_module {
-  version "6.1.0"
+  version "6.1.1"
   description "RLN registry provider (LEZ chain reads + registration/funding txs)"
   category "blockchain"
 
