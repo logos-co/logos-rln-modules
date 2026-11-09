@@ -356,7 +356,8 @@ fn network_conflict(bound: Option<&str>, config_hex: &str) -> Option<String> {
 /// The account a transaction declares as its fee payer: the one the wallet
 /// resolved at bring-up from LEZ_RLN_PAYER, the payer record, or derivation.
 /// A bring-up that resolves none never reaches Ready, so nothing is sent.
-fn fee_payer_hex() -> String {
+// OWNERSHIP: process-lifetime borrow of the payer in wallet's write-once `WALLET` static.
+fn fee_payer_hex() -> &'static str {
     wallet::payer_hex()
 }
 
@@ -503,8 +504,6 @@ fn proofs_with_roots_json(proofs: &[native::ProofJson], roots_array: &serde_json
     serde_json::to_string(&augmented).unwrap_or_default()
 }
 
-/// Build and send one `Register`, dated by chain time read now. `Err(why)` =
-/// not submitted, already logged.
 /// A wire flag that is only ever `true`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Yes;
@@ -560,6 +559,8 @@ impl RegisterReply {
     }
 }
 
+/// Build and send one `Register`, dated by chain time read now. `Err(why)` =
+/// not submitted, already logged.
 fn submit_register(
     ctx: &RlnConfigContext,
     plan: &RlnRegisterPlan,
@@ -610,7 +611,7 @@ fn submit_register(
         mention(payer, NATIVE_TOKEN_PROGRAM, Signer),
         mention(plan.treasury_account_id, NATIVE_TOKEN_PROGRAM, NoSign),
     ];
-    send_generic_tx(who, &mentions, 0, &message, &fee_payer_hex())
+    send_generic_tx(who, &mentions, 0, &message, fee_payer_hex())
 }
 
 /// How often the watcher looks at the chain, and how many times a reverted
@@ -989,7 +990,8 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         // paying on someone else's behalf names an account whose key this
         // wallet holds, because the signature is what authorizes the debit.
         let payer_hex = if payer_account_id.trim().is_empty() {
-            wallet::payer_hex()
+            // OWNERSHIP: the watcher thread owns its payer copy; `WALLET` keeps the original.
+            wallet::payer_hex().to_owned()
         } else {
             resolve_account_id(&payer_account_id)
         };

@@ -40,7 +40,7 @@
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::lock;
@@ -381,10 +381,13 @@ mod handle {
     /// The opaque wallet pointer.
     ///
     /// `wallet_ffi` locks the wallet inside every entry point, so the pointer
-    /// is safe to share between threads; the `RwLock` around it is about *our*
-    /// sequencing (a derivation must not overlap a read), not its.
+    /// is safe to share between threads. Bring-up alone uses it (open, import,
+    /// derive, sync) until it publishes it in `WALLET`; from then on handlers
+    /// call through it concurrently and the library serializes the calls.
     pub struct Handle(pub *mut super::ffi::WalletHandle);
 
+    // OWNERSHIP: created on the bring-up thread, then shared by every handler
+    // thread from the `WALLET` static.
     // SAFETY: the pointer is opaque — this crate never dereferences it — and
     // every library entry point takes the wallet's own lock before use.
     unsafe impl Send for Handle {}
@@ -403,28 +406,30 @@ pub(crate) enum Readiness {
     Failed(String),
 }
 
-struct State {
-    readiness: Readiness,
+/// Where bring-up stands; `SETTLED` is signalled on it. Held only to read or
+/// set the readiness (and, in `bring_up`, to publish `WALLET` with Ready),
+/// never across a library call.
+// OWNERSHIP: Mutex — handlers on several threads wait on it with `SETTLED`.
+static STATE: Mutex<Readiness> = Mutex::new(Readiness::Pending(String::new()));
+
+/// What a successful bring-up publishes, together and once.
+struct Wallet {
+    handle: Handle,
     /// The account this module signs and pays with: `LEZ_RLN_PAYER`, the
     /// account `LEZ_RLN_PAYER_KEY` imported, or one derived at bring-up.
-    /// Empty until bring-up settles.
     payer_hex: String,
-    /// The payer's public key as 64 hex chars, read once at bring-up; "" when
-    /// the wallet holds no key for it. Published because genesis funding and
-    /// the first transfer into a fresh account go by public key.
+    /// The payer's public key as 64 hex chars, read once at bring-up (a payer
+    /// the wallet holds no key for fails bring-up). Published because genesis
+    /// funding and the first transfer into a fresh account go by public key.
     payer_public_key: String,
-    /// Shared for reads and sends, exclusive for deriving an account. Callers
-    /// clone the `Arc` and drop the state lock before calling: holding it
-    /// across a sequencer round trip would serialize every handler.
-    wallet: Option<Arc<RwLock<Handle>>>,
 }
 
-static STATE: Mutex<State> = Mutex::new(State {
-    readiness: Readiness::Pending(String::new()),
-    payer_hex: String::new(),
-    payer_public_key: String::new(),
-    wallet: None,
-});
+/// The open wallet, set by `bring_up` under the `STATE` lock together with
+/// Ready — so a handler that saw Ready finds it — and never replaced or
+/// freed: the handle lives as long as the process. Read without a lock:
+/// handlers call the library through it concurrently.
+// OWNERSHIP: OnceLock — written once by the bring-up thread, then read-only and shared.
+static WALLET: OnceLock<Wallet> = OnceLock::new();
 
 /// Held across a submission and nothing else.
 ///
@@ -996,7 +1001,7 @@ static BRINGUP_STARTED: AtomicBool = AtomicBool::new(false);
 fn fail(reason: String) {
     eprintln!("lez-rln wallet: {reason}");
     let mut state = lock(&STATE);
-    state.readiness = Readiness::Failed(reason);
+    *state = Readiness::Failed(reason);
     SETTLED.notify_all();
 }
 
@@ -1007,7 +1012,7 @@ fn fail(reason: String) {
 /// against `READY_WAIT`.
 fn pending(detail: impl Into<String>) {
     let mut state = lock(&STATE);
-    state.readiness = Readiness::Pending(detail.into());
+    *state = Readiness::Pending(detail.into());
 }
 
 fn bring_up(home: &Path) {
@@ -1057,10 +1062,13 @@ fn bring_up(home: &Path) {
     }
 
     let mut state = lock(&STATE);
-    state.wallet = Some(Arc::new(RwLock::new(handle)));
-    state.payer_hex = payer_hex;
-    state.payer_public_key = payer_public_key;
-    state.readiness = Readiness::Ready;
+    // The only set: `BRINGUP_STARTED` admits one bring-up per process.
+    let _ = WALLET.set(Wallet {
+        handle,
+        payer_hex,
+        payer_public_key,
+    });
+    *state = Readiness::Ready;
     SETTLED.notify_all();
     eprintln!("lez-rln wallet: ready ({})", home.display());
 }
@@ -1430,10 +1438,11 @@ fn wallet_config_json(sequencer: &str) -> String {
 
 /// The wallet, once bring-up has settled. `None` means unusable, and the
 /// caller reports an empty string.
-fn wallet(who: &str) -> Option<Arc<RwLock<Handle>>> {
+// OWNERSHIP: process-lifetime borrow of the handle in the write-once `WALLET` static.
+fn wallet(who: &str) -> Option<&'static Handle> {
     let mut state = lock(&STATE);
     loop {
-        match &state.readiness {
+        match &*state {
             Readiness::Ready => break,
             Readiness::Failed(reason) => {
                 eprintln!("{who}: wallet unavailable: {reason}");
@@ -1451,7 +1460,7 @@ fn wallet(who: &str) -> Option<Arc<RwLock<Handle>>> {
             }
         }
     }
-    state.wallet.clone()
+    WALLET.get().map(|published| &published.handle)
     // The state lock is released here, before the caller's call runs.
 }
 
@@ -1473,13 +1482,12 @@ pub(crate) fn read_account(account_id: &[u8; 32]) -> AccountRead {
     let Some(wallet) = wallet("read_account") else {
         return AccountRead::Error;
     };
-    let guard = wallet.read().unwrap_or_else(|p| p.into_inner());
     let id = ffi::Bytes32 { data: *account_id };
     let mut account = ffi::Account::default();
     // SAFETY: a live handle, a stack id alive across the call, and an out
     // struct we own.
     let rc =
-        unsafe { ffi::wallet_ffi_get_account_public(guard.0, &raw const id, &raw mut account) };
+        unsafe { ffi::wallet_ffi_get_account_public(wallet.0, &raw const id, &raw mut account) };
     if rc == ffi::ACCOUNT_NOT_FOUND {
         return AccountRead::Absent;
     }
@@ -1652,7 +1660,6 @@ pub(crate) fn send_generic_public_transaction(
     let payer_ptr = payer.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
 
     let wallet = wallet("send_generic_public_transaction")?;
-    let guard = wallet.read().unwrap_or_else(|p| p.into_inner());
     let mut result = ffi::TransactionResult::default();
     // SAFETY: a live handle; mentions, message and payer all outlive the call;
     // the out struct is ours.
@@ -1660,7 +1667,7 @@ pub(crate) fn send_generic_public_transaction(
         // One submission at a time; see SEND_LOCK.
         let _serialized = lock(&SEND_LOCK);
         ffi::wallet_ffi_send_generic_public_transaction(
-            guard.0,
+            wallet.0,
             ffi_mentions.as_ptr(),
             ffi_mentions.len(),
             root,
@@ -1702,15 +1709,12 @@ pub(crate) fn send_generic_public_transaction(
     })
 }
 
-/// Derive a fresh public account in this module's own wallet and persist it,
-/// returning it as 64 hex chars. Empty string on failure.
-///
-/// Derivation is deterministic from the wallet's seed, so this hands back the
-/// next slot rather than a random one; a caller that needs an account nothing
-/// has claimed on-chain yet checks the balance and asks again. It lives here
 /// The account this module signs and pays with, or "" before bring-up settles.
-pub(crate) fn payer_hex() -> String {
-    lock(&STATE).payer_hex.clone()
+// OWNERSHIP: process-lifetime borrow from the `WALLET` static, never replaced or freed.
+pub(crate) fn payer_hex() -> &'static str {
+    WALLET
+        .get()
+        .map_or("", |published| published.payer_hex.as_str())
 }
 
 /// Live NATIVE balance of `account_hex`, or of this module's payer when empty.
@@ -1722,7 +1726,8 @@ pub(crate) fn payer_hex() -> String {
 #[allow(unsafe_code)]
 pub(crate) fn native_balance(account_hex: &str) -> Option<(String, u128)> {
     let id_hex = if account_hex.trim().is_empty() {
-        payer_hex()
+        // OWNERSHIP: the reply carries its own copy; `WALLET` keeps the payer.
+        payer_hex().to_owned()
     } else {
         crate::hex::canonical_account_hex(account_hex)?
     };
@@ -1732,12 +1737,11 @@ pub(crate) fn native_balance(account_hex: &str) -> Option<(String, u128)> {
     }
     let bytes = crate::hex::hex_to_bytes32(&id_hex)?;
     let wallet = wallet("native_balance")?;
-    let guard = wallet.read().unwrap_or_else(|p| p.into_inner());
     let id = ffi::Bytes32 { data: bytes };
     let mut out = [0u8; 16];
     // SAFETY: a live handle, an id we own, and a 16-byte out buffer. is_public
     // is true because a balance a program can charge is a public one.
-    let rc = unsafe { ffi::wallet_ffi_get_balance(guard.0, &raw const id, true, &raw mut out) };
+    let rc = unsafe { ffi::wallet_ffi_get_balance(wallet.0, &raw const id, true, &raw mut out) };
     if rc != ffi::SUCCESS {
         eprintln!(
             "native_balance: {id_hex} read failed ({})",
@@ -1758,7 +1762,7 @@ pub(crate) fn status_json() -> String {
     // that matters is not ready-or-not but retry-or-give-up: "pending" means
     // wait, "failed" means waiting longer will not help. `detail` is for a
     // human reading a log.
-    let (name, detail) = match &state.readiness {
+    let (name, detail) = match &*state {
         Readiness::Ready => ("ready", ""),
         Readiness::Pending(detail) if detail.is_empty() => ("pending", "opening the wallet"),
         Readiness::Pending(detail) => ("pending", detail.as_str()),
@@ -1767,14 +1771,22 @@ pub(crate) fn status_json() -> String {
     // `payer` is local configuration, never a chain read: this method is what
     // a consumer polls to tell "coming up" from "broken", so it must not be
     // able to block or fail on a sequencer round trip. What that account can
-    // afford is get_native_balance's question.
+    // afford is get_native_balance's question. Read under the `STATE` guard:
+    // `WALLET` is published under it together with Ready, so a pending or
+    // failed bring-up reads "" here, as Ready reads the payer.
     // `network` is the recorded binding, "" while unbound or when the home was
     // configured by its operator (whose network this module cannot name).
+    let (payer, payer_public_key) = WALLET.get().map_or(("", ""), |published| {
+        (
+            published.payer_hex.as_str(),
+            published.payer_public_key.as_str(),
+        )
+    });
     serde_json::json!({
         "detail": detail,
         "network": network,
-        "payer": state.payer_hex,
-        "payer_public_key": state.payer_public_key,
+        "payer": payer,
+        "payer_public_key": payer_public_key,
         "ready": name == "ready",
         "state": name,
     })
