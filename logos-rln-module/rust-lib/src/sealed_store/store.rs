@@ -3,9 +3,10 @@
 //! MAC-covered allocation ledger, the plaintext cache sidecar, and the
 //! persist-before-issue `message_id` reservation.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use zeroize::Zeroizing;
 
@@ -49,24 +50,24 @@ impl core::fmt::Display for OpenError {
 /// with (or the never-initialized default) so every keystore op can surface
 /// it; `Ready` is the open store.
 enum StoreCell {
-    Unready(String),
+    // OWNERSHIP: the never-initialized cause is the `'static` literal; a
+    // failure's cause is owned.
+    Unready(Cow<'static, str>),
     // OWNERSHIP: every handle taken from the cell shares the open store; it outlives a re-context.
     Ready(Arc<Store>),
 }
 
-impl Default for StoreCell {
-    fn default() -> StoreCell {
-        StoreCell::Unready(UNINIT_MSG.to_string())
-    }
+impl StoreCell {
+    /// The never-initialized cell.
+    const UNINIT: StoreCell = StoreCell::Unready(Cow::Borrowed(UNINIT_MSG));
 }
 
 /// The one current store, for the handlers and the worker loops alike.
 /// Readers clone the `Arc<Store>` out under a short read lock and never hold
 /// the lock across work; a (re-)context replaces the cell under the write lock.
 // OWNERSHIP: the process-wide owner of the open store (handlers run
-// concurrently on `&self`, workers and callbacks on their own threads);
-// `LazyLock` because the default cause is a `String`.
-static STORE: LazyLock<RwLock<StoreCell>> = LazyLock::new(RwLock::default);
+// concurrently on `&self`, workers and callbacks on their own threads).
+static STORE: RwLock<StoreCell> = RwLock::new(StoreCell::UNINIT);
 
 /// The refusal every keystore op surfaces when no store was ever opened.
 pub(crate) const UNINIT_MSG: &str =
@@ -82,7 +83,7 @@ pub(crate) fn current_or_cause() -> Result<Arc<Store>, ApiError> {
     {
         // OWNERSHIP: cheap Arc handle clone, taken out of the read lock.
         StoreCell::Ready(store) => Ok(Arc::clone(store)),
-        StoreCell::Unready(cause) => Err(ApiError::internal(cause)),
+        StoreCell::Unready(cause) => Err(ApiError::internal(cause.as_ref())),
     }
 }
 
@@ -120,7 +121,7 @@ pub(crate) fn open_current(dir: PathBuf) {
             // Fail closed: leave the store unready so every keystore op
             // errors rather than clobbering shared or existing state.
             eprintln!("store: {e}");
-            *cell = StoreCell::Unready(e.to_string());
+            *cell = StoreCell::Unready(Cow::Owned(e.to_string()));
         }
     }
 }
@@ -134,7 +135,7 @@ pub(crate) fn close_current(cause: String) {
     if let StoreCell::Ready(prev) = &*cell {
         prev.close();
     }
-    *cell = StoreCell::Unready(cause);
+    *cell = StoreCell::Unready(Cow::Owned(cause));
 }
 
 /// Make `store` current (`None`: the never-initialized default) without
@@ -144,7 +145,7 @@ pub(crate) fn publish(store: Option<&Arc<Store>>) {
     *STORE.write().unwrap_or_else(PoisonError::into_inner) = match store {
         // OWNERSHIP: the cell holds its own handle; the test keeps its one.
         Some(store) => StoreCell::Ready(Arc::clone(store)),
-        None => StoreCell::default(),
+        None => StoreCell::UNINIT,
     };
 }
 
@@ -153,7 +154,7 @@ pub(crate) fn publish(store: Option<&Arc<Store>>) {
 pub(crate) fn withdraw(store: &Arc<Store>) {
     let mut cell = STORE.write().unwrap_or_else(PoisonError::into_inner);
     if matches!(&*cell, StoreCell::Ready(current) if Arc::ptr_eq(current, store)) {
-        *cell = StoreCell::default();
+        *cell = StoreCell::UNINIT;
     }
 }
 
@@ -1497,6 +1498,21 @@ mod tests {
             )
             .unwrap();
         hash
+    }
+
+    #[test]
+    fn an_unready_store_cell_surfaces_its_cause() {
+        let _serial = crate::lock(&crate::test_support::TEST_GLOBAL_LOCK);
+        publish(None);
+        let uninit = current_or_cause().err().unwrap();
+        assert_eq!(uninit.kind, ErrorKind::Internal);
+        assert_eq!(uninit.message, UNINIT_MSG);
+        close_current("re-context refused".to_string());
+        let closed = current_or_cause().err().unwrap();
+        assert_eq!(closed.kind, ErrorKind::Internal);
+        assert_eq!(closed.message, "re-context refused");
+        assert!(current().is_none());
+        publish(None);
     }
 
     fn edit_json(path: &Path, f: impl FnOnce(&mut serde_json::Value)) {
