@@ -88,7 +88,6 @@ pub(crate) fn get_membership_state_impl(
         }
         ScopeState::One(r) => r,
     };
-    let record = &record;
     let hash = &record.hash;
 
     let pm = backend

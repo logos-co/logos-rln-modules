@@ -92,8 +92,10 @@ pub(crate) fn scope_candidates(
 }
 
 /// Which record answers a `get_membership_state(scope)` read.
-pub(crate) enum ScopeState {
-    One(MembershipRecord),
+// OWNERSHIP: `One` borrows the answering record from the records the caller
+// holds; the ambiguity reason is a string literal.
+pub(crate) enum ScopeState<'a> {
+    One(&'a MembershipRecord),
     Ambiguous(&'static str),
     None,
 }
@@ -108,7 +110,10 @@ pub(crate) enum ScopeState {
 /// scope names its registry"). More than one live record at the winning
 /// rank is ambiguous. Proof-time resolution stays `scope_candidates`'s
 /// (usable records only).
-pub(crate) fn resolve_scope_state(records: &[MembershipRecord], rln_id_hex: &str) -> ScopeState {
+pub(crate) fn resolve_scope_state<'a>(
+    records: &'a [MembershipRecord],
+    rln_id_hex: &str,
+) -> ScopeState<'a> {
     let own: Vec<&MembershipRecord> = records
         .iter()
         .filter(|r| !r.quarantined && r.identity.rln_identifier == rln_id_hex)
@@ -124,10 +129,10 @@ pub(crate) fn resolve_scope_state(records: &[MembershipRecord], rln_id_hex: &str
         let live: Vec<&&MembershipRecord> =
             rank.iter().filter(|r| r.cache.state.is_live()).collect();
         return match live.len() {
-            1 => ScopeState::One((*live[0]).clone()),
+            1 => ScopeState::One(live[0]),
             0 => {
                 let latest = rank.iter().max_by_key(|r| r.identity.submitted_at).expect("non-empty rank");
-                ScopeState::One((*latest).clone())
+                ScopeState::One(latest)
             }
             _ => ScopeState::Ambiguous(
                 "multiple live memberships registered under this scope; use get_memberships / select_membership",
@@ -140,7 +145,7 @@ pub(crate) fn resolve_scope_state(records: &[MembershipRecord], rln_id_hex: &str
         .collect();
     match usable.len() {
         0 => ScopeState::None,
-        1 => ScopeState::One(usable[0].clone()),
+        1 => ScopeState::One(usable[0]),
         _ => ScopeState::Ambiguous(
             "multiple memberships back this scope; use get_memberships / select_membership",
         ),
