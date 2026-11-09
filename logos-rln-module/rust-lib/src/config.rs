@@ -43,6 +43,7 @@ pub(crate) struct ModuleConfig {
     pub(crate) per_registry: std::collections::BTreeMap<String, RegistryConfig>,
 }
 
+// OWNERSHIP: written by start(), read by handler and worker threads.
 static CONFIG: Mutex<Option<ModuleConfig>> = Mutex::new(None);
 
 /// Replace the configuration in force with `start()`'s merged table.
@@ -54,6 +55,7 @@ pub(crate) fn install(config: ModuleConfig) {
 /// first-named order and the per-registry table, both empty before any start.
 pub(crate) fn registries_snapshot() -> (Vec<String>, BTreeMap<String, RegistryConfig>) {
     match lock(&CONFIG).as_ref() {
+        // OWNERSHIP: copied out, so the lock is released at return.
         Some(c) => (c.registries.clone(), c.per_registry.clone()),
         None => (Vec::new(), BTreeMap::new()),
     }
@@ -105,6 +107,7 @@ pub(crate) fn allocator_for(registry_canonical: &str) -> Option<DelegatedOptions
     lock(&CONFIG)
         .as_ref()
         .and_then(|c| c.per_registry.get(registry_canonical))
+        // OWNERSHIP: copied out, so the lock is released at return.
         .and_then(|c| c.allocator.clone())
 }
 

@@ -146,6 +146,7 @@ impl Keychain for Unavailable {
     }
 }
 
+// OWNERSHIP: type-erased backend: the platform's, or a test seam's fake.
 fn default_backend() -> Box<dyn Keychain + Send> {
     #[cfg(target_os = "macos")]
     {
@@ -157,6 +158,7 @@ fn default_backend() -> Box<dyn Keychain + Send> {
     }
 }
 
+// OWNERSHIP: the installed backend, shared by handler threads; tests replace it.
 static BACKEND: Mutex<Option<Box<dyn Keychain + Send>>> = Mutex::new(None);
 
 fn with_backend<R>(f: impl FnOnce(&dyn Keychain) -> R) -> R {
@@ -213,6 +215,7 @@ fn read_file_secret(dir: &std::path::Path) -> (Option<Zeroizing<String>>, Option
                     Some(format!("{AUTO_SECRET_FILE} is present but empty")),
                 )
             } else {
+                // OWNERSHIP: the trimmed secret is its own wiped copy; `raw` is wiped on drop.
                 (Some(Zeroizing::new(trimmed.to_string())), None)
             }
         }
@@ -222,17 +225,11 @@ fn read_file_secret(dir: &std::path::Path) -> (Option<Zeroizing<String>>, Option
 }
 
 fn note_suffix(file: Option<&str>, keychain: Option<&str>) -> String {
-    let mut parts = Vec::new();
-    if let Some(file) = file {
-        parts.push(file.to_string());
-    }
-    if let Some(keychain) = keychain {
-        parts.push(format!("keychain: {keychain}"));
-    }
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", parts.join("; "))
+    match (file, keychain) {
+        (None, None) => String::new(),
+        (Some(file), None) => format!(" ({file})"),
+        (None, Some(keychain)) => format!(" (keychain: {keychain})"),
+        (Some(file), Some(keychain)) => format!(" ({file}; keychain: {keychain})"),
     }
 }
 
@@ -277,10 +274,12 @@ fn quarantine_secret_file(dir: &std::path::Path) {
 /// concurrent auto-unlocks on a fresh store would otherwise both generate,
 /// race the durable secret-file write, and leave one caller's session keyed
 /// to a secret the file no longer holds.
+// OWNERSHIP: a unit token serializing auto-unlocks across handler threads.
 static AUTO_UNLOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn auto_unlock_core(
     store: &sealed::Store,
+    // OWNERSHIP: the source is a string literal.
 ) -> Result<(usize, &'static str, Zeroizing<String>), ApiError> {
     let _walk = crate::util::lock(&AUTO_UNLOCK);
     let dir = store.base_dir();
@@ -347,14 +346,15 @@ pub(crate) fn auto_unlock_impl() -> Result<serde_json::Value, ApiError> {
         )));
     }
     let store = sealed::current_or_uninit()?;
-    let (count, source, secret) = auto_unlock_core(&store)?;
+    let (count, source, mut secret) = auto_unlock_core(&store)?;
     let mut reply = serde_json::json!({
         "membership_count": count,
         "source": source,
         "unlocked": true,
     });
     if source == "created" {
-        reply["secret"] = serde_json::Value::String(secret.as_str().to_string());
+        // The created secret's one hand-out: the reply takes the buffer.
+        reply["secret"] = serde_json::Value::String(std::mem::take(&mut *secret));
     }
     Ok(reply)
 }

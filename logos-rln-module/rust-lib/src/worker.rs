@@ -76,6 +76,7 @@ struct Supervisor {
     warm: Held,
 }
 
+// OWNERSHIP: supervisor state shared by start/stop handlers and the workers.
 static SUP: Mutex<Supervisor> = Mutex::new(Supervisor {
     state: WorkerState::NeverStarted,
     generation: 0,

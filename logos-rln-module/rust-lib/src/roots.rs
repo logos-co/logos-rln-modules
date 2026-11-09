@@ -35,7 +35,9 @@ struct Window {
     updated_at: u64,
 }
 
+// OWNERSHIP: written by the refresh worker and path fills, read by validate handlers.
 static WINDOWS: Mutex<Option<HashMap<String, Window>>> = Mutex::new(None);
+// OWNERSHIP: written by handlers (`track`), read by the refresh worker.
 static TRACKED: Mutex<Option<HashMap<String, CanonicalRegistryId>>> = Mutex::new(None);
 
 /// On-demand refresh floor: a stream of invalid proofs must never become
@@ -74,7 +76,7 @@ pub(crate) fn adopt(canonical: &str, roots: Vec<[u8; 32]>) {
         return;
     }
     lock(&WINDOWS).get_or_insert_with(HashMap::new).insert(
-        canonical.to_string(),
+        canonical.to_string(), // OWNERSHIP: the map owns its key.
         Window {
             roots,
             updated_at: crate::util::now_unix(),
@@ -99,6 +101,7 @@ pub(crate) fn admit(canonical: &str, root: [u8; 32]) {
         }
         None => {
             windows.insert(
+                // OWNERSHIP: the map owns its key, copied for a new registry only.
                 canonical.to_string(),
                 Window {
                     roots: vec![root],
@@ -134,6 +137,7 @@ pub(crate) fn window(canonical: &str) -> Option<Vec<[u8; 32]>> {
     if crate::util::now_unix().saturating_sub(w.updated_at) > STALE_AFTER_SECS {
         return None;
     }
+    // OWNERSHIP: copied out, so the lock is not held across proof verification.
     Some(w.roots.clone())
 }
 
@@ -188,6 +192,7 @@ pub(crate) fn tracked_contains(canonical: &str) -> bool {
 fn tracked_snapshot() -> Vec<CanonicalRegistryId> {
     lock(&TRACKED)
         .as_ref()
+        // OWNERSHIP: copied out, so the lock is not held across the registry reads.
         .map(|m| m.values().cloned().collect())
         .unwrap_or_default()
 }

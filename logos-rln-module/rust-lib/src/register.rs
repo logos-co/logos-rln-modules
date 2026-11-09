@@ -44,9 +44,9 @@ pub(crate) fn parse_registry_options(
         }
     };
     let mut map = serde_json::Map::new();
-    for entry in &entries {
-        let key = match entry.get("key").and_then(|k| k.as_str()) {
-            Some(k) if !k.is_empty() => k,
+    for mut entry in entries {
+        let key = match entry.get_mut("key").map(serde_json::Value::take) {
+            Some(serde_json::Value::String(k)) if !k.is_empty() => k,
             _ => {
                 return Err(ApiError::new(
                     ErrorKind::InvalidArgument,
@@ -54,25 +54,22 @@ pub(crate) fn parse_registry_options(
                 ))
             }
         };
-        let value = match entry.get("value").and_then(|v| v.as_str()) {
-            Some(v) => v,
-            None => {
+        let value = match entry.get_mut("value").map(serde_json::Value::take) {
+            Some(serde_json::Value::String(v)) => v,
+            _ => {
                 return Err(ApiError::new(
                     ErrorKind::InvalidArgument,
                     format!("RegistryOptions value for '{key}' must be a string (char* pair)"),
                 ))
             }
         };
-        let prior = map.insert(
-            key.to_string(),
-            serde_json::Value::String(value.to_string()),
-        );
-        if prior.is_some() {
+        if map.contains_key(&key) {
             return Err(ApiError::new(
                 ErrorKind::InvalidArgument,
                 format!("duplicate RegistryOptions key '{key}'"),
             ));
         }
+        map.insert(key, serde_json::Value::String(value));
     }
     // A present-but-blank value falls back to the default, like absent.
     let raw = map.remove("rate_limit");
@@ -127,7 +124,7 @@ pub(crate) fn register_refusal(reply: &str) -> Option<String> {
 /// returns; `store` is a Weak capture of the store the record was inserted
 /// into — gone (re-context replaced it) means there is nothing to record on.
 pub(crate) fn funded_submit_callback(
-    store: Weak<Store>,
+    store: Weak<Store>, // OWNERSHIP: a late callback must not keep a replaced store alive.
     hash: String,
 ) -> provider::RegisterCallback {
     Box::new(move |result| {
@@ -187,7 +184,7 @@ pub(crate) fn delegated_confirm_deadline(submitted_at: u64) -> u64 {
 /// registry already confirmed keeps its authoritative leaf. Confirmation
 /// stays the poller's registry read-back.
 pub(crate) fn delegated_submit_callback(
-    store: Weak<Store>,
+    store: Weak<Store>, // OWNERSHIP: a late callback must not keep a replaced store alive.
     hash: String,
     registry_account: String,
 ) -> provider::RegisterCallback {
@@ -202,15 +199,19 @@ pub(crate) fn delegated_submit_callback(
         let mut reopened = false;
         let update = store.update_cache(&hash, |m| match result {
             Ok(reply) => match serde_json::from_str::<serde_json::Value>(&reply) {
-                Ok(v) => {
+                Ok(mut v) => {
                     let granted_elsewhere = v
                         .get("config_account")
                         .and_then(|x| x.as_str())
                         .filter(|got| !got.eq_ignore_ascii_case(&registry_account))
                         .map(|got| format!("registered on {got}, not {registry_account}"));
+                    // Taken: every reply that carries an error returns below.
                     let error = v
-                        .get("error")
-                        .map(|e| e.as_str().map(String::from).unwrap_or_else(|| e.to_string()))
+                        .get_mut("error")
+                        .map(|e| match e.take() {
+                            serde_json::Value::String(s) => s,
+                            other => other.to_string(),
+                        })
                         .or(granted_elsewhere);
                     if let Some(msg) = error {
                         // A late gifter rejection must not overwrite a state
@@ -282,6 +283,7 @@ pub(crate) fn delegated_submit_callback(
 /// scan and the insert are separated by a provider round-trip (up to ~70s), so
 /// without a claim two concurrent register(scope) calls double-mint. The loser
 /// errors transient and retries into the short-circuit.
+// OWNERSHIP: claims shared by concurrent register handlers and provisioning threads.
 pub(crate) static REGISTER_IN_FLIGHT: Mutex<Option<std::collections::HashSet<(String, String)>>> =
     Mutex::new(None);
 
@@ -296,6 +298,7 @@ impl RegisterClaim {
     pub(crate) fn take(registry: &str, rln_id_hex: &str) -> Result<RegisterClaim, ApiError> {
         let mut set = lock(&REGISTER_IN_FLIGHT);
         let set = set.get_or_insert_with(std::collections::HashSet::new);
+        // OWNERSHIP: the claim owns its key (its Drop removes it); the arguments are borrowed.
         let key = (registry.to_string(), rln_id_hex.to_string());
         if set.contains(&key) {
             return Err(ApiError::new(
@@ -324,7 +327,7 @@ impl Drop for RegisterClaim {
 /// callback lands on the module's event loop after this returns); the store
 /// lock is NEVER held across a provider call.
 pub(crate) fn register_impl(
-    store: Result<Arc<Store>, ApiError>,
+    store: Result<Arc<Store>, ApiError>, // OWNERSHIP: the handler's handle on the current store.
     registry_id_raw: &str,
     rln_identifier_hex: &str,
     options_json: &str,
@@ -359,6 +362,7 @@ pub(crate) fn register_impl(
 /// provisioning at start() needs, since `start`'s config names registries and
 /// no scopes.
 pub(crate) fn register_scoped(
+    // OWNERSHIP: the caller's handle; the submit callback holds a Weak of it.
     store: Result<Arc<Store>, ApiError>,
     registry: &registry_id::CanonicalRegistryId,
     rln_id_hex: &str,

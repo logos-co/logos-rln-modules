@@ -53,6 +53,7 @@ pub(crate) struct MembershipView<'a> {
     tx_result: Option<&'a str>,
 }
 
+// OWNERSHIP: the constructor ties the view to the hash and record it borrows.
 impl<'a> MembershipView<'a> {
     /// `quarantined` (metadata tamper-check failed) forces `state:"failed"`
     /// and `failed_reason:"metadata_tamper"` and suppresses `retryable` — a
@@ -178,10 +179,12 @@ pub(crate) struct ProvisioningView {
     price: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     required: Option<String>,
+    // OWNERSHIP: every step name is a string literal (`ensure::Step::as_str`).
     step: &'static str,
 }
 
 impl ProvisioningView {
+    // OWNERSHIP: every step name is a string literal (`ensure::Step::as_str`).
     pub(crate) fn new(step: &'static str, detail: String) -> Self {
         ProvisioningView {
             balance: None,
@@ -203,13 +206,13 @@ impl ProvisioningView {
     /// Attach the funding snapshot's fields.
     pub(crate) fn with_funding(
         mut self,
-        payer: &str,
+        payer: impl Into<String>,
         required: u128,
         price: u128,
         fee_reserve: u128,
         balance: Option<u128>,
     ) -> Self {
-        self.payer = Some(payer.to_string());
+        self.payer = Some(payer.into());
         self.required = Some(required.to_string());
         self.price = Some(price.to_string());
         self.fee_reserve = Some(fee_reserve.to_string());
@@ -218,6 +221,7 @@ impl ProvisioningView {
     }
 }
 
+// OWNERSHIP: the constructors tie the view to the ids and reason they borrow.
 impl<'a> MembershipStateView<'a> {
     pub(crate) fn unknown(registry_id: &'a str) -> Self {
         MembershipStateView {
@@ -300,6 +304,7 @@ pub(crate) struct StartReply<'a> {
     started: bool,
 }
 
+// OWNERSHIP: the constructor ties the reply to the registry list it borrows.
 impl<'a> StartReply<'a> {
     pub(crate) fn new(
         epoch_size_sec: u64,
@@ -353,7 +358,7 @@ impl RegistryParametersView {
     pub(crate) fn from_bounds(
         epoch_size_sec: u64,
         max_epoch_gap: u64,
-        bounds: &serde_json::Value,
+        mut bounds: serde_json::Value,
     ) -> Self {
         RegistryParametersView {
             epoch_size_sec,
@@ -361,7 +366,9 @@ impl RegistryParametersView {
             max_rate_limit: bounds.get("max_rate_limit").and_then(|v| v.as_u64()),
             max_total_rate_limit: bounds.get("max_total_rate_limit").and_then(|v| v.as_u64()),
             min_rate_limit: bounds.get("min_rate_limit").and_then(|v| v.as_u64()),
-            price_per_unit: bounds.get("price_per_unit").cloned(),
+            price_per_unit: bounds
+                .get_mut("price_per_unit")
+                .map(serde_json::Value::take),
         }
     }
 }
@@ -381,6 +388,7 @@ pub(crate) struct VerdictReply {
 }
 
 impl VerdictReply {
+    // OWNERSHIP: every verdict is a string literal.
     pub(crate) fn verdict(verdict: &'static str) -> Self {
         VerdictReply {
             external_nullifier: None,
@@ -425,12 +433,15 @@ impl UnlockKeystoreReply {
 // OWNERSHIP: serialisation view; borrows the ApiError's message for one to_value call.
 #[derive(Serialize)]
 pub(crate) struct ErrorBody<'a> {
+    // OWNERSHIP: `class` and `kind` are `ErrorKind`'s string literals.
     class: &'static str,
     kind: &'static str,
     message: &'a str,
 }
 
+// OWNERSHIP: the constructor ties the body to the message it borrows.
 impl<'a> ErrorBody<'a> {
+    // OWNERSHIP: `class` and `kind` are `ErrorKind`'s string literals.
     pub(crate) fn new(class: &'static str, kind: &'static str, message: &'a str) -> Self {
         ErrorBody {
             class,
@@ -491,7 +502,7 @@ mod registry_parameters_tests {
 
     #[test]
     fn registry_parameters_include_epoch_window_without_registry_bounds() {
-        let view = RegistryParametersView::from_bounds(10, 3, &serde_json::json!({}));
+        let view = RegistryParametersView::from_bounds(10, 3, serde_json::json!({}));
         assert_eq!(
             serde_json::to_value(view).unwrap(),
             serde_json::json!({

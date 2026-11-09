@@ -50,6 +50,7 @@ impl core::fmt::Display for OpenError {
 /// it; `Ready` is the open store.
 enum StoreCell {
     Unready(String),
+    // OWNERSHIP: every handle taken from the cell shares the open store; it outlives a re-context.
     Ready(Arc<Store>),
 }
 
@@ -91,6 +92,7 @@ pub(crate) fn current() -> Option<Arc<Store>> {
     }
 }
 
+// OWNERSHIP: the handle `current()` copies out of the read lock.
 pub(crate) fn current_or_uninit() -> Result<Arc<Store>, ApiError> {
     current().ok_or_else(|| ApiError::internal(UNINIT_MSG))
 }
@@ -195,13 +197,16 @@ pub struct Store {
     // authoritative Inner state, never snapshot-derived values; the snapshot
     // is a read-only publication (readers clone the Arc, never wait on
     // fsync).
+    // OWNERSHIP: handlers and workers share the store across threads; this is its one writer.
     write: Mutex<Inner>,
+    // OWNERSHIP: readers copy the Arc out under this short lock; a write replaces it.
     snapshot: Mutex<Arc<Snapshot>>,
 }
 
 impl Store {
     /// Open the store in `dir` — never create-then-write: the first unlock
     /// provisions.
+    // OWNERSHIP: the current-store cell and every handler or worker handle share it.
     pub fn open(dir: PathBuf) -> Result<Arc<Store>, OpenError> {
         match format::detect(&dir) {
             format::FormatPresence::OldOnly => {
@@ -266,6 +271,7 @@ impl Store {
                         "sealed store: entry {hash} fails membership_hash recomputation — \
                          quarantined"
                     );
+                    // OWNERSHIP: the quarantine set owns its hashes; the file keeps its own.
                     census.insert(hash.clone());
                 }
             }
@@ -352,6 +358,7 @@ impl Store {
             inner.sealed = Some(file);
             inner.store_uuid = Some(uuid);
             inner.session = Some(Session {
+                // OWNERSHIP: the session keeps a wiped copy; the caller's password is borrowed.
                 password: Zeroizing::new(password.to_string()),
                 keys,
             });
@@ -384,6 +391,7 @@ impl Store {
                 eprintln!(
                     "sealed store: entry {hash} fails credential authentication — quarantined"
                 );
+                // OWNERSHIP: the quarantine set owns its hashes; the file keeps its own.
                 keyed.insert(hash.clone());
             }
         }
@@ -400,6 +408,7 @@ impl Store {
                     "sealed store: entry {hash} allocation section MAC is missing or fails \
                      verification — quarantined"
                 );
+                // OWNERSHIP: the quarantine set owns its hashes; the file keeps its own.
                 keyed.insert(hash.clone());
             }
         }
@@ -413,7 +422,7 @@ impl Store {
             let mut stored_macs = BTreeMap::new();
             for (hash, s) in &inner.raw_sections {
                 if let Some(m) = registry_id::hex_to_bytes32(&s.mac) {
-                    stored_macs.insert(hash.clone(), m);
+                    stored_macs.insert(hash.as_str(), m);
                 }
             }
             let root_ok = stored_macs.len() == inner.raw_sections.len()
@@ -429,6 +438,7 @@ impl Store {
                 );
                 for hash in sealed.credentials.keys() {
                     if !inner.census_quarantined.contains(hash) {
+                        // OWNERSHIP: the quarantine set owns its hashes; the file keeps its own.
                         keyed.insert(hash.clone());
                     }
                 }
@@ -443,6 +453,7 @@ impl Store {
             .count();
         inner.keyed_quarantined = keyed;
         inner.session = Some(Session {
+            // OWNERSHIP: the session keeps a wiped copy; the caller's password is borrowed.
             password: Zeroizing::new(password.to_string()),
             keys,
         });
@@ -465,6 +476,7 @@ impl Store {
         crate::util::lock(&self.write)
             .session
             .as_ref()
+            // OWNERSHIP: copied out from under the write lock; the copy is wiped on drop.
             .map(|s| s.password.clone())
     }
 
@@ -529,6 +541,7 @@ impl Store {
         // reuses a hash would make this a slot-reissue footgun — gate it there.
         let was_quarantined =
             inner.census_quarantined.remove(hash) | inner.keyed_quarantined.remove(hash);
+        // OWNERSHIP: each of the store's maps owns its key; the caller's hash is borrowed.
         if was_quarantined {
             inner
                 .sections
@@ -538,6 +551,7 @@ impl Store {
         }
         write_allocations(&self.dir, inner)?;
 
+        // OWNERSHIP: each of the store's maps owns its key; the caller's hash is borrowed.
         inner.cache.insert(
             hash.to_string(),
             CacheState {
@@ -567,6 +581,7 @@ impl Store {
         let Some(sealed) = inner.sealed.as_mut() else {
             return Err(ApiError::internal("sealed store is not provisioned"));
         };
+        // OWNERSHIP: each of the store's maps owns its key; the caller's hash is borrowed.
         sealed.credentials.insert(
             hash.to_string(),
             SealedEntry {
@@ -698,6 +713,7 @@ impl Store {
         self.snapshot_arc()
             .records
             .values()
+            // OWNERSHIP: the rows outlive the snapshot handle taken here (one copy per start()).
             .map(|r| {
                 (
                     r.hash.clone(),
@@ -735,6 +751,7 @@ impl Store {
                 "no such membership_hash",
             ));
         }
+        // OWNERSHIP: the cache map owns its key; the caller's hash is borrowed.
         let row = inner.cache.entry(hash.to_string()).or_default();
         let prior = row.state;
         f(row);
@@ -996,6 +1013,7 @@ fn quarantine_all(sealed: Option<&SealedFile>, census: &mut BTreeSet<String>, wh
     }
     eprintln!("sealed store: {why}; quarantining every membership");
     for hash in f.credentials.keys() {
+        // OWNERSHIP: the quarantine set owns its hashes; the file keeps its own.
         census.insert(hash.clone());
     }
 }
@@ -1180,6 +1198,7 @@ fn load_allocations(
                 );
                 continue;
             }
+            // OWNERSHIP: parsed copy; `raw_sections` keeps the loaded sections for the MAC checks.
             sections.insert(
                 hash.clone(),
                 AllocationState {
@@ -1202,6 +1221,7 @@ fn load_allocations(
                 eprintln!(
                     "sealed store: credential {hash} has no allocations section — quarantined"
                 );
+                // OWNERSHIP: the quarantine set owns its hashes; the file keeps its own.
                 census.insert(hash.clone());
             }
         }
@@ -1247,6 +1267,7 @@ fn load_cache(dir: &Path, sealed: Option<&SealedFile>) -> BTreeMap<String, Cache
         Some(f) => {
             entries.retain(|hash, _| f.credentials.contains_key(hash));
             for hash in f.credentials.keys() {
+                // OWNERSHIP: the cache map owns its keys; the sealed file keeps its own.
                 entries.entry(hash.clone()).or_default();
             }
         }
@@ -1278,10 +1299,12 @@ fn write_allocations(dir: &Path, inner: &mut Inner) -> Result<(), ApiError> {
             inner.census_quarantined.contains(hash) || inner.keyed_quarantined.contains(hash);
         let section = if quarantined {
             match inner.raw_sections.get(hash) {
+                // OWNERSHIP: copied: `raw_sections` keeps the loaded one if the write fails.
                 Some(s) => s.clone(),
                 None => continue,
             }
         } else {
+            // OWNERSHIP: the written rows become `raw_sections`; the parsed state keeps its own.
             let rows: Vec<AllocRow> = alloc
                 .allocations
                 .iter()
@@ -1309,7 +1332,8 @@ fn write_allocations(dir: &Path, inner: &mut Inner) -> Result<(), ApiError> {
             }
         };
         let mac_bytes = registry_id::hex_to_bytes32(&section.mac).unwrap_or([0u8; 32]);
-        macs.insert(hash.clone(), mac_bytes);
+        macs.insert(hash.as_str(), mac_bytes);
+        // OWNERSHIP: the written file's map (kept as `raw_sections`) owns its key.
         sections.insert(hash.clone(), section);
     }
     let root = format::mac(

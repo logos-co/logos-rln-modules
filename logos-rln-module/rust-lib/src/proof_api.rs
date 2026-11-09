@@ -36,7 +36,7 @@ pub(crate) fn proof_error(e: proof::ProofError) -> ApiError {
 /// LE hex) plus the spent `message_id`, the u64 `epoch_index`, the
 /// `membership_hash`, and `proof_canonical`.
 pub(crate) fn generate_proof_impl(
-    store: Result<Arc<Store>, ApiError>,
+    store: Result<Arc<Store>, ApiError>, // OWNERSHIP: the handler's handle on the current store.
     registry_id_raw: &str,
     rln_identifier_hex: &str,
     signal_hex: &str,
@@ -58,6 +58,7 @@ pub(crate) fn generate_proof_impl(
 /// pre-hashed form is decoded strictly (a non-canonical value is refused,
 /// never reduced), so one `x` has exactly one wire spelling.
 #[derive(Clone, Copy)]
+// OWNERSHIP: borrows the request's hex text for the call.
 pub(crate) enum SignalArg<'a> {
     Raw(&'a str),
     Prehashed(&'a str),
@@ -80,7 +81,7 @@ impl SignalArg<'_> {
 }
 
 pub(crate) fn generate_proof_with(
-    store: Result<Arc<Store>, ApiError>,
+    store: Result<Arc<Store>, ApiError>, // OWNERSHIP: the handler's handle on the current store.
     registry_id_raw: &str,
     rln_identifier_hex: &str,
     signal: SignalArg<'_>,
@@ -381,7 +382,7 @@ pub(crate) fn validate_proof_with(
 /// error (spec SHALL): rate_limit 0 always means "no usable membership",
 /// never an exhausted budget.
 pub(crate) fn get_epoch_quota_impl(
-    store: Result<Arc<Store>, ApiError>,
+    store: Result<Arc<Store>, ApiError>, // OWNERSHIP: the handler's handle on the current store.
     registry_id_raw: &str,
     rln_identifier_hex: &str,
     timestamp: &str,
@@ -435,7 +436,7 @@ pub(crate) fn get_registry_parameters_impl(
 
     let bounds = backend.registry.get_registry_bounds(&registry)?;
     let (epoch_size_sec, max_epoch_gap) = epoch_params_for(&registry.canonical)?;
-    let view = views::RegistryParametersView::from_bounds(epoch_size_sec, max_epoch_gap, &bounds);
+    let view = views::RegistryParametersView::from_bounds(epoch_size_sec, max_epoch_gap, bounds);
     ok_json(view)
 }
 

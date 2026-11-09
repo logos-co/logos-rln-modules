@@ -140,6 +140,7 @@ fn ok_json<T: serde::Serialize>(v: T) -> Result<serde_json::Value, ApiError> {
 /// start/stop bodies span several supervisor critical sections; interleaving
 /// two of them can strand freshly spawned workers behind a stop's generation
 /// bump. Neither is a hot path.
+// OWNERSHIP: a unit token serializing start and stop across handler threads.
 static LIFECYCLE: Mutex<()> = Mutex::new(());
 
 /// Spec start(): apply configuration, warm the configured registries' root
@@ -383,6 +384,7 @@ struct LogosRlnModuleImpl {}
 
 impl LogosRlnModuleImpl {
     /// The open store (cloned out), or `internal` naming why there is none.
+    // OWNERSHIP: a handle cloned out of the cell, so no lock spans the handler.
     fn store(&self) -> Result<Arc<Store>, ApiError> {
         sealed_store::store::current_or_cause()
     }

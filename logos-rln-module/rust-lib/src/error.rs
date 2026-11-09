@@ -30,6 +30,7 @@ pub(crate) enum ErrorKind {
 }
 
 impl ErrorKind {
+    // OWNERSHIP: every kind name is a string literal.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             ErrorKind::UnknownRegistry => "unknown_registry",
@@ -53,6 +54,7 @@ impl ErrorKind {
     /// carried in every error envelope. `locked` maps to not_ready: the
     /// keystore password is invisible to the spec surface, so the caller
     /// retries after the app's unlock flow.
+    // OWNERSHIP: every class name is a string literal.
     pub(crate) fn class(self) -> &'static str {
         match self {
             ErrorKind::NotReady | ErrorKind::Locked => "not_ready",

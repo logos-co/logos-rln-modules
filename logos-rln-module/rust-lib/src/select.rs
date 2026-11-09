@@ -32,10 +32,11 @@ pub(crate) fn parse_selector(selector_json: &str) -> Result<Selector, ApiError> 
     if trimmed.is_empty() || trimmed == "{}" {
         return Ok(Selector::None);
     }
-    let v: serde_json::Value = serde_json::from_str(trimmed)
+    let mut v: serde_json::Value = serde_json::from_str(trimmed)
         .map_err(|e| ApiError::new(ErrorKind::InvalidArgument, format!("selector_json: {e}")))?;
-    if let Some(hash) = v.get("by_hash").and_then(|x| x.as_str()) {
-        return Ok(Selector::ByHash(hash.to_string()));
+    if let Some(serde_json::Value::String(hash)) = v.get_mut("by_hash").map(serde_json::Value::take)
+    {
+        return Ok(Selector::ByHash(hash));
     }
     match v.get("strategy").and_then(|x| x.as_str()) {
         Some("round_robin") => Ok(Selector::RoundRobin),
@@ -53,6 +54,7 @@ pub(crate) fn parse_selector(selector_json: &str) -> Result<Selector, ApiError> 
 
 /// Last-returned membership_hash per scope. In-memory only: rotation state
 /// need not survive a restart (any starting point is fair).
+// OWNERSHIP: rotation cursors shared by handler threads.
 static ROUND_ROBIN: Mutex<Option<HashMap<(String, String), String>>> = Mutex::new(None);
 
 /// Resolve the record to use. `records` is the registry's full local list of
@@ -107,6 +109,7 @@ pub(crate) fn select<'a, R: Borrow<MembershipRecord>>(
             .copied()
             .expect("non-empty candidates")),
         Selector::RoundRobin => {
+            // OWNERSHIP: the cursor map owns its key, inserted on every call.
             let key = (scope.0.to_string(), scope.1.to_string());
             let mut guard = lock(&ROUND_ROBIN);
             let map = guard.get_or_insert_with(HashMap::new);

@@ -24,7 +24,7 @@ pub(crate) fn provisioning_view(registry: &str) -> Option<views::ProvisioningVie
         let view = views::ProvisioningView::new(p.step.as_str(), p.detail)
             .with_fallback_reason(p.fallback_reason);
         match p.funding {
-            Some(f) => view.with_funding(&f.payer, f.required, f.price, f.fee_reserve, f.balance),
+            Some(f) => view.with_funding(f.payer, f.required, f.price, f.fee_reserve, f.balance),
             None => view,
         }
     })
@@ -41,7 +41,7 @@ pub(crate) fn provisioning_view(registry: &str) -> Option<views::ProvisioningVie
 /// loser a registration is in flight that it never issued. The cache write
 /// below is a compare-and-set instead.
 pub(crate) fn get_membership_state_impl(
-    store: Result<Arc<Store>, ApiError>,
+    store: Result<Arc<Store>, ApiError>, // OWNERSHIP: the handler's handle on the current store.
     registry_id_raw: &str,
     rln_identifier_hex: &str,
 ) -> Result<serde_json::Value, ApiError> {
@@ -172,7 +172,7 @@ pub(crate) fn get_membership_state_impl(
 /// only — the identity credential is never released. No unlocked keystore
 /// is required.
 pub(crate) fn select_membership_impl(
-    store: Result<Arc<Store>, ApiError>,
+    store: Result<Arc<Store>, ApiError>, // OWNERSHIP: the handler's handle on the current store.
     registry_id_raw: &str,
     rln_identifier_hex: &str,
     selector_json: &str,
@@ -210,7 +210,7 @@ pub(crate) fn select_membership_impl(
 /// caller polls next anyway, and this call stays clear of a 70 s provider
 /// deadline.
 pub(crate) fn ensure_membership_impl(
-    store: Result<Arc<Store>, ApiError>,
+    store: Result<Arc<Store>, ApiError>, // OWNERSHIP: the handler's handle on the current store.
     registry_id_raw: &str,
     options_json: &str,
 ) -> Result<serde_json::Value, ApiError> {
@@ -266,9 +266,10 @@ pub(crate) fn ensure_membership_impl(
         // Recorded before the spawn so this very reply already shows a step,
         // and a second call racing the thread's first record sees one too.
         ensure::mark_requested(&registry.canonical);
+        // OWNERSHIP: moved into the pass thread; the reply below reads the registry.
         let canonical = registry.canonical.clone();
         std::thread::Builder::new()
-            .name("rln-ensure".to_owned())
+            .name("rln-ensure".to_owned()) // OWNERSHIP: `Builder::name` takes a `String`.
             .spawn(move || {
                 let _claim = pass;
                 // The order start() keeps: the registry's network binds
@@ -285,7 +286,7 @@ pub(crate) fn ensure_membership_impl(
 }
 
 pub(crate) fn get_memberships_impl(
-    store: Result<Arc<Store>, ApiError>,
+    store: Result<Arc<Store>, ApiError>, // OWNERSHIP: the handler's handle on the current store.
     registry_id_raw: &str,
 ) -> Result<serde_json::Value, ApiError> {
     let registry = parse_registry(registry_id_raw)?;

@@ -106,6 +106,7 @@ fn observe_with(
 /// about (`Unknown` after a lost sidecar, never seen active) was never
 /// registered as far as anyone can tell, and reads `failed`, retryable, so
 /// it is not mistaken for a removal.
+// OWNERSHIP: every reason is a string literal.
 pub(crate) fn absent_verdict(record: &MembershipRecord) -> (MembershipState, &'static str) {
     if record.cache.state == MembershipState::Unknown && record.cache.first_active_at.is_none() {
         (MembershipState::Failed, "not_on_registry")

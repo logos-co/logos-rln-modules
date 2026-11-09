@@ -57,9 +57,12 @@ const REPLY_MARGIN: Duration = Duration::from_secs(10);
 
 // ------------------------------------------------------------ shared clients
 
+// OWNERSHIP: shared typed client; `forget_lez_client` resets the slot while callers keep their
+// handle.
 static LEZ_CLIENT: Mutex<Option<Arc<LiblogosLezRlnModuleClient>>> = Mutex::new(None);
 /// Created by the first `gifter_client()` call (normally `init_client`'s),
 /// on that caller's thread, and never replaced.
+// OWNERSHIP: process-wide client built on first use and never replaced.
 static GIFTER_CLIENT: LazyLock<RlnGifterModuleClient> = LazyLock::new(RlnGifterModuleClient::new);
 
 /// Warm the process-lifetime clients. Called from `on_context_ready` on the
@@ -72,6 +75,7 @@ pub(crate) fn init_client() {
 
 /// The shared typed client to the lez module, created on first use. The lock is
 /// released before the caller makes any SDK call.
+// OWNERSHIP: cheap Arc handle clone; a call keeps its client if the slot is reset.
 fn lez_client() -> Arc<LiblogosLezRlnModuleClient> {
     let mut slot = lock(&LEZ_CLIENT);
     Arc::clone(slot.get_or_insert_with(|| Arc::new(LiblogosLezRlnModuleClient::new())))
@@ -87,9 +91,11 @@ fn forget_lez_client() {
 /// receives the completion callback to hand to the SDK's `*_async_with_timeout`
 /// twin. A transport failure, a dispatch refusal, or a silent callback all
 /// collapse to the lez module's provider_failure (logged), so callers just `?`.
+// OWNERSHIP: `T` crosses from the SDK callback's thread over a channel.
 fn await_reply<T: Send + 'static>(
     method: &str,
     timeout: Duration,
+    // OWNERSHIP: the SDK's completion callback type: a boxed closure run on its thread.
     start: impl FnOnce(Box<dyn FnOnce(Result<T, LogosError>) + Send + 'static>),
 ) -> Result<T, ApiError> {
     let (tx, rx) = mpsc::channel::<Result<T, LogosError>>();
@@ -148,8 +154,9 @@ fn fold_reply(method: &str, result: Result<String, LogosError>) -> Result<String
 /// handler has returned. One mutex orders the two, so a completion racing the
 /// return is delivered exactly once either way.
 fn dispatch_recorded(
-    method: &'static str,
+    method: &'static str, // OWNERSHIP: a method-name literal, moved into the SDK callback.
     on_done: RegisterCallback,
+    // OWNERSHIP: the SDK's completion callback type: a boxed closure run on its thread.
     start: impl FnOnce(Box<dyn FnOnce(Result<String, LogosError>) + Send + 'static>),
 ) -> Result<(), ApiError> {
     struct Pending {
@@ -157,12 +164,13 @@ fn dispatch_recorded(
         on_done: Option<RegisterCallback>,
         sync_result: Option<Result<String, ApiError>>,
     }
+    // OWNERSHIP: shared by this call and the SDK callback, which may run on another thread.
     let state = Arc::new(Mutex::new(Pending {
         dispatched: false,
         on_done: Some(on_done),
         sync_result: None,
     }));
-    let cb_state = Arc::clone(&state);
+    let cb_state = Arc::clone(&state); // OWNERSHIP: the callback's handle.
     start(Box::new(move |result| {
         let outcome = fold_reply(method, result);
         let mut st = lock(&cb_state);
@@ -201,6 +209,7 @@ fn dispatch_recorded(
 /// definitive answers are kept: an accepted network stays accepted and a
 /// refused one stays refused for the life of the process (the lez module never
 /// re-points a wallet home), while a "not yet" is asked again next time.
+// OWNERSHIP: answers shared by handler and worker threads; `HashMap::new` is not const.
 static NETWORK_GATE: std::sync::LazyLock<Mutex<HashMap<String, Result<(), String>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -220,18 +229,16 @@ pub(crate) enum Gate {
 /// refusal is remembered for the life of the process, and must not be
 /// inferred from a reply that never made one.
 pub(crate) fn interpret_use_network(raw: &str) -> Gate {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(raw) else {
         return Gate::Retry;
     };
     match v.get("accepted").and_then(serde_json::Value::as_bool) {
         Some(true) => Gate::Accepted,
         Some(false) if v.get("retry").and_then(serde_json::Value::as_bool) == Some(false) => {
-            Gate::Refused(
-                v.get("detail")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("refused")
-                    .to_owned(),
-            )
+            Gate::Refused(match v.get_mut("detail").map(serde_json::Value::take) {
+                Some(serde_json::Value::String(detail)) => detail,
+                _ => "refused".to_owned(),
+            })
         }
         _ => Gate::Retry,
     }
@@ -241,9 +248,11 @@ pub(crate) fn interpret_use_network(raw: &str) -> Gate {
 fn remember(gate: &mut HashMap<String, Result<(), String>>, reference: &str, answer: &Gate) {
     match answer {
         Gate::Accepted => {
+            // OWNERSHIP: the gate owns its key; the caller's reference is borrowed.
             gate.insert(reference.to_owned(), Ok(()));
         }
         Gate::Refused(detail) => {
+            // OWNERSHIP: the gate owns its key and a copy of the refusal the caller still reads.
             gate.insert(reference.to_owned(), Err(detail.clone()));
         }
         Gate::Retry => {}
@@ -266,8 +275,10 @@ fn network_refused(registry: &CanonicalRegistryId, detail: &str) -> ApiError {
 /// yet is `not_ready`; a sibling that does not answer is `provider_failure`
 /// (and is asked again next time).
 pub(crate) fn ensure_network(registry: &CanonicalRegistryId) -> Result<(), ApiError> {
-    if let Some(known) = lock(&NETWORK_GATE).get(&registry.reference) {
-        return known.clone().map_err(|d| network_refused(registry, &d));
+    match lock(&NETWORK_GATE).get(&registry.reference) {
+        Some(Ok(())) => return Ok(()),
+        Some(Err(detail)) => return Err(network_refused(registry, detail)),
+        None => {}
     }
     let client = lez_client();
     let raw = await_reply("use_network", READ_TIMEOUT, |done| {
@@ -385,7 +396,7 @@ pub(crate) struct DiscoverReply {
 
 impl DiscoverReply {
     fn from_reply(raw: &str) -> Result<Self, ApiError> {
-        let v: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+        let mut v: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
             ApiError::new(ErrorKind::ProviderFailure, format!("discover parse: {e}"))
         })?;
         Ok(DiscoverReply {
@@ -395,10 +406,9 @@ impl DiscoverReply {
                 .map_or(0, Vec::len),
             joined: v.get("joined").and_then(|j| j.as_bool()),
             peers: v.get("peers").and_then(|p| p.as_u64()),
-            error: v.get("error").map(|e| {
-                e.as_str()
-                    .map(String::from)
-                    .unwrap_or_else(|| e.to_string())
+            error: v.get_mut("error").map(|e| match e.take() {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
             }),
         })
     }
@@ -441,6 +451,8 @@ pub(crate) struct ProviderMembership {
     pub(crate) rate_limit: u64,
 }
 
+// OWNERSHIP: type-erased completion carried through the SDK callback; callers pass different
+// closures.
 pub(crate) type RegisterCallback = Box<dyn FnOnce(Result<String, ApiError>) + Send>;
 
 /// The registry's membership records and parameters: what a registration
@@ -506,6 +518,7 @@ pub(crate) trait Payer: Send + Sync {
 /// The three sources of truth serving one namespace.
 #[derive(Clone, Copy)]
 pub(crate) struct Backend {
+    // OWNERSHIP: the three backends are zero-sized statics; `Backend` is a Copy table of borrows.
     pub tree: &'static dyn TreeSource,
     pub registry: &'static dyn Registry,
     pub payer: &'static dyn Payer,
@@ -623,8 +636,8 @@ fn parse_membership_reply(raw: &str) -> Result<Option<ProviderMembership>, ApiEr
             .ok_or_else(|| fault(format!("get_membership: registered member missing {key}")))
     };
     Ok(Some(ProviderMembership {
-        state: serde_json::from_value::<MembershipState>(
-            v.get("state").cloned().unwrap_or(serde_json::Value::Null),
+        state: <MembershipState as serde::Deserialize>::deserialize(
+            v.get("state").unwrap_or(&serde_json::Value::Null),
         )
         .map_err(|_| fault("get_membership: unrecognized state".to_string()))?,
         leaf_index: Some(required("leaf_index")?),

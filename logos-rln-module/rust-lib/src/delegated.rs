@@ -110,6 +110,7 @@ impl DelegatedOptions {
             match obj.get(key) {
                 None | Some(serde_json::Value::Null) => Ok(None),
                 Some(serde_json::Value::String(s)) if s.trim().is_empty() => Ok(None),
+                // OWNERSHIP: the options own their trimmed text; the request is borrowed.
                 Some(serde_json::Value::String(s)) => Ok(Some(s.trim().to_string())),
                 Some(other) => Err(ApiError::new(
                     ErrorKind::InvalidArgument,
@@ -155,11 +156,13 @@ impl DelegatedOptions {
                 None => true,
                 Some(_) => flat_bool_option(opts, "discover"),
             },
+            // OWNERSHIP: the options own their text; the request is borrowed.
             gifter_peer_id: opts
                 .get("gifter_peer_id")
                 .and_then(|x| x.as_str())
                 .unwrap_or_default()
                 .to_string(),
+            // OWNERSHIP: the options own their text; the request is borrowed.
             gifter_multiaddr: opts
                 .get("gifter_multiaddr")
                 .and_then(|x| x.as_str())

@@ -23,6 +23,7 @@ struct CachedPath {
     leaf_index: u64,
 }
 
+// OWNERSHIP: filled by the warm worker and generate handlers, read per generate.
 static PATHS: Mutex<Option<HashMap<String, CachedPath>>> = Mutex::new(None);
 
 /// The cached path for `hash`, or `None` on a cold cache or a leaf_index
@@ -31,6 +32,7 @@ pub(crate) fn hit(hash: &str, current_leaf_index: u64) -> Option<(Vec<String>, V
     let guard = lock(&PATHS);
     let entry = guard.as_ref()?.get(hash)?;
     (entry.leaf_index == current_leaf_index)
+        // OWNERSHIP: copied out of the lock: the witness owns (and wipes) its path.
         .then(|| (entry.path_elements_hex.clone(), entry.path_indices.clone()))
 }
 
@@ -52,7 +54,7 @@ pub(crate) fn fill_path_cache(
     }
     let (path_elements_hex, path_indices) = (witness.path_elements_hex, witness.path_indices);
     lock(&PATHS).get_or_insert_with(HashMap::new).insert(
-        hash.to_string(),
+        hash.to_string(), // OWNERSHIP: the map owns its key.
         CachedPath {
             path_elements_hex,
             path_indices,
@@ -70,7 +72,7 @@ pub(crate) fn set_path_for_test(
     leaf_index: u64,
 ) {
     lock(&PATHS).get_or_insert_with(HashMap::new).insert(
-        hash.to_string(),
+        hash.to_string(), // OWNERSHIP: the map owns its key.
         CachedPath {
             path_elements_hex,
             path_indices,

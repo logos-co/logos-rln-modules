@@ -60,6 +60,7 @@ type RegistryLog = HashMap<u64, EpochBucket>;
 /// canonical registry id → epoch → nullifier → the first accepted proof's
 /// shares. `Option` so the map is `const`-initializable (`HashMap::new` is
 /// not `const`); reached only through the poison-recovering [`crate::util::lock`].
+// OWNERSHIP: validate handlers on any thread record here.
 static LOG: Mutex<Option<HashMap<String, RegistryLog>>> = Mutex::new(None);
 
 /// Record a proof that has ALREADY passed validity + root-window checks, and

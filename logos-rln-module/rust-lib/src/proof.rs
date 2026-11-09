@@ -302,6 +302,7 @@ impl RateLimitProof {
 /// The stateless RLN engine over the embedded Single-mode circuit, built
 /// once — the zkey/graph clones are several MB, too expensive to repeat on
 /// the per-message verify path.
+// OWNERSHIP: built once and shared by every verify; construction is not const.
 static RLN_STATELESS: LazyLock<RLN<Stateless, ArkGroth16Backend<PoseidonHash>>> =
     LazyLock::new(|| {
         // `graph_from_raw` is told the depth it should find, so a mismatched
@@ -445,6 +446,7 @@ pub(crate) mod depth_bridge {
     /// `ZERO_LADDER[h]` is the root of an all-empty subtree of height `h`, so
     /// index 0 is the zero leaf itself. Computed once; the circuit's depth
     /// bounds how far it is ever needed.
+    // OWNERSHIP: computed once, read by every fold; construction is not const.
     static ZERO_LADDER: LazyLock<Vec<Fr>> = LazyLock::new(|| {
         let mut ladder = vec![Fr::from(0u64)];
         for height in 1..=RLN_TREE_DEPTH {
@@ -485,7 +487,7 @@ pub(crate) mod depth_bridge {
     /// substituting one here would be worse than passing it through.
     pub(crate) fn fold_root(root_hex: &str, depth: usize) -> String {
         let Some(mut root) = fr_from_hex(root_hex) else {
-            return root_hex.to_string();
+            return root_hex.to_string(); // OWNERSHIP: the passthrough of a malformed root.
         };
         for height in depth..RLN_TREE_DEPTH {
             root = Hasher::<PoseidonHash>::hash_pair(root, ZERO_LADDER[height]);

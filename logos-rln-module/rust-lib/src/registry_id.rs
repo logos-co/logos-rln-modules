@@ -62,7 +62,7 @@ pub(crate) fn parse(raw: &str) -> Result<CanonicalRegistryId, String> {
     let reference = if namespace == "logos" {
         reference.to_ascii_lowercase()
     } else {
-        reference.to_string()
+        reference.to_string() // OWNERSHIP: the id owns its parts; the input is borrowed.
     };
 
     let account = if namespace == "logos" {
@@ -85,10 +85,11 @@ pub(crate) fn parse(raw: &str) -> Result<CanonicalRegistryId, String> {
         {
             return Err("account_address must match [-.%a-zA-Z0-9]{1,128}".to_string());
         }
-        account_raw.to_string()
+        account_raw.to_string() // OWNERSHIP: the id owns its parts; the input is borrowed.
     };
 
     Ok(CanonicalRegistryId {
+        // OWNERSHIP: the id owns its parts; the input is borrowed.
         namespace: namespace.to_string(),
         canonical: format!("{namespace}:{reference}:{account}"),
         reference,

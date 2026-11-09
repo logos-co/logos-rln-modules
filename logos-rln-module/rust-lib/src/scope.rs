@@ -114,6 +114,7 @@ pub(crate) enum ScopeState<'a> {
 /// scope names its registry"). More than one live record at the winning
 /// rank is ambiguous. Proof-time resolution stays `scope_candidates`'s
 /// (usable records only).
+// OWNERSHIP: the answer borrows its record from `records`.
 pub(crate) fn resolve_scope_state<'a>(
     records: &'a [Arc<MembershipRecord>],
     rln_id_hex: &str,

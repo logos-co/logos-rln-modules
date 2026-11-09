@@ -138,8 +138,8 @@ pub fn section_mac_payload(
     buf
 }
 
-pub fn root_mac_payload(
-    section_macs: &BTreeMap<String, [u8; 32]>,
+pub fn root_mac_payload<K: AsRef<str>>(
+    section_macs: &BTreeMap<K, [u8; 32]>,
     store_uuid: &[u8; 16],
 ) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -147,7 +147,7 @@ pub fn root_mac_payload(
     buf.extend_from_slice(store_uuid);
     buf.extend_from_slice(&(section_macs.len() as u32).to_be_bytes());
     for (membership_hash, section_mac) in section_macs {
-        put_str(&mut buf, membership_hash);
+        put_str(&mut buf, membership_hash.as_ref());
         buf.extend_from_slice(section_mac);
     }
     buf
@@ -168,6 +168,7 @@ pub const MAX_CREDENTIALS: usize = 1024;
 pub const MAX_SECTIONS: usize = 1024;
 pub const MAX_ROWS_PER_SECTION: usize = 4096;
 
+// OWNERSHIP: every cap violation is a string literal.
 pub fn check_sealed_caps(f: &SealedFile) -> Result<(), &'static str> {
     if f.credentials.len() > MAX_CREDENTIALS {
         return Err("too many credentials");
@@ -175,6 +176,7 @@ pub fn check_sealed_caps(f: &SealedFile) -> Result<(), &'static str> {
     Ok(())
 }
 
+// OWNERSHIP: every cap violation is a string literal.
 pub fn check_allocations_caps(f: &AllocationsFile) -> Result<(), &'static str> {
     if f.sections.len() > MAX_SECTIONS {
         return Err("too many sections");

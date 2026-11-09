@@ -242,22 +242,25 @@ fn delegate_one(
     record(
         &registry.canonical,
         Step::Delegating,
-        &format!("asking {who}"),
+        format!("asking {who}"),
     );
     let store = crate::sealed_store::store::current_or_uninit();
-    let reply = match register_scoped(store, registry, REGISTRY_WIDE, rate_limit, Some(allocator)) {
-        Ok(v) => v,
-        Err(e) if e.kind == ErrorKind::Locked => {
-            return Delegated::Locked(format!("{who}: {}", e.message))
-        }
-        // Not sent: the gifter module missing, options the registry refuses.
-        Err(e) => return Delegated::Refused(format!("{who}: {}", e.message)),
+    let mut reply =
+        match register_scoped(store, registry, REGISTRY_WIDE, rate_limit, Some(allocator)) {
+            Ok(v) => v,
+            Err(e) if e.kind == ErrorKind::Locked => {
+                return Delegated::Locked(format!("{who}: {}", e.message))
+            }
+            // Not sent: the gifter module missing, options the registry refuses.
+            Err(e) => return Delegated::Refused(format!("{who}: {}", e.message)),
+        };
+    let hash = match reply
+        .get_mut("membership_hash")
+        .map(serde_json::Value::take)
+    {
+        Some(serde_json::Value::String(h)) => h,
+        _ => String::new(),
     };
-    let hash = reply
-        .get("membership_hash")
-        .and_then(|h| h.as_str())
-        .unwrap_or_default()
-        .to_string();
     let started = Instant::now();
     let mut attribution_wait = Duration::ZERO;
     loop {
@@ -284,7 +287,7 @@ fn delegate_one(
                 record(
                     &registry.canonical,
                     Step::Done,
-                    &format!("gifted by {by} at leaf {}", r.cache.leaf_index.unwrap_or(0)),
+                    format!("gifted by {by} at leaf {}", r.cache.leaf_index.unwrap_or(0)),
                 );
                 eprintln!(
                     "provision {}: {by} registered a registry-wide membership at rate {rate_limit}",
@@ -345,6 +348,7 @@ pub(crate) enum Step {
 }
 
 impl Step {
+    // OWNERSHIP: every step name is a string literal.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Step::Delegating => "delegating",
@@ -411,8 +415,8 @@ fn run_as(registries: Vec<Provision>, mine: u64) {
         match provision_one(&registry, rate_limit, allocator.as_ref(), mine) {
             Ok(()) => wait_confirmed(&registry, mine),
             Err(e) => {
-                record(&registry.canonical, Step::Refused, &e.message);
                 eprintln!("provision {}: {}", registry.canonical, e.message);
+                record(&registry.canonical, Step::Refused, e.message);
             }
         }
     }
@@ -621,7 +625,7 @@ fn ask_again(
             "provision {}: {why}; probing again in {next}s",
             registry.canonical
         );
-        set_fallback(&registry.canonical, &why);
+        set_fallback(&registry.canonical, why);
         return false;
     }
     match delegate_one(registry, rate_limit, a, mine) {
@@ -647,7 +651,7 @@ fn ask_again(
                 "provision {}: {why}; probing again in {next}s",
                 registry.canonical
             );
-            set_fallback(&registry.canonical, &why);
+            set_fallback(&registry.canonical, why);
             false
         }
         Delegated::Refused(why) => {
@@ -688,7 +692,7 @@ fn provision_one(
                 "provision {}: earlier registration failed ({why}); provisioning anew",
                 registry.canonical
             );
-            set_fallback(&registry.canonical, &why);
+            set_fallback(&registry.canonical, why);
         }
         Live::None => {}
     }
@@ -713,7 +717,7 @@ fn provision_one(
             record(
                 &registry.canonical,
                 Step::Refused,
-                &format!(
+                format!(
                     "membership {} is quarantined (local metadata failed its MAC); \
                      not registering a replacement — inspect with get_memberships, \
                      then register_membership deliberately",
@@ -754,10 +758,10 @@ fn provision_one(
                     "provision {}: {why}; falling back to a funded registration",
                     registry.canonical
                 );
-                set_fallback(&registry.canonical, &why);
                 if a.discover && discovery_can_retry(&why) {
                     retry = Some(a);
                 }
+                set_fallback(&registry.canonical, why);
             }
         }
     }
@@ -808,7 +812,7 @@ fn provision_one(
                         record(
                             &registry.canonical,
                             Step::WaitingForWallet,
-                            &format!("{}s: {detail}", waited.as_secs()),
+                            format!("{}s: {detail}", waited.as_secs()),
                         );
                     }
                 }
@@ -853,8 +857,9 @@ fn provision_one(
         .unwrap_or_default();
     record_funding(
         &registry.canonical,
-        &format!("{payer} needs {required} native ({price} price + {reserve} fee reserve)"),
+        format!("{payer} needs {required} native ({price} price + {reserve} fee reserve)"),
         Funding {
+            // OWNERSHIP: the snapshot owns a copy; the wait keeps reporting `payer`.
             payer: payer.clone(),
             required,
             price,
@@ -928,11 +933,13 @@ fn provision_one(
                     // on an account, and how far off it is.
                     record_funding(
                         &registry.canonical,
-                        &format!(
+                        format!(
                             "{payer} needs {required} native \
                              ({price} price + {reserve} fee reserve); it holds {balance}"
                         ),
                         Funding {
+                            // OWNERSHIP: the snapshot owns a copy; the wait keeps reporting
+                            // `payer`.
                             payer: payer.clone(),
                             required,
                             price,
@@ -1087,17 +1094,18 @@ pub(crate) struct Progress {
 
 /// Per registry: the last step reported and the fallback reason in force.
 /// An entry, once recorded, is replaced step by step and never removed.
+// OWNERSHIP: written by the passes' threads, read by the state handlers.
 static PROGRESS: Mutex<Option<HashMap<String, Progress>>> = Mutex::new(None);
 
 /// Every caller has recorded a step for `registry` earlier in its pass
 /// (`delegate_one` records `Delegating` first; `settle_live` records its wait
 /// before it can answer `Failed`), so the entry exists.
-fn set_fallback(registry: &str, why: &str) {
+fn set_fallback(registry: &str, why: impl Into<String>) {
     if let Some(p) = crate::util::lock(&PROGRESS)
         .as_mut()
         .and_then(|m| m.get_mut(registry))
     {
-        p.fallback_reason = Some(why.to_owned());
+        p.fallback_reason = Some(why.into());
     }
 }
 
@@ -1111,21 +1119,22 @@ fn clear_fallback(registry: &str) {
 }
 
 /// Record a step; the entry's fallback reason stays as it was.
-fn record_progress(registry: &str, step: Step, detail: &str, funding: Option<Funding>) {
+fn record_progress(registry: &str, step: Step, detail: String, funding: Option<Funding>) {
     let mut guard = crate::util::lock(&PROGRESS);
     let map = guard.get_or_insert_with(HashMap::new);
     match map.get_mut(registry) {
         Some(p) => {
             p.step = step;
-            p.detail = detail.to_owned();
+            p.detail = detail;
             p.funding = funding;
         }
         None => {
             map.insert(
+                // OWNERSHIP: the map owns its key, copied on a first step only.
                 registry.to_owned(),
                 Progress {
                     step,
-                    detail: detail.to_owned(),
+                    detail,
                     funding,
                     fallback_reason: None,
                 },
@@ -1134,12 +1143,17 @@ fn record_progress(registry: &str, step: Step, detail: &str, funding: Option<Fun
     }
 }
 
-fn record(registry: &str, step: Step, detail: &str) {
-    record_progress(registry, step, detail, None);
+fn record(registry: &str, step: Step, detail: impl Into<String>) {
+    record_progress(registry, step, detail.into(), None);
 }
 
-fn record_funding(registry: &str, detail: &str, funding: Funding) {
-    record_progress(registry, Step::AwaitingFunding, detail, Some(funding));
+fn record_funding(registry: &str, detail: impl Into<String>, funding: Funding) {
+    record_progress(
+        registry,
+        Step::AwaitingFunding,
+        detail.into(),
+        Some(funding),
+    );
 }
 
 /// Note that a pass has been asked for, before its thread has recorded
@@ -1174,6 +1188,7 @@ pub(crate) fn progress(registry: &str) -> Option<Progress> {
 /// entry over; the older one's marker, dropped later, finds another ticket
 /// there and leaves it: a superseded pass must not make the live one look
 /// finished.
+// OWNERSHIP: entered by the passes' threads and the `ensure_membership` handler.
 static ACTIVE: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// RAII marker for a registry's pass; dropped on every exit path of `run_with`'s
@@ -1188,10 +1203,11 @@ impl ActivePass {
     }
 
     pub(crate) fn enter_with(registry: &str, ticket: u64) -> Self {
+        // OWNERSHIP: the map and the marker (its Drop looks the entry up) each own the key.
         crate::util::lock(&ACTIVE)
             .get_or_insert_with(HashMap::new)
             .insert(registry.to_owned(), ticket);
-        ActivePass(registry.to_owned(), ticket)
+        ActivePass(registry.to_owned(), ticket) // OWNERSHIP: the marker's copy, for its Drop.
     }
 
     /// The marker, if no pass holds the registry: the check and the entry
@@ -1203,8 +1219,9 @@ impl ActivePass {
         if map.contains_key(registry) {
             return None;
         }
+        // OWNERSHIP: the map and the marker (its Drop looks the entry up) each own the key.
         map.insert(registry.to_owned(), ticket);
-        Some(ActivePass(registry.to_owned(), ticket))
+        Some(ActivePass(registry.to_owned(), ticket)) // OWNERSHIP: the marker's copy, for its Drop.
     }
 }
 
