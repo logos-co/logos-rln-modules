@@ -43,7 +43,7 @@ pub fn signal_hash(signal: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     signal_to_x(signal)
         .serialize_compressed(&mut out[..])
-        .expect("Fr canonical LE form is exactly 32 bytes");
+        .expect("invariant: Fr's canonical LE form is exactly 32 bytes");
     out
 }
 
