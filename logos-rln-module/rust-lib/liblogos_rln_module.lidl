@@ -41,7 +41,7 @@
 ; Events are a third channel, pushed over the lp event stream rather than
 ; returned from a call — see the events section below.
 module liblogos_rln_module {
-  version "0.16.0"
+  version "0.16.1"
   description "RLN Membership Management Module"
   category "blockchain"
   depends [liblogos_lez_rln_module, rln_gifter_module]
@@ -514,7 +514,12 @@ module liblogos_rln_module {
   ; gifter's reply) and, when nothing was granted — the gifter module not
   ; loaded, no allocator found or reachable, its refusal, a registry it does
   ; not serve — falls back to the funded registration below, with that
-  ; reason in the provisioning object's "fallback_reason". Without an
+  ; reason in the provisioning object's "fallback_reason". Since 0.16.1 a
+  ; discovery miss (no allocator advertises the pair yet, or no connected
+  ; peer to search through) is probed again with the gifter's discover every
+  ; 60 s while the node waits for funds, and once, 60 s after the pass began,
+  ; before paying; the allocator is asked only when a probe lists one.
+  ; Without an
   ; allocator block, provisioning is the funded registration alone, as
   ; before. Since 0.14.2 a call sets the registries it names and leaves
   ; every other registry's configuration in force: an object entry sets its

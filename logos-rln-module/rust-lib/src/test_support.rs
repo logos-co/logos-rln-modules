@@ -24,6 +24,21 @@ pub(crate) fn install_backend(backend: Backend) {
     *crate::util::lock(&INSTALLED_BACKEND) = Some(backend);
 }
 
+/// The gifter module as `provider::gifter_request_async` and
+/// `provider::gifter_discover_async` serve it in tests: the method
+/// (`"request"` | `"discover"`) and its args in, the gifter's reply JSON text
+/// or a dispatch error out.
+pub(crate) type FakeGifter = Box<dyn Fn(&str, &serde_json::Value) -> Result<String, ApiError> + Send + Sync>;
+
+/// The gifter the provider's gifter calls reach instead of the client.
+pub(crate) static INSTALLED_GIFTER: Mutex<Option<FakeGifter>> = Mutex::new(None);
+
+/// Answer gifter requests with `gifter` until `INSTALLED_GIFTER` is cleared.
+/// Callers hold `TEST_GLOBAL_LOCK`.
+pub(crate) fn install_gifter(gifter: FakeGifter) {
+    *crate::util::lock(&INSTALLED_GIFTER) = Some(gifter);
+}
+
 /// Open a store in `dir` and publish it in the worker-loop slot — the tests'
 /// stand-in for `on_context_ready`'s store wiring.
 pub(crate) fn publish_test_store(dir: std::path::PathBuf) -> Arc<Store> {

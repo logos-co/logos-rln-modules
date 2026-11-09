@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use crate::lifecycle::{granted_by, MembershipState};
 use crate::error::{ApiError, ErrorKind};
 use crate::delegated::DelegatedOptions;
-use crate::register::register_scoped;
+use crate::register::{discovery_can_retry, register_scoped};
 use crate::registry_id;
 use crate::scope::{backend_of, records_for_registry};
 use crate::worker;
@@ -75,6 +75,14 @@ const DELEGATE_HOLD: Duration = crate::provider::GIFTER_REQUEST_TIMEOUT
 /// How long a granted gift waits for the allocator's reply to name the
 /// granter after the registry already confirmed it.
 const ATTRIBUTION_HOLD: Duration = Duration::from_secs(20);
+
+/// Seconds between asks of the allocator after a discovery miss (no
+/// allocator advertising the registry yet, no peer to search through).
+pub(crate) static DISCOVERY_RETRY_SECS: AtomicU64 = AtomicU64::new(60);
+
+fn discovery_retry_every() -> Duration {
+    Duration::from_secs(DISCOVERY_RETRY_SECS.load(Ordering::SeqCst))
+}
 
 /// One registry's provisioning order: its allocator first, when `start()`
 /// configured one, then the funded registration.
@@ -220,14 +228,7 @@ fn delegate_one(
     allocator: &DelegatedOptions,
     mine: u64,
 ) -> Delegated {
-    let who = match (allocator.discover, allocator.gifter_peer_id.is_empty()) {
-        (true, true) => format!("a discovered allocator for {}", registry.canonical),
-        (true, false) => format!(
-            "a discovered allocator for {}, else allocator {} at {}",
-            registry.canonical, allocator.gifter_peer_id, allocator.gifter_multiaddr
-        ),
-        (false, _) => format!("allocator {} at {}", allocator.gifter_peer_id, allocator.gifter_multiaddr),
-    };
+    let who = allocator_who(registry, allocator);
     record(&registry.canonical, Step::Delegating, &format!("asking {who}"));
     let store = crate::sealed_store::store::current_or_uninit();
     let reply = match register_scoped(store, registry, REGISTRY_WIDE, rate_limit, Some(allocator.clone())) {
@@ -284,6 +285,18 @@ fn delegate_one(
             ));
         }
         std::thread::sleep(TICK);
+    }
+}
+
+/// The allocator a pass asks, as its log lines and fallback reasons name it.
+fn allocator_who(registry: &registry_id::CanonicalRegistryId, allocator: &DelegatedOptions) -> String {
+    match (allocator.discover, allocator.gifter_peer_id.is_empty()) {
+        (true, true) => format!("a discovered allocator for {}", registry.canonical),
+        (true, false) => format!(
+            "a discovered allocator for {}, else allocator {} at {}",
+            registry.canonical, allocator.gifter_peer_id, allocator.gifter_multiaddr
+        ),
+        (false, _) => format!("allocator {} at {}", allocator.gifter_peer_id, allocator.gifter_multiaddr),
     }
 }
 
@@ -492,12 +505,88 @@ fn settle_live(registry: &registry_id::CanonicalRegistryId, mine: u64) -> Live {
     }
 }
 
+/// The allocator asked once more after a discovery miss: true when the pass
+/// ends here (a grant, a locked keystore, a newer pass).
+///
+/// Discovery is probed first and the request — which mints a credential and
+/// leaves a record — is sent only when an allocator is listed. A probe that
+/// finds none becomes the fallback reason; `discovery unavailable` ends the
+/// asking; a probe that could not be made is tried next interval. A refusal
+/// that is still a discovery miss becomes the fallback reason; any other
+/// refusal ends the asking and leaves the fallback reason as it was.
+fn ask_again(
+    registry: &registry_id::CanonicalRegistryId,
+    rate_limit: u64,
+    retry: &mut Option<&DelegatedOptions>,
+    mine: u64,
+) -> bool {
+    let Some(a) = *retry else { return false };
+    let who = allocator_who(registry, a);
+    let next = discovery_retry_every().as_secs();
+    let miss = match crate::provider::gifter_discover_async(registry, a.auth_type.as_deref()) {
+        Err(e) => {
+            eprintln!("provision {}: discover failed: {}; probing again in {next}s", registry.canonical, e.message);
+            return false;
+        }
+        Ok(found) => match (found.error, found.joined, found.candidates) {
+            (Some(e), _, _) if e.contains("discovery unavailable") => {
+                eprintln!("provision {}: {who}: {e}; no further allocator asks this pass", registry.canonical);
+                *retry = None;
+                return false;
+            }
+            (Some(e), _, _) if discovery_can_retry(&e) => Some(e),
+            (Some(e), _, _) => {
+                eprintln!("provision {}: discover failed: {e}; probing again in {next}s", registry.canonical);
+                return false;
+            }
+            (None, Some(false), _) => Some(format!("discovery not joined ({} peers)", found.peers.unwrap_or(0))),
+            (None, _, 0) => Some(match found.peers {
+                Some(n) => format!("discovery: no allocator yet ({n} peers)"),
+                None => "discovery: no allocator yet".to_string(),
+            }),
+            (None, _, _) => None,
+        },
+    };
+    if let Some(why) = miss {
+        let why = format!("{who}: {why}");
+        eprintln!("provision {}: {why}; probing again in {next}s", registry.canonical);
+        set_fallback(&registry.canonical, &why);
+        return false;
+    }
+    match delegate_one(registry, rate_limit, a, mine) {
+        Delegated::Granted => {
+            clear_fallback(&registry.canonical);
+            true
+        }
+        Delegated::Superseded => true,
+        Delegated::Locked(why) => {
+            record(&registry.canonical, Step::AwaitingFunding, "keystore locked");
+            eprintln!(
+                "provision {}: {why} — unlock the keystore and restart (or ensure_membership) to provision",
+                registry.canonical
+            );
+            true
+        }
+        Delegated::Refused(why) if discovery_can_retry(&why) => {
+            eprintln!("provision {}: {why}; probing again in {next}s", registry.canonical);
+            set_fallback(&registry.canonical, &why);
+            false
+        }
+        Delegated::Refused(why) => {
+            eprintln!("provision {}: {why}; no further allocator asks this pass", registry.canonical);
+            *retry = None;
+            false
+        }
+    }
+}
+
 fn provision_one(
     registry: &registry_id::CanonicalRegistryId,
     rate_limit: u64,
     allocator: Option<&DelegatedOptions>,
     mine: u64,
 ) -> Result<(), ApiError> {
+    let entered = Instant::now();
     clear_fallback(&registry.canonical);
     match settle_live(registry, mine) {
         Live::Usable => {
@@ -551,7 +640,12 @@ fn provision_one(
     //    nothing and needs no wallet, so it is asked first; whatever stops it
     //    — the gifter module not loaded, the allocator unreachable, its
     //    refusal — is recorded as the fallback reason and the funded steps
-    //    below run as they always have.
+    //    below run as they always have. A discovery miss of a discovering
+    //    allocator keeps it in `retry`: probed again every
+    //    `DISCOVERY_RETRY_SECS` while the payer is unfunded, and once before
+    //    paying when the funding wait probed nothing (`ask_again`). A pinned
+    //    pair alone has nothing to probe.
+    let mut retry: Option<&DelegatedOptions> = None;
     if let Some(a) = allocator {
         match delegate_one(registry, rate_limit, a, mine) {
             Delegated::Granted | Delegated::Superseded => return Ok(()),
@@ -569,6 +663,9 @@ fn provision_one(
                     registry.canonical
                 );
                 set_fallback(&registry.canonical, &why);
+                if a.discover && discovery_can_retry(&why) {
+                    retry = Some(a);
+                }
             }
         }
     }
@@ -675,9 +772,18 @@ fn provision_one(
     let mut waited = Duration::ZERO;
     let mut due = Duration::ZERO;
     let mut announced: Option<(u128, u128)> = None;
+    let mut asked_while_waiting: Option<Instant> = None;
     loop {
         if superseded(mine) {
             return Ok(());
+        }
+        if retry.is_some() && asked_while_waiting.unwrap_or(entered).elapsed() >= discovery_retry_every() {
+            if ask_again(registry, rate_limit, &mut retry, mine) {
+                return Ok(());
+            }
+            asked_while_waiting = Some(Instant::now());
+            // A request replaces the funding snapshot; a balance read restores it.
+            due = waited;
         }
         if waited >= due {
             // A membership that arrived by another route — register_membership
@@ -749,6 +855,19 @@ fn provision_one(
     //    nothing: the registry is the newer pass's, or nobody's.
     if superseded(mine) {
         return Ok(());
+    }
+    // A pass funded before its first retry probes once more, no sooner than
+    // `DISCOVERY_RETRY_SECS` after it began, before paying.
+    if retry.is_some() && asked_while_waiting.is_none() {
+        while entered.elapsed() < discovery_retry_every() {
+            if superseded(mine) {
+                return Ok(());
+            }
+            std::thread::sleep(TICK.min(discovery_retry_every().saturating_sub(entered.elapsed())));
+        }
+        if ask_again(registry, rate_limit, &mut retry, mine) {
+            return Ok(());
+        }
     }
     wait_confirmed_any(mine);
     if superseded(mine) {
@@ -1281,6 +1400,182 @@ mod tests {
         assert_eq!(step.step, ensure::Step::AwaitingFunding);
         assert_eq!(step.detail, "keystore locked");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gifter's reply to a request whose allocator was not discovered.
+    fn missed(text: &str) -> Result<String, ApiError> {
+        Ok(serde_json::json!({ "error": format!("no allocator granted and none is configured: {text}") }).to_string())
+    }
+
+    /// A `discover` reply listing `n` allocators.
+    fn listed(n: usize) -> Result<String, ApiError> {
+        let candidates: Vec<_> = (0..n).map(|i| serde_json::json!({ "peerId": format!("p{i}"), "addrs": ["/m"] })).collect();
+        Ok(serde_json::json!({ "serviceId": "s", "candidates": candidates, "joined": true, "peers": 3 }).to_string())
+    }
+
+    /// A discovered allocator's grant, with the registry's read-back already
+    /// in: every pending record goes active at leaf 5.
+    fn granted(args: &serde_json::Value) -> Result<String, ApiError> {
+        let store = crate::sealed_store::store::current().expect("a published store");
+        for r in store.pending_records() {
+            store
+                .update_cache(&r.hash, |m| {
+                    m.state = MembershipState::Active;
+                    m.leaf_index = Some(5);
+                })
+                .unwrap();
+        }
+        Ok(serde_json::json!({ "leaf_index": 5, "gifterPeerId": "p", "discovered": true, "config_account": args["config"] }).to_string())
+    }
+
+    type Answers = dyn Fn(&str, usize, &serde_json::Value, &str) -> Result<String, ApiError> + Send + Sync;
+
+    /// A pass over the fake backend, its payer holding `balance`; the gifter
+    /// answers the `n`th call (from 0) of `method` with
+    /// `answers(method, n, args, registry)`. Undoes the installed gifter, the
+    /// retry interval and the store on drop.
+    struct DiscoveryPass {
+        dir: std::path::PathBuf,
+        _imp: crate::LogosRlnModuleImpl,
+        registry: String,
+        requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        probes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DiscoveryPass {
+        fn new(name: &str, balance: u128, answers: Box<Answers>) -> Self {
+            use crate::provider::fake::{self, FakePayer, FakeRegistry, FakeTree};
+            use std::sync::{atomic::AtomicUsize, Arc};
+            let dir = std::env::temp_dir().join(format!("rln-discovery-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let (imp, _store) = imp_with_store(dir.clone());
+            assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+            let registry = registry_id::parse(&format!("fakens:local:{name}")).unwrap().canonical;
+            crate::test_support::install_backend(fake::backend(
+                FakeTree::default(),
+                FakeRegistry {
+                    membership: None,
+                    bounds: Some(serde_json::json!({ "price_per_unit": "1", "min_rate_limit": 1, "max_rate_limit": 1000 })),
+                },
+                FakePayer { balance: Some(balance) },
+            ));
+            crate::provider::fake::REGISTER_CALLS.store(0, Ordering::SeqCst);
+            let (requests, probes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let (r, p, at) = (requests.clone(), probes.clone(), registry.clone());
+            crate::test_support::install_gifter(Box::new(move |method, args| {
+                let n = if method == "request" { &r } else { &p }.fetch_add(1, Ordering::SeqCst);
+                answers(method, n, args, &at)
+            }));
+            DiscoveryPass { dir, _imp: imp, registry, requests, probes }
+        }
+
+        fn run(&self, allocator: serde_json::Value) {
+            let allocator = DelegatedOptions::from_allocator_block(Some(&allocator), "x").unwrap();
+            ensure::run_with(
+                vec![ensure::Provision { registry: self.registry.clone(), rate_limit: 100, allocator }],
+                ensure::supersede(),
+            );
+        }
+
+        fn counts(&self) -> (usize, usize, usize, usize) {
+            let records = crate::sealed_store::store::current().unwrap().records_for(&self.registry).len();
+            (
+                self.requests.load(Ordering::SeqCst),
+                self.probes.load(Ordering::SeqCst),
+                crate::provider::fake::REGISTER_CALLS.load(Ordering::SeqCst),
+                records,
+            )
+        }
+    }
+
+    impl Drop for DiscoveryPass {
+        fn drop(&mut self) {
+            *crate::lock(&crate::test_support::INSTALLED_GIFTER) = None;
+            DISCOVERY_RETRY_SECS.store(60, Ordering::SeqCst);
+            crate::sealed_store::store::publish(None);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    // A funded payer still waits out the retry interval and probes once more
+    // before paying: an allocator listed by then is asked and grants.
+    #[test]
+    fn a_funded_pass_probes_a_missed_allocator_once_more_before_paying() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        DISCOVERY_RETRY_SECS.store(2, Ordering::SeqCst);
+        let pass = DiscoveryPass::new("funded-grace", 1_000_000_000_000, Box::new(|method, n, args, _| match (method, n) {
+            ("request", 0) => missed("no allocator advertises R/peer-any"),
+            ("request", _) => granted(args),
+            _ => listed(1),
+        }));
+        let began = std::time::Instant::now();
+        pass.run(serde_json::json!({}));
+        let step = ensure::progress(&pass.registry).expect("a step is recorded");
+        assert_eq!(step.step, ensure::Step::Done, "{}", step.detail);
+        assert!(step.detail.contains("(discovered)"), "{}", step.detail);
+        assert!(step.fallback_reason.is_none());
+        // (requests, probes, funded submits, records): the refusal and the grant.
+        assert_eq!(pass.counts(), (2, 1, 0, 2));
+        assert!(began.elapsed() >= std::time::Duration::from_secs(2), "the probe waits out the interval");
+    }
+
+    // An unfunded payer keeps probing every interval, each miss replacing the
+    // fallback reason without a request, until an allocator is listed and
+    // grants.
+    #[test]
+    fn an_unfunded_pass_keeps_probing_a_missed_allocator() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        DISCOVERY_RETRY_SECS.store(1, Ordering::SeqCst);
+        let seen = std::sync::Arc::new(Mutex::new(None));
+        let saw = seen.clone();
+        let pass = DiscoveryPass::new("unfunded", 0, Box::new(move |method, n, args, registry| match (method, n) {
+            ("request", 0) => missed("discovery not joined: no connected peer after 20s"),
+            ("request", _) => {
+                *crate::lock(&saw) = ensure::progress(registry).and_then(|p| p.fallback_reason);
+                granted(args)
+            }
+            (_, 0) => listed(0),
+            _ => listed(1),
+        }));
+        pass.run(serde_json::json!({}));
+        let step = ensure::progress(&pass.registry).expect("a step is recorded");
+        assert_eq!(step.step, ensure::Step::Done, "{}", step.detail);
+        assert!(step.detail.contains("(discovered)"), "{}", step.detail);
+        assert!(step.fallback_reason.is_none());
+        assert_eq!(pass.counts(), (2, 2, 0, 2), "no request, and no record, for the empty probe");
+        let seen = crate::lock(&seen).clone();
+        assert!(seen.as_deref().is_some_and(|r| r.contains("discovery: no allocator yet (3 peers)")), "{seen:?}");
+    }
+
+    // A node that cannot discover at all is neither probed nor asked again;
+    // the funded path runs.
+    #[test]
+    fn discovery_unavailable_is_asked_once_and_paid_for() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        DISCOVERY_RETRY_SECS.store(1, Ordering::SeqCst);
+        let pass = DiscoveryPass::new("unavailable", 1_000_000_000_000, Box::new(|method, _, _, _| match method {
+            "request" => missed("discovery unavailable: no service discovery on this node"),
+            _ => listed(1),
+        }));
+        pass.run(serde_json::json!({}));
+        let step = ensure::progress(&pass.registry).expect("a step is recorded");
+        assert_eq!(pass.counts(), (1, 0, 1, 2), "the funded submit was reached");
+        assert_eq!(step.step, ensure::Step::Refused, "the fake registry refuses every submit");
+        assert!(step.fallback_reason.as_deref().is_some_and(|r| r.contains("discovery unavailable")), "{:?}", step.fallback_reason);
+    }
+
+    // A pinned pair alone has nothing to probe: its refusal goes straight to
+    // the funded path.
+    #[test]
+    fn a_pinned_pair_is_not_probed() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        DISCOVERY_RETRY_SECS.store(1, Ordering::SeqCst);
+        let pass = DiscoveryPass::new("pinned", 1_000_000_000_000, Box::new(|method, _, _, _| match method {
+            "request" => missed("no allocator advertises R/peer-any"),
+            _ => listed(1),
+        }));
+        pass.run(serde_json::json!({ "peer_id": "p", "multiaddr": "/m", "discover": false }));
+        assert_eq!(pass.counts(), (1, 0, 1, 2));
     }
 
     // Any registry's pending registration is every pass's nonce.

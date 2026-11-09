@@ -352,11 +352,71 @@ pub(crate) fn gifter_request_async(
     args_json: &str,
     on_done: RegisterCallback,
 ) -> Result<(), ApiError> {
+    #[cfg(test)]
+    if let Some(gifter) = lock(&crate::test_support::INSTALLED_GIFTER).as_ref() {
+        let args = serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null);
+        let reply = gifter("request", &args)?;
+        on_done(Ok(reply));
+        return Ok(());
+    }
     let client = gifter_client();
     let args_json = args_json.to_string();
     dispatch_recorded("request", on_done, |done| {
         client.request_async_with_timeout(&args_json, GIFTER_REQUEST_TIMEOUT, done)
     })
+}
+
+/// The gifter's `discover` budget: its own wait for a connected peer (20 s)
+/// plus the service-discovery lookups, with dispatch margin.
+pub(crate) const GIFTER_DISCOVER_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The gifter's `discover` reply: how many allocators advertise the pair,
+/// and — from gifter 0.6.0 — whether the node had joined discovery and how
+/// many peers it had. `error` is the gifter's own failure text.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DiscoverReply {
+    pub candidates: usize,
+    pub joined: Option<bool>,
+    pub peers: Option<u64>,
+    pub error: Option<String>,
+}
+
+impl DiscoverReply {
+    fn from_reply(raw: &str) -> Result<Self, ApiError> {
+        let v: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|e| ApiError::new(ErrorKind::ProviderFailure, &format!("discover parse: {e}")))?;
+        Ok(DiscoverReply {
+            candidates: v.get("candidates").and_then(|c| c.as_array()).map_or(0, Vec::len),
+            joined: v.get("joined").and_then(|j| j.as_bool()),
+            peers: v.get("peers").and_then(|p| p.as_u64()),
+            error: v.get("error").map(|e| e.as_str().map(String::from).unwrap_or_else(|| e.to_string())),
+        })
+    }
+}
+
+/// Ask the gifter module which allocators advertise `registry` (with
+/// `auth_type`, when the pass names one) — no credential, no request.
+pub(crate) fn gifter_discover_async(
+    registry: &CanonicalRegistryId,
+    auth_type: Option<&str>,
+) -> Result<DiscoverReply, ApiError> {
+    let mut args = serde_json::json!({ "config": registry.account });
+    if let Some(t) = auth_type {
+        args["authType"] = t.into();
+    }
+    #[cfg(test)]
+    if let Some(gifter) = lock(&crate::test_support::INSTALLED_GIFTER).as_ref() {
+        return DiscoverReply::from_reply(&gifter("discover", &args)?);
+    }
+    let client = gifter_client();
+    let args_json = args.to_string();
+    let raw = read_reply(
+        "discover",
+        await_reply("discover", GIFTER_DISCOVER_TIMEOUT, |done| {
+            client.discover_async_with_timeout(&args_json, GIFTER_DISCOVER_TIMEOUT, done)
+        }),
+    )?;
+    DiscoverReply::from_reply(&raw)
 }
 
 // ---------------------------------------------------------- provider traits
@@ -768,6 +828,9 @@ pub(crate) mod fake {
         }
     }
 
+    /// Every `FakeRegistry::register_async` call, across instances.
+    pub(crate) static REGISTER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
     /// `membership`: None = no answer, Some(None) = not registered,
     /// Some(Some((state, leaf_index, rate_limit))) = registered.
     #[derive(Default)]
@@ -797,6 +860,7 @@ pub(crate) mod fake {
             _: u64,
             _: RegisterCallback,
         ) -> Result<(), ApiError> {
+            REGISTER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(unanswered("register_async"))
         }
 

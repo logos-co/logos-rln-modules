@@ -93,6 +93,15 @@ pub(crate) fn is_retryable_submit_error(e: &ApiError) -> bool {
     matches!(e.kind, ErrorKind::Transient | ErrorKind::NotReady | ErrorKind::ProviderFailure)
 }
 
+/// Whether an allocator refusal is a discovery miss that a later ask can
+/// turn into a grant: no allocator advertised the registry yet, or the node
+/// had no connected peer to search through. `discovery unavailable` (this
+/// node cannot discover at all), a verifier's refusal and an unsent request
+/// are not.
+pub(crate) fn discovery_can_retry(reason: &str) -> bool {
+    reason.contains("no allocator advertises") || reason.contains("discovery not joined")
+}
+
 /// The registry module's refusal to submit, from a register_member reply
 /// `{"error":"<kind>: <reason>"}`; None for an accepted submission.
 pub(crate) fn register_refusal(reply: &str) -> Option<String> {
@@ -499,6 +508,16 @@ mod tests {
         assert_eq!(yielded, None, "the snapshot was Pending, the record is Active: no write");
         assert_eq!(store.membership("hp").unwrap().cache.state, MembershipState::Active);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_discovery_miss_is_worth_asking_again() {
+        let wrap = |t: &str| format!("a discovered allocator for R: gifter_failed: no allocator granted and none is configured: {t}");
+        assert!(discovery_can_retry(&wrap("no allocator advertises R/peer-any")));
+        assert!(discovery_can_retry(&wrap("discovery not joined: no connected peer after 20s")));
+        assert!(!discovery_can_retry(&wrap("discovery unavailable: no service discovery")));
+        assert!(!discovery_can_retry("allocator p at /m: gifter_failed: verifier refused: bad attestation"));
+        assert!(!discovery_can_retry("allocator p at /m: not submitted: provider_failure"));
     }
 
     #[test]
