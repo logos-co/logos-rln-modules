@@ -493,10 +493,10 @@ impl EnvView {
     fn from_env() -> Self {
         // OWNERSHIP: the trimmed copy outlives the variable's temporary String.
         let read = |name: &str| std::env::var(name).unwrap_or_default().trim().to_owned();
-        Self {
-            sequencer: read(SEQUENCER_ENV),
-            network: read(NETWORK_ENV).to_ascii_lowercase(),
-        }
+        let sequencer = read(SEQUENCER_ENV);
+        let mut network = read(NETWORK_ENV);
+        network.make_ascii_lowercase();
+        Self { sequencer, network }
     }
 }
 
