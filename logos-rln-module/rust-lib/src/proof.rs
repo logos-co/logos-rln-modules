@@ -946,7 +946,7 @@ mod tests {
 
         // A tampered public value breaks reconstruction or verification —
         // never a silent pass.
-        let mut bad = decomposed.clone();
+        let mut bad = decomposed;
         bad["share_y"] = serde_json::json!("11".repeat(32));
         match RateLimitProof::from_json(&bad) {
             Err(_) => {}

@@ -461,7 +461,7 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
             // Resume confirmation polling for records that were pending at
             // the last shutdown.
             if let StoreCell::Ready(store) = &*self.store.read().unwrap() {
-                if !store.pending_records().is_empty() {
+                if store.has_pending() {
                     poller::ensure_running();
                 }
                 keychain::lazy_auto_unlock();

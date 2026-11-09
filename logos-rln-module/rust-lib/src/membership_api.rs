@@ -159,7 +159,7 @@ pub(crate) fn get_membership_state_impl(
         // Why, and whether to try again — read back after the write above so
         // a reason this very call recorded is what the caller sees.
         if let Some(now) = store.membership(hash) {
-            view = view.with_failure(now.cache.failed_reason.clone(), now.cache.retryable);
+            view = view.with_failure(now.cache.failed_reason, now.cache.retryable);
         }
     }
     ok_json(view)
@@ -188,11 +188,8 @@ pub(crate) fn select_membership_impl(
     let record = records
         .iter()
         .find(|r| r.hash == hash)
-        .cloned()
         .ok_or_else(|| ApiError::internal("selected record vanished"))?;
-    Ok(views::public_membership(
-        &hash, &record, false, false, false,
-    ))
+    Ok(views::public_membership(&hash, record, false, false, false))
 }
 
 /// ensure_membership(registry): `start()`'s provisioning for one registry,

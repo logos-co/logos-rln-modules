@@ -132,12 +132,12 @@ pub(crate) fn funded_submit_callback(
 ) -> provider::RegisterCallback {
     Box::new(move |result| {
         let update = match store.upgrade() {
-            Some(store) => store.update_cache(&hash, |m| match &result {
+            Some(store) => store.update_cache(&hash, |m| match result {
                 // The lez module refused to submit (an argument or balance the
                 // program would reject). Nothing was sent: fail now with its
                 // reason instead of waiting out the confirmation window.
-                Ok(reply) if register_refusal(reply).is_some() => {
-                    let why = register_refusal(reply).unwrap_or_default();
+                Ok(reply) if register_refusal(&reply).is_some() => {
+                    let why = register_refusal(&reply).unwrap_or_default();
                     m.record_async_submit_error(&why, false)
                 }
                 // A reply that lands after the poller confirmed the record
@@ -145,17 +145,17 @@ pub(crate) fn funded_submit_callback(
                 // estimate must not replace the chain's leaf.
                 Ok(_) if m.state != MembershipState::Pending => {}
                 Ok(reply) => {
-                    m.tx_result = Some(reply.clone());
                     // The reply's leaf_index is a pre-submit ESTIMATE; recorded
                     // for observability, authoritative only after the poller's
                     // read-back.
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(reply) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&reply) {
                         if let Some(leaf) = v.get("leaf_index").and_then(|x| x.as_u64()) {
                             m.leaf_index = Some(leaf);
                         }
                     }
+                    m.tx_result = Some(reply);
                 }
-                Err(e) => m.record_async_submit_error(&e.message, is_retryable_submit_error(e)),
+                Err(e) => m.record_async_submit_error(&e.message, is_retryable_submit_error(&e)),
             }),
             None => Err(ApiError::internal(
                 "store closed before the submit callback landed",
@@ -200,8 +200,8 @@ pub(crate) fn delegated_submit_callback(
         };
         let before = store.membership(&hash);
         let mut reopened = false;
-        let update = store.update_cache(&hash, |m| match &result {
-            Ok(reply) => match serde_json::from_str::<serde_json::Value>(reply) {
+        let update = store.update_cache(&hash, |m| match result {
+            Ok(reply) => match serde_json::from_str::<serde_json::Value>(&reply) {
                 Ok(v) => {
                     let granted_elsewhere = v
                         .get("config_account")
@@ -257,10 +257,10 @@ pub(crate) fn delegated_submit_callback(
                     eprintln!(
                         "membership delegated callback: unparseable gifter reply ({parse}): {reply}"
                     );
-                    m.tx_result = Some(reply.clone());
+                    m.tx_result = Some(reply);
                 }
             },
-            Err(e) => m.record_async_submit_error(&e.message, is_retryable_submit_error(e)),
+            Err(e) => m.record_async_submit_error(&e.message, is_retryable_submit_error(&e)),
         });
         let prior = match update {
             Ok(prior) => prior,
@@ -285,7 +285,8 @@ pub(crate) fn delegated_submit_callback(
 pub(crate) static REGISTER_IN_FLIGHT: Mutex<Option<std::collections::HashSet<(String, String)>>> =
     Mutex::new(None);
 
-pub(crate) struct RegisterClaim(String, String);
+/// Holds its `REGISTER_IN_FLIGHT` key, removed on drop.
+pub(crate) struct RegisterClaim((String, String));
 
 impl RegisterClaim {
     /// Taken BEFORE argument validation, so any test that reaches
@@ -295,20 +296,23 @@ impl RegisterClaim {
     pub(crate) fn take(registry: &str, rln_id_hex: &str) -> Result<RegisterClaim, ApiError> {
         let mut set = lock(&REGISTER_IN_FLIGHT);
         let set = set.get_or_insert_with(std::collections::HashSet::new);
-        if !set.insert((registry.to_string(), rln_id_hex.to_string())) {
+        let key = (registry.to_string(), rln_id_hex.to_string());
+        if set.contains(&key) {
             return Err(ApiError::new(
                 ErrorKind::ProviderFailure,
                 "a registration for this scope is already in flight — retry to observe its result",
             ));
         }
-        Ok(RegisterClaim(registry.to_string(), rln_id_hex.to_string()))
+        // OWNERSHIP: the set and the claim each own the key.
+        set.insert(key.clone());
+        Ok(RegisterClaim(key))
     }
 }
 
 impl Drop for RegisterClaim {
     fn drop(&mut self) {
         if let Some(set) = lock(&REGISTER_IN_FLIGHT).as_mut() {
-            set.remove(&(self.0.clone(), self.1.clone()));
+            set.remove(&self.0);
         }
     }
 }
@@ -931,7 +935,7 @@ mod tests {
             ("auth_type", "voucher-v1"),
             ("auth_payload", "deadbeef"),
         ]);
-        let out = imp.register_membership(registry.clone(), rln_id, opts);
+        let out = imp.register_membership(registry, rln_id, opts);
         assert!(out.contains(r#""kind":"provider_failure""#), "got: {out}");
 
         sealed_store::store::publish(None);

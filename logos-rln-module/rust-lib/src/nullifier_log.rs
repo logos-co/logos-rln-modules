@@ -86,7 +86,12 @@ pub(crate) fn record_verified(
 ) -> RecordOutcome {
     let mut guard = crate::util::lock(&LOG);
     let log = guard.get_or_insert_with(HashMap::new);
-    let epochs = log.entry(registry.to_string()).or_default();
+    // The registry's key is allocated only on its first verified proof.
+    let epochs = match log.get_mut(registry) {
+        Some(epochs) => epochs,
+        // OWNERSHIP: the map owns its key.
+        None => log.entry(registry.to_string()).or_default(),
+    };
     epochs.retain(|&e, _| e >= retain_floor);
     let bucket = epochs.entry(epoch).or_default();
     match bucket.get(&nullifier).copied() {

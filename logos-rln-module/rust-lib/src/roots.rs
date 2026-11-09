@@ -115,10 +115,13 @@ pub(crate) fn admit(canonical: &str, root: [u8; 32]) {
 pub(crate) fn track(registry: &CanonicalRegistryId) {
     {
         let mut guard = lock(&TRACKED);
-        guard
-            .get_or_insert_with(HashMap::new)
-            .entry(registry.canonical.clone())
-            .or_insert_with(|| registry.clone());
+        let tracked = guard.get_or_insert_with(HashMap::new);
+        // First interest wins: an existing entry is kept. The key is
+        // allocated only on that first call (every generate/validate lands here).
+        if !tracked.contains_key(&registry.canonical) {
+            // OWNERSHIP: the map owns its key and its copy of the id.
+            tracked.insert(registry.canonical.clone(), registry.clone());
+        }
     }
     ensure_refresher();
 }
@@ -201,13 +204,21 @@ fn refresh_one(registry: &CanonicalRegistryId) -> Result<(), ApiError> {
 
 fn refresh_one_with(registry: &CanonicalRegistryId, tree: &dyn TreeSource) -> Result<(), ApiError> {
     let roots = tree.valid_roots(registry)?.lifted();
-    lock(&WINDOWS).get_or_insert_with(HashMap::new).insert(
-        registry.canonical.clone(),
-        Window {
-            roots,
-            updated_at: crate::util::now_unix(),
-        },
-    );
+    let mut guard = lock(&WINDOWS);
+    let windows = guard.get_or_insert_with(HashMap::new);
+    let window = Window {
+        roots,
+        updated_at: crate::util::now_unix(),
+    };
+    // Replaces any existing window; the key is allocated only for a registry
+    // with no window yet.
+    match windows.get_mut(&registry.canonical) {
+        Some(w) => *w = window,
+        None => {
+            // OWNERSHIP: the map owns its key.
+            windows.insert(registry.canonical.clone(), window);
+        }
+    }
     Ok(())
 }
 

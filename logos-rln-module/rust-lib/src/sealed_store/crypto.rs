@@ -189,7 +189,7 @@ mod tests {
     fn wrong_key_fails_bad_password() {
         let key = seal_key();
         let (nonce, ct) = seal(&key, b"aad", b"secret").unwrap();
-        let mut other = *key.clone();
+        let mut other = *key;
         other[0] ^= 1;
         let r = unseal(&other, &nonce, b"aad", &ct);
         assert!(matches!(r, Err(CryptoError::BadPassword)));

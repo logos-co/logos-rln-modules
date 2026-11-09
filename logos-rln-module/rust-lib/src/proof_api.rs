@@ -555,12 +555,7 @@ mod tests {
             serde_json::json!({ "verdict": "invalid" })
         );
         // Malformed: non-canonical, short, or the raw bytes in the hash slot.
-        for bad in [
-            "ff".repeat(32),
-            "ab".repeat(31),
-            signal_hex.clone(),
-            "zz".into(),
-        ] {
+        for bad in ["ff".repeat(32), "ab".repeat(31), signal_hex, "zz".into()] {
             let err = prehashed(&bad).unwrap_err();
             assert_eq!(
                 err.kind,
@@ -1185,14 +1180,8 @@ mod tests {
             .update_cache(&hash, |m| m.leaf_index = None)
             .expect("clear the leaf");
 
-        let err = generate_proof_impl(
-            Ok(store.clone()),
-            &reg,
-            &rln_id_hex,
-            "aa",
-            &now_unix().to_string(),
-        )
-        .expect_err("a usable row without a leaf must not prove against leaf 0");
+        let err = generate_proof_impl(Ok(store), &reg, &rln_id_hex, "aa", &now_unix().to_string())
+            .expect_err("a usable row without a leaf must not prove against leaf 0");
         assert_eq!(
             err.kind,
             ErrorKind::UnknownMembership,
@@ -1264,7 +1253,7 @@ mod tests {
             leaf_index,
         );
         let out = generate_proof_impl(
-            Ok(store.clone()),
+            Ok(store),
             &reg,
             &rln_id_hex,
             signal_hex,
@@ -1351,7 +1340,7 @@ mod tests {
         assert_eq!(bad.kind, ErrorKind::InvalidArgument, "got: {}", bad.message);
 
         let out = generate_proof_with(
-            Ok(store.clone()),
+            Ok(store),
             &reg,
             &rln_id_hex,
             SignalArg::Prehashed(&hash_hex),
@@ -1430,7 +1419,7 @@ mod tests {
         let now_epoch = rate_limit::current_epoch(now_unix(), size);
         // One epoch in the past — inside now ± max_epoch_gap (=1).
         let ts = (now_unix() - size).to_string();
-        let out = generate_proof_impl(Ok(store.clone()), &reg, &rln_id_hex, "aa", &ts)
+        let out = generate_proof_impl(Ok(store), &reg, &rln_id_hex, "aa", &ts)
             .expect("a past-but-in-window timestamp still proves");
         assert_eq!(
             out.get("epoch_index").and_then(|v| v.as_u64()),

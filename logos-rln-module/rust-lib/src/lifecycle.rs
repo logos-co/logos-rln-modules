@@ -208,12 +208,14 @@ pub fn merge_state(
 /// must NOT emit). `record` is the PRE-transition record, so `previous` is
 /// the state held just before the change; an empty `rln_identifier`
 /// carries through verbatim.
-pub fn transition_event(
-    hash: &str,
-    record: &MembershipRecord,
+// OWNERSHIP: the ids borrow `hash` and `record` for the emit call; the two
+// state strings are computed.
+pub fn transition_event<'a>(
+    hash: &'a str,
+    record: &'a MembershipRecord,
     prior: MembershipState,
     new_state: MembershipState,
-) -> Option<(String, String, String, String, String)> {
+) -> Option<(&'a str, &'a str, &'a str, String, String)> {
     if new_state == prior {
         return None;
     }
@@ -226,9 +228,9 @@ pub fn transition_event(
             .unwrap_or_default()
     };
     Some((
-        record.identity.registry_id.clone(),
-        record.identity.rln_identifier.clone(),
-        hash.to_string(),
+        &record.identity.registry_id,
+        &record.identity.rln_identifier,
+        hash,
         wire(new_state),
         wire(prior),
     ))
@@ -248,9 +250,9 @@ pub(crate) fn emit_transition(
         transition_event(hash, record, prior, new_state)
     {
         crate::generated::emit_membership_state_changed(
-            &registry_id,
-            &rln_identifier,
-            &membership_hash,
+            registry_id,
+            rln_identifier,
+            membership_hash,
             &state,
             &previous,
         );
@@ -283,6 +285,27 @@ impl CacheFile {
 impl Default for CacheFile {
     fn default() -> CacheFile {
         CacheFile::new()
+    }
+}
+
+/// `CacheFile`'s serialized form over a borrowed entry map: the same fields
+/// in the same order, so the written bytes are identical.
+// OWNERSHIP: serialisation view; borrows the store's cache map for one write
+// (`format` is the FORMAT_CACHE constant).
+#[derive(Serialize)]
+pub struct CacheFileRef<'a> {
+    pub format: &'static str,
+    pub version: u32,
+    pub entries: &'a BTreeMap<String, CacheState>,
+}
+
+impl<'a> CacheFileRef<'a> {
+    pub fn new(entries: &'a BTreeMap<String, CacheState>) -> CacheFileRef<'a> {
+        CacheFileRef {
+            format: FORMAT_CACHE,
+            version: crate::sealed_store::format::FORMAT_VERSION,
+            entries,
+        }
     }
 }
 

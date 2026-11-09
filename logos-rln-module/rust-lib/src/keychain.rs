@@ -280,15 +280,15 @@ fn auto_unlock_core(
     store: &sealed::Store,
 ) -> Result<(usize, &'static str, Zeroizing<String>), ApiError> {
     let _walk = crate::util::lock(&AUTO_UNLOCK);
-    let dir = store.base_dir().to_path_buf();
+    let dir = store.base_dir();
     let account = account_for_dir(&dir.to_string_lossy());
-    let (file_secret, file_note) = read_file_secret(&dir);
+    let (file_secret, file_note) = read_file_secret(dir);
     let mut rejected_file: Option<ApiError> = None;
     if let Some(password) = file_secret {
         match store.unlock(&password) {
             Ok(count) => return Ok((count, "existing", password)),
             Err(e) if e.kind == ErrorKind::BadPassword => {
-                quarantine_secret_file(&dir);
+                quarantine_secret_file(dir);
                 rejected_file = Some(e);
             }
             Err(e) => return Err(e),
@@ -330,7 +330,7 @@ fn auto_unlock_core(
     getrandom::getrandom(raw.as_mut())
         .map_err(|e| ApiError::internal(format!("no entropy for secret: {e}")))?;
     let secret = Zeroizing::new(registry_id::bytes_to_hex(&raw[..]));
-    crate::sealed_store::fs::write_durable(&dir, AUTO_SECRET_FILE, secret.as_bytes())
+    crate::sealed_store::fs::write_durable(dir, AUTO_SECRET_FILE, secret.as_bytes())
         .map_err(|e| ApiError::internal(format!("could not persist the generated secret: {e}")))?;
     let count = store.unlock(&secret)?;
     Ok((count, "created", secret))
@@ -363,7 +363,7 @@ pub(crate) fn lazy_auto_unlock() {
     let Some(store) = sealed::current() else {
         return;
     };
-    if store.session_password().is_some() {
+    if store.is_unlocked() {
         return;
     }
     match auto_unlock_core(&store) {
@@ -382,7 +382,7 @@ pub(crate) fn lazy_auto_unlock() {
 /// plaintext never re-crosses the wire; it is read from the store here.
 pub(crate) fn remember_impl() -> Result<serde_json::Value, ApiError> {
     let store = sealed::current_or_uninit()?;
-    let dir = store.base_dir().to_string_lossy().into_owned();
+    let dir = store.base_dir().to_string_lossy();
     let password = store.session_password().ok_or_else(|| {
         ApiError::new(
             ErrorKind::Locked,
@@ -608,7 +608,7 @@ mod tests {
         );
         assert_eq!(
             session_secret(),
-            Some(secret.clone()),
+            Some(secret),
             "and it is what unlocked the store"
         );
 

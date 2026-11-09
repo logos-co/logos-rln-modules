@@ -11,7 +11,7 @@ use zeroize::Zeroizing;
 
 use crate::error::{ApiError, ErrorKind};
 use crate::lifecycle::{
-    CacheFile, CacheState, MembershipRecord, MembershipState, StoredCredential,
+    CacheFile, CacheFileRef, CacheState, MembershipRecord, MembershipState, StoredCredential,
 };
 use crate::rate_limit::{remaining, reserve_slot, AllocError, AllocationState, EpochAllocation};
 use crate::registry_id;
@@ -369,6 +369,11 @@ impl Store {
         crate::util::lock(&self.write).session = None;
     }
 
+    /// Whether a session is open (what `session_password` would return `Some` for).
+    pub fn is_unlocked(&self) -> bool {
+        crate::util::lock(&self.write).session.is_some()
+    }
+
     /// The active session password, if unlocked — a Zeroizing clone for
     /// keychain persistence.
     pub fn session_password(&self) -> Option<Zeroizing<String>> {
@@ -553,9 +558,18 @@ impl Store {
         self.snapshot_arc()
             .records
             .values()
-            .filter(|r| !r.quarantined && r.cache.state == MembershipState::Pending)
+            .filter(|r| awaits_confirmation(r))
+            // OWNERSHIP: the poller works on owned records outside the snapshot lock.
             .cloned()
             .collect()
+    }
+
+    /// Whether `pending_records` would be non-empty.
+    pub fn has_pending(&self) -> bool {
+        self.snapshot_arc()
+            .records
+            .values()
+            .any(awaits_confirmation)
     }
 
     /// The state-refresh work list, widened to include Unknown — heal-only,
@@ -724,8 +738,9 @@ impl Store {
         }
         let quarantined =
             inner.census_quarantined.contains(hash) || inner.keyed_quarantined.contains(hash);
-        let alloc = inner.sections.get(hash).cloned().unwrap_or_default();
-        reservation_guards(quarantined, Some(&alloc), epoch_size_sec)?;
+        let default = AllocationState::default();
+        let alloc = inner.sections.get(hash).unwrap_or(&default);
+        reservation_guards(quarantined, Some(alloc), epoch_size_sec)?;
         if epoch < alloc.prune_floor {
             return Err(floor_refusal());
         }
@@ -938,6 +953,11 @@ fn load_sealed(dir: &Path) -> Result<Option<SealedFile>, OpenError> {
         )));
     }
     Ok(Some(file))
+}
+
+/// A record the poller confirms: non-quarantined `pending`.
+fn awaits_confirmation(r: &MembershipRecord) -> bool {
+    !r.quarantined && r.cache.state == MembershipState::Pending
 }
 
 struct LoadedAllocations {
@@ -1205,10 +1225,7 @@ fn write_allocations(dir: &Path, inner: &mut Inner) -> Result<(), ApiError> {
 }
 
 fn write_cache(dir: &Path, inner: &Inner) -> Result<(), ApiError> {
-    let file = CacheFile {
-        entries: inner.cache.clone(),
-        ..CacheFile::new()
-    };
+    let file = CacheFileRef::new(&inner.cache);
     fs::write_atomic_loose_json(dir, format::CACHE_FILE, &file)
         .map_err(|e| ApiError::internal(format!("cache save: {e}")))
 }
@@ -1351,7 +1368,7 @@ mod tests {
         assert_eq!(store.unlock("pw").unwrap(), 1);
         assert_eq!(
             store.epoch_size_bindings(),
-            vec![(hash.clone(), registry.to_string(), 600)]
+            vec![(hash.clone(), registry, 600)]
         );
         let rewound = store.reserve_message_id(&hash, "aa", 10, 9, 5, 600);
         assert!(matches!(rewound, Err(e) if e.kind == ErrorKind::Permanent));
@@ -2359,7 +2376,6 @@ mod tests {
         let reader = {
             let store = Arc::clone(&store);
             let done = Arc::clone(&done);
-            let registry = registry.clone();
             std::thread::spawn(move || {
                 // Readers only clone the published Arc, so the loop ends with
                 // the writer instead of waiting on any fsync.
@@ -2399,6 +2415,46 @@ mod tests {
         assert_eq!(
             rec.alloc.allocations.iter().map(|a| a.used).sum::<u64>(),
             20
+        );
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cache sidecar holds exactly the pretty JSON of an owned
+    /// `CacheFile` over the store's cache map: field order, skipped `None`s
+    /// and string escaping included.
+    #[test]
+    fn cache_file_bytes_are_the_owned_cache_file() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("cache-file-bytes");
+        let registry = format!("logos:local:{}", "dd".repeat(32));
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let full = insert_membership(&store, &registry, &[0x5du8; 32]);
+        let _bare = insert_membership(&store, &registry, &[0x5eu8; 32]);
+        store
+            .update_cache(&full, |c| {
+                c.state = MembershipState::Failed;
+                c.leaf_index = Some(9);
+                c.rate_limit = Some(100);
+                c.failed_reason = Some("gifter_failed: \"quoted\" \u{2014} \u{fc}".into());
+                c.retryable = Some(true);
+                c.tx_result = Some(r#"{"ok":true}"#.into());
+                c.first_active_at = Some(1);
+                c.confirm_deadline = Some(2);
+            })
+            .unwrap();
+
+        let expected = serde_json::to_string_pretty(&CacheFile {
+            entries: crate::util::lock(&store.write).cache.clone(),
+            ..CacheFile::new()
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(format::CACHE_FILE)).unwrap(),
+            expected
         );
 
         store.close();

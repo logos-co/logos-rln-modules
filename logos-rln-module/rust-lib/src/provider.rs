@@ -293,16 +293,14 @@ pub(crate) fn ensure_network(registry: &CanonicalRegistryId) -> Result<(), ApiEr
 /// The registries whose network `select_networks` asks about: the first of
 /// each distinct `logos` reference, in configuration order.
 fn networks_in_order(tracked: &[String]) -> Vec<CanonicalRegistryId> {
-    let mut seen: Vec<String> = Vec::new();
-    let mut out = Vec::new();
+    let mut out: Vec<CanonicalRegistryId> = Vec::new();
     for raw in tracked {
         let Ok(registry) = crate::registry_id::parse(raw) else {
             continue;
         };
-        if registry.namespace != "logos" || seen.contains(&registry.reference) {
+        if registry.namespace != "logos" || out.iter().any(|r| r.reference == registry.reference) {
             continue;
         }
-        seen.push(registry.reference.clone());
         out.push(registry);
     }
     out

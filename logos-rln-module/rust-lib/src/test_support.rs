@@ -108,6 +108,6 @@ pub(crate) fn seed_membership(
 pub(crate) fn imp_with_store(dir: std::path::PathBuf) -> (LogosRlnModuleImpl, Arc<Store>) {
     let imp = LogosRlnModuleImpl::default();
     imp.open_store(dir);
-    let store = imp.store().expect("test store open").clone();
+    let store = imp.store().expect("test store open");
     (imp, store)
 }

@@ -298,7 +298,6 @@ fn delegate_one(
                 let why = r
                     .cache
                     .failed_reason
-                    .clone()
                     .unwrap_or_else(|| format!("record went {:?}", r.cache.state));
                 return Delegated::Refused(format!("{who}: {why}"));
             }
@@ -537,10 +536,10 @@ fn settle_live(registry: &registry_id::CanonicalRegistryId, mine: u64) -> Live {
                 return Live::None;
             }
             let why = records
-                .iter()
+                .into_iter()
                 .filter(|r| r.cache.state == MembershipState::Failed)
                 .max_by_key(|r| r.identity.submitted_at)
-                .and_then(|r| r.cache.failed_reason.clone())
+                .and_then(|r| r.cache.failed_reason)
                 .unwrap_or_else(|| "the pending registration failed".to_string());
             return Live::Failed(why);
         }
@@ -1476,7 +1475,7 @@ mod tests {
         // A balance read refreshes the snapshot in place.
         let read = Funding {
             balance: Some(1_000_000),
-            ..first.clone()
+            ..first
         };
         record_funding(r, "…; it holds 1000000", read.clone());
         assert_eq!(progress(r).expect("refreshed").funding, Some(read));

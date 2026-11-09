@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn a_shallow_registry_reports_roots_at_circuit_depth() {
         let root = "11".repeat(32);
-        let reply = json!({ "depth": 9, "valid_roots": [root.clone()] });
+        let reply = json!({ "depth": 9, "valid_roots": [root] });
         let lifted = RootSet::from_provider_json(&reply)
             .expect("depth-9 reply")
             .lifted();
@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn a_full_depth_registry_passes_through() {
         let root = "22".repeat(32);
-        let reply = json!({ "depth": RLN_TREE_DEPTH, "valid_roots": [root.clone()] });
+        let reply = json!({ "depth": RLN_TREE_DEPTH, "valid_roots": [root] });
         let lifted = RootSet::from_provider_json(&reply)
             .expect("full-depth reply")
             .lifted();
@@ -315,13 +315,13 @@ mod tests {
     fn a_reply_with_no_depth_or_an_absurd_one_is_refused() {
         let root = "44".repeat(32);
         for bad in [
-            json!({ "valid_roots": [root.clone()] }),
-            json!({ "depth": 0, "valid_roots": [root.clone()] }),
-            json!({ "depth": 99, "valid_roots": [root.clone()] }),
+            json!({ "valid_roots": [root] }),
+            json!({ "depth": 0, "valid_roots": [root] }),
+            json!({ "depth": 99, "valid_roots": [root] }),
             json!({ "depth": 9, "valid_roots": ["not hex"] }),
             json!({ "depth": 9 }),
             json!("not a reply"),
-            json!([root.clone()]),
+            json!([root]),
         ] {
             let err = RootSet::from_provider_json(&bad)
                 .err()
