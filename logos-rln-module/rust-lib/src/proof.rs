@@ -406,10 +406,16 @@ fn fr_to_bytes32(fr: &Fr) -> [u8; 32] {
 /// owns the lifetime of the returned copy.
 fn secret_to_bytes32(secret: &SecretFr) -> [u8; 32] {
     let mut out = [0u8; 32];
+    write_secret_bytes32(secret, &mut out);
+    out
+}
+
+/// [`secret_to_bytes32`] into a buffer the caller provides, so a caller that
+/// wipes the buffer holds the only copy.
+fn write_secret_bytes32(secret: &SecretFr, out: &mut [u8; 32]) {
     secret
         .serialize_compressed(&mut out[..])
         .expect("SecretFr canonical LE form is exactly 32 bytes");
-    out
 }
 
 /// Extend a registry's Merkle path and root to the circuit's depth.
@@ -507,9 +513,12 @@ pub(crate) fn generate_identity() -> Result<(String, String), ProofError> {
     getrandom::getrandom(&mut seed).map_err(|e| ProofError::Engine(format!("rng: {e}")))?;
     let keys = IdentityKeys::generate_seeded::<PoseidonHash, ChaCha20Rng>(&seed);
     seed.zeroize();
+    // Serialized in place into a buffer wiped on drop.
+    let mut secret_bytes = Zeroizing::new([0u8; 32]);
+    write_secret_bytes32(&keys.identity_secret(), &mut secret_bytes);
     Ok((
         bytes_to_hex(&fr_to_bytes32(&keys.id_commitment())),
-        bytes_to_hex(&secret_to_bytes32(&keys.identity_secret())),
+        bytes_to_hex(&secret_bytes[..]),
     ))
 }
 

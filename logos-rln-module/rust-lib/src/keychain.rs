@@ -241,15 +241,17 @@ fn read_keychain_secret(
 ) -> Result<(Option<Zeroizing<String>>, Option<String>), ApiError> {
     match with_backend(|k| k.read(SERVICE, account)) {
         Ok(Some(payload)) => {
-            let bytes =
+            let mut bytes =
                 Zeroizing::new(registry_id::hex_to_vec(&payload).ok_or_else(|| {
                     keychain_err("keychain item payload is not hex — foreign item?")
                 })?);
-            let password = Zeroizing::new(
-                String::from_utf8(bytes.to_vec())
-                    .map_err(|_| keychain_err("keychain item payload is not a utf-8 password"))?,
-            );
-            Ok((Some(password), None))
+            // The decoded buffer moves into the password, or back out of the
+            // UTF-8 error, and is wiped on drop either way.
+            let password = String::from_utf8(std::mem::take(&mut *bytes)).map_err(|e| {
+                drop(Zeroizing::new(e.into_bytes()));
+                keychain_err("keychain item payload is not a utf-8 password")
+            })?;
+            Ok((Some(Zeroizing::new(password)), None))
         }
         Ok(None) => Ok((None, None)),
         Err(e) => Ok((None, Some(e))),
@@ -734,6 +736,27 @@ mod tests {
 
         let err = auto_unlock_impl().unwrap_err();
         assert_kind(&err, "keychain_unavailable");
+
+        teardown(&fixture);
+    }
+
+    #[test]
+    fn non_utf8_payload_is_keychain_unavailable() {
+        let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
+        let fixture = setup("non-utf8");
+        let account = account_for_dir(&fixture.dir.to_string_lossy());
+        crate::util::lock(&fixture.items).insert(
+            format!("{SERVICE}/{account}"),
+            registry_id::bytes_to_hex(&[0xff, 0xfe, 0x00]),
+        );
+
+        let err = auto_unlock_impl().unwrap_err();
+        assert_kind(&err, "keychain_unavailable");
+        assert!(
+            err.to_json().contains("not a utf-8 password"),
+            "{}",
+            err.to_json()
+        );
 
         teardown(&fixture);
     }

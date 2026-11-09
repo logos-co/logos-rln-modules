@@ -421,11 +421,9 @@ pub(crate) fn register_scoped(
     }
 
     // Generate the identity credential in-module; the secret is encrypted into
-    // the keystore and never returned across this interface.
+    // the keystore and never returned across this interface. It goes straight
+    // into the credential (wiped on drop), before any early return.
     let (commitment_hex, secret_hash_hex) = proof::generate_identity().map_err(proof_error)?;
-    let commitment = registry_id::hex_to_bytes32(&commitment_hex)
-        .ok_or_else(|| ApiError::internal("generated commitment is not 32 bytes"))?;
-    let hash = registry_id::membership_hash(&registry.canonical, &commitment);
     // OWNERSHIP: the credential owns its fields; the commitment is read again
     // below and the registry is borrowed.
     let credential = StoredCredential {
@@ -433,6 +431,9 @@ pub(crate) fn register_scoped(
         identity_secret_hash: secret_hash_hex,
         registry_id: registry.canonical.clone(),
     };
+    let commitment = registry_id::hex_to_bytes32(&commitment_hex)
+        .ok_or_else(|| ApiError::internal("generated commitment is not 32 bytes"))?;
+    let hash = registry_id::membership_hash(&registry.canonical, &commitment);
 
     // Pending record FIRST (an interrupted submit still leaves an auditable
     // record the poller will resolve), then the async submit, whose callback
