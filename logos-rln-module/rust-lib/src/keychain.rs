@@ -29,9 +29,9 @@
 //! writes the module-owned `rln_autounlock.secret`, and deleting THAT file
 //! orphans the credentials it unlocks — the user never saw the secret.
 
+use crate::error::{ApiError, ErrorKind};
 use crate::registry_id;
 use crate::sealed_store::store as sealed;
-use crate::error::{ApiError, ErrorKind};
 use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 use zeroize::Zeroizing;
@@ -73,7 +73,10 @@ impl Keychain for SecurityCli {
         Err(format!(
             "find-generic-password exit {:?}: {}",
             out.status.code(),
-            String::from_utf8_lossy(&out.stderr).chars().take(200).collect::<String>()
+            String::from_utf8_lossy(&out.stderr)
+                .chars()
+                .take(200)
+                .collect::<String>()
         ))
     }
 
@@ -118,7 +121,10 @@ fn run_security_batch(line: &str) -> Result<(), String> {
         Err(format!(
             "security -i exit {:?}: {}",
             out.status.code(),
-            String::from_utf8_lossy(&out.stderr).chars().take(200).collect::<String>()
+            String::from_utf8_lossy(&out.stderr)
+                .chars()
+                .take(200)
+                .collect::<String>()
         ))
     }
 }
@@ -201,7 +207,10 @@ fn read_file_secret(dir: &std::path::Path) -> (Option<Zeroizing<String>>, Option
         Ok(raw) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
-                (None, Some(format!("{AUTO_SECRET_FILE} is present but empty")))
+                (
+                    None,
+                    Some(format!("{AUTO_SECRET_FILE} is present but empty")),
+                )
             } else {
                 (Some(Zeroizing::new(trimmed.to_string())), None)
             }
@@ -231,10 +240,10 @@ fn read_keychain_secret(
 ) -> Result<(Option<Zeroizing<String>>, Option<String>), ApiError> {
     match with_backend(|k| k.read(SERVICE, account)) {
         Ok(Some(payload)) => {
-            let bytes = Zeroizing::new(
-                registry_id::hex_to_vec(&payload)
-                    .ok_or_else(|| keychain_err("keychain item payload is not hex — foreign item?"))?,
-            );
+            let bytes =
+                Zeroizing::new(registry_id::hex_to_vec(&payload).ok_or_else(|| {
+                    keychain_err("keychain item payload is not hex — foreign item?")
+                })?);
             let password = Zeroizing::new(
                 String::from_utf8(bytes.to_vec())
                     .map_err(|_| keychain_err("keychain item payload is not a utf-8 password"))?,
@@ -247,7 +256,10 @@ fn read_keychain_secret(
 }
 
 fn quarantine_secret_file(dir: &std::path::Path) {
-    let bad = dir.join(format!("{AUTO_SECRET_FILE}.bad.{}", crate::util::now_unix()));
+    let bad = dir.join(format!(
+        "{AUTO_SECRET_FILE}.bad.{}",
+        crate::util::now_unix()
+    ));
     eprintln!(
         "keystore auto-unlock: {AUTO_SECRET_FILE} does not open this keystore; attempting to \
          move it aside to {}",
@@ -348,7 +360,9 @@ pub(crate) fn lazy_auto_unlock() {
     if auto_unlock_disabled() {
         return;
     }
-    let Some(store) = sealed::current() else { return };
+    let Some(store) = sealed::current() else {
+        return;
+    };
     if store.session_password().is_some() {
         return;
     }
@@ -356,7 +370,10 @@ pub(crate) fn lazy_auto_unlock() {
         Ok((count, source, _)) => {
             eprintln!("keystore auto-unlock at init: {source} ({count} membership(s))");
         }
-        Err(e) => eprintln!("keystore auto-unlock at init: staying locked — {}", e.message),
+        Err(e) => eprintln!(
+            "keystore auto-unlock at init: staying locked — {}",
+            e.message
+        ),
     }
 }
 
@@ -367,7 +384,10 @@ pub(crate) fn remember_impl() -> Result<serde_json::Value, ApiError> {
     let store = sealed::current_or_uninit()?;
     let dir = store.base_dir().to_string_lossy().into_owned();
     let password = store.session_password().ok_or_else(|| {
-        ApiError::new(ErrorKind::Locked, "keystore is locked — unlock before remembering")
+        ApiError::new(
+            ErrorKind::Locked,
+            "keystore is locked — unlock before remembering",
+        )
     })?;
     let account = account_for_dir(&dir);
     let payload = Zeroizing::new(registry_id::bytes_to_hex(password.as_bytes()));
@@ -396,7 +416,10 @@ mod tests {
                 return Err("simulated keychain read denial".to_string());
             }
             let key = format!("{service}/{account}");
-            Ok(crate::util::lock(&self.items).get(&key).cloned().map(Zeroizing::new))
+            Ok(crate::util::lock(&self.items)
+                .get(&key)
+                .cloned()
+                .map(Zeroizing::new))
         }
         fn write(&self, service: &str, account: &str, payload_hex: &str) -> Result<(), String> {
             if self.fail_writes.load(Ordering::SeqCst) {
@@ -425,10 +448,17 @@ mod tests {
             fail_writes: fail_writes.clone(),
             fail_reads: fail_reads.clone(),
         }));
-        let dir = std::env::temp_dir().join(format!("rln-ms-keychain-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rln-ms-keychain-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = crate::test_support::publish_test_store(dir.clone());
-        Fixture { items, fail_writes, fail_reads, dir, store }
+        Fixture {
+            items,
+            fail_writes,
+            fail_reads,
+            dir,
+            store,
+        }
     }
 
     fn file_secret(fixture: &Fixture) -> Option<String> {
@@ -441,7 +471,10 @@ mod tests {
 
     fn assert_kind(err: &ApiError, kind: &str) {
         let json = err.to_json();
-        assert!(json.contains(&format!(r#""kind":"{kind}""#)), "expected {kind}, got: {json}");
+        assert!(
+            json.contains(&format!(r#""kind":"{kind}""#)),
+            "expected {kind}, got: {json}"
+        );
     }
 
     fn quarantined_secrets(fixture: &Fixture) -> Vec<String> {
@@ -495,7 +528,9 @@ mod tests {
 
     fn item_payload(fixture: &Fixture) -> Option<String> {
         let account = account_for_dir(&fixture.dir.to_string_lossy());
-        crate::util::lock(&fixture.items).get(&format!("{SERVICE}/{account}")).cloned()
+        crate::util::lock(&fixture.items)
+            .get(&format!("{SERVICE}/{account}"))
+            .cloned()
     }
 
     /// A stored credential so unlock() actually verifies (empty keystores
@@ -515,7 +550,9 @@ mod tests {
             identity_secret_hash: "22".repeat(32),
             registry_id: registry,
         };
-        store.insert(&"cd".repeat(32), identity, &credential, 100).expect("fixture credential");
+        store
+            .insert(&"cd".repeat(32), identity, &credential, 100)
+            .expect("fixture credential");
         store.lock();
     }
 
@@ -525,13 +562,22 @@ mod tests {
         let fixture = setup("fresh");
 
         let first = auto_unlock_impl().expect("fresh auto-unlock");
-        assert!(first.to_string().starts_with(r#"{"membership_count":"#), "got: {first}");
+        assert!(
+            first.to_string().starts_with(r#"{"membership_count":"#),
+            "got: {first}"
+        );
         assert_eq!(first["source"], "created");
         assert_eq!(first["unlocked"], true);
-        let secret = first["secret"].as_str().expect("secret in reply").to_string();
+        let secret = first["secret"]
+            .as_str()
+            .expect("secret in reply")
+            .to_string();
         assert_eq!(secret.len(), 64, "32 random bytes as hex");
         assert_eq!(file_secret(&fixture).expect("secret file written"), secret);
-        assert!(item_payload(&fixture).is_none(), "self-provision must not touch the keychain");
+        assert!(
+            item_payload(&fixture).is_none(),
+            "self-provision must not touch the keychain"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -539,7 +585,11 @@ mod tests {
                 .unwrap()
                 .permissions()
                 .mode();
-            assert_eq!(mode & 0o777, 0o600, "the secret file must be private to the owner");
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "the secret file must be private to the owner"
+            );
         }
 
         // Relaunch: same dir, fresh store — the file is reused, not recreated.
@@ -551,8 +601,16 @@ mod tests {
             second.get("secret").is_none(),
             "a resume must not re-release the live secret: {second}"
         );
-        assert_eq!(file_secret(&fixture).as_deref(), Some(secret.as_str()), "reused, not recreated");
-        assert_eq!(session_secret(), Some(secret.clone()), "and it is what unlocked the store");
+        assert_eq!(
+            file_secret(&fixture).as_deref(),
+            Some(secret.as_str()),
+            "reused, not recreated"
+        );
+        assert_eq!(
+            session_secret(),
+            Some(secret.clone()),
+            "and it is what unlocked the store"
+        );
 
         teardown(&fixture);
     }
@@ -583,12 +641,21 @@ mod tests {
         let fixture = setup("lazy");
 
         lazy_auto_unlock();
-        assert!(fixture.store.session_password().is_some(), "lazy must unlock a fresh store");
-        assert!(file_secret(&fixture).is_some(), "lazy must persist the secret file");
+        assert!(
+            fixture.store.session_password().is_some(),
+            "lazy must unlock a fresh store"
+        );
+        assert!(
+            file_secret(&fixture).is_some(),
+            "lazy must persist the secret file"
+        );
 
         fixture.store.lock();
         lazy_auto_unlock();
-        assert!(fixture.store.session_password().is_some(), "lazy must resume from the file");
+        assert!(
+            fixture.store.session_password().is_some(),
+            "lazy must resume from the file"
+        );
 
         teardown(&fixture);
         let fixture2 = setup("lazy-user");
@@ -598,7 +665,10 @@ mod tests {
             fixture2.store.session_password().is_none(),
             "lazy must never invent a secret over a user-owned store"
         );
-        assert!(file_secret(&fixture2).is_none(), "and must not write a file either");
+        assert!(
+            file_secret(&fixture2).is_none(),
+            "and must not write a file either"
+        );
 
         teardown(&fixture2);
     }
@@ -641,8 +711,14 @@ mod tests {
 
         let err = auto_unlock_impl().unwrap_err();
         assert_kind(&err, "keychain_unavailable");
-        assert!(item_payload(&fixture).is_none(), "must not write an invented secret");
-        assert!(file_secret(&fixture).is_none(), "must not write an invented secret file");
+        assert!(
+            item_payload(&fixture).is_none(),
+            "must not write an invented secret"
+        );
+        assert!(
+            file_secret(&fixture).is_none(),
+            "must not write an invented secret file"
+        );
 
         teardown(&fixture);
     }
@@ -670,7 +746,10 @@ mod tests {
         assert_kind(&err, "locked");
 
         fixture.store.unlock("pw-one").unwrap();
-        assert_eq!(remember_impl().unwrap().to_string(), r#"{"remembered":true}"#);
+        assert_eq!(
+            remember_impl().unwrap().to_string(),
+            r#"{"remembered":true}"#
+        );
         assert_eq!(
             item_payload(&fixture).unwrap(),
             registry_id::bytes_to_hex("pw-one".as_bytes())
@@ -715,7 +794,10 @@ mod tests {
         let err = auto_unlock_impl().unwrap_err();
         assert_kind(&err, "keychain_unavailable");
         let json = err.to_json();
-        assert!(json.contains("keychain:"), "the keychain outage must be noted: {json}");
+        assert!(
+            json.contains("keychain:"),
+            "the keychain outage must be noted: {json}"
+        );
 
         teardown(&fixture2);
     }
@@ -758,14 +840,30 @@ mod tests {
 
         let err = auto_unlock_impl().unwrap_err();
         assert_kind(&err, "keychain_unavailable");
-        assert!(err.message.contains(DISABLE_ENV), "the refusal must name it: {}", err.message);
-        assert!(file_secret(&fixture).is_none(), "an opted-out deployment provisions no secret");
-        assert!(sealed_verifier(&fixture).is_none(), "and never touches the sealed header");
+        assert!(
+            err.message.contains(DISABLE_ENV),
+            "the refusal must name it: {}",
+            err.message
+        );
+        assert!(
+            file_secret(&fixture).is_none(),
+            "an opted-out deployment provisions no secret"
+        );
+        assert!(
+            sealed_verifier(&fixture).is_none(),
+            "and never touches the sealed header"
+        );
         assert!(fixture.store.session_password().is_none());
 
         lazy_auto_unlock();
-        assert!(fixture.store.session_password().is_none(), "opted out: init must not unlock");
-        assert!(file_secret(&fixture).is_none(), "opted out: init must not self-provision");
+        assert!(
+            fixture.store.session_password().is_none(),
+            "opted out: init must not unlock"
+        );
+        assert!(
+            file_secret(&fixture).is_none(),
+            "opted out: init must not self-provision"
+        );
         assert!(sealed_verifier(&fixture).is_none());
         teardown(&fixture);
 
@@ -773,7 +871,10 @@ mod tests {
         store_credential("pw-file");
         crate::sealed_store::fs::write_durable(&fixture2.dir, AUTO_SECRET_FILE, b"pw-file")
             .expect("seed a stored secret");
-        assert!(auto_unlock_impl().is_err(), "a stored secret stays unused while opted out");
+        assert!(
+            auto_unlock_impl().is_err(),
+            "a stored secret stays unused while opted out"
+        );
         assert!(fixture2.store.session_password().is_none());
 
         drop(env);
@@ -788,13 +889,19 @@ mod tests {
     fn a_provisioned_but_empty_store_is_never_self_provisioned_over() {
         let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         let fixture = setup("provisioned-empty");
-        fixture.store.unlock("pw-user").expect("user provisions the empty store");
+        fixture
+            .store
+            .unlock("pw-user")
+            .expect("user provisions the empty store");
         fixture.store.lock();
         let verifier = sealed_verifier(&fixture).expect("header provisioned");
 
         let err = auto_unlock_impl().unwrap_err();
         assert_kind(&err, "keychain_unavailable");
-        assert!(file_secret(&fixture).is_none(), "must not invent a secret over a user password");
+        assert!(
+            file_secret(&fixture).is_none(),
+            "must not invent a secret over a user password"
+        );
         assert!(fixture.store.session_password().is_none());
         assert_eq!(
             sealed_verifier(&fixture).as_deref(),
@@ -803,10 +910,22 @@ mod tests {
         );
 
         lazy_auto_unlock();
-        assert!(fixture.store.session_password().is_none(), "lazy must leave it locked");
-        assert_eq!(sealed_verifier(&fixture).as_deref(), Some(verifier.as_str()));
+        assert!(
+            fixture.store.session_password().is_none(),
+            "lazy must leave it locked"
+        );
+        assert_eq!(
+            sealed_verifier(&fixture).as_deref(),
+            Some(verifier.as_str())
+        );
 
-        assert_eq!(fixture.store.unlock("pw-user").expect("user password survives"), 0);
+        assert_eq!(
+            fixture
+                .store
+                .unlock("pw-user")
+                .expect("user password survives"),
+            0
+        );
 
         teardown(&fixture);
     }
@@ -824,9 +943,16 @@ mod tests {
         assert_eq!(out["source"], "existing");
         assert_eq!(out["membership_count"], 1);
         assert_eq!(session_secret().as_deref(), Some("pw-real"));
-        assert!(file_secret(&fixture).is_none(), "the bad file must stop shadowing the keychain");
+        assert!(
+            file_secret(&fixture).is_none(),
+            "the bad file must stop shadowing the keychain"
+        );
         let quarantined = quarantined_secrets(&fixture);
-        assert_eq!(quarantined.len(), 1, "exactly one quarantined file: {quarantined:?}");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "exactly one quarantined file: {quarantined:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(fixture.dir.join(&quarantined[0])).unwrap(),
             "pw-stale",
@@ -857,7 +983,11 @@ mod tests {
         let out = auto_unlock_impl().expect("the remembered password is no longer shadowed");
         assert_eq!(out["source"], "existing");
         assert_eq!(session_secret().as_deref(), Some("pw-real"));
-        assert_eq!(quarantined_secrets(&fixture).len(), 1, "the evidence survives the recovery");
+        assert_eq!(
+            quarantined_secrets(&fixture).len(),
+            1,
+            "the evidence survives the recovery"
+        );
 
         teardown(&fixture);
     }
@@ -876,8 +1006,14 @@ mod tests {
             err.message
         );
         assert!(fixture.store.session_password().is_none());
-        assert!(sealed_verifier(&fixture).is_none(), "the header must not be provisioned");
-        assert!(fixture.dir.join(AUTO_SECRET_FILE).is_dir(), "the file must survive untouched");
+        assert!(
+            sealed_verifier(&fixture).is_none(),
+            "the header must not be provisioned"
+        );
+        assert!(
+            fixture.dir.join(AUTO_SECRET_FILE).is_dir(),
+            "the file must survive untouched"
+        );
 
         teardown(&fixture);
         let fixture2 = setup("unreadable-creds");
@@ -885,7 +1021,11 @@ mod tests {
         std::fs::create_dir_all(fixture2.dir.join(AUTO_SECRET_FILE)).expect("unreadable secret");
         let err = auto_unlock_impl().unwrap_err();
         assert_kind(&err, "keychain_unavailable");
-        assert!(err.message.contains(AUTO_SECRET_FILE), "got: {}", err.message);
+        assert!(
+            err.message.contains(AUTO_SECRET_FILE),
+            "got: {}",
+            err.message
+        );
         assert!(fixture2.store.session_password().is_none());
 
         teardown(&fixture2);

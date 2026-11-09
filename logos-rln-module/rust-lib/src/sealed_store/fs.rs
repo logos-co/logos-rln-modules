@@ -164,15 +164,25 @@ mod tests {
         let fresh: Toy = load_json(&dir, "toy.json").unwrap();
         assert_eq!(fresh, Toy::default());
 
-        let value = Toy { n: 7, s: "seven".into() };
+        let value = Toy {
+            n: 7,
+            s: "seven".into(),
+        };
         write_durable_json(&dir, "toy.json", &value).unwrap();
         let reloaded: Toy = load_json(&dir, "toy.json").unwrap();
         assert_eq!(reloaded, value);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(dir.join("toy.json")).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "durable writes must be private to the owner");
+            let mode = fs::metadata(dir.join("toy.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "durable writes must be private to the owner"
+            );
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -211,8 +221,15 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(dir.join("cache.json")).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "loose writes must still be private to the owner");
+            let mode = fs::metadata(dir.join("cache.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "loose writes must still be private to the owner"
+            );
         }
         write_atomic_loose(&dir, "cache.json", b"second").unwrap();
         assert_eq!(fs::read(dir.join("cache.json")).unwrap(), b"second");

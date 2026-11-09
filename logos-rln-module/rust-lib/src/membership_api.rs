@@ -64,7 +64,9 @@ pub(crate) fn get_membership_state_impl(
                     .with_provisioning(provisioning_view(&registry.canonical)),
             )
         }
-        ScopeState::Ambiguous(why) => return Err(ApiError::new(ErrorKind::AmbiguousSelection, why)),
+        ScopeState::Ambiguous(why) => {
+            return Err(ApiError::new(ErrorKind::AmbiguousSelection, why))
+        }
         // An allocator's refusal while a provisioning pass works this
         // registry is a verdict the pass is already acting on (the funded
         // fallback follows): the pass's own step says what is going on, and a
@@ -73,7 +75,10 @@ pub(crate) fn get_membership_state_impl(
         // on may be there after all, and only this read heals it.
         ScopeState::One(r)
             if !r.cache.state.is_live()
-                && r.cache.failed_reason.as_deref().is_some_and(|w| w.starts_with("gifter_failed"))
+                && r.cache
+                    .failed_reason
+                    .as_deref()
+                    .is_some_and(|w| w.starts_with("gifter_failed"))
                 && ensure::is_running(&registry.canonical) =>
         {
             return ok_json(
@@ -86,7 +91,9 @@ pub(crate) fn get_membership_state_impl(
     let record = &record;
     let hash = &record.hash;
 
-    let pm = backend.registry.get_membership(&registry, &record.identity.identity_commitment)?;
+    let pm = backend
+        .registry
+        .get_membership(&registry, &record.identity.identity_commitment)?;
     let registry_state = pm.as_ref().map(|p| p.state);
     let merged = lifecycle::merge_state(Some(record), registry_state, now_unix());
 
@@ -132,8 +139,14 @@ pub(crate) fn get_membership_state_impl(
     }
 
     let (leaf_index, rate_limit) = match &pm {
-        Some(pm) => (pm.leaf_index.or(record.cache.leaf_index).unwrap_or(0), pm.rate_limit),
-        None => (record.cache.leaf_index.unwrap_or(0), record.cache.rate_limit.unwrap_or(0)),
+        Some(pm) => (
+            pm.leaf_index.or(record.cache.leaf_index).unwrap_or(0),
+            pm.rate_limit,
+        ),
+        None => (
+            record.cache.leaf_index.unwrap_or(0),
+            record.cache.rate_limit.unwrap_or(0),
+        ),
     };
     let mut view = views::MembershipStateView::resolved(
         hash,
@@ -177,7 +190,9 @@ pub(crate) fn select_membership_impl(
         .find(|r| r.hash == hash)
         .cloned()
         .ok_or_else(|| ApiError::internal("selected record vanished"))?;
-    Ok(views::public_membership(&hash, &record, false, false, false))
+    Ok(views::public_membership(
+        &hash, &record, false, false, false,
+    ))
 }
 
 /// ensure_membership(registry): `start()`'s provisioning for one registry,
@@ -231,15 +246,16 @@ pub(crate) fn ensure_membership_impl(
                 record.cache.rate_limit.unwrap_or(0),
             ));
         }
-        _ => {
-            return Err(ApiError::new(
-                ErrorKind::AmbiguousSelection,
-                "multiple live memberships on this registry; use get_memberships / select_membership",
-            ))
-        }
+        _ => return Err(ApiError::new(
+            ErrorKind::AmbiguousSelection,
+            "multiple live memberships on this registry; use get_memberships / select_membership",
+        )),
     }
     if worker::is_stopped() {
-        return Err(ApiError::new(ErrorKind::NotReady, "module stopped; start() first"));
+        return Err(ApiError::new(
+            ErrorKind::NotReady,
+            "module stopped; start() first",
+        ));
     }
     // The claim is the check and the marker in one step: two calls racing
     // each other spawn one pass, and the marker rides into the thread so
@@ -286,33 +302,55 @@ pub(crate) fn get_memberships_impl(
 mod tests {
     use super::*;
     use crate::generated::LiblogosRlnModule;
+    use crate::proof;
+    use crate::proof_api::{generate_proof_impl, validate_proof_impl};
     use crate::register::{RegisterClaim, WINDOW_ELAPSED};
     use crate::registry_id;
-    use crate::test_support::{imp_with_store, no_store, opts_arr, seed_membership, TEST_GLOBAL_LOCK};
-    use crate::proof;
     use crate::sealed_store;
-    use crate::proof_api::{generate_proof_impl, validate_proof_impl};
+    use crate::test_support::{
+        imp_with_store, no_store, opts_arr, seed_membership, TEST_GLOBAL_LOCK,
+    };
 
     // While a provisioning pass works a registry, a scope whose only record
     // is terminal reads unknown with the pass's step, not the stale verdict.
     #[test]
     fn a_terminal_record_reads_unknown_while_provisioning_runs() {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
-        let dir = std::env::temp_dir().join(format!("rln-terminal-while-prov-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "rln-terminal-while-prov-test-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         let (imp, store) = imp_with_store(dir.clone());
         store.unlock("pw").unwrap();
         let registry = format!("logos:local:{}", "6d".repeat(32));
         let canonical = registry_id::parse(&registry).unwrap().canonical;
         let rid = "b1".repeat(32);
-        seed_membership(&store, "hf", &registry, &"44".repeat(32), "", &"f6".repeat(32), MembershipState::Failed, 0, 100);
-        store.update_cache("hf", |m| m.failed_reason = Some("gifter_failed: dead allocator".into())).unwrap();
+        seed_membership(
+            &store,
+            "hf",
+            &registry,
+            &"44".repeat(32),
+            "",
+            &"f6".repeat(32),
+            MembershipState::Failed,
+            0,
+            100,
+        );
+        store
+            .update_cache("hf", |m| {
+                m.failed_reason = Some("gifter_failed: dead allocator".into())
+            })
+            .unwrap();
         {
             let _pass = ensure::ActivePass::enter(&canonical);
             ensure::mark_requested(&canonical);
             let out = get_membership_state_impl(imp.store(), &registry, &rid).unwrap();
             assert_eq!(out["state"], serde_json::json!("unknown"), "got: {out}");
-            assert!(out.get("provisioning").is_some(), "the pass's step rides along: {out}");
+            assert!(
+                out.get("provisioning").is_some(),
+                "the pass's step rides along: {out}"
+            );
         }
         // With no pass the record itself answers (reaching the registry read,
         // which the test environment cannot serve).
@@ -333,11 +371,26 @@ mod tests {
         let registry = format!("logos:local:{}", "6e".repeat(32));
         let canonical = registry_id::parse(&registry).unwrap().canonical;
         let rid = "b2".repeat(32);
-        seed_membership(&store, "hw", &registry, &"45".repeat(32), "", &"f7".repeat(32), MembershipState::Failed, 0, 100);
-        store.update_cache("hw", |m| m.failed_reason = Some(WINDOW_ELAPSED.into())).unwrap();
+        seed_membership(
+            &store,
+            "hw",
+            &registry,
+            &"45".repeat(32),
+            "",
+            &"f7".repeat(32),
+            MembershipState::Failed,
+            0,
+            100,
+        );
+        store
+            .update_cache("hw", |m| m.failed_reason = Some(WINDOW_ELAPSED.into()))
+            .unwrap();
         let _pass = ensure::ActivePass::enter(&canonical);
         ensure::mark_requested(&canonical);
-        assert!(get_membership_state_impl(imp.store(), &registry, &rid).is_err(), "window-failed: read through");
+        assert!(
+            get_membership_state_impl(imp.store(), &registry, &rid).is_err(),
+            "window-failed: read through"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -346,7 +399,8 @@ mod tests {
     #[test]
     fn ensure_membership_after_stop_is_not_ready() {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
-        let dir = std::env::temp_dir().join(format!("rln-ensure-stopped-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rln-ensure-stopped-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (imp, _store) = imp_with_store(dir.clone());
         imp.stop().unwrap();
@@ -391,7 +445,11 @@ mod tests {
         assert!(claim.is_some(), "the first claim must be granted");
         match RegisterClaim::take(&canonical.canonical, &rln_id_hex) {
             Ok(_) => panic!("the register claim must stay exclusive"),
-            Err(e) => assert!(e.message.contains("already in flight"), "got: {}", e.message),
+            Err(e) => assert!(
+                e.message.contains("already in flight"),
+                "got: {}",
+                e.message
+            ),
         }
 
         // Reads of that same scope are unaffected, and repeat freely.
@@ -425,7 +483,11 @@ mod tests {
             ensure_membership_impl(no_store(), &registry, &opts_arr(&[("delegated", "true")]))
                 .unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument, "got: {}", err.message);
-        assert!(err.message.contains("register_membership"), "got: {}", err.message);
+        assert!(
+            err.message.contains("register_membership"),
+            "got: {}",
+            err.message
+        );
 
         let err = ensure_membership_impl(no_store(), &registry, &opts_arr(&[("rate_limit", "0")]))
             .unwrap_err();
@@ -436,7 +498,10 @@ mod tests {
         let err = ensure_membership_impl(no_store(), &registry, "").unwrap_err();
         assert_eq!(err.kind, ErrorKind::Internal, "got: {}", err.message);
         assert!(!ensure::is_running(&canonical));
-        assert!(ensure::progress(&canonical).is_none(), "nothing may be recorded for it");
+        assert!(
+            ensure::progress(&canonical).is_none(),
+            "nothing may be recorded for it"
+        );
     }
 
     // A source that does not know the leaf: the view shows 0 for a record
@@ -448,40 +513,78 @@ mod tests {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
         crate::test_support::install_backend(fake::backend(
             FakeTree::default(),
-            FakeRegistry { membership: Some(Some((MembershipState::Active, None, 300))), bounds: None },
+            FakeRegistry {
+                membership: Some(Some((MembershipState::Active, None, 300))),
+                bounds: None,
+            },
             FakePayer::default(),
         ));
         crate::start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
-        let dir = std::env::temp_dir().join(format!("rln-no-leaf-read-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rln-no-leaf-read-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (imp, store) = imp_with_store(dir.clone());
-        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+        assert!(imp
+            .unlock_keystore("pw".into())
+            .contains(r#""unlocked":true"#));
         let rln_id_hex = "ef".repeat(32);
 
         let fresh = "fakens:local:fresh";
         let (commitment_hex, secret_hex) = proof::generate_identity().expect("test identity");
         let commitment = registry_id::hex_to_bytes32(&commitment_hex).unwrap();
         let hash = registry_id::membership_hash(fresh, &commitment);
-        seed_membership(&store, &hash, fresh, &commitment_hex, &rln_id_hex, &secret_hex, MembershipState::Pending, 0, 300);
+        seed_membership(
+            &store,
+            &hash,
+            fresh,
+            &commitment_hex,
+            &rln_id_hex,
+            &secret_hex,
+            MembershipState::Pending,
+            0,
+            300,
+        );
         store.update_cache(&hash, |m| m.leaf_index = None).unwrap();
         let out = get_membership_state_impl(imp.store(), fresh, &rln_id_hex).unwrap();
         assert_eq!(out["state"], serde_json::json!("active"), "got: {out}");
         assert_eq!(out["leaf_index"], serde_json::json!(0), "got: {out}");
         let rec = store.membership(&hash).unwrap();
-        assert_eq!((rec.cache.state, rec.cache.leaf_index), (MembershipState::Active, None));
-        let err = generate_proof_impl(imp.store(), fresh, &rln_id_hex, "aa", &now_unix().to_string())
-            .expect_err("no leaf, no proof");
+        assert_eq!(
+            (rec.cache.state, rec.cache.leaf_index),
+            (MembershipState::Active, None)
+        );
+        let err = generate_proof_impl(
+            imp.store(),
+            fresh,
+            &rln_id_hex,
+            "aa",
+            &now_unix().to_string(),
+        )
+        .expect_err("no leaf, no proof");
         assert!(err.message.contains("leaf_index"), "got: {}", err.message);
 
         let known = "fakens:local:known";
         let (commitment_hex, secret_hex) = proof::generate_identity().expect("test identity");
         let commitment = registry_id::hex_to_bytes32(&commitment_hex).unwrap();
         let hash = registry_id::membership_hash(known, &commitment);
-        seed_membership(&store, &hash, known, &commitment_hex, &rln_id_hex, &secret_hex, MembershipState::Pending, 7, 300);
+        seed_membership(
+            &store,
+            &hash,
+            known,
+            &commitment_hex,
+            &rln_id_hex,
+            &secret_hex,
+            MembershipState::Pending,
+            7,
+            300,
+        );
         let out = get_membership_state_impl(imp.store(), known, &rln_id_hex).unwrap();
         assert_eq!(out["leaf_index"], serde_json::json!(7), "got: {out}");
         let rec = store.membership(&hash).unwrap();
-        assert_eq!((rec.cache.state, rec.cache.leaf_index), (MembershipState::Active, Some(7)));
+        assert_eq!(
+            (rec.cache.state, rec.cache.leaf_index),
+            (MembershipState::Active, Some(7))
+        );
 
         sealed_store::store::publish(None);
         let _ = std::fs::remove_dir_all(&dir);
@@ -496,7 +599,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rln-ensure-live-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (imp, store) = imp_with_store(dir.clone());
-        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+        assert!(imp
+            .unlock_keystore("pw".into())
+            .contains(r#""unlocked":true"#));
 
         let registry = format!("logos:local:{}", "e2".repeat(32));
         let canonical = parse_registry(&registry).unwrap().canonical;
@@ -520,10 +625,17 @@ mod tests {
 
         let out = ensure_membership_impl(imp.store(), &registry, "").unwrap();
         assert_eq!(out["state"], serde_json::json!("active"), "got: {out}");
-        assert_eq!(out["membership_hash"], serde_json::json!(hash), "got: {out}");
+        assert_eq!(
+            out["membership_hash"],
+            serde_json::json!(hash),
+            "got: {out}"
+        );
         assert_eq!(out["leaf_index"], serde_json::json!(7), "got: {out}");
         assert_eq!(out["rate_limit"], serde_json::json!(300), "got: {out}");
-        assert!(out.get("provisioning").is_none(), "a provisioned registry has no pass: {out}");
+        assert!(
+            out.get("provisioning").is_none(),
+            "a provisioned registry has no pass: {out}"
+        );
         assert!(!ensure::is_running(&canonical));
         assert!(ensure::progress(&canonical).is_none());
 
@@ -537,7 +649,8 @@ mod tests {
     #[test]
     fn ensure_membership_spawns_one_pass_and_reports_its_step() {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
-        let dir = std::env::temp_dir().join(format!("rln-ensure-spawn-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rln-ensure-spawn-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (imp, _store) = imp_with_store(dir.clone());
 
@@ -561,7 +674,11 @@ mod tests {
         let out = ensure_membership_impl(imp.store(), &fresh, &opts_arr(&[("rate_limit", "250")]))
             .unwrap();
         assert_eq!(out["state"], serde_json::json!("unknown"), "got: {out}");
-        assert_eq!(out["registry_id"], serde_json::json!(fresh_canonical), "got: {out}");
+        assert_eq!(
+            out["registry_id"],
+            serde_json::json!(fresh_canonical),
+            "got: {out}"
+        );
         assert!(
             out["provisioning"]["step"].is_string(),
             "the spawning reply carries the pass's first step: {out}"
@@ -580,7 +697,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let (imp, store) = imp_with_store(dir.clone());
         // Seeding a credential still needs unlock (writes are encrypted).
-        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+        assert!(imp
+            .unlock_keystore("pw".into())
+            .contains(r#""unlocked":true"#));
 
         let registry = format!("logos:local:{}", "cd".repeat(32));
         let commitment = [0x66u8; 32];
@@ -601,12 +720,18 @@ mod tests {
         // Even locked, select returns the public view — no secret, no error.
         assert!(imp.lock_keystore().contains(r#""locked":true"#));
         let out = imp.select_membership(registry.clone(), rln_id, String::new());
-        assert!(out.contains(&format!(r#""membership_hash":"{hash}""#)), "got: {out}");
+        assert!(
+            out.contains(&format!(r#""membership_hash":"{hash}""#)),
+            "got: {out}"
+        );
         assert!(
             !out.contains("identity_secret_hash"),
             "the identity secret must NEVER be released: {out}"
         );
-        assert!(!out.contains(r#""kind":"locked""#), "no unlock required to select: {out}");
+        assert!(
+            !out.contains(r#""kind":"locked""#),
+            "no unlock required to select: {out}"
+        );
         assert!(imp.get_memberships(registry).contains(&hash));
 
         sealed_store::store::publish(None);

@@ -28,9 +28,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::lifecycle::{granted_by, MembershipState};
-use crate::error::{ApiError, ErrorKind};
 use crate::delegated::DelegatedOptions;
+use crate::error::{ApiError, ErrorKind};
+use crate::lifecycle::{granted_by, MembershipState};
 use crate::register::{discovery_can_retry, register_scoped};
 use crate::registry_id;
 use crate::scope::{backend_of, records_for_registry};
@@ -70,7 +70,9 @@ const DELEGATE_HOLD_MARGIN: Duration = Duration::from_secs(80);
 /// A still-pending record short-circuits the funded register (one live
 /// record per scope).
 const DELEGATE_HOLD: Duration = crate::provider::GIFTER_REQUEST_TIMEOUT
-    .saturating_add(Duration::from_secs(crate::lifecycle::CONFIRMATION_WINDOW_SECS))
+    .saturating_add(Duration::from_secs(
+        crate::lifecycle::CONFIRMATION_WINDOW_SECS,
+    ))
     .saturating_add(DELEGATE_HOLD_MARGIN);
 /// How long a granted gift waits for the allocator's reply to name the
 /// granter after the registry already confirmed it.
@@ -184,7 +186,12 @@ enum ReserveBasis {
 /// fee 8 (ceiling 9) against the cap's 646M. The fee still dominates a price
 /// near 1M, so "can afford the price" remains the wrong question.
 fn fee_reserve_from(quote: &serde_json::Value) -> Option<u128> {
-    let ceiling = |key: &str| quote.get(key).and_then(serde_json::Value::as_u64).map(u128::from);
+    let ceiling = |key: &str| {
+        quote
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .map(u128::from)
+    };
     let exec = ceiling("next_base_fee_exec_ceiling")?;
     let stor = ceiling("next_base_fee_stor_ceiling")?;
     Some(
@@ -198,7 +205,10 @@ fn fee_reserve_from(quote: &serde_json::Value) -> Option<u128> {
 /// The reserve from the lez module's live quote, or `FALLBACK_FEE_RESERVE`.
 fn fee_reserve(quote: Result<serde_json::Value, ApiError>) -> (u128, ReserveBasis) {
     let computed = quote.ok().and_then(|q| {
-        let height = q.get("height").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let height = q
+            .get("height")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         fee_reserve_from(&q).map(|r| (r, ReserveBasis::Quote(height)))
     });
     computed.unwrap_or((FALLBACK_FEE_RESERVE, ReserveBasis::Fallback))
@@ -229,23 +239,42 @@ fn delegate_one(
     mine: u64,
 ) -> Delegated {
     let who = allocator_who(registry, allocator);
-    record(&registry.canonical, Step::Delegating, &format!("asking {who}"));
+    record(
+        &registry.canonical,
+        Step::Delegating,
+        &format!("asking {who}"),
+    );
     let store = crate::sealed_store::store::current_or_uninit();
-    let reply = match register_scoped(store, registry, REGISTRY_WIDE, rate_limit, Some(allocator.clone())) {
+    let reply = match register_scoped(
+        store,
+        registry,
+        REGISTRY_WIDE,
+        rate_limit,
+        Some(allocator.clone()),
+    ) {
         Ok(v) => v,
-        Err(e) if e.kind == ErrorKind::Locked => return Delegated::Locked(format!("{who}: {}", e.message)),
+        Err(e) if e.kind == ErrorKind::Locked => {
+            return Delegated::Locked(format!("{who}: {}", e.message))
+        }
         // Not sent: the gifter module missing, options the registry refuses.
         Err(e) => return Delegated::Refused(format!("{who}: {}", e.message)),
     };
-    let hash = reply.get("membership_hash").and_then(|h| h.as_str()).unwrap_or_default().to_string();
+    let hash = reply
+        .get("membership_hash")
+        .and_then(|h| h.as_str())
+        .unwrap_or_default()
+        .to_string();
     let started = Instant::now();
     let mut attribution_wait = Duration::ZERO;
     loop {
         if superseded(mine) {
             return Delegated::Superseded;
         }
-        let record_now = crate::sealed_store::store::current()
-            .and_then(|s| records_for_registry(&s, registry).into_iter().find(|r| r.hash == hash));
+        let record_now = crate::sealed_store::store::current().and_then(|s| {
+            records_for_registry(&s, registry)
+                .into_iter()
+                .find(|r| r.hash == hash)
+        });
         match record_now {
             Some(r) if r.cache.state.is_usable() => {
                 // The registry can confirm the gift before the allocator's
@@ -272,7 +301,11 @@ fn delegate_one(
             }
             Some(r) if r.cache.state == MembershipState::Pending => {}
             Some(r) => {
-                let why = r.cache.failed_reason.clone().unwrap_or_else(|| format!("record went {:?}", r.cache.state));
+                let why = r
+                    .cache
+                    .failed_reason
+                    .clone()
+                    .unwrap_or_else(|| format!("record went {:?}", r.cache.state));
                 return Delegated::Refused(format!("{who}: {why}"));
             }
             // The store was republished under the pass; keep looking until the hold ends.
@@ -289,14 +322,20 @@ fn delegate_one(
 }
 
 /// The allocator a pass asks, as its log lines and fallback reasons name it.
-fn allocator_who(registry: &registry_id::CanonicalRegistryId, allocator: &DelegatedOptions) -> String {
+fn allocator_who(
+    registry: &registry_id::CanonicalRegistryId,
+    allocator: &DelegatedOptions,
+) -> String {
     match (allocator.discover, allocator.gifter_peer_id.is_empty()) {
         (true, true) => format!("a discovered allocator for {}", registry.canonical),
         (true, false) => format!(
             "a discovered allocator for {}, else allocator {} at {}",
             registry.canonical, allocator.gifter_peer_id, allocator.gifter_multiaddr
         ),
-        (false, _) => format!("allocator {} at {}", allocator.gifter_peer_id, allocator.gifter_multiaddr),
+        (false, _) => format!(
+            "allocator {} at {}",
+            allocator.gifter_peer_id, allocator.gifter_multiaddr
+        ),
     }
 }
 
@@ -347,11 +386,23 @@ pub(crate) fn run_with(registries: Vec<Provision>, ticket: u64) {
 /// `is_running` keeps two from working the same registry at once.
 pub(crate) fn run_alongside(registry: String, rate_limit: u64) {
     let allocator = crate::config::allocator_for(&registry);
-    run_as(vec![Provision { registry, rate_limit, allocator }], EPOCH.load(Ordering::SeqCst))
+    run_as(
+        vec![Provision {
+            registry,
+            rate_limit,
+            allocator,
+        }],
+        EPOCH.load(Ordering::SeqCst),
+    )
 }
 
 fn run_as(registries: Vec<Provision>, mine: u64) {
-    for Provision { registry: raw, rate_limit, allocator } in registries {
+    for Provision {
+        registry: raw,
+        rate_limit,
+        allocator,
+    } in registries
+    {
         if superseded(mine) {
             return;
         }
@@ -474,12 +525,20 @@ fn settle_live(registry: &registry_id::CanonicalRegistryId, mine: u64) -> Live {
     let started = Instant::now();
     let mut saw_pending = false;
     loop {
-        let Some(store) = crate::sealed_store::store::current() else { return Live::None };
-        let records: Vec<_> = records_for_registry(&store, registry).into_iter().filter(|r| !r.quarantined).collect();
+        let Some(store) = crate::sealed_store::store::current() else {
+            return Live::None;
+        };
+        let records: Vec<_> = records_for_registry(&store, registry)
+            .into_iter()
+            .filter(|r| !r.quarantined)
+            .collect();
         if records.iter().any(|r| r.cache.state.is_usable()) {
             return Live::Usable;
         }
-        if !records.iter().any(|r| r.cache.state == MembershipState::Pending) {
+        if !records
+            .iter()
+            .any(|r| r.cache.state == MembershipState::Pending)
+        {
             if !saw_pending {
                 return Live::None;
             }
@@ -493,7 +552,11 @@ fn settle_live(registry: &registry_id::CanonicalRegistryId, mine: u64) -> Live {
         }
         if !saw_pending {
             saw_pending = true;
-            record(&registry.canonical, Step::Delegating, "waiting for an earlier registration to settle");
+            record(
+                &registry.canonical,
+                Step::Delegating,
+                "waiting for an earlier registration to settle",
+            );
         }
         if superseded(mine) {
             return Live::Superseded;
@@ -525,21 +588,33 @@ fn ask_again(
     let next = discovery_retry_every().as_secs();
     let miss = match crate::provider::gifter_discover_async(registry, a.auth_type.as_deref()) {
         Err(e) => {
-            eprintln!("provision {}: discover failed: {}; probing again in {next}s", registry.canonical, e.message);
+            eprintln!(
+                "provision {}: discover failed: {}; probing again in {next}s",
+                registry.canonical, e.message
+            );
             return false;
         }
         Ok(found) => match (found.error, found.joined, found.candidates) {
             (Some(e), _, _) if e.contains("discovery unavailable") => {
-                eprintln!("provision {}: {who}: {e}; no further allocator asks this pass", registry.canonical);
+                eprintln!(
+                    "provision {}: {who}: {e}; no further allocator asks this pass",
+                    registry.canonical
+                );
                 *retry = None;
                 return false;
             }
             (Some(e), _, _) if discovery_can_retry(&e) => Some(e),
             (Some(e), _, _) => {
-                eprintln!("provision {}: discover failed: {e}; probing again in {next}s", registry.canonical);
+                eprintln!(
+                    "provision {}: discover failed: {e}; probing again in {next}s",
+                    registry.canonical
+                );
                 return false;
             }
-            (None, Some(false), _) => Some(format!("discovery not joined ({} peers)", found.peers.unwrap_or(0))),
+            (None, Some(false), _) => Some(format!(
+                "discovery not joined ({} peers)",
+                found.peers.unwrap_or(0)
+            )),
             (None, _, 0) => Some(match found.peers {
                 Some(n) => format!("discovery: no allocator yet ({n} peers)"),
                 None => "discovery: no allocator yet".to_string(),
@@ -549,7 +624,10 @@ fn ask_again(
     };
     if let Some(why) = miss {
         let why = format!("{who}: {why}");
-        eprintln!("provision {}: {why}; probing again in {next}s", registry.canonical);
+        eprintln!(
+            "provision {}: {why}; probing again in {next}s",
+            registry.canonical
+        );
         set_fallback(&registry.canonical, &why);
         return false;
     }
@@ -560,7 +638,11 @@ fn ask_again(
         }
         Delegated::Superseded => true,
         Delegated::Locked(why) => {
-            record(&registry.canonical, Step::AwaitingFunding, "keystore locked");
+            record(
+                &registry.canonical,
+                Step::AwaitingFunding,
+                "keystore locked",
+            );
             eprintln!(
                 "provision {}: {why} — unlock the keystore and restart (or ensure_membership) to provision",
                 registry.canonical
@@ -568,12 +650,18 @@ fn ask_again(
             true
         }
         Delegated::Refused(why) if discovery_can_retry(&why) => {
-            eprintln!("provision {}: {why}; probing again in {next}s", registry.canonical);
+            eprintln!(
+                "provision {}: {why}; probing again in {next}s",
+                registry.canonical
+            );
             set_fallback(&registry.canonical, &why);
             false
         }
         Delegated::Refused(why) => {
-            eprintln!("provision {}: {why}; no further allocator asks this pass", registry.canonical);
+            eprintln!(
+                "provision {}: {why}; no further allocator asks this pass",
+                registry.canonical
+            );
             *retry = None;
             false
         }
@@ -590,7 +678,11 @@ fn provision_one(
     clear_fallback(&registry.canonical);
     match settle_live(registry, mine) {
         Live::Usable => {
-            record(&registry.canonical, Step::Done, "membership already present");
+            record(
+                &registry.canonical,
+                Step::Done,
+                "membership already present",
+            );
             return Ok(());
         }
         Live::StillPending => {
@@ -599,7 +691,10 @@ fn provision_one(
         }
         Live::Superseded => return Ok(()),
         Live::Failed(why) => {
-            eprintln!("provision {}: earlier registration failed ({why}); provisioning anew", registry.canonical);
+            eprintln!(
+                "provision {}: earlier registration failed ({why}); provisioning anew",
+                registry.canonical
+            );
             set_fallback(&registry.canonical, &why);
         }
         Live::None => {}
@@ -650,7 +745,11 @@ fn provision_one(
         match delegate_one(registry, rate_limit, a, mine) {
             Delegated::Granted | Delegated::Superseded => return Ok(()),
             Delegated::Locked(why) => {
-                record(&registry.canonical, Step::AwaitingFunding, "keystore locked");
+                record(
+                    &registry.canonical,
+                    Step::AwaitingFunding,
+                    "keystore locked",
+                );
                 eprintln!(
                     "provision {}: {why} — unlock the keystore and restart (or ensure_membership) to provision",
                     registry.canonical
@@ -762,7 +861,13 @@ fn provision_one(
     record_funding(
         &registry.canonical,
         &format!("{payer} needs {required} native ({price} price + {reserve} fee reserve)"),
-        Funding { payer: payer.clone(), required, price, fee_reserve: reserve, balance: None },
+        Funding {
+            payer: payer.clone(),
+            required,
+            price,
+            fee_reserve: reserve,
+            balance: None,
+        },
     );
     // No deadline: acquiring native balance (a bridge, an exchange) takes
     // arbitrary time, and giving up is permanent (`ensure::run_with` is entered
@@ -777,7 +882,9 @@ fn provision_one(
         if superseded(mine) {
             return Ok(());
         }
-        if retry.is_some() && asked_while_waiting.unwrap_or(entered).elapsed() >= discovery_retry_every() {
+        if retry.is_some()
+            && asked_while_waiting.unwrap_or(entered).elapsed() >= discovery_retry_every()
+        {
             if ask_again(registry, rate_limit, &mut retry, mine) {
                 return Ok(());
             }
@@ -790,7 +897,11 @@ fn provision_one(
             // from a UI, a gift — ends the wait: funding one more would be the
             // second registration the entry check exists to prevent.
             if live_membership_present(registry) {
-                record(&registry.canonical, Step::Done, "membership already present");
+                record(
+                    &registry.canonical,
+                    Step::Done,
+                    "membership already present",
+                );
                 return Ok(());
             }
             // The base fee moves while a wait runs for hours, so the reserve
@@ -839,7 +950,10 @@ fn provision_one(
                 }
                 // NOT treated as zero: an unreachable sequencer is not a broke
                 // account, and it must not look like one.
-                Err(e) => eprintln!("provision {}: balance read failed: {}", registry.canonical, e.message),
+                Err(e) => eprintln!(
+                    "provision {}: balance read failed: {}",
+                    registry.canonical, e.message
+                ),
             }
             due = waited + read_interval(waited);
         }
@@ -874,7 +988,11 @@ fn provision_one(
         return Ok(());
     }
     if live_membership_present(registry) {
-        record(&registry.canonical, Step::Done, "membership already present");
+        record(
+            &registry.canonical,
+            Step::Done,
+            "membership already present",
+        );
         return Ok(());
     }
     record(&registry.canonical, Step::Registering, "");
@@ -892,7 +1010,11 @@ fn provision_one(
         // means an operator unlocks later, and the next start() re-enters
         // here. Anything else is this registry's provisioning giving up.
         Err(e) if e.kind == ErrorKind::Locked => {
-            record(&registry.canonical, Step::AwaitingFunding, "keystore locked");
+            record(
+                &registry.canonical,
+                Step::AwaitingFunding,
+                "keystore locked",
+            );
             eprintln!(
                 "provision {}: keystore is locked — unlock it and restart to provision",
                 registry.canonical
@@ -929,7 +1051,10 @@ fn registration_price(
         .and_then(|p| p.as_str())
         .and_then(|p| p.parse::<u128>().ok())
         .ok_or_else(|| {
-            ApiError::new(ErrorKind::ProviderFailure, "registry bounds carry no price_per_unit")
+            ApiError::new(
+                ErrorKind::ProviderFailure,
+                "registry bounds carry no price_per_unit",
+            )
         })?;
     Ok(price_per_unit.saturating_mul(u128::from(rate_limit)))
 }
@@ -983,7 +1108,9 @@ fn clear_fallback(registry: &str) {
 }
 
 fn fallback_of(registry: &str) -> Option<String> {
-    crate::util::lock(&FALLBACK).as_ref().and_then(|m| m.get(registry).cloned())
+    crate::util::lock(&FALLBACK)
+        .as_ref()
+        .and_then(|m| m.get(registry).cloned())
 }
 
 fn record_progress(registry: &str, progress: Progress) {
@@ -996,7 +1123,12 @@ fn record_progress(registry: &str, progress: Progress) {
 fn record(registry: &str, step: Step, detail: &str) {
     record_progress(
         registry,
-        Progress { step, detail: detail.to_owned(), funding: None, fallback_reason: None },
+        Progress {
+            step,
+            detail: detail.to_owned(),
+            funding: None,
+            fallback_reason: None,
+        },
     );
 }
 
@@ -1028,7 +1160,10 @@ pub(crate) fn progress(registry: &str) -> Option<Progress> {
     crate::util::lock(&PROGRESS)
         .as_ref()
         .and_then(|m| m.get(registry).cloned())
-        .map(|p| Progress { fallback_reason: fallback_of(registry), ..p })
+        .map(|p| Progress {
+            fallback_reason: fallback_of(registry),
+            ..p
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,7 +1253,10 @@ mod tests {
     #[test]
     fn a_later_pass_supersedes_the_one_still_waiting() {
         let first = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
-        assert!(!superseded(first), "the only pass must not think itself stale");
+        assert!(
+            !superseded(first),
+            "the only pass must not think itself stale"
+        );
 
         let second = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
         assert!(
@@ -1193,11 +1331,17 @@ mod tests {
     #[test]
     fn the_headroom_multiplies_the_quoted_reserve() {
         let unmargined = DECLARED_GAS_LIMIT * 9 + ASSUMED_DATA_BYTES * 9;
-        assert_eq!(fee_reserve_from(&devnet_quote()), Some(unmargined * BASE_FEE_HEADROOM));
+        assert_eq!(
+            fee_reserve_from(&devnet_quote()),
+            Some(unmargined * BASE_FEE_HEADROOM)
+        );
         let mut dearer = devnet_quote();
         dearer["next_base_fee_exec_ceiling"] = 18.into();
         dearer["next_base_fee_stor_ceiling"] = 18.into();
-        assert_eq!(fee_reserve_from(&dearer), Some(unmargined * 2 * BASE_FEE_HEADROOM));
+        assert_eq!(
+            fee_reserve_from(&dearer),
+            Some(unmargined * 2 * BASE_FEE_HEADROOM)
+        );
     }
 
     /// No quote (no get_fee_state, "", a transport error, a reply that is not
@@ -1211,7 +1355,10 @@ mod tests {
         assert_eq!(fee_reserve(Ok(serde_json::json!("garbage"))), fallback);
         assert_eq!(fee_reserve(Ok(serde_json::json!({}))), fallback);
         let mut partial = devnet_quote();
-        partial.as_object_mut().unwrap().remove("next_base_fee_stor_ceiling");
+        partial
+            .as_object_mut()
+            .unwrap()
+            .remove("next_base_fee_stor_ceiling");
         assert_eq!(fee_reserve(Ok(partial)), fallback);
         let mut stringly = devnet_quote();
         stringly["next_base_fee_exec_ceiling"] = "9".into();
@@ -1283,16 +1430,35 @@ mod tests {
         record(r, Step::Delegating, "asking allocator p at /m");
         assert_eq!(progress(r).unwrap().step.as_str(), "delegating");
         assert!(progress(r).unwrap().fallback_reason.is_none());
-        set_fallback(r, "allocator p at /m: gifter_failed: credential already used");
+        set_fallback(
+            r,
+            "allocator p at /m: gifter_failed: credential already used",
+        );
         record(r, Step::WaitingForWallet, "");
         assert_eq!(
             progress(r).unwrap().fallback_reason.as_deref(),
             Some("allocator p at /m: gifter_failed: credential already used")
         );
-        record_funding(r, "x needs 1", Funding { payer: "x".into(), required: 1, price: 1, fee_reserve: 0, balance: None });
-        assert!(progress(r).unwrap().fallback_reason.is_some(), "the funding step keeps it");
+        record_funding(
+            r,
+            "x needs 1",
+            Funding {
+                payer: "x".into(),
+                required: 1,
+                price: 1,
+                fee_reserve: 0,
+                balance: None,
+            },
+        );
+        assert!(
+            progress(r).unwrap().fallback_reason.is_some(),
+            "the funding step keeps it"
+        );
         clear_fallback(r);
-        assert!(progress(r).unwrap().fallback_reason.is_none(), "a new pass starts clean");
+        assert!(
+            progress(r).unwrap().fallback_reason.is_none(),
+            "a new pass starts clean"
+        );
     }
 
     /// The funding step carries its numbers as fields, and a later step
@@ -1314,14 +1480,20 @@ mod tests {
         assert_eq!(p.funding.as_ref(), Some(&first));
 
         // A balance read refreshes the snapshot in place.
-        let read = Funding { balance: Some(1_000_000), ..first.clone() };
+        let read = Funding {
+            balance: Some(1_000_000),
+            ..first.clone()
+        };
         record_funding(r, "…; it holds 1000000", read.clone());
         assert_eq!(progress(r).expect("refreshed").funding, Some(read));
 
         record(r, Step::Registering, "");
         let p = progress(r).expect("moved on");
         assert_eq!(p.step, Step::Registering);
-        assert!(p.funding.is_none(), "a non-funding step must not carry the snapshot");
+        assert!(
+            p.funding.is_none(),
+            "a non-funding step must not carry the snapshot"
+        );
     }
 
     /// `is_running` answers for the pass itself, not for what it last wrote:
@@ -1336,8 +1508,14 @@ mod tests {
         let older = ActivePass::enter_with(r, 1);
         let newer = ActivePass::enter_with(r, 2);
         drop(older);
-        assert!(is_running(r), "the older marker's drop must not end the newer pass");
-        assert!(ActivePass::claim(r).is_none(), "a running pass refuses a claim");
+        assert!(
+            is_running(r),
+            "the older marker's drop must not end the newer pass"
+        );
+        assert!(
+            ActivePass::claim(r).is_none(),
+            "a running pass refuses a claim"
+        );
         drop(newer);
         assert!(!is_running(r));
         let claimed = ActivePass::claim(r).expect("free registry");
@@ -1379,7 +1557,10 @@ mod tests {
         let scoped = "aa".repeat(32);
         // A scoped record is not registry-wide; `provision_one` filters on
         // `is_live()` alone and never consults the scope.
-        assert!(!crate::scope::scope_matches_for_test(&scoped, REGISTRY_WIDE));
+        assert!(!crate::scope::scope_matches_for_test(
+            &scoped,
+            REGISTRY_WIDE
+        ));
         assert!(crate::scope::scope_matches_for_test("", REGISTRY_WIDE));
     }
 
@@ -1389,13 +1570,25 @@ mod tests {
     #[test]
     fn a_locked_keystore_stops_the_pass_before_the_funding_wait() {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
-        let dir = std::env::temp_dir().join(format!("rln-locked-allocator-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rln-locked-allocator-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (_imp, _store) = imp_with_store(dir.clone());
         let registry = format!("logos:local:{}", "7d".repeat(32));
         let canonical = registry_id::parse(&registry).unwrap().canonical;
-        let allocator = DelegatedOptions::from_allocator_block(Some(&serde_json::json!({ "peer_id": "p", "multiaddr": "/m", "discover": false })), "x").unwrap();
-        ensure::run_with(vec![ensure::Provision { registry: canonical.clone(), rate_limit: 100, allocator }], ensure::supersede());
+        let allocator = DelegatedOptions::from_allocator_block(
+            Some(&serde_json::json!({ "peer_id": "p", "multiaddr": "/m", "discover": false })),
+            "x",
+        )
+        .unwrap();
+        ensure::run_with(
+            vec![ensure::Provision {
+                registry: canonical.clone(),
+                rate_limit: 100,
+                allocator,
+            }],
+            ensure::supersede(),
+        );
         let step = ensure::progress(&canonical).expect("a step is recorded");
         assert_eq!(step.step, ensure::Step::AwaitingFunding);
         assert_eq!(step.detail, "keystore locked");
@@ -1409,7 +1602,9 @@ mod tests {
 
     /// A `discover` reply listing `n` allocators.
     fn listed(n: usize) -> Result<String, ApiError> {
-        let candidates: Vec<_> = (0..n).map(|i| serde_json::json!({ "peerId": format!("p{i}"), "addrs": ["/m"] })).collect();
+        let candidates: Vec<_> = (0..n)
+            .map(|i| serde_json::json!({ "peerId": format!("p{i}"), "addrs": ["/m"] }))
+            .collect();
         Ok(serde_json::json!({ "serviceId": "s", "candidates": candidates, "joined": true, "peers": 3 }).to_string())
     }
 
@@ -1428,7 +1623,8 @@ mod tests {
         Ok(serde_json::json!({ "leaf_index": 5, "gifterPeerId": "p", "discovered": true, "config_account": args["config"] }).to_string())
     }
 
-    type Answers = dyn Fn(&str, usize, &serde_json::Value, &str) -> Result<String, ApiError> + Send + Sync;
+    type Answers =
+        dyn Fn(&str, usize, &serde_json::Value, &str) -> Result<String, ApiError> + Send + Sync;
 
     /// A pass over the fake backend, its payer holding `balance`; the gifter
     /// answers the `n`th call (from 0) of `method` with
@@ -1446,18 +1642,27 @@ mod tests {
         fn new(name: &str, balance: u128, answers: Box<Answers>) -> Self {
             use crate::provider::fake::{self, FakePayer, FakeRegistry, FakeTree};
             use std::sync::{atomic::AtomicUsize, Arc};
-            let dir = std::env::temp_dir().join(format!("rln-discovery-{name}-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("rln-discovery-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             let (imp, _store) = imp_with_store(dir.clone());
-            assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
-            let registry = registry_id::parse(&format!("fakens:local:{name}")).unwrap().canonical;
+            assert!(imp
+                .unlock_keystore("pw".into())
+                .contains(r#""unlocked":true"#));
+            let registry = registry_id::parse(&format!("fakens:local:{name}"))
+                .unwrap()
+                .canonical;
             crate::test_support::install_backend(fake::backend(
                 FakeTree::default(),
                 FakeRegistry {
                     membership: None,
-                    bounds: Some(serde_json::json!({ "price_per_unit": "1", "min_rate_limit": 1, "max_rate_limit": 1000 })),
+                    bounds: Some(
+                        serde_json::json!({ "price_per_unit": "1", "min_rate_limit": 1, "max_rate_limit": 1000 }),
+                    ),
                 },
-                FakePayer { balance: Some(balance) },
+                FakePayer {
+                    balance: Some(balance),
+                },
             ));
             crate::provider::fake::REGISTER_CALLS.store(0, Ordering::SeqCst);
             let (requests, probes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
@@ -1466,19 +1671,32 @@ mod tests {
                 let n = if method == "request" { &r } else { &p }.fetch_add(1, Ordering::SeqCst);
                 answers(method, n, args, &at)
             }));
-            DiscoveryPass { dir, _imp: imp, registry, requests, probes }
+            DiscoveryPass {
+                dir,
+                _imp: imp,
+                registry,
+                requests,
+                probes,
+            }
         }
 
         fn run(&self, allocator: serde_json::Value) {
             let allocator = DelegatedOptions::from_allocator_block(Some(&allocator), "x").unwrap();
             ensure::run_with(
-                vec![ensure::Provision { registry: self.registry.clone(), rate_limit: 100, allocator }],
+                vec![ensure::Provision {
+                    registry: self.registry.clone(),
+                    rate_limit: 100,
+                    allocator,
+                }],
                 ensure::supersede(),
             );
         }
 
         fn counts(&self) -> (usize, usize, usize, usize) {
-            let records = crate::sealed_store::store::current().unwrap().records_for(&self.registry).len();
+            let records = crate::sealed_store::store::current()
+                .unwrap()
+                .records_for(&self.registry)
+                .len();
             (
                 self.requests.load(Ordering::SeqCst),
                 self.probes.load(Ordering::SeqCst),
@@ -1503,11 +1721,15 @@ mod tests {
     fn a_funded_pass_probes_a_missed_allocator_once_more_before_paying() {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
         DISCOVERY_RETRY_SECS.store(2, Ordering::SeqCst);
-        let pass = DiscoveryPass::new("funded-grace", 1_000_000_000_000, Box::new(|method, n, args, _| match (method, n) {
-            ("request", 0) => missed("no allocator advertises R/peer-any"),
-            ("request", _) => granted(args),
-            _ => listed(1),
-        }));
+        let pass = DiscoveryPass::new(
+            "funded-grace",
+            1_000_000_000_000,
+            Box::new(|method, n, args, _| match (method, n) {
+                ("request", 0) => missed("no allocator advertises R/peer-any"),
+                ("request", _) => granted(args),
+                _ => listed(1),
+            }),
+        );
         let began = std::time::Instant::now();
         pass.run(serde_json::json!({}));
         let step = ensure::progress(&pass.registry).expect("a step is recorded");
@@ -1516,7 +1738,10 @@ mod tests {
         assert!(step.fallback_reason.is_none());
         // (requests, probes, funded submits, records): the refusal and the grant.
         assert_eq!(pass.counts(), (2, 1, 0, 2));
-        assert!(began.elapsed() >= std::time::Duration::from_secs(2), "the probe waits out the interval");
+        assert!(
+            began.elapsed() >= std::time::Duration::from_secs(2),
+            "the probe waits out the interval"
+        );
     }
 
     // An unfunded payer keeps probing every interval, each miss replacing the
@@ -1528,23 +1753,35 @@ mod tests {
         DISCOVERY_RETRY_SECS.store(1, Ordering::SeqCst);
         let seen = std::sync::Arc::new(Mutex::new(None));
         let saw = seen.clone();
-        let pass = DiscoveryPass::new("unfunded", 0, Box::new(move |method, n, args, registry| match (method, n) {
-            ("request", 0) => missed("discovery not joined: no connected peer after 20s"),
-            ("request", _) => {
-                *crate::lock(&saw) = ensure::progress(registry).and_then(|p| p.fallback_reason);
-                granted(args)
-            }
-            (_, 0) => listed(0),
-            _ => listed(1),
-        }));
+        let pass = DiscoveryPass::new(
+            "unfunded",
+            0,
+            Box::new(move |method, n, args, registry| match (method, n) {
+                ("request", 0) => missed("discovery not joined: no connected peer after 20s"),
+                ("request", _) => {
+                    *crate::lock(&saw) = ensure::progress(registry).and_then(|p| p.fallback_reason);
+                    granted(args)
+                }
+                (_, 0) => listed(0),
+                _ => listed(1),
+            }),
+        );
         pass.run(serde_json::json!({}));
         let step = ensure::progress(&pass.registry).expect("a step is recorded");
         assert_eq!(step.step, ensure::Step::Done, "{}", step.detail);
         assert!(step.detail.contains("(discovered)"), "{}", step.detail);
         assert!(step.fallback_reason.is_none());
-        assert_eq!(pass.counts(), (2, 2, 0, 2), "no request, and no record, for the empty probe");
+        assert_eq!(
+            pass.counts(),
+            (2, 2, 0, 2),
+            "no request, and no record, for the empty probe"
+        );
         let seen = crate::lock(&seen).clone();
-        assert!(seen.as_deref().is_some_and(|r| r.contains("discovery: no allocator yet (3 peers)")), "{seen:?}");
+        assert!(
+            seen.as_deref()
+                .is_some_and(|r| r.contains("discovery: no allocator yet (3 peers)")),
+            "{seen:?}"
+        );
     }
 
     // A node that cannot discover at all is neither probed nor asked again;
@@ -1553,15 +1790,29 @@ mod tests {
     fn discovery_unavailable_is_asked_once_and_paid_for() {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
         DISCOVERY_RETRY_SECS.store(1, Ordering::SeqCst);
-        let pass = DiscoveryPass::new("unavailable", 1_000_000_000_000, Box::new(|method, _, _, _| match method {
-            "request" => missed("discovery unavailable: no service discovery on this node"),
-            _ => listed(1),
-        }));
+        let pass = DiscoveryPass::new(
+            "unavailable",
+            1_000_000_000_000,
+            Box::new(|method, _, _, _| match method {
+                "request" => missed("discovery unavailable: no service discovery on this node"),
+                _ => listed(1),
+            }),
+        );
         pass.run(serde_json::json!({}));
         let step = ensure::progress(&pass.registry).expect("a step is recorded");
         assert_eq!(pass.counts(), (1, 0, 1, 2), "the funded submit was reached");
-        assert_eq!(step.step, ensure::Step::Refused, "the fake registry refuses every submit");
-        assert!(step.fallback_reason.as_deref().is_some_and(|r| r.contains("discovery unavailable")), "{:?}", step.fallback_reason);
+        assert_eq!(
+            step.step,
+            ensure::Step::Refused,
+            "the fake registry refuses every submit"
+        );
+        assert!(
+            step.fallback_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("discovery unavailable")),
+            "{:?}",
+            step.fallback_reason
+        );
     }
 
     // A pinned pair alone has nothing to probe: its refusal goes straight to
@@ -1570,10 +1821,14 @@ mod tests {
     fn a_pinned_pair_is_not_probed() {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
         DISCOVERY_RETRY_SECS.store(1, Ordering::SeqCst);
-        let pass = DiscoveryPass::new("pinned", 1_000_000_000_000, Box::new(|method, _, _, _| match method {
-            "request" => missed("no allocator advertises R/peer-any"),
-            _ => listed(1),
-        }));
+        let pass = DiscoveryPass::new(
+            "pinned",
+            1_000_000_000_000,
+            Box::new(|method, _, _, _| match method {
+                "request" => missed("no allocator advertises R/peer-any"),
+                _ => listed(1),
+            }),
+        );
         pass.run(serde_json::json!({ "peer_id": "p", "multiaddr": "/m", "discover": false }));
         assert_eq!(pass.counts(), (1, 0, 1, 2));
     }
@@ -1588,9 +1843,21 @@ mod tests {
         store.unlock("pw").unwrap();
         assert!(!ensure::any_pending_membership());
         let registry = format!("logos:local:{}", "7e".repeat(32));
-        seed_membership(&store, "pb", &registry, &"56".repeat(32), "", &"e6".repeat(32), MembershipState::Pending, 0, 100);
+        seed_membership(
+            &store,
+            "pb",
+            &registry,
+            &"56".repeat(32),
+            "",
+            &"e6".repeat(32),
+            MembershipState::Pending,
+            0,
+            100,
+        );
         assert!(ensure::any_pending_membership());
-        store.update_cache("pb", |m| m.state = MembershipState::Active).unwrap();
+        store
+            .update_cache("pb", |m| m.state = MembershipState::Active)
+            .unwrap();
         assert!(!ensure::any_pending_membership());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1604,7 +1871,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rln-ms-hold-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (imp, store) = imp_with_store(dir.clone());
-        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+        assert!(imp
+            .unlock_keystore("pw".into())
+            .contains(r#""unlocked":true"#));
         let registry = format!("logos:local:{}", "7a".repeat(32));
         let parsed = registry_id::parse(&registry).unwrap();
         let hash = "hold-pending";
@@ -1624,10 +1893,15 @@ mod tests {
         // A superseded pass does not wait on it.
         let t0 = std::time::Instant::now();
         ensure::wait_confirmed(&parsed, u64::MAX);
-        assert!(t0.elapsed() < std::time::Duration::from_secs(2), "a superseded pass must return at once");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "a superseded pass must return at once"
+        );
 
         // Confirmed: nothing to hold for, superseded or not.
-        store.update_cache(hash, |m| m.state = MembershipState::Active).unwrap();
+        store
+            .update_cache(hash, |m| m.state = MembershipState::Active)
+            .unwrap();
         assert!(!ensure::pending_membership_present(&parsed));
         let t0 = std::time::Instant::now();
         ensure::wait_confirmed(&parsed, ensure::ticket_in_force());

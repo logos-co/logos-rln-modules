@@ -42,7 +42,13 @@ pub(crate) fn generate_proof_impl(
     signal_hex: &str,
     timestamp: &str,
 ) -> Result<serde_json::Value, ApiError> {
-    generate_proof_with(store, registry_id_raw, rln_identifier_hex, SignalArg::Raw(signal_hex), timestamp)
+    generate_proof_with(
+        store,
+        registry_id_raw,
+        rln_identifier_hex,
+        SignalArg::Raw(signal_hex),
+        timestamp,
+    )
 }
 
 /// The signal argument of the two generate/validate wire dialects: the raw
@@ -80,8 +86,7 @@ pub(crate) fn generate_proof_with(
     signal: SignalArg<'_>,
     timestamp: &str,
 ) -> Result<serde_json::Value, ApiError> {
-    let (registry, rln_identifier, rln_id_hex) =
-        parse_scope(registry_id_raw, rln_identifier_hex)?;
+    let (registry, rln_identifier, rln_id_hex) = parse_scope(registry_id_raw, rln_identifier_hex)?;
     let backend = backend_of(&registry)?;
     // Readiness gate FIRST (spec: not_ready before anything else). The epoch
     // derives from the CONSUMER's timestamp — the value stamped on the
@@ -103,9 +108,9 @@ pub(crate) fn generate_proof_with(
         (&registry.canonical, &rln_id_hex),
         &select::Selector::None,
     )?;
-    let record = store
-        .membership(&hash)
-        .ok_or_else(|| ApiError::new(ErrorKind::UnknownMembership, "selected membership vanished"))?;
+    let record = store.membership(&hash).ok_or_else(|| {
+        ApiError::new(ErrorKind::UnknownMembership, "selected membership vanished")
+    })?;
     // Leaf 0 is a VALID leaf: defaulting here would prove against the wrong
     // membership and burn a message-id slot doing it. The cache is
     // deliberately unauthenticated (lifecycle.rs), so refuse rather than
@@ -149,8 +154,7 @@ pub(crate) fn generate_proof_with(
         path_elements_hex,
         path_indices,
     };
-    let rlp =
-        proof::generate(&material, x, epoch, &rln_identifier).map_err(proof_error)?;
+    let rlp = proof::generate(&material, x, epoch, &rln_identifier).map_err(proof_error)?;
 
     let mut out = rlp.to_json();
     if let Some(obj) = out.as_object_mut() {
@@ -168,7 +172,10 @@ pub(crate) fn generate_proof_with(
 pub(crate) fn epoch_of_timestamp(timestamp: &str, epoch_size_sec: u64) -> Result<u64, ApiError> {
     Ok(rate_limit::current_epoch(
         timestamp.trim().parse::<u64>().map_err(|_| {
-            ApiError::new(ErrorKind::InvalidArgument, "timestamp must be a Unix-seconds integer")
+            ApiError::new(
+                ErrorKind::InvalidArgument,
+                "timestamp must be a Unix-seconds integer",
+            )
         })?,
         epoch_size_sec,
     ))
@@ -187,7 +194,10 @@ pub(crate) fn epoch_in_window(epoch: u64, now_epoch: u64, gap: u64) -> bool {
 /// too (spec: permanent) — so the rule has one home. Returns the caller's
 /// epoch and the observation it was checked against: `(epoch, size, gap,
 /// now_epoch)`.
-pub(crate) fn fresh_epoch_for(registry: &str, timestamp: &str) -> Result<(u64, u64, u64, u64), ApiError> {
+pub(crate) fn fresh_epoch_for(
+    registry: &str,
+    timestamp: &str,
+) -> Result<(u64, u64, u64, u64), ApiError> {
     let (size, gap) = epoch_params_for(registry)?;
     let epoch = epoch_of_timestamp(timestamp, size)?;
     let now_epoch = rate_limit::current_epoch(now_unix(), size);
@@ -252,7 +262,13 @@ pub(crate) fn validate_proof_impl(
     timestamp: &str,
     proof_json: &str,
 ) -> Result<serde_json::Value, ApiError> {
-    validate_proof_with(registry_id_raw, rln_identifier_hex, SignalArg::Raw(signal_hex), timestamp, proof_json)
+    validate_proof_with(
+        registry_id_raw,
+        rln_identifier_hex,
+        SignalArg::Raw(signal_hex),
+        timestamp,
+        proof_json,
+    )
 }
 
 pub(crate) fn validate_proof_with(
@@ -275,14 +291,12 @@ pub(crate) fn validate_proof_with(
     // Mix omits this derivable public input on the network. Reconstruct it
     // from the trusted request scope; cryptographic verification still binds
     // the received proof to this application and epoch.
-    let derive_external_nullifier = proof_value.get("root").is_some()
-        && proof_value.get("external_nullifier").is_none();
+    let derive_external_nullifier =
+        proof_value.get("root").is_some() && proof_value.get("external_nullifier").is_none();
     if derive_external_nullifier {
-        proof_value["external_nullifier"] = serde_json::Value::String(
-            registry_id::bytes_to_hex(&proof::expected_external_nullifier(
-                expected_epoch, &rln_identifier,
-            )),
-        );
+        proof_value["external_nullifier"] = serde_json::Value::String(registry_id::bytes_to_hex(
+            &proof::expected_external_nullifier(expected_epoch, &rln_identifier),
+        ));
     }
     let rlp = proof::RateLimitProof::from_json(&proof_value).map_err(proof_error)?;
 
@@ -290,8 +304,14 @@ pub(crate) fn validate_proof_with(
     // or wrong-application proof rejects definitively even before the root
     // window is consulted.
     let bound = rlp.external_nullifier();
-    if !epoch_binding_holds(rlp.epoch(), &bound, &rln_identifier, expected_epoch, now_epoch, gap)
-    {
+    if !epoch_binding_holds(
+        rlp.epoch(),
+        &bound,
+        &rln_identifier,
+        expected_epoch,
+        now_epoch,
+        gap,
+    ) {
         return ok_json(views::VerdictReply::verdict("invalid"));
     }
 
@@ -386,7 +406,11 @@ pub(crate) fn get_epoch_quota_impl(
 
     let remaining =
         store.remaining_budget(&record.hash, &rln_id_hex, epoch_index, rate_limit, size)?;
-    ok_json(views::EpochQuotaView::new(epoch_index, rate_limit, remaining))
+    ok_json(views::EpochQuotaView::new(
+        epoch_index,
+        rate_limit,
+        remaining,
+    ))
 }
 
 /// Registry parameters read (spec's optional extension): the
@@ -415,8 +439,8 @@ mod tests {
     use crate::generated::LiblogosRlnModule;
     use crate::lifecycle::MembershipState;
     use crate::sealed_store;
-    use crate::test_support::{imp_with_store, no_store, seed_membership, TEST_GLOBAL_LOCK};
     use crate::start_impl;
+    use crate::test_support::{imp_with_store, no_store, seed_membership, TEST_GLOBAL_LOCK};
 
     // Spec: before start() configures the epoch size, the epoch-dependent
     // surface answers not_ready (RLN_ERR_NOT_READY).
@@ -431,7 +455,8 @@ mod tests {
         let ts = now_unix().to_string();
         let err = get_epoch_quota_impl(no_store(), &registry, &rln_id_hex, &ts).unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotReady);
-        let err = generate_proof_impl(no_store(), &registry, &rln_id_hex, signal_hex, &ts).unwrap_err();
+        let err =
+            generate_proof_impl(no_store(), &registry, &rln_id_hex, signal_hex, &ts).unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotReady);
         let err = validate_proof_impl(&registry, &rln_id_hex, signal_hex, &ts, "{}").unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotReady);
@@ -471,7 +496,8 @@ mod tests {
 
         // Warm the window with the proof's own root → valid.
         roots::set_window_for_test(&canonical, vec![root], now_unix());
-        let ok = validate_proof_impl(&registry, &rln_id_hex, &signal_hex, &ts, &proof_json).unwrap();
+        let ok =
+            validate_proof_impl(&registry, &rln_id_hex, &signal_hex, &ts, &proof_json).unwrap();
         assert_eq!(ok, serde_json::json!({ "verdict": "valid" }));
 
         // A different signal is invalid, not an error.
@@ -506,19 +532,42 @@ mod tests {
         roots::set_window_for_test(&registry, vec![rlp.root()], now_unix());
 
         let prehashed = |hex: &str| {
-            validate_proof_with(&registry, &rln_id_hex, SignalArg::Prehashed(hex), &ts, &proof_json)
+            validate_proof_with(
+                &registry,
+                &rln_id_hex,
+                SignalArg::Prehashed(hex),
+                &ts,
+                &proof_json,
+            )
         };
-        assert_eq!(prehashed(&hash_hex).unwrap(), serde_json::json!({ "verdict": "valid" }));
+        assert_eq!(
+            prehashed(&hash_hex).unwrap(),
+            serde_json::json!({ "verdict": "valid" })
+        );
         // The same proof through the raw dialect is a retransmission.
-        let dup = validate_proof_impl(&registry, &rln_id_hex, &signal_hex, &ts, &proof_json).unwrap();
+        let dup =
+            validate_proof_impl(&registry, &rln_id_hex, &signal_hex, &ts, &proof_json).unwrap();
         assert_eq!(dup, serde_json::json!({ "verdict": "duplicate" }));
         // Another message's hash: invalid, not an error.
         let other = registry_id::bytes_to_hex(&rln_signal::signal_hash(b"another"));
-        assert_eq!(prehashed(&other).unwrap(), serde_json::json!({ "verdict": "invalid" }));
+        assert_eq!(
+            prehashed(&other).unwrap(),
+            serde_json::json!({ "verdict": "invalid" })
+        );
         // Malformed: non-canonical, short, or the raw bytes in the hash slot.
-        for bad in ["ff".repeat(32), "ab".repeat(31), signal_hex.clone(), "zz".into()] {
+        for bad in [
+            "ff".repeat(32),
+            "ab".repeat(31),
+            signal_hex.clone(),
+            "zz".into(),
+        ] {
             let err = prehashed(&bad).unwrap_err();
-            assert_eq!(err.kind, ErrorKind::InvalidArgument, "{bad}: {}", err.message);
+            assert_eq!(
+                err.kind,
+                ErrorKind::InvalidArgument,
+                "{bad}: {}",
+                err.message
+            );
         }
 
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
@@ -549,7 +598,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, serde_json::json!({ "verdict": "invalid" }));
-        assert_eq!(crate::worker::nudges_for_test(), before + 1, "a root miss must nudge");
+        assert_eq!(
+            crate::worker::nudges_for_test(),
+            before + 1,
+            "a root miss must nudge"
+        );
 
         // An in-window root that fails crypto is plain invalid — NO nudge.
         roots::set_window_for_test(&registry, vec![rlp.root()], now_unix());
@@ -565,7 +618,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, serde_json::json!({ "verdict": "invalid" }));
-        assert_eq!(crate::worker::nudges_for_test(), before, "a crypto-invalid proof must not nudge");
+        assert_eq!(
+            crate::worker::nudges_for_test(),
+            before,
+            "a crypto-invalid proof must not nudge"
+        );
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
     }
 
@@ -729,8 +786,8 @@ mod tests {
         // Message stamped one epoch earlier — inside the gap, so freshness
         // passes; the equality requirement is what rejects.
         let earlier = ((now_epoch - 1) * 600).to_string();
-        let out =
-            validate_proof_impl(&registry, &rln_id_hex, &signal_hex, &earlier, &proof_json).unwrap();
+        let out = validate_proof_impl(&registry, &rln_id_hex, &signal_hex, &earlier, &proof_json)
+            .unwrap();
         assert_eq!(out, serde_json::json!({ "verdict": "invalid" }));
 
         // The honest timestamp verifies.
@@ -778,7 +835,8 @@ mod tests {
         wire.as_object_mut().unwrap().remove("external_nullifier");
         let wire = wire.to_string();
         let time = timestamp.to_string();
-        let wrong = validate_proof_impl(&registry, &"aa".repeat(32), &signal_hex, &time, &wire).unwrap();
+        let wrong =
+            validate_proof_impl(&registry, &"aa".repeat(32), &signal_hex, &time, &wire).unwrap();
         assert_eq!(wrong["verdict"], "invalid");
         assert!(wrong.get("external_nullifier").is_none());
         let wrong = validate_proof_impl(&registry, &scope, "00", &time, &wire).unwrap();
@@ -786,10 +844,16 @@ mod tests {
         assert!(wrong.get("external_nullifier").is_none());
         let valid = validate_proof_impl(&registry, &scope, &signal_hex, &time, &wire).unwrap();
         assert_eq!(valid["verdict"], "valid");
-        assert_eq!(valid["external_nullifier"], registry_id::bytes_to_hex(&proof.external_nullifier()));
+        assert_eq!(
+            valid["external_nullifier"],
+            registry_id::bytes_to_hex(&proof.external_nullifier())
+        );
         let duplicate = validate_proof_impl(&registry, &scope, &signal_hex, &time, &wire).unwrap();
         assert_eq!(duplicate["verdict"], "duplicate");
-        assert_eq!(duplicate["external_nullifier"], registry_id::bytes_to_hex(&proof.external_nullifier()));
+        assert_eq!(
+            duplicate["external_nullifier"],
+            registry_id::bytes_to_hex(&proof.external_nullifier())
+        );
     }
 
     // An epoch-less proof (the decomposed spec shape may omit "epoch") is
@@ -816,8 +880,8 @@ mod tests {
         let proof_json = json.to_string();
 
         let neighbor = (now_epoch * 600).to_string();
-        let out =
-            validate_proof_impl(&registry, &rln_id_hex, &signal_hex, &neighbor, &proof_json).unwrap();
+        let out = validate_proof_impl(&registry, &rln_id_hex, &signal_hex, &neighbor, &proof_json)
+            .unwrap();
         assert_eq!(out, serde_json::json!({ "verdict": "invalid" }));
 
         let honest = ((now_epoch - 1) * 600).to_string();
@@ -852,15 +916,25 @@ mod tests {
 
         let ts = (epoch * 600).to_string();
         let sig_a = registry_id::bytes_to_hex(b"sig-A");
-        let first =
-            validate_proof_impl(&registry, &rln_id_hex, &sig_a, &ts, &pa.to_json().to_string())
-                .unwrap();
+        let first = validate_proof_impl(
+            &registry,
+            &rln_id_hex,
+            &sig_a,
+            &ts,
+            &pa.to_json().to_string(),
+        )
+        .unwrap();
         assert_eq!(first, serde_json::json!({ "verdict": "valid" }));
 
         let sig_b = registry_id::bytes_to_hex(b"sig-B");
-        let second =
-            validate_proof_impl(&registry, &rln_id_hex, &sig_b, &ts, &pb.to_json().to_string())
-                .unwrap();
+        let second = validate_proof_impl(
+            &registry,
+            &rln_id_hex,
+            &sig_b,
+            &ts,
+            &pb.to_json().to_string(),
+        )
+        .unwrap();
         assert_eq!(second["verdict"], serde_json::json!("rate_limit_violation"));
         assert_eq!(
             second["recovered_secret"],
@@ -919,7 +993,8 @@ mod tests {
 
         let wrong = registry_id::bytes_to_hex(b"wrong-sig");
         for _ in 0..2 {
-            let out = validate_proof_impl(&registry, &rln_id_hex, &wrong, &ts, &proof_json).unwrap();
+            let out =
+                validate_proof_impl(&registry, &rln_id_hex, &wrong, &ts, &proof_json).unwrap();
             assert_eq!(out, serde_json::json!({ "verdict": "invalid" }));
         }
 
@@ -978,8 +1053,12 @@ mod tests {
 
         // Spend two slots in the CURRENT epoch; the snapshot pairs the same
         // index with the decremented budget.
-        store.reserve_message_id(&hash, &rln_id, epoch_index, epoch_index, 100, 600).unwrap();
-        store.reserve_message_id(&hash, &rln_id, epoch_index, epoch_index, 100, 600).unwrap();
+        store
+            .reserve_message_id(&hash, &rln_id, epoch_index, epoch_index, 100, 600)
+            .unwrap();
+        store
+            .reserve_message_id(&hash, &rln_id, epoch_index, epoch_index, 100, 600)
+            .unwrap();
         let spent = get_epoch_quota_impl(Ok(store.clone()), &registry, &rln_id, &ts).unwrap();
         assert_eq!(spent["epoch_index"], serde_json::json!(epoch_index));
         assert_eq!(spent["remaining"], serde_json::json!(98));
@@ -1047,8 +1126,14 @@ mod tests {
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
         let registry = format!("logos:local:{}", "cd".repeat(32));
         let rln_id_hex = "ef".repeat(32);
-        let err = generate_proof_impl(no_store(), &registry, &rln_id_hex, "nothex", &now_unix().to_string())
-            .unwrap_err();
+        let err = generate_proof_impl(
+            no_store(),
+            &registry,
+            &rln_id_hex,
+            "nothex",
+            &now_unix().to_string(),
+        )
+        .unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument);
     }
 
@@ -1067,7 +1152,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rln-ms-no-leaf-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (imp, store) = imp_with_store(dir.clone());
-        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+        assert!(imp
+            .unlock_keystore("pw".into())
+            .contains(r#""unlocked":true"#));
 
         let reg = format!("logos:local:{}", "ab".repeat(32));
         let rln_id_hex = "ef".repeat(32);
@@ -1098,10 +1185,20 @@ mod tests {
             .update_cache(&hash, |m| m.leaf_index = None)
             .expect("clear the leaf");
 
-        let err =
-            generate_proof_impl(Ok(store.clone()), &reg, &rln_id_hex, "aa", &now_unix().to_string())
-                .expect_err("a usable row without a leaf must not prove against leaf 0");
-        assert_eq!(err.kind, ErrorKind::UnknownMembership, "got: {}", err.message);
+        let err = generate_proof_impl(
+            Ok(store.clone()),
+            &reg,
+            &rln_id_hex,
+            "aa",
+            &now_unix().to_string(),
+        )
+        .expect_err("a usable row without a leaf must not prove against leaf 0");
+        assert_eq!(
+            err.kind,
+            ErrorKind::UnknownMembership,
+            "got: {}",
+            err.message
+        );
         assert!(err.message.contains("leaf_index"), "got: {}", err.message);
 
         sealed_store::store::publish(None);
@@ -1115,7 +1212,9 @@ mod tests {
             std::env::temp_dir().join(format!("rln-ms-path-cache-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (imp, store) = imp_with_store(dir.clone());
-        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+        assert!(imp
+            .unlock_keystore("pw".into())
+            .contains(r#""unlocked":true"#));
 
         let reg = format!("logos:local:{}", "ab".repeat(32));
         let rln_id_hex = "ef".repeat(32);
@@ -1141,9 +1240,14 @@ mod tests {
 
         // MISS: cold cache falls back to the registry — dead transport, so
         // provider_failure proves a real read was attempted.
-        let miss =
-            generate_proof_impl(Ok(store.clone()), &reg, &rln_id_hex, signal_hex, &now_unix().to_string())
-                .unwrap_err();
+        let miss = generate_proof_impl(
+            Ok(store.clone()),
+            &reg,
+            &rln_id_hex,
+            signal_hex,
+            &now_unix().to_string(),
+        )
+        .unwrap_err();
         assert_eq!(
             miss.kind,
             ErrorKind::ProviderFailure,
@@ -1159,17 +1263,31 @@ mod tests {
             vec![0u8; proof::RLN_TREE_DEPTH],
             leaf_index,
         );
-        let out =
-            generate_proof_impl(Ok(store.clone()), &reg, &rln_id_hex, signal_hex, &now_unix().to_string())
-                .expect("a warm cache entry needs no registry call");
-        assert!(out.get("proof").and_then(|v| v.as_str()).is_some(), "got: {out}");
-        assert!(out.get("root").and_then(|v| v.as_str()).is_some(), "got: {out}");
+        let out = generate_proof_impl(
+            Ok(store.clone()),
+            &reg,
+            &rln_id_hex,
+            signal_hex,
+            &now_unix().to_string(),
+        )
+        .expect("a warm cache entry needs no registry call");
+        assert!(
+            out.get("proof").and_then(|v| v.as_str()).is_some(),
+            "got: {out}"
+        );
+        assert!(
+            out.get("root").and_then(|v| v.as_str()).is_some(),
+            "got: {out}"
+        );
         assert_eq!(
             out.get("message_id").and_then(|v| v.as_u64()),
             Some(0),
             "first allocation on a fresh (rln_identifier, epoch): {out}"
         );
-        assert_eq!(out.get("membership_hash").and_then(|v| v.as_str()), Some(hash.as_str()));
+        assert_eq!(
+            out.get("membership_hash").and_then(|v| v.as_str()),
+            Some(hash.as_str())
+        );
 
         sealed_store::store::publish(None);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1188,7 +1306,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
         let (imp, store) = imp_with_store(dir.clone());
-        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+        assert!(imp
+            .unlock_keystore("pw".into())
+            .contains(r#""unlocked":true"#));
 
         let reg = format!("logos:local:{}", "ac".repeat(32));
         let rln_id_hex = "ee".repeat(32);
@@ -1278,7 +1398,9 @@ mod tests {
         start_impl(r#"{"epoch_size_sec": 600, "max_epoch_gap": 1}"#).unwrap();
 
         let (imp, store) = imp_with_store(dir.clone());
-        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+        assert!(imp
+            .unlock_keystore("pw".into())
+            .contains(r#""unlocked":true"#));
 
         let reg = format!("logos:local:{}", "1a".repeat(32));
         let rln_id_hex = "2b".repeat(32);
@@ -1338,7 +1460,8 @@ mod tests {
         let rln_id_hex = "4d".repeat(32);
         // 100 epochs in the past — far outside now ± 1.
         let stale = (now_unix() - 100 * 600).to_string();
-        let err = generate_proof_impl(no_store(), &registry, &rln_id_hex, "aa", &stale).unwrap_err();
+        let err =
+            generate_proof_impl(no_store(), &registry, &rln_id_hex, "aa", &stale).unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument);
         assert!(err.message.contains("window"), "got: {}", err.message);
         // Leave CONFIG set (per the suite convention): a trailing reset would

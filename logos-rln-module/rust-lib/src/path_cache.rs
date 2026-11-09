@@ -12,10 +12,10 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use crate::error::ApiError;
 use crate::registry_id::CanonicalRegistryId;
 use crate::tree::TreeSource;
 use crate::util::lock;
-use crate::error::ApiError;
 
 struct CachedPath {
     path_elements_hex: Vec<String>,
@@ -24,7 +24,6 @@ struct CachedPath {
 }
 
 static PATHS: Mutex<Option<HashMap<String, CachedPath>>> = Mutex::new(None);
-
 
 /// The cached path for `hash`, or `None` on a cold cache or a leaf_index
 /// mismatch (the stale-leaf guard). Miss fallback: [`fill_path_cache`].
@@ -54,7 +53,11 @@ pub(crate) fn fill_path_cache(
     let (path_elements_hex, path_indices) = (witness.path_elements_hex, witness.path_indices);
     lock(&PATHS).get_or_insert_with(HashMap::new).insert(
         hash.to_string(),
-        CachedPath { path_elements_hex, path_indices, leaf_index },
+        CachedPath {
+            path_elements_hex,
+            path_indices,
+            leaf_index,
+        },
     );
     Ok(())
 }
@@ -68,7 +71,11 @@ pub(crate) fn set_path_for_test(
 ) {
     lock(&PATHS).get_or_insert_with(HashMap::new).insert(
         hash.to_string(),
-        CachedPath { path_elements_hex, path_indices, leaf_index },
+        CachedPath {
+            path_elements_hex,
+            path_indices,
+            leaf_index,
+        },
     );
 }
 
@@ -88,8 +95,14 @@ mod tests {
             "path_elements": ["cc".repeat(32), "dd".repeat(32)], "path_indices": [1, 0],
             "root": "bb".repeat(32),
         });
-        let expected = crate::tree::MerkleProof::from_provider_json(&proof).unwrap().lifted().root;
-        let tree = FakeTree { proof: Some(proof), roots: None };
+        let expected = crate::tree::MerkleProof::from_provider_json(&proof)
+            .unwrap()
+            .lifted()
+            .root;
+        let tree = FakeTree {
+            proof: Some(proof),
+            roots: None,
+        };
         crate::roots::adopt(&registry.canonical, (1..=5).map(|n| [n; 32]).collect());
 
         fill_path_cache(&registry, "path-cache-test-admit", 3, &tree).expect("proof cached");
@@ -113,7 +126,10 @@ mod tests {
         assert_eq!(elements, vec!["ab".repeat(32)]);
         assert_eq!(indices, vec![1]);
 
-        assert!(hit(hash, 6).is_none(), "leaf_index mismatch must miss, never serve a stale path");
+        assert!(
+            hit(hash, 6).is_none(),
+            "leaf_index mismatch must miss, never serve a stale path"
+        );
     }
 
     #[test]
@@ -125,6 +141,9 @@ mod tests {
         let (elements, indices) = hit(hash, 2).expect("refreshed entry served");
         assert_eq!(elements, vec!["11".repeat(32)]);
         assert_eq!(indices, vec![1]);
-        assert!(hit(hash, 1).is_none(), "the old leaf_index's path is gone once the refresh overwrote it");
+        assert!(
+            hit(hash, 1).is_none(),
+            "the old leaf_index's path is gone once the refresh overwrote it"
+        );
     }
 }

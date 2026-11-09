@@ -197,7 +197,8 @@ mod tests {
     // construction. A change here breaks every existing keystore key.
     #[test]
     fn membership_hash_matches_frozen_vector() {
-        let registry = "logos:testnet:8f3a2b1c4d5e6f708192a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
+        let registry =
+            "logos:testnet:8f3a2b1c4d5e6f708192a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
         assert_eq!(
             membership_hash(registry, &[0x11u8; 32]),
             "400683426fc56e13d6f7b6cf8b31a825ab4356ac294ef98f91784514c5cbfc08"

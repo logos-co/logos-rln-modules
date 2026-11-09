@@ -12,11 +12,11 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::error::{ApiError, ErrorKind};
+use crate::provider;
 use crate::registry_id::CanonicalRegistryId;
 use crate::tree::TreeSource;
 use crate::util::lock;
-use crate::error::{ApiError, ErrorKind};
-use crate::provider;
 
 /// Refresh cadence. Roots rotate over seconds–minutes and the window carries
 /// few historical roots (lez-rln ROOT_HISTORY_SIZE = 4); 10s keeps proofs
@@ -75,7 +75,10 @@ pub(crate) fn adopt(canonical: &str, roots: Vec<[u8; 32]>) {
     }
     lock(&WINDOWS).get_or_insert_with(HashMap::new).insert(
         canonical.to_string(),
-        Window { roots, updated_at: crate::util::now_unix() },
+        Window {
+            roots,
+            updated_at: crate::util::now_unix(),
+        },
     );
 }
 
@@ -97,7 +100,10 @@ pub(crate) fn admit(canonical: &str, root: [u8; 32]) {
         None => {
             windows.insert(
                 canonical.to_string(),
-                Window { roots: vec![root], updated_at: crate::util::now_unix() },
+                Window {
+                    roots: vec![root],
+                    updated_at: crate::util::now_unix(),
+                },
             );
         }
     }
@@ -157,7 +163,10 @@ pub(crate) fn refresh_all() {
     }
     for registry in tracked_snapshot() {
         if let Err(e) = refresh_one(&registry) {
-            eprintln!("roots: refresh {} failed: {}", registry.canonical, e.message);
+            eprintln!(
+                "roots: refresh {} failed: {}",
+                registry.canonical, e.message
+            );
         }
         // A worker abandoned by stop() does at most one more read.
         if crate::worker::is_stopped() {
@@ -168,7 +177,9 @@ pub(crate) fn refresh_all() {
 
 #[cfg(test)]
 pub(crate) fn tracked_contains(canonical: &str) -> bool {
-    lock(&TRACKED).as_ref().is_some_and(|m| m.contains_key(canonical))
+    lock(&TRACKED)
+        .as_ref()
+        .is_some_and(|m| m.contains_key(canonical))
 }
 
 fn tracked_snapshot() -> Vec<CanonicalRegistryId> {
@@ -207,10 +218,9 @@ pub(crate) fn reset_nudge_for_test() {
 
 #[cfg(test)]
 pub(crate) fn set_window_for_test(canonical: &str, roots: Vec<[u8; 32]>, updated_at: u64) {
-    lock(&WINDOWS).get_or_insert_with(HashMap::new).insert(
-        canonical.to_string(),
-        Window { roots, updated_at },
-    );
+    lock(&WINDOWS)
+        .get_or_insert_with(HashMap::new)
+        .insert(canonical.to_string(), Window { roots, updated_at });
 }
 
 #[cfg(test)]
@@ -226,21 +236,36 @@ mod tests {
     fn admit_puts_a_proofs_root_first_and_keeps_the_window_size() {
         let canonical = "logos:local:admit-test";
         admit(canonical, [1; 32]);
-        assert_eq!(window(canonical), Some(vec![[1; 32]]), "no window yet: the root alone is one");
+        assert_eq!(
+            window(canonical),
+            Some(vec![[1; 32]]),
+            "no window yet: the root alone is one"
+        );
         adopt(canonical, (2..=6).map(|n| [n; 32]).collect());
         admit(canonical, [4; 32]);
-        assert_eq!(window(canonical).unwrap()[0], [2; 32], "a root already in the window moves nothing");
+        assert_eq!(
+            window(canonical).unwrap()[0],
+            [2; 32],
+            "a root already in the window moves nothing"
+        );
         admit(canonical, [9; 32]);
         let w = window(canonical).unwrap();
         assert_eq!(w.len(), WINDOW_CAP);
-        assert_eq!((w[0], w[4]), ([9; 32], [5; 32]), "newest first; the oldest drops out");
+        assert_eq!(
+            (w[0], w[4]),
+            ([9; 32], [5; 32]),
+            "newest first; the oldest drops out"
+        );
     }
 
     #[test]
     fn adopt_installs_a_fresh_window_and_skips_empty() {
         let canonical = "logos:local:adopt-test";
         adopt(canonical, vec![]);
-        assert!(window(canonical).is_none(), "empty adoption must be a no-op");
+        assert!(
+            window(canonical).is_none(),
+            "empty adoption must be a no-op"
+        );
         adopt(canonical, vec![[7u8; 32]]);
         assert_eq!(window(canonical).expect("adopted window"), vec![[7u8; 32]]);
     }

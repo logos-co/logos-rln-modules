@@ -87,7 +87,12 @@ pub(crate) fn epoch_size() -> Result<u64, ApiError> {
 
 /// start()'s stale-binding warning: the membership's own registry's
 /// configured size, which is what the check compared against.
-pub(crate) fn epoch_binding_warning(hash: &str, registry: &str, bound: u64, configured: u64) -> String {
+pub(crate) fn epoch_binding_warning(
+    hash: &str,
+    registry: &str,
+    bound: u64,
+    configured: u64,
+) -> String {
     format!(
         "membership start: entry {hash} on {registry} allocations are bound to \
          epoch_size_sec={bound}, configured size is {configured}; \

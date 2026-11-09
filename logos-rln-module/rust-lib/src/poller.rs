@@ -76,7 +76,11 @@ fn observe(record: &MembershipRecord) -> Option<Option<ProviderMembership>> {
             return None;
         }
     };
-    observe_with(record, &registry, backend_for(&registry.namespace)?.registry)
+    observe_with(
+        record,
+        &registry,
+        backend_for(&registry.namespace)?.registry,
+    )
 }
 
 fn observe_with(
@@ -257,7 +261,9 @@ pub(crate) fn refresh_paths() {
                 continue;
             }
         };
-        let Some(backend) = backend_for(&registry.namespace) else { continue };
+        let Some(backend) = backend_for(&registry.namespace) else {
+            continue;
+        };
         // Leaf 0 is a VALID leaf, so a usable row without one cannot be
         // defaulted — that would cache the wrong membership's path. The cache
         // is deliberately unauthenticated (see lifecycle.rs), so this pairing
@@ -269,7 +275,10 @@ pub(crate) fn refresh_paths() {
         if let Err(e) = path_cache::fill_path_cache(&registry, hash, leaf_index, backend.tree) {
             // Keep the previous cache entry — a slightly-stale but still
             // verifiable path beats none.
-            eprintln!("membership poller: {hash} path refresh failed: {}", e.message);
+            eprintln!(
+                "membership poller: {hash} path refresh failed: {}",
+                e.message
+            );
         }
         // Re-checked after every record's read so a worker abandoned by
         // stop() does at most one more read before exiting.
@@ -291,31 +300,53 @@ mod tests {
     fn a_pending_record_is_confirmed_through_the_registry() {
         use crate::provider::fake::{self, FakePayer, FakeRegistry, FakeTree};
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
-        let dir = std::env::temp_dir().join(format!("rln-poller-confirm-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rln-poller-confirm-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (_imp, store) = imp_with_store(dir.clone());
         store.unlock("pw").unwrap();
         let registry = "fakens:local:confirm";
-        seed_membership(&store, "conf", registry, &"56".repeat(32), "", &"e6".repeat(32), MembershipState::Pending, 0, 100);
+        seed_membership(
+            &store,
+            "conf",
+            registry,
+            &"56".repeat(32),
+            "",
+            &"e6".repeat(32),
+            MembershipState::Pending,
+            0,
+            100,
+        );
         store.update_cache("conf", |m| m.leaf_index = None).unwrap();
 
         let install = |leaf: Option<u64>| {
             crate::test_support::install_backend(fake::backend(
                 FakeTree::default(),
-                FakeRegistry { membership: Some(Some((MembershipState::Active, leaf, 100))), bounds: None },
+                FakeRegistry {
+                    membership: Some(Some((MembershipState::Active, leaf, 100))),
+                    bounds: None,
+                },
                 FakePayer::default(),
             ))
         };
         install(Some(4));
         poller::tick(false);
         let rec = store.membership("conf").unwrap();
-        assert_eq!((rec.cache.state, rec.cache.leaf_index), (MembershipState::Active, Some(4)));
+        assert_eq!(
+            (rec.cache.state, rec.cache.leaf_index),
+            (MembershipState::Active, Some(4))
+        );
 
         install(None);
-        store.update_cache("conf", |m| m.state = MembershipState::Pending).unwrap();
+        store
+            .update_cache("conf", |m| m.state = MembershipState::Pending)
+            .unwrap();
         poller::tick(false);
         let rec = store.membership("conf").unwrap();
-        assert_eq!((rec.cache.state, rec.cache.leaf_index), (MembershipState::Active, Some(4)));
+        assert_eq!(
+            (rec.cache.state, rec.cache.leaf_index),
+            (MembershipState::Active, Some(4))
+        );
 
         crate::sealed_store::store::publish(None);
         let _ = std::fs::remove_dir_all(&dir);
@@ -326,15 +357,42 @@ mod tests {
     #[test]
     fn an_absent_record_is_erased_only_if_it_was_ever_on_the_registry() {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
-        let dir = std::env::temp_dir().join(format!("rln-absent-verdict-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rln-absent-verdict-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (_imp, store) = imp_with_store(dir.clone());
         store.unlock("pw").unwrap();
         let registry = format!("logos:local:{}", "7c".repeat(32));
-        seed_membership(&store, "was", &registry, &"54".repeat(32), "", &"e4".repeat(32), MembershipState::Active, 1, 100);
-        seed_membership(&store, "never", &registry, &"55".repeat(32), "", &"e5".repeat(32), MembershipState::Unknown, 0, 100);
-        assert_eq!(poller::absent_verdict(&store.membership("was").unwrap()), (MembershipState::Erased, "removed_from_registry"));
-        assert_eq!(poller::absent_verdict(&store.membership("never").unwrap()), (MembershipState::Failed, "not_on_registry"));
+        seed_membership(
+            &store,
+            "was",
+            &registry,
+            &"54".repeat(32),
+            "",
+            &"e4".repeat(32),
+            MembershipState::Active,
+            1,
+            100,
+        );
+        seed_membership(
+            &store,
+            "never",
+            &registry,
+            &"55".repeat(32),
+            "",
+            &"e5".repeat(32),
+            MembershipState::Unknown,
+            0,
+            100,
+        );
+        assert_eq!(
+            poller::absent_verdict(&store.membership("was").unwrap()),
+            (MembershipState::Erased, "removed_from_registry")
+        );
+        assert_eq!(
+            poller::absent_verdict(&store.membership("never").unwrap()),
+            (MembershipState::Failed, "not_on_registry")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

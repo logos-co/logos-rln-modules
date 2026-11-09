@@ -34,13 +34,13 @@ use std::time::Duration;
 
 use logos_rust_sdk::LogosError;
 
+use crate::error::{ApiError, ErrorKind};
 use crate::generated::liblogos_lez_rln_module::LiblogosLezRlnModuleClient;
 use crate::generated::rln_gifter_module::RlnGifterModuleClient;
 use crate::lifecycle::MembershipState;
 use crate::registry_id::CanonicalRegistryId;
 use crate::tree::{MerkleProof, RootSet, TreeSource};
 use crate::util::lock;
-use crate::error::{ApiError, ErrorKind};
 
 const TARGET_MODULE: &str = "liblogos_lez_rln_module";
 /// The lez module's reads run up to 60s against the wallet; add hop margin.
@@ -317,7 +317,10 @@ fn networks_in_order(tracked: &[String]) -> Vec<CanonicalRegistryId> {
 pub(crate) fn select_networks(tracked: &[String]) {
     for registry in networks_in_order(tracked) {
         match ensure_network(&registry) {
-            Ok(()) => eprintln!("membership start: network '{}' selected", registry.reference),
+            Ok(()) => eprintln!(
+                "membership start: network '{}' selected",
+                registry.reference
+            ),
             Err(e) => eprintln!(
                 "membership start: network '{}': {}",
                 registry.reference, e.message
@@ -383,13 +386,21 @@ pub(crate) struct DiscoverReply {
 
 impl DiscoverReply {
     fn from_reply(raw: &str) -> Result<Self, ApiError> {
-        let v: serde_json::Value = serde_json::from_str(raw)
-            .map_err(|e| ApiError::new(ErrorKind::ProviderFailure, &format!("discover parse: {e}")))?;
+        let v: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+            ApiError::new(ErrorKind::ProviderFailure, &format!("discover parse: {e}"))
+        })?;
         Ok(DiscoverReply {
-            candidates: v.get("candidates").and_then(|c| c.as_array()).map_or(0, Vec::len),
+            candidates: v
+                .get("candidates")
+                .and_then(|c| c.as_array())
+                .map_or(0, Vec::len),
             joined: v.get("joined").and_then(|j| j.as_bool()),
             peers: v.get("peers").and_then(|p| p.as_u64()),
-            error: v.get("error").map(|e| e.as_str().map(String::from).unwrap_or_else(|| e.to_string())),
+            error: v.get("error").map(|e| {
+                e.as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| e.to_string())
+            }),
         })
     }
 }
@@ -466,7 +477,8 @@ pub(crate) trait Registry: Send + Sync {
     /// Whether the registry is deployed on the chain the provider reads, as
     /// the lez module's raw check object (`{status, detail?, sequencer?,
     /// chain_head?}`). An error means the question could not be asked.
-    fn check_registry(&self, registry: &CanonicalRegistryId) -> Result<serde_json::Value, ApiError>;
+    fn check_registry(&self, registry: &CanonicalRegistryId)
+        -> Result<serde_json::Value, ApiError>;
 }
 
 /// The wallet that pays for a self-funded registration.
@@ -502,8 +514,13 @@ pub(crate) struct Backend {
 
 /// The registry statuses that mean "this registry cannot work here", as
 /// opposed to "could not tell" (`unreachable`, or no answer at all).
-const REGISTRY_PROBLEMS: [&str; 5] =
-    ["not_deployed", "wrong_generation", "unexpected_layout", "network_conflict", "invalid"];
+const REGISTRY_PROBLEMS: [&str; 5] = [
+    "not_deployed",
+    "wrong_generation",
+    "unexpected_layout",
+    "network_conflict",
+    "invalid",
+];
 
 /// A sentence for the caller when the registry is known not to be usable on
 /// the provider's chain: a reset network, a registry from another program
@@ -522,7 +539,10 @@ fn registry_problem_from(canonical: &str, check: &serde_json::Value) -> Option<S
     if !REGISTRY_PROBLEMS.contains(&status) {
         return None;
     }
-    let detail = check.get("detail").and_then(|d| d.as_str()).unwrap_or(status);
+    let detail = check
+        .get("detail")
+        .and_then(|d| d.as_str())
+        .unwrap_or(status);
     let at = match (
         check.get("sequencer").and_then(|s| s.as_str()),
         check.get("chain_head").and_then(serde_json::Value::as_u64),
@@ -531,17 +551,15 @@ fn registry_problem_from(canonical: &str, check: &serde_json::Value) -> Option<S
         (Some(seq), None) => format!(" on {seq}"),
         _ => String::new(),
     };
-    Some(format!("registry {canonical} is not usable{at}: {status} — {detail}"))
+    Some(format!(
+        "registry {canonical} is not usable{at}: {status} — {detail}"
+    ))
 }
 
 /// A failed registry read, explained when the registry itself is the cause:
 /// an empty reply from the lez module says nothing, so ask it whether the
 /// registry is there at all and, if not, say that instead.
-fn explained(
-    prov: &dyn Registry,
-    registry: &CanonicalRegistryId,
-    e: ApiError,
-) -> ApiError {
+fn explained(prov: &dyn Registry, registry: &CanonicalRegistryId, e: ApiError) -> ApiError {
     if e.kind != ErrorKind::ProviderFailure {
         return e;
     }
@@ -557,7 +575,11 @@ static LEZ_RLN: LezRlnProvider = LezRlnProvider;
 /// `unknown_registry` error.
 pub(crate) fn backend_for(namespace: &str) -> Option<Backend> {
     match namespace {
-        "logos" => Some(Backend { tree: &LEZ_RLN, registry: &LEZ_RLN, payer: &LEZ_RLN }),
+        "logos" => Some(Backend {
+            tree: &LEZ_RLN,
+            registry: &LEZ_RLN,
+            payer: &LEZ_RLN,
+        }),
         #[cfg(test)]
         "fakens" => *lock(&crate::test_support::INSTALLED_BACKEND),
         _ => None,
@@ -587,8 +609,8 @@ fn provider_failure(method: &str) -> ApiError {
 /// wrong membership.)
 fn parse_membership_reply(raw: &str) -> Result<Option<ProviderMembership>, ApiError> {
     let fault = |msg: String| ApiError::new(ErrorKind::ProviderFailure, &msg);
-    let v: serde_json::Value = serde_json::from_str(raw)
-        .map_err(|e| fault(format!("get_membership reply parse: {e}")))?;
+    let v: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| fault(format!("get_membership reply parse: {e}")))?;
     let registered = v
         .get("registered")
         .and_then(|x| x.as_bool())
@@ -644,7 +666,10 @@ impl Registry for LezRlnProvider {
         // The wire carries `int`; a rate the lez module could not even receive
         // is the caller's error, not a submission to be recorded.
         let rate_limit = i64::try_from(rate_limit).map_err(|_| {
-            ApiError::new(ErrorKind::InvalidArgument, "rate_limit exceeds the wire's i64")
+            ApiError::new(
+                ErrorKind::InvalidArgument,
+                "rate_limit exceeds the wire's i64",
+            )
         })?;
 
         // After argument validation, so a malformed call is still the
@@ -678,11 +703,17 @@ impl Registry for LezRlnProvider {
         )
         .map_err(|e| explained(self, registry, e))?;
         serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
-            ApiError::new(ErrorKind::ProviderFailure, &format!("bounds reply parse: {e}"))
+            ApiError::new(
+                ErrorKind::ProviderFailure,
+                &format!("bounds reply parse: {e}"),
+            )
         })
     }
 
-    fn check_registry(&self, registry: &CanonicalRegistryId) -> Result<serde_json::Value, ApiError> {
+    fn check_registry(
+        &self,
+        registry: &CanonicalRegistryId,
+    ) -> Result<serde_json::Value, ApiError> {
         ensure_network(registry)?;
         let client = lez_client();
         let raw = read_reply(
@@ -692,7 +723,10 @@ impl Registry for LezRlnProvider {
             }),
         )?;
         serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
-            ApiError::new(ErrorKind::ProviderFailure, &format!("check_registry parse: {e}"))
+            ApiError::new(
+                ErrorKind::ProviderFailure,
+                &format!("check_registry parse: {e}"),
+            )
         })
     }
 }
@@ -707,7 +741,10 @@ impl Payer for LezRlnProvider {
             }),
         )?;
         serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
-            ApiError::new(ErrorKind::ProviderFailure, &format!("wallet_status parse: {e}"))
+            ApiError::new(
+                ErrorKind::ProviderFailure,
+                &format!("wallet_status parse: {e}"),
+            )
         })
     }
 
@@ -723,7 +760,10 @@ impl Payer for LezRlnProvider {
             }),
         )?;
         let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-            ApiError::new(ErrorKind::ProviderFailure, &format!("balance reply parse: {e}"))
+            ApiError::new(
+                ErrorKind::ProviderFailure,
+                &format!("balance reply parse: {e}"),
+            )
         })?;
         // A decimal STRING on the wire: a u128 balance exceeds JSON number
         // precision, and a truncated one compared against a price is worse
@@ -733,7 +773,10 @@ impl Payer for LezRlnProvider {
             .and_then(|b| b.as_str())
             .and_then(|b| b.parse::<u128>().ok())
             .ok_or_else(|| {
-                ApiError::new(ErrorKind::ProviderFailure, "balance reply has no decimal balance")
+                ApiError::new(
+                    ErrorKind::ProviderFailure,
+                    "balance reply has no decimal balance",
+                )
             })
     }
 
@@ -773,10 +816,16 @@ impl TreeSource for LezRlnProvider {
         )
         .map_err(|e| explained(self, registry, e))?;
         let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-            ApiError::new(ErrorKind::ProviderFailure, &format!("proofs reply parse: {e}"))
+            ApiError::new(
+                ErrorKind::ProviderFailure,
+                &format!("proofs reply parse: {e}"),
+            )
         })?;
         let first = v.as_array().and_then(|arr| arr.first()).ok_or_else(|| {
-            ApiError::new(ErrorKind::ProviderFailure, "empty proof array (leaf out of range?)")
+            ApiError::new(
+                ErrorKind::ProviderFailure,
+                "empty proof array (leaf out of range?)",
+            )
         })?;
         MerkleProof::from_provider_json(first)
     }
@@ -792,7 +841,10 @@ impl TreeSource for LezRlnProvider {
         )
         .map_err(|e| explained(self, registry, e))?;
         let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-            ApiError::new(ErrorKind::ProviderFailure, &format!("roots reply parse: {e}"))
+            ApiError::new(
+                ErrorKind::ProviderFailure,
+                &format!("roots reply parse: {e}"),
+            )
         })?;
         RootSet::from_provider_json(&parsed)
     }
@@ -807,7 +859,10 @@ pub(crate) mod fake {
     use super::*;
 
     fn unanswered(what: &str) -> ApiError {
-        ApiError::new(ErrorKind::ProviderFailure, &format!("fake {what}: no answer configured"))
+        ApiError::new(
+            ErrorKind::ProviderFailure,
+            &format!("fake {what}: no answer configured"),
+        )
     }
 
     /// Serves its proof and roots replies through the same decoders the lez
@@ -820,16 +875,25 @@ pub(crate) mod fake {
 
     impl TreeSource for FakeTree {
         fn merkle_proof(&self, _: &CanonicalRegistryId, _: u64) -> Result<MerkleProof, ApiError> {
-            MerkleProof::from_provider_json(self.proof.as_ref().ok_or_else(|| unanswered("merkle_proof"))?)
+            MerkleProof::from_provider_json(
+                self.proof
+                    .as_ref()
+                    .ok_or_else(|| unanswered("merkle_proof"))?,
+            )
         }
 
         fn valid_roots(&self, _: &CanonicalRegistryId) -> Result<RootSet, ApiError> {
-            RootSet::from_provider_json(self.roots.as_ref().ok_or_else(|| unanswered("valid_roots"))?)
+            RootSet::from_provider_json(
+                self.roots
+                    .as_ref()
+                    .ok_or_else(|| unanswered("valid_roots"))?,
+            )
         }
     }
 
     /// Every `FakeRegistry::register_async` call, across instances.
-    pub(crate) static REGISTER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    pub(crate) static REGISTER_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
     /// `membership`: None = no answer, Some(None) = not registered,
     /// Some(Some((state, leaf_index, rate_limit))) = registered.
@@ -845,12 +909,16 @@ pub(crate) mod fake {
             _: &CanonicalRegistryId,
             _: &str,
         ) -> Result<Option<ProviderMembership>, ApiError> {
-            let answer = self.membership.ok_or_else(|| unanswered("get_membership"))?;
-            Ok(answer.map(|(state, leaf_index, rate_limit)| ProviderMembership {
-                state,
-                leaf_index,
-                rate_limit,
-            }))
+            let answer = self
+                .membership
+                .ok_or_else(|| unanswered("get_membership"))?;
+            Ok(
+                answer.map(|(state, leaf_index, rate_limit)| ProviderMembership {
+                    state,
+                    leaf_index,
+                    rate_limit,
+                }),
+            )
         }
 
         fn register_async(
@@ -864,8 +932,13 @@ pub(crate) mod fake {
             Err(unanswered("register_async"))
         }
 
-        fn get_registry_bounds(&self, _: &CanonicalRegistryId) -> Result<serde_json::Value, ApiError> {
-            self.bounds.clone().ok_or_else(|| unanswered("get_registry_bounds"))
+        fn get_registry_bounds(
+            &self,
+            _: &CanonicalRegistryId,
+        ) -> Result<serde_json::Value, ApiError> {
+            self.bounds
+                .clone()
+                .ok_or_else(|| unanswered("get_registry_bounds"))
         }
 
         fn check_registry(&self, _: &CanonicalRegistryId) -> Result<serde_json::Value, ApiError> {
@@ -880,7 +953,9 @@ pub(crate) mod fake {
 
     impl Payer for FakePayer {
         fn wallet_status(&self) -> Result<serde_json::Value, ApiError> {
-            Ok(serde_json::json!({ "detail": "", "payer": "fake", "ready": true, "state": "ready" }))
+            Ok(
+                serde_json::json!({ "detail": "", "payer": "fake", "ready": true, "state": "ready" }),
+            )
         }
 
         fn payer_balance(&self) -> Result<u128, ApiError> {
@@ -976,10 +1051,16 @@ mod tests {
         });
         let msg = registry_problem_from("logos:testnet:ab", &gone).expect("explained");
         assert!(msg.contains("not_deployed"), "{msg}");
-        assert!(msg.contains("https://testnet.lez.logos.co/ (chain at block 12)"), "{msg}");
+        assert!(
+            msg.contains("https://testnet.lez.logos.co/ (chain at block 12)"),
+            "{msg}"
+        );
         for status in ["ok", "unreachable", "something_new"] {
             let check = serde_json::json!({"status": status});
-            assert!(registry_problem_from("logos:testnet:ab", &check).is_none(), "{status}");
+            assert!(
+                registry_problem_from("logos:testnet:ab", &check).is_none(),
+                "{status}"
+            );
         }
         assert!(registry_problem_from("logos:testnet:ab", &serde_json::json!({})).is_none());
     }
@@ -1036,7 +1117,10 @@ mod tests {
     fn stubbed_transport_degrades_to_provider_failure() {
         let registry = registry_id::parse(&format!("logos:local:{}", "ab".repeat(32))).unwrap();
         let backend = backend_for("logos").unwrap();
-        assert!(backend.registry.get_membership(&registry, &"11".repeat(32)).is_err());
+        assert!(backend
+            .registry
+            .get_membership(&registry, &"11".repeat(32))
+            .is_err());
         assert!(backend.tree.merkle_proof(&registry, 0).is_err());
         assert!(backend.tree.valid_roots(&registry).is_err());
         assert!(backend.payer.fee_state().is_err());
@@ -1057,7 +1141,10 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::ProviderFailure);
-        assert!(!*lock(&fired), "a synchronous failure must not also reach on_done");
+        assert!(
+            !*lock(&fired),
+            "a synchronous failure must not also reach on_done"
+        );
     }
 
     /// The logos namespace needs nothing from the caller to name a payer:
@@ -1093,7 +1180,13 @@ mod tests {
             Gate::Retry
         );
         // Nothing that failed to say "refused" may be read as a refusal.
-        for raw in ["", "garbage", "[]", r#"{"accepted":false}"#, r#"{"retry":false}"#] {
+        for raw in [
+            "",
+            "garbage",
+            "[]",
+            r#"{"accepted":false}"#,
+            r#"{"retry":false}"#,
+        ] {
             assert_eq!(interpret_use_network(raw), Gate::Retry, "{raw:?}");
         }
     }
@@ -1104,9 +1197,16 @@ mod tests {
         remember(&mut gate, "devnet", &Gate::Retry);
         assert!(gate.is_empty(), "a retry must be asked again");
         remember(&mut gate, "devnet", &Gate::Accepted);
-        remember(&mut gate, "testnet", &Gate::Refused("bound to devnet".to_owned()));
+        remember(
+            &mut gate,
+            "testnet",
+            &Gate::Refused("bound to devnet".to_owned()),
+        );
         assert_eq!(gate.get("devnet"), Some(&Ok(())));
-        assert_eq!(gate.get("testnet"), Some(&Err("bound to devnet".to_owned())));
+        assert_eq!(
+            gate.get("testnet"),
+            Some(&Err("bound to devnet".to_owned()))
+        );
     }
 
     /// The first registry id binds an unconfigured wallet, so the order the
@@ -1123,8 +1223,10 @@ mod tests {
             format!("logos:testnet:{c}"),
             "not a registry id".to_owned(),
         ];
-        let picked: Vec<String> =
-            networks_in_order(&tracked).into_iter().map(|r| r.canonical).collect();
+        let picked: Vec<String> = networks_in_order(&tracked)
+            .into_iter()
+            .map(|r| r.canonical)
+            .collect();
         assert_eq!(
             picked,
             vec![format!("logos:testnet:{a}"), format!("logos:devnet:{b}")]
@@ -1135,15 +1237,22 @@ mod tests {
     fn a_remembered_refusal_is_unknown_registry() {
         let registry =
             registry_id::parse(&format!("logos:gate-refused-test:{}", "ab".repeat(32))).unwrap();
-        lock(&NETWORK_GATE)
-            .insert(registry.reference.clone(), Err("bound to devnet".to_owned()));
+        lock(&NETWORK_GATE).insert(
+            registry.reference.clone(),
+            Err("bound to devnet".to_owned()),
+        );
         let err = ensure_network(&registry).unwrap_err();
         assert_eq!(err.kind, ErrorKind::UnknownRegistry);
         assert!(err.message.contains("bound to devnet"), "{}", err.message);
         // And every provider method that takes the registry refuses with it.
         let backend = backend_for("logos").unwrap();
         assert_eq!(
-            backend.tree.valid_roots(&registry).err().expect("refused").kind,
+            backend
+                .tree
+                .valid_roots(&registry)
+                .err()
+                .expect("refused")
+                .kind,
             ErrorKind::UnknownRegistry
         );
         lock(&NETWORK_GATE).remove(&registry.reference);

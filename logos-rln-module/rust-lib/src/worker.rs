@@ -320,7 +320,10 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    const RESPAWN: &[fn()] = &[crate::poller::ensure_running, crate::roots::ensure_refresher];
+    const RESPAWN: &[fn()] = &[
+        crate::poller::ensure_running,
+        crate::roots::ensure_refresher,
+    ];
 
     // The supervisor is process-global; every test here serializes on the
     // crate's designated global-state lock and starts from a clean reset.
@@ -335,7 +338,10 @@ mod tests {
         let woke = Arc::new(AtomicBool::new(false));
         let woke2 = woke.clone();
         let subscriber = std::thread::spawn(move || {
-            woke2.store(wait_tick_or_nudge(gen, Duration::from_secs(60)), Ordering::SeqCst);
+            woke2.store(
+                wait_tick_or_nudge(gen, Duration::from_secs(60)),
+                Ordering::SeqCst,
+            );
         });
         let returned = Arc::new(AtomicBool::new(false));
         let returned2 = returned.clone();
@@ -349,8 +355,15 @@ mod tests {
         let began = Instant::now();
         nudge();
         subscriber.join().unwrap();
-        assert!(woke.load(Ordering::SeqCst), "a nudge must count as a DUE tick, not a spurious wake");
-        assert!(began.elapsed() < Duration::from_secs(5), "nudge wake took {:?}", began.elapsed());
+        assert!(
+            woke.load(Ordering::SeqCst),
+            "a nudge must count as a DUE tick, not a spurious wake"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "nudge wake took {:?}",
+            began.elapsed()
+        );
 
         std::thread::sleep(Duration::from_millis(200));
         assert!(
@@ -360,7 +373,10 @@ mod tests {
 
         // The generation bump is the bystander's exit signal — no minute wait.
         reset_for_test();
-        assert!(!bystander.join().unwrap(), "a superseded waiter must not report a due tick");
+        assert!(
+            !bystander.join().unwrap(),
+            "a superseded waiter must not report a due tick"
+        );
     }
 
     #[test]
@@ -375,7 +391,11 @@ mod tests {
         assert_eq!(live_worker_count(), 0);
         // Design target is milliseconds (workers sleep in wait_tick); the
         // bound is generous for a loaded CI box.
-        assert!(began.elapsed() < Duration::from_secs(2), "stop took {:?}", began.elapsed());
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "stop took {:?}",
+            began.elapsed()
+        );
         reset_for_test();
     }
 
@@ -438,8 +458,15 @@ mod tests {
         // detaches after the grace and returns promptly.
         let began = Instant::now();
         stop();
-        assert!(began.elapsed() < Duration::from_secs(2), "stop took {:?}", began.elapsed());
-        assert!(!exited.load(Ordering::SeqCst), "the blocked worker is still parked, i.e. detached");
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "stop took {:?}",
+            began.elapsed()
+        );
+        assert!(
+            !exited.load(Ordering::SeqCst),
+            "the blocked worker is still parked, i.e. detached"
+        );
 
         // Release the "provider read"; the detached straggler self-exits
         // (observed via its own flag — superseded, it never touches `running`).
@@ -452,7 +479,10 @@ mod tests {
         while !exited.load(Ordering::SeqCst) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(exited.load(Ordering::SeqCst), "released straggler must self-exit");
+        assert!(
+            exited.load(Ordering::SeqCst),
+            "released straggler must self-exit"
+        );
 
         // A restart spawns exactly the fresh set — stop() closed the
         // generation and zeroed the count, so the detached straggler never

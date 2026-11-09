@@ -28,7 +28,8 @@ pub(crate) fn install_backend(backend: Backend) {
 /// `provider::gifter_discover_async` serve it in tests: the method
 /// (`"request"` | `"discover"`) and its args in, the gifter's reply JSON text
 /// or a dispatch error out.
-pub(crate) type FakeGifter = Box<dyn Fn(&str, &serde_json::Value) -> Result<String, ApiError> + Send + Sync>;
+pub(crate) type FakeGifter =
+    Box<dyn Fn(&str, &serde_json::Value) -> Result<String, ApiError> + Send + Sync>;
 
 /// The gifter the provider's gifter calls reach instead of the client.
 pub(crate) static INSTALLED_GIFTER: Mutex<Option<FakeGifter>> = Mutex::new(None);
@@ -90,7 +91,9 @@ pub(crate) fn seed_membership(
         identity_secret_hash: secret_hex.to_string(),
         registry_id: registry.to_string(),
     };
-    store.insert(hash, identity, &credential, 100).expect("seed insert");
+    store
+        .insert(hash, identity, &credential, 100)
+        .expect("seed insert");
     store
         .update_cache(hash, |m| {
             m.state = state;

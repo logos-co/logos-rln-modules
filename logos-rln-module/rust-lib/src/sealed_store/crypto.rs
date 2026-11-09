@@ -48,14 +48,24 @@ impl KdfParams {
     pub fn generate() -> Result<KdfParams, CryptoError> {
         let mut salt = [0u8; 16];
         getrandom::getrandom(&mut salt).map_err(|_| CryptoError::NoEntropy)?;
-        Ok(KdfParams { m_cost_kib: 65536, t_cost: 3, p_cost: 1, salt: bytes_to_hex(&salt) })
+        Ok(KdfParams {
+            m_cost_kib: 65536,
+            t_cost: 3,
+            p_cost: 1,
+            salt: bytes_to_hex(&salt),
+        })
     }
 
     #[cfg(test)]
     pub fn fast_for_tests() -> KdfParams {
         let mut salt = [0u8; 16];
         getrandom::getrandom(&mut salt).expect("test entropy");
-        KdfParams { m_cost_kib: 8, t_cost: 1, p_cost: 1, salt: bytes_to_hex(&salt) }
+        KdfParams {
+            m_cost_kib: 8,
+            t_cost: 1,
+            p_cost: 1,
+            salt: bytes_to_hex(&salt),
+        }
     }
 }
 
@@ -81,8 +91,11 @@ impl MasterKey {
         let argon_params =
             argon2::Params::new(params.m_cost_kib, params.t_cost, params.p_cost, Some(32))
                 .map_err(|_| CryptoError::Kdf("argon2 params"))?;
-        let argon =
-            argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, argon_params);
+        let argon = argon2::Argon2::new(
+            argon2::Algorithm::Argon2id,
+            argon2::Version::V0x13,
+            argon_params,
+        );
         let mut out = Zeroizing::new([0u8; 32]);
         argon
             .hash_password_into(password.as_bytes(), &salt, &mut out[..])
@@ -110,7 +123,8 @@ impl SubKeys {
 
 fn expand32(hk: &Hkdf<Sha256>, info: &[u8]) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     let mut out = Zeroizing::new([0u8; 32]);
-    hk.expand(info, &mut out[..]).map_err(|_| CryptoError::Kdf("hkdf expand"))?;
+    hk.expand(info, &mut out[..])
+        .map_err(|_| CryptoError::Kdf("hkdf expand"))?;
     Ok(out)
 }
 
@@ -123,7 +137,13 @@ pub fn seal(
     getrandom::getrandom(&mut nonce).map_err(|_| CryptoError::NoEntropy)?;
     let cipher = XChaCha20Poly1305::new(key.into());
     let ct = cipher
-        .encrypt(&XNonce::from(nonce), Payload { msg: plaintext, aad })
+        .encrypt(
+            &XNonce::from(nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| CryptoError::Malformed("aead input"))?;
     Ok((nonce, ct))
 }
@@ -134,8 +154,9 @@ pub fn unseal(
     aad: &[u8],
     ct: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
-    let nonce: [u8; 24] =
-        nonce.try_into().map_err(|_| CryptoError::Malformed("nonce length"))?;
+    let nonce: [u8; 24] = nonce
+        .try_into()
+        .map_err(|_| CryptoError::Malformed("nonce length"))?;
     let cipher = XChaCha20Poly1305::new(key.into());
     let pt = cipher
         .decrypt(&XNonce::from(nonce), Payload { msg: ct, aad })
@@ -178,7 +199,10 @@ mod tests {
     fn aad_flip_fails() {
         let key = seal_key();
         let (nonce, ct) = seal(&key, b"aad", b"secret").unwrap();
-        assert!(matches!(unseal(&key, &nonce, b"axd", &ct), Err(CryptoError::BadPassword)));
+        assert!(matches!(
+            unseal(&key, &nonce, b"axd", &ct),
+            Err(CryptoError::BadPassword)
+        ));
     }
 
     #[test]
@@ -186,7 +210,10 @@ mod tests {
         let key = seal_key();
         let (mut nonce, ct) = seal(&key, b"aad", b"secret").unwrap();
         nonce[0] ^= 1;
-        assert!(matches!(unseal(&key, &nonce, b"aad", &ct), Err(CryptoError::BadPassword)));
+        assert!(matches!(
+            unseal(&key, &nonce, b"aad", &ct),
+            Err(CryptoError::BadPassword)
+        ));
     }
 
     #[test]
@@ -194,7 +221,10 @@ mod tests {
         let key = seal_key();
         let (nonce, mut ct) = seal(&key, b"aad", b"secret").unwrap();
         ct[0] ^= 1;
-        assert!(matches!(unseal(&key, &nonce, b"aad", &ct), Err(CryptoError::BadPassword)));
+        assert!(matches!(
+            unseal(&key, &nonce, b"aad", &ct),
+            Err(CryptoError::BadPassword)
+        ));
     }
 
     #[test]
@@ -203,7 +233,10 @@ mod tests {
         let a = MasterKey::derive("pw", &params).unwrap();
         let b = MasterKey::derive("pw", &params).unwrap();
         assert_eq!(*a.0, *b.0);
-        let other_salt = KdfParams { salt: KdfParams::fast_for_tests().salt, ..params };
+        let other_salt = KdfParams {
+            salt: KdfParams::fast_for_tests().salt,
+            ..params
+        };
         let c = MasterKey::derive("pw", &other_salt).unwrap();
         assert_ne!(*a.0, *c.0);
     }

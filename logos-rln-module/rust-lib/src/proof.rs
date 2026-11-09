@@ -33,9 +33,10 @@ use std::sync::LazyLock;
 
 use rand_chacha::ChaCha20Rng;
 use rln::prelude::{
-    compute_id_secret, graph_from_raw, hash_to_field_le, zkey_from_raw, ArkGroth16Backend, CanonicalDeserialize,
-    CanonicalSerialize, Fr, Hasher, IdentityKeys, PoseidonHash, Proof, RLNBuilder, RLNMerkleProof,
-    RLNProof, RLNProofValues, RLNWitnessInput, SecretFr, Stateless, VerifyProofError, RLN,
+    compute_id_secret, graph_from_raw, hash_to_field_le, zkey_from_raw, ArkGroth16Backend,
+    CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, IdentityKeys, PoseidonHash, Proof,
+    RLNBuilder, RLNMerkleProof, RLNProof, RLNProofValues, RLNWitnessInput, SecretFr, Stateless,
+    VerifyProofError, RLN,
 };
 use zeroize::Zeroize;
 
@@ -427,8 +428,9 @@ fn secret_to_bytes32(secret: &SecretFr) -> [u8; 32] {
 /// The same fold has to be applied to every root the registry reports, or a
 /// proof's root would never match the window it is checked against.
 pub(crate) mod depth_bridge {
-    use super::{CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, PoseidonHash,
-        RLN_TREE_DEPTH};
+    use super::{
+        CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, PoseidonHash, RLN_TREE_DEPTH,
+    };
     use crate::registry_id::{bytes_to_hex, hex_to_bytes32};
     use std::sync::LazyLock;
 
@@ -761,7 +763,10 @@ mod tests {
         let x = signal_to_x(b"Hello, RLN!");
         let hex = bytes_to_hex(&fr_to_bytes32(&x));
         assert_eq!(x_from_hash_hex(&hex).expect("canonical"), x);
-        assert_eq!(x_from_hash_hex(&format!("0x{hex}")).expect("0x tolerated"), x);
+        assert_eq!(
+            x_from_hash_hex(&format!("0x{hex}")).expect("0x tolerated"),
+            x
+        );
         assert_eq!(fr_to_bytes32(&x), rln_signal::signal_hash(b"Hello, RLN!"));
 
         // At or above the modulus: refused, never reduced.
@@ -770,8 +775,14 @@ mod tests {
             Err(ProofError::BadInput(m)) if m.contains("signal_hash")
         ));
         // Wrong length / not hex.
-        assert!(matches!(x_from_hash_hex(&"ab".repeat(31)), Err(ProofError::BadInput(_))));
-        assert!(matches!(x_from_hash_hex("zz"), Err(ProofError::BadInput(_))));
+        assert!(matches!(
+            x_from_hash_hex(&"ab".repeat(31)),
+            Err(ProofError::BadInput(_))
+        ));
+        assert!(matches!(
+            x_from_hash_hex("zz"),
+            Err(ProofError::BadInput(_))
+        ));
     }
 
     // Frozen interop vectors — the wire contract other implementations must
@@ -860,7 +871,8 @@ mod tests {
     fn generate_then_verify_roundtrips() {
         let material = material_from_seed(&[7u8; 32], 100, 0);
         let rln_id = [9u8; 32];
-        let proof = generate(&material, signal_to_x(b"hello"), 1231028105, &rln_id).expect("generate");
+        let proof =
+            generate(&material, signal_to_x(b"hello"), 1231028105, &rln_id).expect("generate");
         let root = proof.root();
         assert!(verify(&proof, signal_to_x(b"hello"), &[root]).expect("verify"));
     }
@@ -869,7 +881,8 @@ mod tests {
     fn wrong_signal_is_invalid_not_error() {
         let material = material_from_seed(&[7u8; 32], 100, 0);
         let rln_id = [9u8; 32];
-        let proof = generate(&material, signal_to_x(b"hello"), 1231028105, &rln_id).expect("generate");
+        let proof =
+            generate(&material, signal_to_x(b"hello"), 1231028105, &rln_id).expect("generate");
         let root = proof.root();
         // A different signal must verify false, NOT raise an engine error.
         assert!(!verify(&proof, signal_to_x(b"goodbye"), &[root]).expect("verify"));
@@ -936,7 +949,9 @@ mod tests {
         bad["share_y"] = serde_json::json!("11".repeat(32));
         match RateLimitProof::from_json(&bad) {
             Err(_) => {}
-            Ok(p) => assert!(!verify(&p, signal_to_x(b"net msg"), &[root]).expect("verify tampered")),
+            Ok(p) => {
+                assert!(!verify(&p, signal_to_x(b"net msg"), &[root]).expect("verify tampered"))
+            }
         }
     }
 
@@ -946,7 +961,11 @@ mod tests {
         let rln_id = [6u8; 32];
         let proof = generate(&material, signal_to_x(b"net msg"), 77, &rln_id).expect("generate");
         let hex = proof.canonical_hex();
-        assert_eq!(hex.len(), 289 * 2, "Single-mode canonical blob is 289 bytes");
+        assert_eq!(
+            hex.len(),
+            289 * 2,
+            "Single-mode canonical blob is 289 bytes"
+        );
         assert!(
             hex.starts_with(proof.to_json()["proof"].as_str().unwrap()),
             "the blob's leading segment is the bare proof[128]"
@@ -968,7 +987,11 @@ mod tests {
         let restored = RateLimitProof::from_json(&json).expect("from_json");
         assert_eq!(restored.root(), root);
         assert_eq!(proof.epoch(), Some(42));
-        assert_eq!(restored.epoch(), Some(42), "the epoch survives the round trip");
+        assert_eq!(
+            restored.epoch(),
+            Some(42),
+            "the epoch survives the round trip"
+        );
         assert!(verify(&restored, signal_to_x(b"signal"), &[root]).expect("verify"));
     }
 

@@ -168,10 +168,12 @@ fn has_been_active(record: &MembershipRecord) -> bool {
 /// own deadline, else the funded window after submission (`submitted_at` 0 =
 /// unset behaves as maximally stale).
 pub fn confirmation_deadline(record: &MembershipRecord) -> u64 {
-    record
-        .cache
-        .confirm_deadline
-        .unwrap_or_else(|| record.identity.submitted_at.saturating_add(CONFIRMATION_WINDOW_SECS))
+    record.cache.confirm_deadline.unwrap_or_else(|| {
+        record
+            .identity
+            .submitted_at
+            .saturating_add(CONFIRMATION_WINDOW_SECS)
+    })
 }
 
 /// The spec's merged view, as a pure function: the registry's report
@@ -290,15 +292,28 @@ impl Default for CacheFile {
 static GRANTED_BY: Mutex<Option<std::collections::HashMap<String, String>>> = Mutex::new(None);
 
 pub(crate) fn note_granted_by(hash: &str, reply: &serde_json::Value) {
-    let Some(peer) = reply.get("gifterPeerId").and_then(|p| p.as_str()) else { return };
-    let discovered = reply.get("discovered").and_then(|d| d.as_bool()).unwrap_or(false);
-    let who = if discovered { format!("{peer} (discovered)") } else { peer.to_string() };
-    crate::util::lock(&GRANTED_BY).get_or_insert_with(std::collections::HashMap::new).insert(hash.to_owned(), who);
+    let Some(peer) = reply.get("gifterPeerId").and_then(|p| p.as_str()) else {
+        return;
+    };
+    let discovered = reply
+        .get("discovered")
+        .and_then(|d| d.as_bool())
+        .unwrap_or(false);
+    let who = if discovered {
+        format!("{peer} (discovered)")
+    } else {
+        peer.to_string()
+    };
+    crate::util::lock(&GRANTED_BY)
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(hash.to_owned(), who);
 }
 
 /// The allocator that granted a delegated record, once its reply arrived.
 pub(crate) fn granted_by(hash: &str) -> Option<String> {
-    crate::util::lock(&GRANTED_BY).as_ref().and_then(|m| m.get(hash).cloned())
+    crate::util::lock(&GRANTED_BY)
+        .as_ref()
+        .and_then(|m| m.get(hash).cloned())
 }
 
 /// A record that went terminal no longer needs its granter remembered.
@@ -351,7 +366,10 @@ mod tests {
         assert_eq!(merge_state(Some(&gift), None, now), Pending);
         gift.cache.confirm_deadline = Some(now - 1);
         assert_eq!(merge_state(Some(&gift), None, now), Failed);
-        assert_eq!(merge_state(Some(&stale), Some(GracePeriod), now), GracePeriod);
+        assert_eq!(
+            merge_state(Some(&stale), Some(GracePeriod), now),
+            GracePeriod
+        );
         let failed = rec(Failed, now - 1_000);
         assert_eq!(merge_state(Some(&failed), None, now), Failed);
         let was_active = rec(Active, now - 1_000);
@@ -415,10 +433,19 @@ mod tests {
 
     #[test]
     fn grant_log_names_whoever_the_gifter_client_reported() {
-        note_granted_by("h1", &serde_json::json!({ "gifterPeerId": "16Uiu2Found", "discovered": true }));
-        note_granted_by("h2", &serde_json::json!({ "gifterPeerId": "16Uiu2Fixed", "discovered": false }));
+        note_granted_by(
+            "h1",
+            &serde_json::json!({ "gifterPeerId": "16Uiu2Found", "discovered": true }),
+        );
+        note_granted_by(
+            "h2",
+            &serde_json::json!({ "gifterPeerId": "16Uiu2Fixed", "discovered": false }),
+        );
         note_granted_by("h3", &serde_json::json!({ "leaf_index": 1 }));
-        assert_eq!(granted_by("h1").as_deref(), Some("16Uiu2Found (discovered)"));
+        assert_eq!(
+            granted_by("h1").as_deref(),
+            Some("16Uiu2Found (discovered)")
+        );
         assert_eq!(granted_by("h2").as_deref(), Some("16Uiu2Fixed"));
         assert!(granted_by("h3").is_none());
     }
@@ -429,17 +456,41 @@ mod tests {
     // single anchor forcing a coordinated rename on both sides.
     #[test]
     fn membership_state_wire_strings() {
-        assert_eq!(serde_json::to_value(MembershipState::Unknown).unwrap(), serde_json::json!("unknown"));
-        assert_eq!(serde_json::to_value(MembershipState::Pending).unwrap(), serde_json::json!("pending"));
-        assert_eq!(serde_json::to_value(MembershipState::Failed).unwrap(), serde_json::json!("failed"));
-        assert_eq!(serde_json::to_value(MembershipState::Active).unwrap(), serde_json::json!("active"));
-        assert_eq!(serde_json::to_value(MembershipState::GracePeriod).unwrap(), serde_json::json!("grace_period"));
-        assert_eq!(serde_json::to_value(MembershipState::Expired).unwrap(), serde_json::json!("expired"));
+        assert_eq!(
+            serde_json::to_value(MembershipState::Unknown).unwrap(),
+            serde_json::json!("unknown")
+        );
+        assert_eq!(
+            serde_json::to_value(MembershipState::Pending).unwrap(),
+            serde_json::json!("pending")
+        );
+        assert_eq!(
+            serde_json::to_value(MembershipState::Failed).unwrap(),
+            serde_json::json!("failed")
+        );
+        assert_eq!(
+            serde_json::to_value(MembershipState::Active).unwrap(),
+            serde_json::json!("active")
+        );
+        assert_eq!(
+            serde_json::to_value(MembershipState::GracePeriod).unwrap(),
+            serde_json::json!("grace_period")
+        );
+        assert_eq!(
+            serde_json::to_value(MembershipState::Expired).unwrap(),
+            serde_json::json!("expired")
+        );
         assert_eq!(
             serde_json::to_value(MembershipState::ErasedAwaitsWithdrawal).unwrap(),
             serde_json::json!("erased_awaits_withdrawal")
         );
-        assert_eq!(serde_json::to_value(MembershipState::Erased).unwrap(), serde_json::json!("erased"));
-        assert_eq!(serde_json::to_value(MembershipState::Slashed).unwrap(), serde_json::json!("slashed"));
+        assert_eq!(
+            serde_json::to_value(MembershipState::Erased).unwrap(),
+            serde_json::json!("erased")
+        );
+        assert_eq!(
+            serde_json::to_value(MembershipState::Slashed).unwrap(),
+            serde_json::json!("slashed")
+        );
     }
 }

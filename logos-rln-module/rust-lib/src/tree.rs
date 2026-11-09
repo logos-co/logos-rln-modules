@@ -70,11 +70,15 @@ fn lift_root(root: &[u8; 32], depth: usize) -> [u8; 32] {
 
 impl MerkleProof {
     pub(crate) fn from_provider_json(v: &Value) -> Result<Self, ApiError> {
-        let o = v.as_object().ok_or_else(|| fault("merkle proof reply is not an object"))?;
+        let o = v
+            .as_object()
+            .ok_or_else(|| fault("merkle proof reply is not an object"))?;
         let path_elements = hex32_array(o.get("path_elements"), "merkle proof path_elements")?;
         let depth = path_elements.len();
         if depth == 0 || depth > RLN_TREE_DEPTH {
-            return Err(fault(&format!("merkle proof has an impossible depth {depth}")));
+            return Err(fault(&format!(
+                "merkle proof has an impossible depth {depth}"
+            )));
         }
         let path_indices: Vec<u8> = o
             .get("path_indices")
@@ -83,11 +87,15 @@ impl MerkleProof {
             .iter()
             .map(|i| match i.as_u64() {
                 Some(b @ (0 | 1)) => Ok(b as u8),
-                _ => Err(fault("merkle proof path_indices holds a value other than 0 or 1")),
+                _ => Err(fault(
+                    "merkle proof path_indices holds a value other than 0 or 1",
+                )),
             })
             .collect::<Result<_, _>>()?;
         if path_indices.len() != depth {
-            return Err(fault("merkle proof path_indices and path_elements differ in length"));
+            return Err(fault(
+                "merkle proof path_indices and path_elements differ in length",
+            ));
         }
         if let Some(declared) = o.get("depth") {
             if declared.as_u64() != Some(depth as u64) {
@@ -117,13 +125,17 @@ impl MerkleProof {
     /// The wire `get_merkle_proof` object: the lidl's keys in alphabetical
     /// order, `valid_roots` only when the source gave one.
     pub(crate) fn to_wire(&self) -> Value {
-        let hexes = |v: &[[u8; 32]]| Value::from(v.iter().map(|e| bytes_to_hex(e)).collect::<Vec<_>>());
+        let hexes =
+            |v: &[[u8; 32]]| Value::from(v.iter().map(|e| bytes_to_hex(e)).collect::<Vec<_>>());
         let mut o = serde_json::Map::new();
         o.insert("depth".into(), Value::from(self.path_elements.len()));
         o.insert("leaf".into(), Value::from(bytes_to_hex(&self.leaf)));
         o.insert("leaf_index".into(), Value::from(self.leaf_index));
         o.insert("path_elements".into(), hexes(&self.path_elements));
-        o.insert("path_indices".into(), Value::from(self.path_indices.clone()));
+        o.insert(
+            "path_indices".into(),
+            Value::from(self.path_indices.clone()),
+        );
         o.insert("root".into(), Value::from(bytes_to_hex(&self.root)));
         if let Some(roots) = &self.valid_roots {
             o.insert("valid_roots".into(), hexes(roots));
@@ -154,13 +166,17 @@ impl RootSet {
     /// A `{"depth":N,"valid_roots":[…]}` reply; any other shape is a
     /// `ProviderFailure`.
     pub(crate) fn from_provider_json(v: &Value) -> Result<Self, ApiError> {
-        let o = v.as_object().ok_or_else(|| fault("roots reply is not an object"))?;
+        let o = v
+            .as_object()
+            .ok_or_else(|| fault("roots reply is not an object"))?;
         let depth = o
             .get("depth")
             .and_then(Value::as_u64)
             .ok_or_else(|| fault("roots reply has no depth"))? as usize;
         if depth == 0 || depth > RLN_TREE_DEPTH {
-            return Err(fault(&format!("roots reply declares an impossible depth {depth}")));
+            return Err(fault(&format!(
+                "roots reply declares an impossible depth {depth}"
+            )));
         }
         let roots = hex32_array(o.get("valid_roots"), "roots reply valid_roots")?;
         Ok(RootSet { depth, roots })
@@ -169,7 +185,10 @@ impl RootSet {
     /// The roots at the circuit's depth, the shape `generate_proof` lifts
     /// its own root to and `validate_proof` compares against.
     pub(crate) fn lifted(&self) -> Vec<[u8; 32]> {
-        self.roots.iter().map(|r| lift_root(r, self.depth)).collect()
+        self.roots
+            .iter()
+            .map(|r| lift_root(r, self.depth))
+            .collect()
     }
 }
 
@@ -235,7 +254,9 @@ mod tests {
             json!({ "path_elements": [e], "path_indices": [1], "leaf": r, "root": r }),
             json!({ "path_elements": [e], "path_indices": [1], "leaf": r, "root": r, "leaf_index": 0, "valid_roots": ["ab"] }),
         ] {
-            let err = MerkleProof::from_provider_json(&bad).err().unwrap_or_else(|| panic!("accepted {bad}"));
+            let err = MerkleProof::from_provider_json(&bad)
+                .err()
+                .unwrap_or_else(|| panic!("accepted {bad}"));
             assert_eq!(err.kind, ErrorKind::ProviderFailure);
         }
     }
@@ -261,10 +282,15 @@ mod tests {
     fn a_shallow_registry_reports_roots_at_circuit_depth() {
         let root = "11".repeat(32);
         let reply = json!({ "depth": 9, "valid_roots": [root.clone()] });
-        let lifted = RootSet::from_provider_json(&reply).expect("depth-9 reply").lifted();
+        let lifted = RootSet::from_provider_json(&reply)
+            .expect("depth-9 reply")
+            .lifted();
         assert_eq!(lifted.len(), 1);
         let lifted_hex = bytes_to_hex(&lifted[0]);
-        assert_ne!(lifted_hex, root, "a depth-9 root must not pass through unlifted");
+        assert_ne!(
+            lifted_hex, root,
+            "a depth-9 root must not pass through unlifted"
+        );
         assert_eq!(
             lifted_hex,
             depth_bridge::fold_root(&root, 9),
@@ -278,8 +304,13 @@ mod tests {
     fn a_full_depth_registry_passes_through() {
         let root = "22".repeat(32);
         let reply = json!({ "depth": RLN_TREE_DEPTH, "valid_roots": [root.clone()] });
-        let lifted = RootSet::from_provider_json(&reply).expect("full-depth reply").lifted();
-        assert_eq!(lifted.iter().map(|r| bytes_to_hex(r)).collect::<Vec<_>>(), vec![root]);
+        let lifted = RootSet::from_provider_json(&reply)
+            .expect("full-depth reply")
+            .lifted();
+        assert_eq!(
+            lifted.iter().map(|r| bytes_to_hex(r)).collect::<Vec<_>>(),
+            vec![root]
+        );
     }
 
     #[test]
@@ -294,7 +325,9 @@ mod tests {
             json!("not a reply"),
             json!([root.clone()]),
         ] {
-            let err = RootSet::from_provider_json(&bad).err().unwrap_or_else(|| panic!("accepted {bad}"));
+            let err = RootSet::from_provider_json(&bad)
+                .err()
+                .unwrap_or_else(|| panic!("accepted {bad}"));
             assert_eq!(err.kind, ErrorKind::ProviderFailure);
         }
     }

@@ -22,19 +22,19 @@ use crate::views;
 /// string pairs (char* pairs, so a non-string value is a type error, never a
 /// coercion; duplicate keys are rejected). Returns the rate_limit (defaulted
 /// when absent) and the remaining pairs as a flat object.
-pub(crate) fn parse_registry_options(options_json: &str) -> Result<(u64, serde_json::Value), ApiError> {
+pub(crate) fn parse_registry_options(
+    options_json: &str,
+) -> Result<(u64, serde_json::Value), ApiError> {
     let trimmed = options_json.trim();
     let entries = if trimmed.is_empty() {
         Vec::new()
     } else {
         match serde_json::from_str::<serde_json::Value>(trimmed) {
             Ok(serde_json::Value::Array(a)) => a,
-            Ok(_) => {
-                return Err(ApiError::new(
-                    ErrorKind::InvalidArgument,
-                    "options_json must be a RegistryOptions array of {\"key\",\"value\"} string pairs",
-                ))
-            }
+            Ok(_) => return Err(ApiError::new(
+                ErrorKind::InvalidArgument,
+                "options_json must be a RegistryOptions array of {\"key\",\"value\"} string pairs",
+            )),
             Err(e) => {
                 return Err(ApiError::new(
                     ErrorKind::InvalidArgument,
@@ -63,7 +63,10 @@ pub(crate) fn parse_registry_options(options_json: &str) -> Result<(u64, serde_j
                 ))
             }
         };
-        let prior = map.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+        let prior = map.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
         if prior.is_some() {
             return Err(ApiError::new(
                 ErrorKind::InvalidArgument,
@@ -73,7 +76,11 @@ pub(crate) fn parse_registry_options(options_json: &str) -> Result<(u64, serde_j
     }
     // A present-but-blank value falls back to the default, like absent.
     let raw = map.remove("rate_limit");
-    let given = raw.as_ref().and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let given = raw
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let rate_limit = match given {
         None => DEFAULT_RATE_LIMIT,
         Some(s) => s.parse::<u64>().ok().filter(|r| *r > 0).ok_or_else(|| {
@@ -90,7 +97,10 @@ pub(crate) fn parse_registry_options(options_json: &str) -> Result<(u64, serde_j
 /// provider-side failures MAY succeed on a fresh register; anything else
 /// needs the caller to change something first.
 pub(crate) fn is_retryable_submit_error(e: &ApiError) -> bool {
-    matches!(e.kind, ErrorKind::Transient | ErrorKind::NotReady | ErrorKind::ProviderFailure)
+    matches!(
+        e.kind,
+        ErrorKind::Transient | ErrorKind::NotReady | ErrorKind::ProviderFailure
+    )
 }
 
 /// Whether an allocator refusal is a discovery miss that a later ask can
@@ -116,7 +126,10 @@ pub(crate) fn register_refusal(reply: &str) -> Option<String> {
 /// or mark the record failed. Runs on the module's event loop after register
 /// returns; `store` is a Weak capture of the store the record was inserted
 /// into — gone (re-context replaced it) means there is nothing to record on.
-pub(crate) fn funded_submit_callback(store: Weak<Store>, hash: String) -> provider::RegisterCallback {
+pub(crate) fn funded_submit_callback(
+    store: Weak<Store>,
+    hash: String,
+) -> provider::RegisterCallback {
     Box::new(move |result| {
         let update = match store.upgrade() {
             Some(store) => store.update_cache(&hash, |m| match &result {
@@ -144,7 +157,9 @@ pub(crate) fn funded_submit_callback(store: Weak<Store>, hash: String) -> provid
                 }
                 Err(e) => m.record_async_submit_error(&e.message, is_retryable_submit_error(e)),
             }),
-            None => Err(ApiError::internal("store closed before the submit callback landed")),
+            None => Err(ApiError::internal(
+                "store closed before the submit callback landed",
+            )),
         };
         if let Err(e) = update {
             eprintln!("membership register callback: {}", e.message);
@@ -178,7 +193,9 @@ pub(crate) fn delegated_submit_callback(
 ) -> provider::RegisterCallback {
     Box::new(move |result| {
         let Some(store) = store.upgrade() else {
-            eprintln!("membership delegated callback: store closed before the submit callback landed");
+            eprintln!(
+                "membership delegated callback: store closed before the submit callback landed"
+            );
             return;
         };
         let before = store.membership(&hash);
@@ -364,7 +381,13 @@ pub(crate) fn register_scoped(
         let bound = rec.alloc.epoch_size_sec;
         let epoch_mismatch = epoch_params_for(&registry.canonical)
             .is_ok_and(|(size, _)| bound != 0 && bound != size);
-        return Ok(views::public_membership(&rec.hash, rec, false, mismatch, epoch_mismatch));
+        return Ok(views::public_membership(
+            &rec.hash,
+            rec,
+            false,
+            mismatch,
+            epoch_mismatch,
+        ));
     }
 
     // Fast-fail a rate_limit outside the registry's bounds BEFORE minting a
@@ -423,7 +446,11 @@ pub(crate) fn register_scoped(
     let submit = match &delegated {
         Some(d) => provider::gifter_request_async(
             &delegated_request_args(d, &commitment_hex, rate_limit, &registry.account),
-            delegated_submit_callback(Arc::downgrade(&store), hash.clone(), registry.account.clone()),
+            delegated_submit_callback(
+                Arc::downgrade(&store),
+                hash.clone(),
+                registry.account.clone(),
+            ),
         ),
         None => backend.registry.register_async(
             &registry,
@@ -444,7 +471,9 @@ pub(crate) fn register_scoped(
     let record = store
         .membership(&hash)
         .ok_or_else(|| ApiError::internal("record vanished after insert"))?;
-    Ok(views::public_membership(&hash, &record, false, false, false))
+    Ok(views::public_membership(
+        &hash, &record, false, false, false,
+    ))
 }
 
 #[cfg(test)]
@@ -468,56 +497,150 @@ mod tests {
         let registry = format!("logos:local:{}", "6f".repeat(32));
         let account = "6f".repeat(32);
         // Confirmed by the poller: Active at the chain's leaf 7.
-        seed_membership(&store, "ha", &registry, &"46".repeat(32), "", &"f8".repeat(32), MembershipState::Active, 7, 100);
+        seed_membership(
+            &store,
+            "ha",
+            &registry,
+            &"46".repeat(32),
+            "",
+            &"f8".repeat(32),
+            MembershipState::Active,
+            7,
+            100,
+        );
         funded_submit_callback(Arc::downgrade(&store), "ha".into())(Ok(
             r#"{"leaf_index":3,"pending":true,"tx_result":"{}"}"#.to_string(),
         ));
         let rec = store.membership("ha").unwrap();
-        assert_eq!((rec.cache.state, rec.cache.leaf_index), (MembershipState::Active, Some(7)), "funded estimate kept out");
+        assert_eq!(
+            (rec.cache.state, rec.cache.leaf_index),
+            (MembershipState::Active, Some(7)),
+            "funded estimate kept out"
+        );
         delegated_submit_callback(Arc::downgrade(&store), "ha".into(), account.clone())(Ok(
             format!(r#"{{"leaf_index":3,"gifterPeerId":"p","config_account":"{account}"}}"#),
         ));
         let rec = store.membership("ha").unwrap();
-        assert_eq!((rec.cache.state, rec.cache.leaf_index), (MembershipState::Active, Some(7)), "gifter leaf kept out");
+        assert_eq!(
+            (rec.cache.state, rec.cache.leaf_index),
+            (MembershipState::Active, Some(7)),
+            "gifter leaf kept out"
+        );
 
         // The window gave up on a gift; the grant arrives later.
-        seed_membership(&store, "hg", &registry, &"47".repeat(32), "", &"f9".repeat(32), MembershipState::Failed, 0, 100);
-        store.update_cache("hg", |m| { m.failed_reason = Some(WINDOW_ELAPSED.into()); m.retryable = Some(true); }).unwrap();
+        seed_membership(
+            &store,
+            "hg",
+            &registry,
+            &"47".repeat(32),
+            "",
+            &"f9".repeat(32),
+            MembershipState::Failed,
+            0,
+            100,
+        );
+        store
+            .update_cache("hg", |m| {
+                m.failed_reason = Some(WINDOW_ELAPSED.into());
+                m.retryable = Some(true);
+            })
+            .unwrap();
         delegated_submit_callback(Arc::downgrade(&store), "hg".into(), account.clone())(Ok(
-            format!(r#"{{"leaf_index":9,"gifterPeerId":"p","discovered":true,"config_account":"{account}"}}"#),
+            format!(
+                r#"{{"leaf_index":9,"gifterPeerId":"p","discovered":true,"config_account":"{account}"}}"#
+            ),
         ));
         let rec = store.membership("hg").unwrap();
-        assert_eq!(rec.cache.state, MembershipState::Pending, "re-opened for the poller: {:?}", rec.cache.failed_reason);
+        assert_eq!(
+            rec.cache.state,
+            MembershipState::Pending,
+            "re-opened for the poller: {:?}",
+            rec.cache.failed_reason
+        );
         assert_eq!(rec.cache.leaf_index, Some(9));
         assert!(rec.cache.failed_reason.is_none() && rec.cache.retryable.is_none());
-        assert_eq!(lifecycle::granted_by("hg").as_deref(), Some("p (discovered)"));
+        assert_eq!(
+            lifecycle::granted_by("hg").as_deref(),
+            Some("p (discovered)")
+        );
 
         // A record failed for another reason stays failed.
-        seed_membership(&store, "hf", &registry, &"48".repeat(32), "", &"fa".repeat(32), MembershipState::Failed, 0, 100);
-        store.update_cache("hf", |m| m.failed_reason = Some("gifter_failed: refused".into())).unwrap();
+        seed_membership(
+            &store,
+            "hf",
+            &registry,
+            &"48".repeat(32),
+            "",
+            &"fa".repeat(32),
+            MembershipState::Failed,
+            0,
+            100,
+        );
+        store
+            .update_cache("hf", |m| {
+                m.failed_reason = Some("gifter_failed: refused".into())
+            })
+            .unwrap();
         delegated_submit_callback(Arc::downgrade(&store), "hf".into(), account)(Ok(
             r#"{"leaf_index":9,"gifterPeerId":"p"}"#.to_string(),
         ));
-        assert_eq!(store.membership("hf").unwrap().cache.state, MembershipState::Failed);
+        assert_eq!(
+            store.membership("hf").unwrap().cache.state,
+            MembershipState::Failed
+        );
 
         // The poller's writes yield to a fresher writer.
-        seed_membership(&store, "hp", &registry, &"49".repeat(32), "", &"fb".repeat(32), MembershipState::Pending, 0, 100);
-        let written = poller::write_if_still("hp", MembershipState::Pending, |m| m.state = MembershipState::Active).unwrap();
+        seed_membership(
+            &store,
+            "hp",
+            &registry,
+            &"49".repeat(32),
+            "",
+            &"fb".repeat(32),
+            MembershipState::Pending,
+            0,
+            100,
+        );
+        let written = poller::write_if_still("hp", MembershipState::Pending, |m| {
+            m.state = MembershipState::Active
+        })
+        .unwrap();
         assert_eq!(written, Some(MembershipState::Pending));
-        let yielded = poller::write_if_still("hp", MembershipState::Pending, |m| m.state = MembershipState::Failed).unwrap();
-        assert_eq!(yielded, None, "the snapshot was Pending, the record is Active: no write");
-        assert_eq!(store.membership("hp").unwrap().cache.state, MembershipState::Active);
+        let yielded = poller::write_if_still("hp", MembershipState::Pending, |m| {
+            m.state = MembershipState::Failed
+        })
+        .unwrap();
+        assert_eq!(
+            yielded, None,
+            "the snapshot was Pending, the record is Active: no write"
+        );
+        assert_eq!(
+            store.membership("hp").unwrap().cache.state,
+            MembershipState::Active
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn only_a_discovery_miss_is_worth_asking_again() {
-        let wrap = |t: &str| format!("a discovered allocator for R: gifter_failed: no allocator granted and none is configured: {t}");
-        assert!(discovery_can_retry(&wrap("no allocator advertises R/peer-any")));
-        assert!(discovery_can_retry(&wrap("discovery not joined: no connected peer after 20s")));
-        assert!(!discovery_can_retry(&wrap("discovery unavailable: no service discovery")));
-        assert!(!discovery_can_retry("allocator p at /m: gifter_failed: verifier refused: bad attestation"));
-        assert!(!discovery_can_retry("allocator p at /m: not submitted: provider_failure"));
+        let wrap = |t: &str| {
+            format!("a discovered allocator for R: gifter_failed: no allocator granted and none is configured: {t}")
+        };
+        assert!(discovery_can_retry(&wrap(
+            "no allocator advertises R/peer-any"
+        )));
+        assert!(discovery_can_retry(&wrap(
+            "discovery not joined: no connected peer after 20s"
+        )));
+        assert!(!discovery_can_retry(&wrap(
+            "discovery unavailable: no service discovery"
+        )));
+        assert!(!discovery_can_retry(
+            "allocator p at /m: gifter_failed: verifier refused: bad attestation"
+        ));
+        assert!(!discovery_can_retry(
+            "allocator p at /m: not submitted: provider_failure"
+        ));
     }
 
     #[test]
@@ -553,19 +676,19 @@ mod tests {
     #[test]
     fn register_defaults_rate_limit_when_option_absent() {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
-        let dir =
-            std::env::temp_dir().join(format!("rln-ms-default-rate-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rln-ms-default-rate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (imp, _store) = imp_with_store(dir.clone());
-        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+        assert!(imp
+            .unlock_keystore("pw".into())
+            .contains(r#""unlocked":true"#));
         let registry = format!("logos:local:{}", "ab".repeat(32));
 
-        let out = imp.register_membership(
-            registry.clone(),
-            "ef".repeat(32),
-            opts_arr(&[]),
+        let out = imp.register_membership(registry.clone(), "ef".repeat(32), opts_arr(&[]));
+        assert!(
+            out.contains(r#""kind":"provider_failure""#),
+            "dead transport: {out}"
         );
-        assert!(out.contains(r#""kind":"provider_failure""#), "dead transport: {out}");
         let listed = imp.get_memberships(registry);
         assert!(
             listed.contains(&format!(r#""rate_limit":{DEFAULT_RATE_LIMIT}"#)),
@@ -586,7 +709,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rln-ms-lib-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (imp, store) = imp_with_store(dir.clone());
-        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+        assert!(imp
+            .unlock_keystore("pw".into())
+            .contains(r#""unlocked":true"#));
         let rln_id = "ef".repeat(32);
 
         // Part 1 — internal generation + dead transport: a credential is minted
@@ -597,7 +722,10 @@ mod tests {
         let out = imp.register_membership(reg_a.clone(), rln_id.clone(), funding);
         assert!(out.contains(r#""kind":"provider_failure""#), "got: {out}");
         let listed = imp.get_memberships(reg_a);
-        assert!(listed.contains("membership_hash"), "a credential was generated and persisted");
+        assert!(
+            listed.contains("membership_hash"),
+            "a credential was generated and persisted"
+        );
         assert!(
             listed.contains(r#""retryable":true"#),
             "a provider_failure dispatch is retryable (spec: a failed submission SHALL report whether it is retryable): {listed}"
@@ -621,12 +749,22 @@ mod tests {
             300,
         );
 
-        let out = imp.register_membership(reg_b.clone(), rln_id, opts_arr(&[("rate_limit", "250")]));
-        assert!(!out.contains(r#""error""#), "idempotent short-circuit, no provider call: {out}");
+        let out =
+            imp.register_membership(reg_b.clone(), rln_id, opts_arr(&[("rate_limit", "250")]));
+        assert!(
+            !out.contains(r#""error""#),
+            "idempotent short-circuit, no provider call: {out}"
+        );
         assert!(out.contains(r#""state":"active""#), "got: {out}");
-        assert!(out.contains(r#""rate_limit":300"#), "existing registration's rate wins: {out}");
+        assert!(
+            out.contains(r#""rate_limit":300"#),
+            "existing registration's rate wins: {out}"
+        );
         assert!(out.contains(r#""rate_limit_mismatch":true"#), "got: {out}");
-        assert!(out.contains(&format!(r#""membership_hash":"{hash}""#)), "got: {out}");
+        assert!(
+            out.contains(&format!(r#""membership_hash":"{hash}""#)),
+            "got: {out}"
+        );
 
         // Part 3 — a DIFFERENT application (rln_identifier) on the same
         // registry is NOT the same scope: no short-circuit — register mints a
@@ -652,11 +790,12 @@ mod tests {
     #[test]
     fn register_ignores_terminal_records_mints_fresh_credential() {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
-        let dir =
-            std::env::temp_dir().join(format!("rln-ms-terminal-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rln-ms-terminal-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (imp, store) = imp_with_store(dir.clone());
-        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+        assert!(imp
+            .unlock_keystore("pw".into())
+            .contains(r#""unlocked":true"#));
         let rln_id = "ef".repeat(32);
         let funding = opts_arr(&[("rate_limit", "300")]);
 
@@ -690,7 +829,9 @@ mod tests {
             "the expired record is retained AND a fresh one was minted: {hashes:?}"
         );
         assert!(
-            records.iter().any(|r| r.hash != expired_hash && r.cache.state == MembershipState::Failed),
+            records
+                .iter()
+                .any(|r| r.hash != expired_hash && r.cache.state == MembershipState::Failed),
             "a NEW credential (different membership_hash) was minted, then failed at the \
              dead transport: {hashes:?}"
         );
@@ -714,8 +855,14 @@ mod tests {
         let out = imp.register_membership(reg_erased.clone(), rln_id, funding);
         assert!(out.contains(r#""kind":"provider_failure""#), "got: {out}");
         let records = store.records_for(&reg_erased);
-        assert_eq!(records.len(), 2, "the erased record is retained AND a fresh one was minted");
-        assert!(records.iter().any(|r| r.hash != erased_hash && r.cache.state == MembershipState::Failed));
+        assert_eq!(
+            records.len(),
+            2,
+            "the erased record is retained AND a fresh one was minted"
+        );
+        assert!(records
+            .iter()
+            .any(|r| r.hash != erased_hash && r.cache.state == MembershipState::Failed));
 
         sealed_store::store::publish(None);
         let _ = std::fs::remove_dir_all(&dir);
@@ -731,7 +878,9 @@ mod tests {
             std::env::temp_dir().join(format!("rln-ms-delegated-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (imp, _store) = imp_with_store(dir.clone());
-        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+        assert!(imp
+            .unlock_keystore("pw".into())
+            .contains(r#""unlocked":true"#));
         let registry = format!("logos:local:{}", "ab".repeat(32));
         let rln_id = "ef".repeat(32);
 
@@ -757,7 +906,8 @@ mod tests {
         let out = imp.register_membership(registry.clone(), rln_id.clone(), opts);
         assert!(out.contains(r#""kind":"provider_failure""#), "got: {out}");
         assert!(
-            imp.get_memberships(registry.clone()).contains("membership_hash"),
+            imp.get_memberships(registry.clone())
+                .contains("membership_hash"),
             "the credential was minted and the failed record retained"
         );
 
@@ -795,17 +945,26 @@ mod tests {
         assert!(out.contains(r#""kind":"invalid_argument""#), "got: {out}");
         assert!(out.contains("'delegated' must be a string"), "got: {out}");
 
-        let out =
-            imp.register_membership(registry.clone(), rln_id.clone(), r#"{"delegated":"true"}"#.into());
+        let out = imp.register_membership(
+            registry.clone(),
+            rln_id.clone(),
+            r#"{"delegated":"true"}"#.into(),
+        );
         assert!(out.contains(r#""kind":"invalid_argument""#), "got: {out}");
-        assert!(out.contains("must be a RegistryOptions array"), "got: {out}");
+        assert!(
+            out.contains("must be a RegistryOptions array"),
+            "got: {out}"
+        );
 
         let out = imp.register_membership(
             registry,
             rln_id,
             r#"[{"key":"rate_limit","value":"5"},{"key":"rate_limit","value":"9"}]"#.into(),
         );
-        assert!(out.contains("duplicate RegistryOptions key 'rate_limit'"), "got: {out}");
+        assert!(
+            out.contains("duplicate RegistryOptions key 'rate_limit'"),
+            "got: {out}"
+        );
     }
 
     // Shape-only auth validation (the vocabulary is OPEN): every rejection
@@ -813,11 +972,12 @@ mod tests {
     #[test]
     fn delegated_register_validates_auth_options_before_minting() {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
-        let dir =
-            std::env::temp_dir().join(format!("rln-ms-auth-validate-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rln-ms-auth-validate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (imp, _store) = imp_with_store(dir.clone());
-        assert!(imp.unlock_keystore("pw".into()).contains(r#""unlocked":true"#));
+        assert!(imp
+            .unlock_keystore("pw".into())
+            .contains(r#""unlocked":true"#));
         let registry = format!("logos:local:{}", "ab".repeat(32));
         let rln_id = "ef".repeat(32);
         let opts = |extra: &str| {
@@ -832,8 +992,14 @@ mod tests {
         };
 
         for (extra, expect) in [
-            (r#"{"key":"auth_type","value":42}"#, "'auth_type' must be a string"),
-            (r#"{"key":"auth_payload","value":"deadbeef"}"#, "need auth_type"),
+            (
+                r#"{"key":"auth_type","value":42}"#,
+                "'auth_type' must be a string",
+            ),
+            (
+                r#"{"key":"auth_payload","value":"deadbeef"}"#,
+                "need auth_type",
+            ),
             (
                 r#"{"key":"auth_type","value":"voucher-v1"}"#,
                 "needs auth_payload or auth_provider",
@@ -848,7 +1014,10 @@ mod tests {
             ),
         ] {
             let out = reg(&imp, extra);
-            assert!(out.contains(r#""kind":"invalid_argument""#), "{extra} got: {out}");
+            assert!(
+                out.contains(r#""kind":"invalid_argument""#),
+                "{extra} got: {out}"
+            );
             assert!(out.contains(expect), "{extra} got: {out}");
         }
 
@@ -875,17 +1044,25 @@ mod tests {
     // dials that gifter only.
     #[test]
     fn an_allocator_block_without_a_pair_discovers() {
-        let d = DelegatedOptions::from_allocator_block(Some(&serde_json::json!({})), "x").unwrap().unwrap();
+        let d = DelegatedOptions::from_allocator_block(Some(&serde_json::json!({})), "x")
+            .unwrap()
+            .unwrap();
         assert!(d.discover && d.gifter_peer_id.is_empty() && d.gifter_multiaddr.is_empty());
         let v: serde_json::Value =
             serde_json::from_str(&delegated_request_args(&d, "ab", 300, "cf")).unwrap();
         assert_eq!(v["discover"], true, "got: {v}");
-        assert!(v.get("gifterPeerId").is_none() && v.get("gifterMultiaddr").is_none(), "got: {v}");
+        assert!(
+            v.get("gifterPeerId").is_none() && v.get("gifterMultiaddr").is_none(),
+            "got: {v}"
+        );
         let flat = |pairs: serde_json::Value| {
             let (_, flat) = parse_registry_options(&pairs.to_string()).unwrap();
             DelegatedOptions::from_registry_options(&flat).unwrap()
         };
-        assert_eq!(flat(serde_json::json!([{ "key": "delegated", "value": "true" }])), Some(d));
+        assert_eq!(
+            flat(serde_json::json!([{ "key": "delegated", "value": "true" }])),
+            Some(d)
+        );
 
         let d = DelegatedOptions::from_allocator_block(
             Some(&serde_json::json!({ "discover": false, "peer_id": "p", "multiaddr": "/m" })),
@@ -907,6 +1084,9 @@ mod tests {
             ])),
             Some(d)
         );
-        assert_eq!(flat(serde_json::json!([{ "key": "rate_limit", "value": "7" }])), None);
+        assert_eq!(
+            flat(serde_json::json!([{ "key": "rate_limit", "value": "7" }])),
+            None
+        );
     }
 }

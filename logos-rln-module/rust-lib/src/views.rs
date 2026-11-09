@@ -71,7 +71,10 @@ impl MembershipView {
         let (failed_reason, retryable) = if quarantined {
             (Some("metadata_tamper".to_string()), None)
         } else {
-            (cache.failed_reason.clone(), cache.failed_reason.as_ref().and(cache.retryable))
+            (
+                cache.failed_reason.clone(),
+                cache.failed_reason.as_ref().and(cache.retryable),
+            )
         };
         MembershipView {
             credential: CredentialView {
@@ -87,7 +90,11 @@ impl MembershipView {
             retryable,
             rln_identifier: (!identity.rln_identifier.is_empty())
                 .then(|| identity.rln_identifier.clone()),
-            state: if quarantined { MembershipState::Failed } else { cache.state },
+            state: if quarantined {
+                MembershipState::Failed
+            } else {
+                cache.state
+            },
             submitted_at: identity.submitted_at,
             tx_result: cache.tx_result.clone(),
         }
@@ -267,7 +274,11 @@ pub(crate) struct EpochQuotaView {
 
 impl EpochQuotaView {
     pub(crate) fn new(epoch_index: u64, rate_limit: u64, remaining: u64) -> Self {
-        EpochQuotaView { epoch_index, rate_limit, remaining }
+        EpochQuotaView {
+            epoch_index,
+            rate_limit,
+            remaining,
+        }
     }
 }
 
@@ -292,7 +303,13 @@ impl StartReply {
         overrides: Option<serde_json::Value>,
         registries: Vec<String>,
     ) -> Self {
-        StartReply { epoch_size_sec, max_epoch_gap, overrides, registries, started: true }
+        StartReply {
+            epoch_size_sec,
+            max_epoch_gap,
+            overrides,
+            registries,
+            started: true,
+        }
     }
 }
 
@@ -329,7 +346,11 @@ pub(crate) struct RegistryParametersView {
 }
 
 impl RegistryParametersView {
-    pub(crate) fn from_bounds(epoch_size_sec: u64, max_epoch_gap: u64, bounds: &serde_json::Value) -> Self {
+    pub(crate) fn from_bounds(
+        epoch_size_sec: u64,
+        max_epoch_gap: u64,
+        bounds: &serde_json::Value,
+    ) -> Self {
         RegistryParametersView {
             epoch_size_sec,
             max_epoch_gap,
@@ -387,7 +408,10 @@ pub(crate) struct UnlockKeystoreReply {
 
 impl UnlockKeystoreReply {
     pub(crate) fn new(membership_count: u64) -> Self {
-        UnlockKeystoreReply { membership_count, unlocked: true }
+        UnlockKeystoreReply {
+            membership_count,
+            unlocked: true,
+        }
     }
 }
 
@@ -402,7 +426,11 @@ pub(crate) struct ErrorBody {
 
 impl ErrorBody {
     pub(crate) fn new(class: &'static str, kind: &'static str, message: String) -> Self {
-        ErrorBody { class, kind, message }
+        ErrorBody {
+            class,
+            kind,
+            message,
+        }
     }
 }
 
@@ -415,8 +443,9 @@ mod provisioning_view_tests {
     /// and `balance` absent until something read it.
     #[test]
     fn provisioning_funding_fields_are_strings_and_optional() {
-        let bare = MembershipStateView::unknown("logos:test:r")
-            .with_provisioning(Some(ProvisioningView::new("waiting_for_wallet", String::new())));
+        let bare = MembershipStateView::unknown("logos:test:r").with_provisioning(Some(
+            ProvisioningView::new("waiting_for_wallet", String::new()),
+        ));
         assert_eq!(
             serde_json::to_string(&bare).unwrap(),
             r#"{"provisioning":{"step":"waiting_for_wallet"},"registry_id":"logos:test:r","state":"unknown"}"#
@@ -441,7 +470,11 @@ mod provisioning_view_tests {
         );
         let json = serde_json::to_value(read).unwrap();
         assert_eq!(json["balance"], "7");
-        assert_eq!(json["required"], u128::MAX.to_string(), "u128 travels as a string");
+        assert_eq!(
+            json["required"],
+            u128::MAX.to_string(),
+            "u128 travels as a string"
+        );
         assert!(json.get("detail").is_none(), "empty detail is omitted");
     }
 }
@@ -453,9 +486,12 @@ mod registry_parameters_tests {
     #[test]
     fn registry_parameters_include_epoch_window_without_registry_bounds() {
         let view = RegistryParametersView::from_bounds(10, 3, &serde_json::json!({}));
-        assert_eq!(serde_json::to_value(view).unwrap(), serde_json::json!({
-            "epoch_size_sec": 10, "max_epoch_gap": 3
-        }));
+        assert_eq!(
+            serde_json::to_value(view).unwrap(),
+            serde_json::json!({
+                "epoch_size_sec": 10, "max_epoch_gap": 3
+            })
+        );
     }
 }
 
@@ -517,7 +553,9 @@ mod tests {
         // The absent case is pinned by the exact-shape asserts above.
         let bound_elsewhere = public_membership("fixture-hash", &record, false, false, true);
         assert!(
-            bound_elsewhere.to_string().contains(r#""epoch_size_mismatch":true"#),
+            bound_elsewhere
+                .to_string()
+                .contains(r#""epoch_size_mismatch":true"#),
             "got: {bound_elsewhere}"
         );
     }

@@ -13,9 +13,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use crate::error::{ApiError, ErrorKind};
 use crate::lifecycle::MembershipRecord;
 use crate::util::lock;
-use crate::error::{ApiError, ErrorKind};
 
 pub(crate) enum Selector {
     None,
@@ -111,11 +111,13 @@ pub(crate) fn select_hash(
             // Next = first candidate strictly after the cursor in hash
             // order, wrapping — stable when the candidate set churns.
             let next = match map.get(&key) {
-                Some(last) => candidates
-                    .iter()
-                    .find(|(hash, _)| *hash > last.as_str())
-                    .unwrap_or(&candidates[0])
-                    .0,
+                Some(last) => {
+                    candidates
+                        .iter()
+                        .find(|(hash, _)| *hash > last.as_str())
+                        .unwrap_or(&candidates[0])
+                        .0
+                }
                 None => candidates[0].0,
             };
             map.insert(key, next.to_string());
@@ -129,7 +131,12 @@ mod tests {
     use super::*;
     use crate::lifecycle::{CacheState, MembershipState};
 
-    fn record(hash: &str, state: MembershipState, rate: u64, quarantined: bool) -> MembershipRecord {
+    fn record(
+        hash: &str,
+        state: MembershipState,
+        rate: u64,
+        quarantined: bool,
+    ) -> MembershipRecord {
         MembershipRecord {
             hash: hash.to_string(),
             identity: crate::sealed_store::format::IdentityBlock {
@@ -186,7 +193,11 @@ mod tests {
             "a1"
         );
         let err = select_hash(&records, SCOPE, &Selector::ByHash("b2".into())).unwrap_err();
-        assert_eq!(err.kind, ErrorKind::UnknownMembership, "failed record is not usable");
+        assert_eq!(
+            err.kind,
+            ErrorKind::UnknownMembership,
+            "failed record is not usable"
+        );
     }
 
     #[test]
@@ -212,17 +223,32 @@ mod tests {
         let scope_x = ("logos:local:aa", "aaaa1111");
         let scope_y = ("logos:local:aa", "bbbb2222");
 
-        assert_eq!(select_hash(&records, scope_x, &Selector::RoundRobin).unwrap(), "a1");
-        assert_eq!(select_hash(&records, scope_x, &Selector::RoundRobin).unwrap(), "b2");
+        assert_eq!(
+            select_hash(&records, scope_x, &Selector::RoundRobin).unwrap(),
+            "a1"
+        );
+        assert_eq!(
+            select_hash(&records, scope_x, &Selector::RoundRobin).unwrap(),
+            "b2"
+        );
         // A different rln_identifier rotates independently.
-        assert_eq!(select_hash(&records, scope_y, &Selector::RoundRobin).unwrap(), "a1");
+        assert_eq!(
+            select_hash(&records, scope_y, &Selector::RoundRobin).unwrap(),
+            "a1"
+        );
         // Candidate churn: b2 vanishes while the cursor sits on it.
         let churned = vec![
             record("a1", MembershipState::Active, 300, false),
             record("c3", MembershipState::Active, 300, false),
         ];
-        assert_eq!(select_hash(&churned, scope_x, &Selector::RoundRobin).unwrap(), "c3");
-        assert_eq!(select_hash(&churned, scope_x, &Selector::RoundRobin).unwrap(), "a1");
+        assert_eq!(
+            select_hash(&churned, scope_x, &Selector::RoundRobin).unwrap(),
+            "c3"
+        );
+        assert_eq!(
+            select_hash(&churned, scope_x, &Selector::RoundRobin).unwrap(),
+            "a1"
+        );
     }
 
     #[test]

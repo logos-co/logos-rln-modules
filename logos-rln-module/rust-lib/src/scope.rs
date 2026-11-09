@@ -11,7 +11,10 @@ use crate::sealed_store::store::Store;
 /// lowercase re-encoding. Invalid → InvalidArgument.
 pub(crate) fn parse_hex32(field: &str, hex: &str) -> Result<([u8; 32], String), ApiError> {
     let bytes = registry_id::hex_to_bytes32(hex).ok_or_else(|| {
-        ApiError::new(ErrorKind::InvalidArgument, &format!("{field} must be 32-byte hex"))
+        ApiError::new(
+            ErrorKind::InvalidArgument,
+            &format!("{field} must be 32-byte hex"),
+        )
     })?;
     let hex = registry_id::bytes_to_hex(&bytes);
     Ok((bytes, hex))
@@ -67,13 +70,21 @@ pub(crate) fn scope_candidates(
     rln_id_hex: &str,
 ) -> Vec<MembershipRecord> {
     let usable = |r: &&MembershipRecord| !r.quarantined && r.cache.state.is_usable();
-    let own: Vec<MembershipRecord> =
-        records.iter().filter(usable).filter(|r| r.identity.rln_identifier == rln_id_hex).cloned().collect();
+    let own: Vec<MembershipRecord> = records
+        .iter()
+        .filter(usable)
+        .filter(|r| r.identity.rln_identifier == rln_id_hex)
+        .cloned()
+        .collect();
     if !own.is_empty() {
         return own;
     }
-    let wide: Vec<MembershipRecord> =
-        records.iter().filter(usable).filter(|r| r.identity.rln_identifier.is_empty()).cloned().collect();
+    let wide: Vec<MembershipRecord> = records
+        .iter()
+        .filter(usable)
+        .filter(|r| r.identity.rln_identifier.is_empty())
+        .cloned()
+        .collect();
     if !wide.is_empty() {
         return wide;
     }
@@ -110,7 +121,8 @@ pub(crate) fn resolve_scope_state(records: &[MembershipRecord], rln_id_hex: &str
         if rank.is_empty() {
             continue;
         }
-        let live: Vec<&&MembershipRecord> = rank.iter().filter(|r| r.cache.state.is_live()).collect();
+        let live: Vec<&&MembershipRecord> =
+            rank.iter().filter(|r| r.cache.state.is_live()).collect();
         return match live.len() {
             1 => ScopeState::One((*live[0]).clone()),
             0 => {
@@ -122,8 +134,10 @@ pub(crate) fn resolve_scope_state(records: &[MembershipRecord], rln_id_hex: &str
             ),
         };
     }
-    let usable: Vec<&MembershipRecord> =
-        records.iter().filter(|r| !r.quarantined && r.cache.state.is_usable()).collect();
+    let usable: Vec<&MembershipRecord> = records
+        .iter()
+        .filter(|r| !r.quarantined && r.cache.state.is_usable())
+        .collect();
     match usable.len() {
         0 => ScopeState::None,
         1 => ScopeState::One(usable[0].clone()),
@@ -165,7 +179,8 @@ mod tests {
         store.unlock("pw").unwrap();
         let registry = format!("logos:local:{}", "5c".repeat(32));
         let (r1, r2, r3) = ("a1".repeat(32), "a2".repeat(32), "a3".repeat(32));
-        let state_of = |scope: &str| match resolve_scope_state(&store.records_for(&registry), scope) {
+        let state_of = |scope: &str| match resolve_scope_state(&store.records_for(&registry), scope)
+        {
             ScopeState::One(r) => Ok(r.hash.clone()),
             ScopeState::Ambiguous(why) => Err(why.to_string()),
             ScopeState::None => Ok(String::new()),
@@ -173,12 +188,36 @@ mod tests {
 
         // Nothing: unknown. One active R1: it backs every scope.
         assert_eq!(state_of(&r2).unwrap(), "");
-        seed_membership(&store, "h1", &registry, &"11".repeat(32), &r1, &"f1".repeat(32), MembershipState::Active, 1, 100);
+        seed_membership(
+            &store,
+            "h1",
+            &registry,
+            &"11".repeat(32),
+            &r1,
+            &"f1".repeat(32),
+            MembershipState::Active,
+            1,
+            100,
+        );
         assert_eq!(state_of(&r1).unwrap(), "h1");
-        assert_eq!(state_of(&r2).unwrap(), "h1", "a lone membership backs any application");
+        assert_eq!(
+            state_of(&r2).unwrap(),
+            "h1",
+            "a lone membership backs any application"
+        );
 
         // A pending R2 beside it: R2's own record answers, R1's still answers R1.
-        seed_membership(&store, "h2", &registry, &"22".repeat(32), &r2, &"f2".repeat(32), MembershipState::Pending, 0, 100);
+        seed_membership(
+            &store,
+            "h2",
+            &registry,
+            &"22".repeat(32),
+            &r2,
+            &"f2".repeat(32),
+            MembershipState::Pending,
+            0,
+            100,
+        );
         assert_eq!(state_of(&r2).unwrap(), "h2");
         assert_eq!(state_of(&r1).unwrap(), "h1");
         // A third scope with no record of its own: two usable? No — one usable
@@ -186,25 +225,73 @@ mod tests {
         assert_eq!(state_of(&r3).unwrap(), "h1");
 
         // R2 refused by the gifter: its scope reads back the failed record.
-        store.update_cache("h2", |m| {
-            m.state = MembershipState::Failed;
-            m.failed_reason = Some("gifter_failed: credential already used".into());
-        }).unwrap();
-        assert_eq!(state_of(&r2).unwrap(), "h2", "a failed scoped registration is the scope's answer");
+        store
+            .update_cache("h2", |m| {
+                m.state = MembershipState::Failed;
+                m.failed_reason = Some("gifter_failed: credential already used".into());
+            })
+            .unwrap();
+        assert_eq!(
+            state_of(&r2).unwrap(),
+            "h2",
+            "a failed scoped registration is the scope's answer"
+        );
         assert_eq!(state_of(&r1).unwrap(), "h1");
 
         // A second live R2 record: ambiguous within the rank.
-        seed_membership(&store, "h2b", &registry, &"23".repeat(32), &r2, &"f3".repeat(32), MembershipState::Active, 2, 100);
-        assert_eq!(state_of(&r2).unwrap(), "h2b", "the live record beats the failed one");
-        seed_membership(&store, "h2c", &registry, &"24".repeat(32), &r2, &"f4".repeat(32), MembershipState::Pending, 0, 100);
-        assert!(state_of(&r2).unwrap_err().contains("registered under this scope"));
+        seed_membership(
+            &store,
+            "h2b",
+            &registry,
+            &"23".repeat(32),
+            &r2,
+            &"f3".repeat(32),
+            MembershipState::Active,
+            2,
+            100,
+        );
+        assert_eq!(
+            state_of(&r2).unwrap(),
+            "h2b",
+            "the live record beats the failed one"
+        );
+        seed_membership(
+            &store,
+            "h2c",
+            &registry,
+            &"24".repeat(32),
+            &r2,
+            &"f4".repeat(32),
+            MembershipState::Pending,
+            0,
+            100,
+        );
+        assert!(state_of(&r2)
+            .unwrap_err()
+            .contains("registered under this scope"));
         // R3 has no record: two usable memberships back it — ambiguous.
-        assert!(state_of(&r3).unwrap_err().contains("multiple memberships back this scope"));
+        assert!(state_of(&r3)
+            .unwrap_err()
+            .contains("multiple memberships back this scope"));
 
         // A registry-wide record outranks the any-usable fallback for R3.
-        seed_membership(&store, "hw", &registry, &"33".repeat(32), "", &"f5".repeat(32), MembershipState::Active, 3, 100);
+        seed_membership(
+            &store,
+            "hw",
+            &registry,
+            &"33".repeat(32),
+            "",
+            &"f5".repeat(32),
+            MembershipState::Active,
+            3,
+            100,
+        );
         assert_eq!(state_of(&r3).unwrap(), "hw");
-        assert_eq!(state_of(&r1).unwrap(), "h1", "an own record still wins over the registry-wide one");
+        assert_eq!(
+            state_of(&r1).unwrap(),
+            "h1",
+            "an own record still wins over the registry-wide one"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -220,17 +307,61 @@ mod tests {
         store.unlock("pw").unwrap();
         let registry = format!("logos:local:{}", "7b".repeat(32));
         let scope = "c1".repeat(32);
-        seed_membership(&store, "own", &registry, &"51".repeat(32), &scope, &"e1".repeat(32), MembershipState::Active, 1, 100);
-        seed_membership(&store, "wide", &registry, &"52".repeat(32), "", &"e2".repeat(32), MembershipState::Active, 2, 100);
-        seed_membership(&store, "other", &registry, &"53".repeat(32), &"c2".repeat(32), &"e3".repeat(32), MembershipState::Active, 3, 100);
+        seed_membership(
+            &store,
+            "own",
+            &registry,
+            &"51".repeat(32),
+            &scope,
+            &"e1".repeat(32),
+            MembershipState::Active,
+            1,
+            100,
+        );
+        seed_membership(
+            &store,
+            "wide",
+            &registry,
+            &"52".repeat(32),
+            "",
+            &"e2".repeat(32),
+            MembershipState::Active,
+            2,
+            100,
+        );
+        seed_membership(
+            &store,
+            "other",
+            &registry,
+            &"53".repeat(32),
+            &"c2".repeat(32),
+            &"e3".repeat(32),
+            MembershipState::Active,
+            3,
+            100,
+        );
         let canonical = registry_id::parse(&registry).unwrap().canonical;
         let records = records_for_registry(&store, &registry_id::parse(&registry).unwrap());
-        let names = |v: Vec<MembershipRecord>| { let mut n: Vec<String> = v.into_iter().map(|r| r.hash).collect(); n.sort(); n };
+        let names = |v: Vec<MembershipRecord>| {
+            let mut n: Vec<String> = v.into_iter().map(|r| r.hash).collect();
+            n.sort();
+            n
+        };
         assert_eq!(names(scope_candidates(&records, &scope)), ["own"]);
-        assert_eq!(names(scope_candidates(&records, &"c3".repeat(32))), ["wide"], "no own record: the registry-wide one");
-        store.update_cache("wide", |m| m.state = MembershipState::Failed).unwrap();
+        assert_eq!(
+            names(scope_candidates(&records, &"c3".repeat(32))),
+            ["wide"],
+            "no own record: the registry-wide one"
+        );
+        store
+            .update_cache("wide", |m| m.state = MembershipState::Failed)
+            .unwrap();
         let records = records_for_registry(&store, &registry_id::parse(&registry).unwrap());
-        assert_eq!(names(scope_candidates(&records, &"c3".repeat(32))), ["other", "own", "wide"], "nothing of its own or wide: every record");
+        assert_eq!(
+            names(scope_candidates(&records, &"c3".repeat(32))),
+            ["other", "own", "wide"],
+            "nothing of its own or wide: every record"
+        );
         let _ = canonical;
         let _ = std::fs::remove_dir_all(&dir);
     }

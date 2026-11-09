@@ -43,7 +43,10 @@ pub(crate) enum RecordOutcome {
     /// A prior proof carried this nullifier under a DIFFERENT `share_x`: a
     /// double-signal. Carries the recorded prior share so the caller can
     /// reconstruct the double-signaller's identity secret from the two shares.
-    Collision { prior_x: [u8; 32], prior_y: [u8; 32] },
+    Collision {
+        prior_x: [u8; 32],
+        prior_y: [u8; 32],
+    },
 }
 
 /// One accepted proof's `(share_x, share_y)` — the Shamir point a later
@@ -118,8 +121,14 @@ mod tests {
         let (x1, y1) = ([0x11u8; 32], [0x21u8; 32]);
         let (x2, y2) = ([0x12u8; 32], [0x22u8; 32]);
 
-        assert!(matches!(record_verified(REG, 100, n, x1, y1, 0), RecordOutcome::Fresh));
-        assert!(matches!(record_verified(REG, 100, n, x1, y1, 0), RecordOutcome::Duplicate));
+        assert!(matches!(
+            record_verified(REG, 100, n, x1, y1, 0),
+            RecordOutcome::Fresh
+        ));
+        assert!(matches!(
+            record_verified(REG, 100, n, x1, y1, 0),
+            RecordOutcome::Duplicate
+        ));
         match record_verified(REG, 100, n, x2, y2, 0) {
             RecordOutcome::Collision { prior_x, prior_y } => {
                 assert_eq!(prior_x, x1);
@@ -136,11 +145,20 @@ mod tests {
         let n = [0xb2u8; 32];
         let (x1, y1) = ([0x31u8; 32], [0x41u8; 32]);
 
-        assert!(matches!(record_verified(REG, 100, n, x1, y1, 0), RecordOutcome::Fresh));
+        assert!(matches!(
+            record_verified(REG, 100, n, x1, y1, 0),
+            RecordOutcome::Fresh
+        ));
         // Recording at 102 with retain_floor 101 drops epoch 100 first.
-        assert!(matches!(record_verified(REG, 102, n, x1, y1, 101), RecordOutcome::Fresh));
+        assert!(matches!(
+            record_verified(REG, 102, n, x1, y1, 101),
+            RecordOutcome::Fresh
+        ));
         // Epoch 100 is empty again → Fresh, proving the earlier entry was pruned.
-        assert!(matches!(record_verified(REG, 100, n, x1, y1, 0), RecordOutcome::Fresh));
+        assert!(matches!(
+            record_verified(REG, 100, n, x1, y1, 0),
+            RecordOutcome::Fresh
+        ));
     }
 
     // A 600 s registry's epoch (~3e6) sits far below a 10 s registry's prune

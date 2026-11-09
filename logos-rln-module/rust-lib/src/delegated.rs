@@ -126,14 +126,17 @@ impl DelegatedOptions {
             auth_provider: text("auth_provider")?,
             auth_args: text("auth_args")?,
         };
-        validate_delegated(&d).map_err(|e| ApiError::new(e.kind, &format!("{what}: {}", e.message)))?;
+        validate_delegated(&d)
+            .map_err(|e| ApiError::new(e.kind, &format!("{what}: {}", e.message)))?;
         Ok(Some(d))
     }
 
     /// The RegistryOptions flat pairs `parse_registry_options` leaves
     /// (rate_limit removed) — `register_membership`'s delegated vocabulary.
     /// `None` = a funded registration, which takes no auth material.
-    pub(crate) fn from_registry_options(opts: &serde_json::Value) -> Result<Option<Self>, ApiError> {
+    pub(crate) fn from_registry_options(
+        opts: &serde_json::Value,
+    ) -> Result<Option<Self>, ApiError> {
         if !flat_bool_option(opts, "delegated") {
             if ["auth_type", "auth_payload", "auth_provider", "auth_args"]
                 .iter()
@@ -247,7 +250,10 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&delegated_request_args(&d, "ab", 300, "cf")).unwrap();
         for key in ["authType", "authPayload", "authProvider", "authArgs"] {
-            assert!(v.get(key).is_none(), "unset {key} must stay absent, got: {v}");
+            assert!(
+                v.get(key).is_none(),
+                "unset {key} must stay absent, got: {v}"
+            );
         }
         assert_eq!(v["config"], "cf", "the scope's registry rides along: {v}");
         assert_eq!(v["identityCommitment"], "ab", "got: {v}");

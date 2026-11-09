@@ -10,8 +10,8 @@
 //! config is never rewritten — a second call with a different
 //! sequencer_addr must not silently re-point a wallet.
 
-use crate::sealed_store::store as sealed;
 use crate::error::{ApiError, ErrorKind};
+use crate::sealed_store::store as sealed;
 
 pub(crate) fn provision_impl(options_json: &str) -> Result<serde_json::Value, ApiError> {
     let raw = options_json.trim();
@@ -62,7 +62,11 @@ pub(crate) fn provision_impl(options_json: &str) -> Result<serde_json::Value, Ap
         // process), behind an exclusive-create claim so two concurrent first
         // provisions can't tear the tmp file.
         let claim = home.join("wallet_config.json.claim");
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&claim) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&claim)
+        {
             Ok(_) => {
                 let tmp = home.join("wallet_config.json.tmp");
                 let write = std::fs::write(&tmp, config.to_string())
@@ -126,7 +130,11 @@ mod tests {
         let _serial = crate::util::lock(&crate::test_support::TEST_GLOBAL_LOCK);
         sealed::publish(None);
         let err = provision_impl(r#"{"sequencer_addr":"https://seq.example/"}"#).unwrap_err();
-        assert!(err.to_json().contains(r#""kind":"internal""#), "got: {}", err.to_json());
+        assert!(
+            err.to_json().contains(r#""kind":"internal""#),
+            "got: {}",
+            err.to_json()
+        );
     }
 
     #[test]
@@ -145,9 +153,15 @@ mod tests {
         assert_eq!(first["storage_exists"], false);
         let config_path = std::path::PathBuf::from(first["config_path"].as_str().unwrap());
         let storage_path = std::path::PathBuf::from(first["storage_path"].as_str().unwrap());
-        assert_eq!(config_path, dir.join("wallet-home").join("wallet_config.json"));
+        assert_eq!(
+            config_path,
+            dir.join("wallet-home").join("wallet_config.json")
+        );
         assert_eq!(storage_path, dir.join("wallet-home").join("storage.json"));
-        assert!(!storage_path.exists(), "provision must not create storage.json");
+        assert!(
+            !storage_path.exists(),
+            "provision must not create storage.json"
+        );
 
         // The written config is field-for-field the staged fixtures' shape.
         let on_disk: serde_json::Value =

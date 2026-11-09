@@ -227,12 +227,18 @@ mod tests {
         let mut alloc = AllocationState::default();
         assert_eq!(reserve_slot(&mut alloc, APP_A, 10, 9, 5), Ok(0));
         assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 11, 5), Ok(0));
-        assert_eq!(alloc.prune_floor, 11, "pruning epoch 10 must be recorded in the floor");
+        assert_eq!(
+            alloc.prune_floor, 11,
+            "pruning epoch 10 must be recorded in the floor"
+        );
         assert_eq!(
             reserve_slot(&mut alloc, APP_A, 10, 9, 5),
             Err(AllocError::EpochBelowFloor)
         );
-        assert_eq!(alloc.prune_floor, 11, "a rewound candidate must never lower the floor");
+        assert_eq!(
+            alloc.prune_floor, 11,
+            "a rewound candidate must never lower the floor"
+        );
         assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 9, 5), Ok(1));
     }
 
@@ -244,7 +250,10 @@ mod tests {
             reserve_slot(&mut alloc, APP_A, 1_000_000, 999_999, 5),
             Ok(0)
         );
-        assert_eq!(alloc.prune_floor, 11, "the spike must not persist a far-future floor");
+        assert_eq!(
+            alloc.prune_floor, 11,
+            "the spike must not persist a far-future floor"
+        );
         assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 11, 5), Ok(0));
         assert_eq!(
             reserve_slot(&mut alloc, APP_A, 10, 11, 5),
@@ -259,9 +268,18 @@ mod tests {
         // the spiked clock value.
         let mut alloc = AllocationState::default();
         assert_eq!(reserve_slot(&mut alloc, APP_A, 10, 9, 5), Ok(0));
-        assert_eq!(reserve_slot(&mut alloc, APP_A, 1_000_000, 999_999, 5), Ok(0));
-        assert_eq!(reserve_slot(&mut alloc, APP_A, 1_000_000, 999_999, 5), Ok(1));
-        assert_eq!(alloc.prune_floor, 11, "a second spike must not drag the floor to the spiked clock");
+        assert_eq!(
+            reserve_slot(&mut alloc, APP_A, 1_000_000, 999_999, 5),
+            Ok(0)
+        );
+        assert_eq!(
+            reserve_slot(&mut alloc, APP_A, 1_000_000, 999_999, 5),
+            Ok(1)
+        );
+        assert_eq!(
+            alloc.prune_floor, 11,
+            "a second spike must not drag the floor to the spiked clock"
+        );
         assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 11, 5), Ok(0));
     }
 
@@ -296,7 +314,10 @@ mod tests {
         let mut alloc = AllocationState::default();
         assert_eq!(reserve_slot(&mut alloc, APP_A, 9, 8, 5), Ok(0));
         assert_eq!(reserve_slot(&mut alloc, APP_A, 12, 11, 5), Ok(0));
-        assert!(alloc.allocations.iter().all(|a| a.epoch >= 10), "epoch 9's row is pruned");
+        assert!(
+            alloc.allocations.iter().all(|a| a.epoch >= 10),
+            "epoch 9's row is pruned"
+        );
         assert_eq!(alloc.prune_floor, 10);
         assert_eq!(
             reserve_slot(&mut alloc, APP_A, 9, 2, 5),

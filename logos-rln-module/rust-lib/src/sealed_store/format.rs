@@ -27,8 +27,8 @@ pub struct SealedFile {
     pub format: String,
     pub version: u32,
     pub kdf: KdfParams,
-    pub verifier: String,   // hex, 32 bytes
-    pub store_uuid: String, // hex, 16 bytes
+    pub verifier: String,                           // hex, 32 bytes
+    pub store_uuid: String,                         // hex, 16 bytes
     pub credentials: BTreeMap<String, SealedEntry>, // keyed by membership_hash
 }
 
@@ -66,7 +66,7 @@ pub struct AllocationsFile {
     pub version: u32,
     pub store_uuid: String,
     pub sections: BTreeMap<String, Section>, // keyed by membership_hash
-    pub root_mac: String, // hex, 32 bytes
+    pub root_mac: String,                    // hex, 32 bytes
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -118,7 +118,11 @@ pub fn section_mac_payload(
     store_uuid: &[u8; 16],
 ) -> Vec<u8> {
     let mut sorted: Vec<&AllocRow> = rows.iter().collect();
-    sorted.sort_by(|a, b| a.rln_identifier.cmp(&b.rln_identifier).then(a.epoch.cmp(&b.epoch)));
+    sorted.sort_by(|a, b| {
+        a.rln_identifier
+            .cmp(&b.rln_identifier)
+            .then(a.epoch.cmp(&b.epoch))
+    });
     let mut buf = Vec::new();
     buf.extend_from_slice(b"rln-sealed/v1/section");
     put_str(&mut buf, membership_hash);
@@ -200,7 +204,10 @@ pub enum FormatPresence {
 }
 
 pub fn detect(dir: &Path) -> FormatPresence {
-    match (dir.join(SEALED_FILE).exists(), dir.join(OLD_FORMAT_FILE).exists()) {
+    match (
+        dir.join(SEALED_FILE).exists(),
+        dir.join(OLD_FORMAT_FILE).exists(),
+    ) {
         (false, false) => FormatPresence::Neither,
         (true, false) => FormatPresence::NewOnly,
         (false, true) => FormatPresence::OldOnly,
@@ -214,8 +221,8 @@ mod tests {
     use crate::registry_id::bytes_to_hex;
 
     const UUID: [u8; 16] = [
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-        0x0e, 0x0f,
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f,
     ];
     const KEY: [u8; 32] = [0x42; 32];
     const MEMBERSHIP_HASH: &str = "6d656d626572736869702d68617368";
@@ -231,7 +238,11 @@ mod tests {
     }
 
     fn row(rln_identifier: &str, epoch: u64, used: u64) -> AllocRow {
-        AllocRow { rln_identifier: rln_identifier.to_string(), epoch, used }
+        AllocRow {
+            rln_identifier: rln_identifier.to_string(),
+            epoch,
+            used,
+        }
     }
 
     // Deliberately unsorted: "0xbeef" must come out first in the payload.
@@ -272,7 +283,10 @@ mod tests {
         let mut section_macs = BTreeMap::new();
         section_macs.insert(
             MEMBERSHIP_HASH.to_string(),
-            mac(&KEY, &section_mac_payload(MEMBERSHIP_HASH, 600, 7, &rows(), &UUID)),
+            mac(
+                &KEY,
+                &section_mac_payload(MEMBERSHIP_HASH, 600, 7, &rows(), &UUID),
+            ),
         );
         section_macs.insert(
             SECOND_HASH.to_string(),
@@ -301,7 +315,11 @@ mod tests {
         for i in 0..n {
             f.credentials.insert(
                 format!("hash{i:04}"),
-                SealedEntry { identity: identity(), nonce: "bb".repeat(24), ct: "cc".into() },
+                SealedEntry {
+                    identity: identity(),
+                    nonce: "bb".repeat(24),
+                    ct: "cc".into(),
+                },
             );
         }
         f

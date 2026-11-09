@@ -71,8 +71,8 @@ mod rate_limit;
 mod register;
 mod registry_id;
 mod roots;
-mod sealed_store;
 mod scope;
+mod sealed_store;
 mod select;
 #[cfg(test)]
 mod test_support;
@@ -197,7 +197,8 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
     // Protocol), for every registry this call names unless an entry carries
     // its own block (or `null`, which opts that registry out). Without one,
     // provisioning is the funded registration alone.
-    let default_allocator = DelegatedOptions::from_allocator_block(cfg.get("allocator"), "config_json.allocator")?;
+    let default_allocator =
+        DelegatedOptions::from_allocator_block(cfg.get("allocator"), "config_json.allocator")?;
 
     // Merge into the table in force; unparseable entries are skipped.
     let (mut registries, mut per_registry) = config::registries_snapshot();
@@ -209,12 +210,14 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
                     per_registry.insert(registry.canonical.clone(), c);
                 }
                 None => {
-                    per_registry.entry(registry.canonical.clone()).or_insert(RegistryConfig {
-                        epoch_size_sec,
-                        max_epoch_gap,
-                        rate_limit: default_rate,
-                        allocator: default_allocator.clone(),
-                    });
+                    per_registry
+                        .entry(registry.canonical.clone())
+                        .or_insert(RegistryConfig {
+                            epoch_size_sec,
+                            max_epoch_gap,
+                            rate_limit: default_rate,
+                            allocator: default_allocator.clone(),
+                        });
                 }
             }
             if !registries.contains(&registry.canonical) {
@@ -227,13 +230,19 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
             match entry {
                 serde_json::Value::String(raw) => track(raw, None),
                 serde_json::Value::Object(o) => {
-                    let raw = o.get("registry_id").and_then(|x| x.as_str()).unwrap_or_default();
+                    let raw = o
+                        .get("registry_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default();
                     let positive =
                         |key: &str| o.get(key).and_then(|x| x.as_u64()).filter(|n| *n > 0);
                     // An entry's own block wins; an explicit null opts out.
                     let allocator = match o.get("allocator") {
                         None => default_allocator.clone(),
-                        Some(v) => DelegatedOptions::from_allocator_block(Some(v), &format!("registries[{raw}].allocator"))?,
+                        Some(v) => DelegatedOptions::from_allocator_block(
+                            Some(v),
+                            &format!("registries[{raw}].allocator"),
+                        )?,
                     };
                     let set = RegistryConfig {
                         epoch_size_sec: positive("epoch_size_sec").unwrap_or(epoch_size_sec),
@@ -256,14 +265,18 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
     // stale local membership.
     if let Some(store) = sealed_store::store::current() {
         for (hash, registry, bound) in store.epoch_size_bindings() {
-            let canonical =
-                registry_id::parse(&registry).map(|r| r.canonical).unwrap_or(registry);
+            let canonical = registry_id::parse(&registry)
+                .map(|r| r.canonical)
+                .unwrap_or(registry);
             let configured = per_registry
                 .get(&canonical)
                 .map(|c| c.epoch_size_sec)
                 .unwrap_or(epoch_size_sec);
             if bound != 0 && bound != configured {
-                eprintln!("{}", epoch_binding_warning(&hash, &canonical, bound, configured));
+                eprintln!(
+                    "{}",
+                    epoch_binding_warning(&hash, &canonical, bound, configured)
+                );
             }
         }
     }
@@ -300,27 +313,40 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
     };
     let selection_order = registries.clone();
     let reply_registries = registries.clone();
-    config::install(ModuleConfig { epoch_size_sec, max_epoch_gap, registries, per_registry });
+    config::install(ModuleConfig {
+        epoch_size_sec,
+        max_epoch_gap,
+        registries,
+        per_registry,
+    });
     // Every pass in flight ends here, provisioning or not: a start that turns
     // provisioning off must not leave an earlier pass funding and registering
     // at a configuration it replaced.
     let ticket = ensure::supersede();
-    worker::start(move || {
-        // First, before anything reaches the registry module: the first
-        // `logos` registry id is what binds its wallet to a network when
-        // nothing else configured one, and that must be the first one
-        // configured, not whichever the warm-up happens to reach first.
-        provider::select_networks(&selection_order);
-        if warm_roots {
-            roots::refresh_all();
-        }
-        poller::refresh_paths();
-        if !provision_registries.is_empty() {
-            ensure::run_with(provision_registries, ticket);
-        }
-    }, &[poller::ensure_running, roots::ensure_refresher]);
+    worker::start(
+        move || {
+            // First, before anything reaches the registry module: the first
+            // `logos` registry id is what binds its wallet to a network when
+            // nothing else configured one, and that must be the first one
+            // configured, not whichever the warm-up happens to reach first.
+            provider::select_networks(&selection_order);
+            if warm_roots {
+                roots::refresh_all();
+            }
+            poller::refresh_paths();
+            if !provision_registries.is_empty() {
+                ensure::run_with(provision_registries, ticket);
+            }
+        },
+        &[poller::ensure_running, roots::ensure_refresher],
+    );
 
-    ok_json(views::StartReply::new(epoch_size_sec, max_epoch_gap, overrides_view, reply_registries))
+    ok_json(views::StartReply::new(
+        epoch_size_sec,
+        max_epoch_gap,
+        overrides_view,
+        reply_registries,
+    ))
 }
 
 /// Spec stop(): halt the maintenance tasks. Sleeping workers are joined
@@ -469,19 +495,28 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
         rln_identifier_hex: String,
         options_json: String,
     ) -> String {
-        reply(register_impl(self.store(), &registry_id, &rln_identifier_hex, &options_json))
+        reply(register_impl(
+            self.store(),
+            &registry_id,
+            &rln_identifier_hex,
+            &options_json,
+        ))
     }
 
     fn ensure_membership(&self, registry_id: String, options_json: String) -> String {
-        reply(ensure_membership_impl(self.store(), &registry_id, &options_json))
+        reply(ensure_membership_impl(
+            self.store(),
+            &registry_id,
+            &options_json,
+        ))
     }
 
-    fn get_membership_state(
-        &self,
-        registry_id: String,
-        rln_identifier_hex: String,
-    ) -> String {
-        reply(get_membership_state_impl(self.store(), &registry_id, &rln_identifier_hex))
+    fn get_membership_state(&self, registry_id: String, rln_identifier_hex: String) -> String {
+        reply(get_membership_state_impl(
+            self.store(),
+            &registry_id,
+            &rln_identifier_hex,
+        ))
     }
 
     fn get_memberships(&self, registry_id: String) -> String {
@@ -507,9 +542,15 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
             let registry = parse_registry(&registry_id)?;
             let backend = backend_of(&registry)?;
             if leaf_index < 0 {
-                return Err(ApiError::new(ErrorKind::InvalidArgument, "leaf_index must be non-negative"));
+                return Err(ApiError::new(
+                    ErrorKind::InvalidArgument,
+                    "leaf_index must be non-negative",
+                ));
             }
-            Ok(backend.tree.merkle_proof(&registry, leaf_index as u64)?.to_wire())
+            Ok(backend
+                .tree
+                .merkle_proof(&registry, leaf_index as u64)?
+                .to_wire())
         })())
     }
 
@@ -517,8 +558,13 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
         reply((|| {
             let registry = parse_registry(&registry_id)?;
             let backend = backend_of(&registry)?;
-            let roots: Vec<String> =
-                backend.tree.valid_roots(&registry)?.lifted().iter().map(|r| registry_id::bytes_to_hex(r)).collect();
+            let roots: Vec<String> = backend
+                .tree
+                .valid_roots(&registry)?
+                .lifted()
+                .iter()
+                .map(|r| registry_id::bytes_to_hex(r))
+                .collect();
             Ok(serde_json::json!({ "valid_roots": roots }))
         })())
     }
@@ -608,7 +654,10 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
         registry_id: String,
         rln_identifier_hex: String,
     ) -> Result<serde_json::Value, String> {
-        reply_result(get_registry_parameters_impl(&registry_id, &rln_identifier_hex))
+        reply_result(get_registry_parameters_impl(
+            &registry_id,
+            &rln_identifier_hex,
+        ))
     }
 
     fn start(&self, config_json: String) -> Result<serde_json::Value, String> {
@@ -662,7 +711,13 @@ mod tests {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
         let imp = LogosRlnModuleImpl::default();
         let err = imp
-            .validate_proof("not-caip10".into(), "ef".repeat(32), "00".into(), "0".into(), "{}".into())
+            .validate_proof(
+                "not-caip10".into(),
+                "ef".repeat(32),
+                "00".into(),
+                "0".into(),
+                "{}".into(),
+            )
             .unwrap_err();
         assert_eq!(
             err,
@@ -693,10 +748,17 @@ mod tests {
         let out = start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
         assert!(!worker::is_stopped());
         assert_eq!(out["epoch_size_sec"], serde_json::json!(600));
-        assert_eq!(out["max_epoch_gap"], serde_json::json!(DEFAULT_MAX_EPOCH_GAP));
+        assert_eq!(
+            out["max_epoch_gap"],
+            serde_json::json!(DEFAULT_MAX_EPOCH_GAP)
+        );
         let err = start_impl(r#"{"max_epoch_gap": 2}"#).unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument);
-        assert!(err.message.contains("epoch_size_sec"), "got: {}", err.message);
+        assert!(
+            err.message.contains("epoch_size_sec"),
+            "got: {}",
+            err.message
+        );
     }
 
     // Spec: epoch size and max gap are per-REGISTRY configuration — an
@@ -735,7 +797,10 @@ mod tests {
         // No registries at all: no overrides key.
         reset_config_for_test();
         let out = start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
-        assert!(out.get("overrides").is_none(), "no overrides key when none are set: {out}");
+        assert!(
+            out.get("overrides").is_none(),
+            "no overrides key when none are set: {out}"
+        );
         reset_config_for_test();
     }
 
@@ -757,11 +822,19 @@ mod tests {
         assert_eq!(epoch_params_for(&mix).unwrap(), (10, 3));
 
         // Delivery names only its registry, as a plain string.
-        let out =
-            start_impl(&serde_json::json!({"epoch_size_sec": 600, "registries": [deliv]}).to_string())
-                .unwrap();
-        assert_eq!(epoch_params_for(&mix).unwrap(), (10, 3), "the mix registry lost its epoch: {out}");
-        assert_eq!(epoch_params_for(&deliv).unwrap(), (600, DEFAULT_MAX_EPOCH_GAP));
+        let out = start_impl(
+            &serde_json::json!({"epoch_size_sec": 600, "registries": [deliv]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            epoch_params_for(&mix).unwrap(),
+            (10, 3),
+            "the mix registry lost its epoch: {out}"
+        );
+        assert_eq!(
+            epoch_params_for(&deliv).unwrap(),
+            (600, DEFAULT_MAX_EPOCH_GAP)
+        );
         assert_eq!(
             out["registries"],
             serde_json::json!([deliv, mix]),
@@ -776,7 +849,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(epoch_params_for(&mix).unwrap(), (10, 3));
-        assert_eq!(epoch_params_for(&deliv).unwrap(), (600, DEFAULT_MAX_EPOCH_GAP));
+        assert_eq!(
+            epoch_params_for(&deliv).unwrap(),
+            (600, DEFAULT_MAX_EPOCH_GAP)
+        );
         assert_eq!(epoch_params_for("logos:local:other").unwrap(), (10, 3));
 
         // An object entry sets: absent fields take this call's defaults.
@@ -785,7 +861,10 @@ mod tests {
                 .to_string(),
         )
         .unwrap();
-        assert_eq!(epoch_params_for(&mix).unwrap(), (600, DEFAULT_MAX_EPOCH_GAP));
+        assert_eq!(
+            epoch_params_for(&mix).unwrap(),
+            (600, DEFAULT_MAX_EPOCH_GAP)
+        );
         reset_config_for_test();
     }
 
@@ -830,7 +909,10 @@ mod tests {
         assert_eq!(a_alloc.auth_payload.as_deref(), Some("026400000000000000"));
         let b_alloc = allocator_for(&canonical(&b)).expect("b has its own");
         assert_eq!(b_alloc.gifter_peer_id, "16Uiu2Other");
-        assert!(b_alloc.auth_type.is_none(), "an own block does not inherit the global auth");
+        assert!(
+            b_alloc.auth_type.is_none(),
+            "an own block does not inherit the global auth"
+        );
         assert!(allocator_for(&canonical(&c)).is_none(), "null opts out");
 
         // The wire method's flat vocabulary decodes to the same options.
@@ -847,25 +929,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rate, 42);
-        assert_eq!(DelegatedOptions::from_registry_options(&flat).unwrap(), Some(a_alloc));
+        assert_eq!(
+            DelegatedOptions::from_registry_options(&flat).unwrap(),
+            Some(a_alloc)
+        );
 
         for (bad, needle) in [
-            (serde_json::json!({ "multiaddr": "/ip4/1/tcp/1" }), "go together"),
-            (serde_json::json!({ "discover": false }), "needs discover or gifter_peer_id"),
-            (serde_json::json!({ "discover": "yes" }), "discover must be a boolean"),
-            (serde_json::json!({ "peer_id": "p", "multiaddr": "/m", "auth_payload": "00" }), "need auth_type"),
-            (serde_json::json!({ "peer_id": "p", "multiaddr": "/m", "auth_type": "t" }), "needs auth_payload or auth_provider"),
-            (serde_json::json!({ "peer_id": "p", "multiaddr": "/m", "auth_type": "t", "auth_payload": "zz" }), "hex"),
-            (serde_json::json!({ "peer_id": 7, "multiaddr": "/m" }), "must be a string"),
+            (
+                serde_json::json!({ "multiaddr": "/ip4/1/tcp/1" }),
+                "go together",
+            ),
+            (
+                serde_json::json!({ "discover": false }),
+                "needs discover or gifter_peer_id",
+            ),
+            (
+                serde_json::json!({ "discover": "yes" }),
+                "discover must be a boolean",
+            ),
+            (
+                serde_json::json!({ "peer_id": "p", "multiaddr": "/m", "auth_payload": "00" }),
+                "need auth_type",
+            ),
+            (
+                serde_json::json!({ "peer_id": "p", "multiaddr": "/m", "auth_type": "t" }),
+                "needs auth_payload or auth_provider",
+            ),
+            (
+                serde_json::json!({ "peer_id": "p", "multiaddr": "/m", "auth_type": "t", "auth_payload": "zz" }),
+                "hex",
+            ),
+            (
+                serde_json::json!({ "peer_id": 7, "multiaddr": "/m" }),
+                "must be a string",
+            ),
             (serde_json::json!("16Uiu2Peer"), "must be an object"),
         ] {
             let cfg = serde_json::json!({ "epoch_size_sec": 600, "provision": false, "allocator": bad, "registries": [a] });
             let e = start_impl(&cfg.to_string()).unwrap_err();
             assert_eq!(e.kind, ErrorKind::InvalidArgument, "{bad}: {}", e.message);
             assert!(e.message.contains(needle), "{bad}: {}", e.message);
-            assert!(e.message.starts_with("config_json.allocator"), "{bad}: {}", e.message);
+            assert!(
+                e.message.starts_with("config_json.allocator"),
+                "{bad}: {}",
+                e.message
+            );
         }
         stop_impl().unwrap();
     }
-
 }
