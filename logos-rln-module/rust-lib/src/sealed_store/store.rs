@@ -578,10 +578,8 @@ impl Store {
         let Some(uuid) = inner.store_uuid else {
             return Err(ApiError::internal("sealed store is not provisioned"));
         };
-        let plaintext = Zeroizing::new(
-            serde_json::to_vec(credential)
-                .map_err(|e| ApiError::internal(format!("credential serialize: {e}")))?,
-        );
+        let plaintext = credential_plaintext(credential)
+            .map_err(|e| ApiError::internal(format!("credential serialize: {e}")))?;
         let aad = format::credential_aad(hash, &identity, &uuid);
         let (nonce, ct) = crypto::seal(&session.keys.seal, &aad, &plaintext)
             .map_err(|e| ApiError::internal(format!("credential seal: {e}")))?;
@@ -910,6 +908,29 @@ fn derive_keys(password: &str, params: &KdfParams) -> Result<SubKeys, ApiError> 
     let mk =
         MasterKey::derive(password, params).map_err(|e| ApiError::internal(format!("kdf: {e}")))?;
     SubKeys::derive(&mk).map_err(|e| ApiError::internal(format!("kdf: {e}")))
+}
+
+/// The credential's JSON in one wiped buffer. A counting pass sizes the
+/// buffer first, so the serializing pass never reallocates and no freed
+/// intermediate block holds the secret.
+fn credential_plaintext(
+    credential: &StoredCredential,
+) -> Result<Zeroizing<Vec<u8>>, serde_json::Error> {
+    struct ByteCount(usize);
+    impl std::io::Write for ByteCount {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut len = ByteCount(0);
+    serde_json::to_writer(&mut len, credential)?;
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(len.0));
+    serde_json::to_writer(&mut *plaintext, credential)?;
+    Ok(plaintext)
 }
 
 /// True when the entry's AEAD opens under this session AND the plaintext
@@ -1459,6 +1480,15 @@ mod tests {
             identity_secret_hash: "77".repeat(32),
             registry_id: registry.to_string(),
         }
+    }
+
+    #[test]
+    fn credential_plaintext_is_the_json_in_one_exact_buffer() {
+        let registry = format!("logos:local:{}", "ab".repeat(32));
+        let credential = credential_for(&registry, &[7; 32]);
+        let plaintext = credential_plaintext(&credential).unwrap();
+        assert_eq!(*plaintext, serde_json::to_vec(&credential).unwrap());
+        assert_eq!(plaintext.capacity(), plaintext.len(), "no reallocation");
     }
 
     fn insert_membership(store: &Store, registry: &str, commitment: &[u8; 32]) -> String {

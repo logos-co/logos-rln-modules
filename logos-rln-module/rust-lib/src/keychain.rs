@@ -59,13 +59,20 @@ impl Keychain for SecurityCli {
             .args(["find-generic-password", "-s", service, "-a", account, "-w"])
             .output()
             .map_err(|e| format!("spawn {SECURITY_BIN}: {e}"))?;
+        // The output buffer moves into the password, or back out of the UTF-8
+        // error, and is wiped on drop either way.
+        let mut stdout = Zeroizing::new(out.stdout);
         if out.status.success() {
-            let mut payload = String::from_utf8(out.stdout)
-                .map_err(|_| "keychain payload is not utf-8".to_string())?;
+            let mut payload = Zeroizing::new(
+                String::from_utf8(std::mem::take(&mut *stdout)).map_err(|e| {
+                    drop(Zeroizing::new(e.into_bytes()));
+                    "keychain payload is not utf-8".to_string()
+                })?,
+            );
             while payload.ends_with('\n') || payload.ends_with('\r') {
                 payload.pop();
             }
-            return Ok(Some(Zeroizing::new(payload)));
+            return Ok(Some(payload));
         }
         if out.status.code() == Some(44) {
             return Ok(None);
