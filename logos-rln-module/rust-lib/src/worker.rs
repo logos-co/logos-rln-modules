@@ -20,7 +20,9 @@
 //! `start()`'s respawn and warm pass.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+#[cfg(test)]
+use std::sync::Arc;
+use std::sync::{Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -43,9 +45,9 @@ enum WorkerState {
     Stopped,
 }
 
-/// A slot's handle plus the worker's own "I have returned" flag, so `stop()`
-/// can tell an instant join from a blocked worker without ever blocking.
-type Held = Option<(JoinHandle<()>, Arc<AtomicBool>)>;
+/// A slot's worker handle. `JoinHandle::is_finished` tells an instant join
+/// from a blocked worker without ever blocking.
+type Held = Option<JoinHandle<()>>;
 
 /// The long-lived worker slots a respawn fills; the one-shot warm pass is
 /// `start()`'s own.
@@ -142,6 +144,7 @@ pub(crate) fn generation_for_test() -> u64 {
 /// Spawn `body(generation)` into `slot` if permitted and not already alive.
 /// A slot whose previous worker has returned is reaped (instant join) and
 /// respawned; a live worker makes this a no-op.
+// OWNERSHIP: thread names are string literals.
 pub(crate) fn ensure(slot: Slot, name: &'static str, body: fn(u64)) {
     fn held(s: &mut Supervisor, slot: Slot) -> &mut Held {
         match slot {
@@ -153,11 +156,11 @@ pub(crate) fn ensure(slot: Slot, name: &'static str, body: fn(u64)) {
     if sup.state == WorkerState::Stopped {
         return;
     }
-    let alive = matches!(held(&mut sup, slot), Some((_, done)) if !done.load(Ordering::SeqCst));
+    let alive = matches!(held(&mut sup, slot), Some(handle) if !handle.is_finished());
     if alive {
         return;
     }
-    if let Some((handle, _)) = held(&mut sup, slot).take() {
+    if let Some(handle) = held(&mut sup, slot).take() {
         let _ = handle.join();
     }
     let gen = sup.generation;
@@ -166,24 +169,23 @@ pub(crate) fn ensure(slot: Slot, name: &'static str, body: fn(u64)) {
 }
 
 /// Spawn a named worker of generation `gen`, wrapped in the exit epilogue
-/// (generation-scoped `running` decrement + done flag + wake). The decrement
-/// is skipped for a worker whose generation is no longer current: a
-/// `stop()`/reset bumps the generation only once its workers are already
-/// accounted for, so a superseded straggler exiting later must not disturb
-/// the count a fresh run is now keeping.
+/// (generation-scoped `running` decrement + wake). The decrement is skipped
+/// for a worker whose generation is no longer current: a `stop()`/reset
+/// bumps the generation only once its workers are already accounted for, so
+/// a superseded straggler exiting later must not disturb the count a fresh
+/// run is now keeping.
 ///
-/// The `done` flag is set LAST — only after the worker has released SUP — so a
-/// reaper that joins a `done` slot WHILE HOLDING SUP can never block on the
-/// worker still trying to acquire SUP. (Setting it before the SUP-locked tail
-/// deadlocks: the reaper holds SUP and joins; the worker parks on SUP.)
+/// `is_finished` turns true only once this closure has returned — after its
+/// SUP section — so a reaper that joins a finished slot WHILE HOLDING SUP can
+/// never block on the worker still trying to acquire SUP.
+// OWNERSHIP: the body moves into the spawned thread, so it is Send and owns
+// its captures; thread names are string literals.
 fn spawn_into(
     name: &'static str,
     gen: u64,
     body: impl FnOnce() + Send + 'static,
-) -> (JoinHandle<()>, Arc<AtomicBool>) {
-    let done = Arc::new(AtomicBool::new(false));
-    let done_in = done.clone();
-    let handle = std::thread::Builder::new()
+) -> JoinHandle<()> {
+    std::thread::Builder::new()
         .name(name.into())
         .spawn(move || {
             body();
@@ -193,14 +195,11 @@ fn spawn_into(
                     sup.running = sup.running.saturating_sub(1);
                 }
             }
-            // Past the SUP section: the flag means "instant
-            // join" for a reaper holding SUP. Only the wake — which needs no
-            // lock — and the thread's own teardown remain.
-            done_in.store(true, Ordering::SeqCst);
+            // Past the SUP section: only the wake — which needs no lock —
+            // and the thread's own teardown remain.
             CVAR.notify_all();
         })
-        .expect("spawn worker thread");
-    (handle, done)
+        .expect("spawn worker thread")
 }
 
 /// start(): permit + spawn maintenance (each `respawn` entry idempotently
@@ -208,7 +207,9 @@ fn spawn_into(
 /// start after stop() bumps the generation (fresh workers, stale stragglers
 /// die); a repeated start is idempotent — live workers are kept, only the
 /// warm pass respawns.
-pub(crate) fn start(warm: impl FnOnce() + Send + 'static, respawn: &'static [fn()]) {
+// OWNERSHIP: `warm` moves into the spawned thread (Send, owns its captures);
+// `respawn` is only iterated during the call.
+pub(crate) fn start(warm: impl FnOnce() + Send + 'static, respawn: &[fn()]) {
     {
         let mut sup = crate::util::lock(&SUP);
         if sup.state == WorkerState::Stopped {
@@ -222,10 +223,10 @@ pub(crate) fn start(warm: impl FnOnce() + Send + 'static, respawn: &'static [fn(
         ensure_worker();
     }
     let mut sup = crate::util::lock(&SUP);
-    if let Some((handle, done)) = sup.warm.take() {
+    if let Some(handle) = sup.warm.take() {
         // A previous warm pass that finished is reaped; one still in flight
         // is detached — its body bails on the stopped/generation checks.
-        if done.load(Ordering::SeqCst) {
+        if handle.is_finished() {
             let _ = handle.join();
         }
     }
@@ -261,8 +262,8 @@ pub(crate) fn stop() {
         .unwrap_or_else(|p| p.into_inner());
     let sup: &mut Supervisor = &mut sup;
     for slot in [&mut sup.poller, &mut sup.refresher, &mut sup.warm] {
-        if let Some((handle, done)) = slot.take() {
-            if done.load(Ordering::SeqCst) {
+        if let Some(handle) = slot.take() {
+            if handle.is_finished() {
                 let _ = handle.join();
             }
             // else: detached by dropping the handle; the generation close

@@ -29,7 +29,7 @@
 //! that finds no client may create one lazily.
 
 use std::collections::HashMap;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use logos_rust_sdk::LogosError;
@@ -58,7 +58,9 @@ const REPLY_MARGIN: Duration = Duration::from_secs(10);
 // ------------------------------------------------------------ shared clients
 
 static LEZ_CLIENT: Mutex<Option<Arc<LiblogosLezRlnModuleClient>>> = Mutex::new(None);
-static GIFTER_CLIENT: Mutex<Option<Arc<RlnGifterModuleClient>>> = Mutex::new(None);
+/// Created by the first `gifter_client()` call (normally `init_client`'s),
+/// on that caller's thread, and never replaced.
+static GIFTER_CLIENT: LazyLock<RlnGifterModuleClient> = LazyLock::new(RlnGifterModuleClient::new);
 
 /// Warm the process-lifetime clients. Called from `on_context_ready` on the
 /// host's main Qt thread so the one-time construction happens at load rather
@@ -339,9 +341,9 @@ pub(crate) fn select_networks(tracked: &[String]) {
 /// dispatch margin.
 pub(crate) const GIFTER_REQUEST_TIMEOUT: Duration = Duration::from_secs(340);
 
-fn gifter_client() -> Arc<RlnGifterModuleClient> {
-    let mut slot = lock(&GIFTER_CLIENT);
-    Arc::clone(slot.get_or_insert_with(|| Arc::new(RlnGifterModuleClient::new())))
+// OWNERSHIP: process-lifetime borrow of the never-replaced client.
+fn gifter_client() -> &'static RlnGifterModuleClient {
+    LazyLock::force(&GIFTER_CLIENT)
 }
 
 /// Fire the gifter module's `request` with the module-generated commitment and
