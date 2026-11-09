@@ -1625,7 +1625,7 @@ mod tests {
     /// retry interval and the store on drop.
     struct DiscoveryPass {
         dir: std::path::PathBuf,
-        _imp: crate::LogosRlnModuleImpl,
+        _imp: crate::test_support::TestImp,
         registry: String,
         requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         probes: std::sync::Arc<std::sync::atomic::AtomicUsize>,

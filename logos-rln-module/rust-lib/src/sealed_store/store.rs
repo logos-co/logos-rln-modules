@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 
 use zeroize::Zeroizing;
 
@@ -43,27 +43,109 @@ impl core::fmt::Display for OpenError {
     }
 }
 
-// ------------------------------------------------------------ published slot
+// ------------------------------------------------------------- current store
 
-/// The published store for worker loops (poller, keychain auto-unlock): a
-/// Weak so a published-but-closed store can actually drop.
-static CURRENT: Mutex<Weak<Store>> = Mutex::new(Weak::new());
-
-pub(crate) fn publish(store: Option<&Arc<Store>>) {
-    *crate::util::lock(&CURRENT) = store.map_or_else(Weak::new, Arc::downgrade);
+/// The store handle: `Unready` carries the cause the last (re-)context failed
+/// with (or the never-initialized default) so every keystore op can surface
+/// it; `Ready` is the open store.
+enum StoreCell {
+    Unready(String),
+    Ready(Arc<Store>),
 }
 
-pub(crate) fn current() -> Option<Arc<Store>> {
-    crate::util::lock(&CURRENT).upgrade()
+impl Default for StoreCell {
+    fn default() -> StoreCell {
+        StoreCell::Unready(UNINIT_MSG.to_string())
+    }
 }
+
+/// The one current store, for the handlers and the worker loops alike.
+/// Readers clone the `Arc<Store>` out under a short read lock and never hold
+/// the lock across work; a (re-)context replaces the cell under the write lock.
+// OWNERSHIP: the process-wide owner of the open store (handlers run
+// concurrently on `&self`, workers and callbacks on their own threads);
+// `LazyLock` because the default cause is a `String`.
+static STORE: LazyLock<RwLock<StoreCell>> = LazyLock::new(RwLock::default);
 
 /// The refusal every keystore op surfaces when no store was ever opened.
 pub(crate) const UNINIT_MSG: &str =
     "store not initialized (no instance persistence path from the host, unreadable \
      keystore, or another process holds the keystore lock)";
 
+/// The open store, or `internal` naming why there is none — the handlers'
+/// read.
+pub(crate) fn current_or_cause() -> Result<Arc<Store>, ApiError> {
+    match &*STORE.read().unwrap() {
+        // OWNERSHIP: cheap Arc handle clone, taken out of the read lock.
+        StoreCell::Ready(store) => Ok(Arc::clone(store)),
+        StoreCell::Unready(cause) => Err(ApiError::internal(cause)),
+    }
+}
+
+/// The open store, if any — the worker loops' read (poison-recovering).
+pub(crate) fn current() -> Option<Arc<Store>> {
+    match &*STORE.read().unwrap_or_else(PoisonError::into_inner) {
+        // OWNERSHIP: cheap Arc handle clone, taken out of the read lock.
+        StoreCell::Ready(store) => Some(Arc::clone(store)),
+        StoreCell::Unready(_) => None,
+    }
+}
+
 pub(crate) fn current_or_uninit() -> Result<Arc<Store>, ApiError> {
     current().ok_or_else(|| ApiError::internal(UNINIT_MSG))
+}
+
+/// (Re-)open the store in `dir` and make it current; on failure the cell
+/// records the cause every later op will surface. A previously current store
+/// is closed FIRST so its directory lock releases deterministically and the
+/// re-open can reacquire it — OS file locks conflict between file
+/// descriptions even within one process. The whole close -> open -> publish
+/// sequence runs under the write lock so a re-context cannot interleave with
+/// another, and no reader sees the closed store.
+pub(crate) fn open_current(dir: PathBuf) {
+    let mut cell = STORE.write().unwrap();
+    if let StoreCell::Ready(prev) = &*cell {
+        prev.close();
+    }
+    match Store::open(dir) {
+        Ok(store) => *cell = StoreCell::Ready(store),
+        Err(e) => {
+            // Fail closed: leave the store unready so every keystore op
+            // errors rather than clobbering shared or existing state.
+            eprintln!("store: {e}");
+            *cell = StoreCell::Unready(e.to_string());
+        }
+    }
+}
+
+/// Close the current store, if any, and leave the cell unready with `cause`,
+/// under the write lock.
+pub(crate) fn close_current(cause: String) {
+    let mut cell = STORE.write().unwrap();
+    if let StoreCell::Ready(prev) = &*cell {
+        prev.close();
+    }
+    *cell = StoreCell::Unready(cause);
+}
+
+/// Make `store` current (`None`: the never-initialized default) without
+/// closing the one it replaces — the tests' publication.
+#[cfg(test)]
+pub(crate) fn publish(store: Option<&Arc<Store>>) {
+    *STORE.write().unwrap_or_else(PoisonError::into_inner) = match store {
+        // OWNERSHIP: the cell holds its own handle; the test keeps its one.
+        Some(store) => StoreCell::Ready(Arc::clone(store)),
+        None => StoreCell::default(),
+    };
+}
+
+/// Reset the cell to the never-initialized default if `store` is current.
+#[cfg(test)]
+pub(crate) fn withdraw(store: &Arc<Store>) {
+    let mut cell = STORE.write().unwrap_or_else(PoisonError::into_inner);
+    if matches!(&*cell, StoreCell::Ready(current) if Arc::ptr_eq(current, store)) {
+        *cell = StoreCell::default();
+    }
 }
 
 // -------------------------------------------------------------------- state

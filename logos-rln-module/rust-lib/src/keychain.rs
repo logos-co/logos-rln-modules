@@ -437,7 +437,7 @@ mod tests {
         fail_writes: Arc<AtomicBool>,
         fail_reads: Arc<AtomicBool>,
         dir: std::path::PathBuf,
-        store: Arc<sealed::Store>,
+        store: crate::test_support::PublishedStore,
     }
 
     fn setup(tag: &str) -> Fixture {

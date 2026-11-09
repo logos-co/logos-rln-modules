@@ -374,63 +374,17 @@ fn stop_impl() -> Result<serde_json::Value, ApiError> {
 
 // -------------------------------------------------------------------- module
 
-/// The store handle: `Unready` carries the cause `on_context_ready` failed
-/// with (or the never-initialized default) so every keystore op can surface
-/// it; `Ready` is the open store.
-enum StoreCell {
-    Unready(String),
-    Ready(Arc<Store>),
-}
-
-impl Default for StoreCell {
-    fn default() -> StoreCell {
-        StoreCell::Unready(sealed_store::store::UNINIT_MSG.to_string())
-    }
-}
-
+/// The module instance. Stateless: concurrency:"multi" dispatch shares it as
+/// Arc<Self> and every handler takes &self; the store lives in
+/// `sealed_store::store`'s one current-store cell. Braced, not a unit struct:
+/// the generated loader and the tests construct it through `Default`.
 #[derive(Default)]
-struct LogosRlnModuleImpl {
-    // Interior-mutable: concurrency:"multi" dispatch shares the impl as
-    // Arc<Self> and every handler takes &self. Handlers clone the Arc<Store>
-    // out under a short read lock — never hold the cell lock across work.
-    store: std::sync::RwLock<StoreCell>,
-}
+struct LogosRlnModuleImpl {}
 
 impl LogosRlnModuleImpl {
     /// The open store (cloned out), or `internal` naming why there is none.
     fn store(&self) -> Result<Arc<Store>, ApiError> {
-        match &*self.store.read().unwrap() {
-            StoreCell::Ready(store) => Ok(store.clone()),
-            StoreCell::Unready(cause) => Err(ApiError::internal(cause)),
-        }
-    }
-
-    /// (Re-)open the store in `dir`, adopt it, and publish it for the worker
-    /// loops; on failure the cell records the cause every later op will
-    /// surface. A previously adopted store is closed FIRST so its directory
-    /// lock releases deterministically and the re-open can reacquire it —
-    /// OS file locks conflict between file descriptions even within one
-    /// process.
-    fn open_store(&self, dir: std::path::PathBuf) {
-        // The whole close -> open -> publish sequence runs under the write
-        // lock so a re-context cannot interleave with another.
-        let mut cell = self.store.write().unwrap();
-        sealed_store::store::publish(None);
-        if let StoreCell::Ready(prev) = &*cell {
-            prev.close();
-        }
-        match Store::open(dir) {
-            Ok(store) => {
-                sealed_store::store::publish(Some(&store));
-                *cell = StoreCell::Ready(store);
-            }
-            Err(e) => {
-                // Fail closed: leave the store unready so every keystore op
-                // errors rather than clobbering shared or existing state.
-                eprintln!("store: {e}");
-                *cell = StoreCell::Unready(e.to_string());
-            }
-        }
+        sealed_store::store::current_or_cause()
     }
 }
 
@@ -446,21 +400,19 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
             eprintln!(
                 "membership module: host provided no instance_persistence_path — keystore ops will fail"
             );
-            let mut cell = self.store.write().unwrap();
-            sealed_store::store::publish(None);
-            if let StoreCell::Ready(prev) = &*cell {
-                prev.close();
-            }
-            *cell = StoreCell::Unready(
+            sealed_store::store::close_current(
                 "no instance persistence path from the host — keystore ops are \
                  disabled (no silent cwd fallback; see README)"
                     .to_string(),
             );
         } else {
-            self.open_store(std::path::PathBuf::from(&ctx.instance_persistence_path));
+            sealed_store::store::open_current(std::path::PathBuf::from(
+                &ctx.instance_persistence_path,
+            ));
             // Resume confirmation polling for records that were pending at
-            // the last shutdown.
-            if let StoreCell::Ready(store) = &*self.store.read().unwrap() {
+            // the last shutdown. The handle is cloned out: the auto-unlock
+            // reads the current store itself.
+            if let Some(store) = sealed_store::store::current() {
                 if store.has_pending() {
                     poller::ensure_running();
                 }

@@ -12,7 +12,7 @@ use crate::LogosRlnModuleImpl;
 
 /// Tests touching process-global subsystems (the worker supervisor, CONFIG,
 /// the nullifier log, root windows, the path cache, the keychain backend,
-/// the published store slot, event emission) serialize on this.
+/// the current-store cell, event emission) serialize on this.
 pub(crate) static TEST_GLOBAL_LOCK: Mutex<()> = Mutex::new(());
 
 /// The backend `provider::backend_for("fakens")` serves.
@@ -40,13 +40,31 @@ pub(crate) fn install_gifter(gifter: FakeGifter) {
     *crate::util::lock(&INSTALLED_GIFTER) = Some(gifter);
 }
 
-/// Open a store in `dir` and publish it in the worker-loop slot — the tests'
-/// stand-in for `on_context_ready`'s store wiring.
-pub(crate) fn publish_test_store(dir: std::path::PathBuf) -> Arc<Store> {
+/// A store a test made current. It derefs to the store's handle, and on drop
+/// resets the current-store cell if the store is still current, so a later
+/// test starts from the never-initialized default.
+pub(crate) struct PublishedStore(Arc<Store>);
+
+impl std::ops::Deref for PublishedStore {
+    type Target = Arc<Store>;
+    fn deref(&self) -> &Arc<Store> {
+        &self.0
+    }
+}
+
+impl Drop for PublishedStore {
+    fn drop(&mut self) {
+        sealed_store::store::withdraw(&self.0);
+    }
+}
+
+/// Open a store in `dir` and make it current — the tests' stand-in for
+/// `on_context_ready`'s store wiring.
+pub(crate) fn publish_test_store(dir: std::path::PathBuf) -> PublishedStore {
     sealed_store::store::publish(None);
     let store = Store::open(dir).expect("test store open");
     sealed_store::store::publish(Some(&store));
-    store
+    PublishedStore(store)
 }
 
 /// The "no store" argument for `_impl` fns whose store access must never
@@ -103,11 +121,27 @@ pub(crate) fn seed_membership(
         .expect("seed cache");
 }
 
+/// A module instance whose store a test made current. It derefs to the
+/// instance; the store stays current until the instance drops.
+pub(crate) struct TestImp {
+    imp: LogosRlnModuleImpl,
+    _store: PublishedStore,
+}
+
+impl std::ops::Deref for TestImp {
+    type Target = LogosRlnModuleImpl;
+    fn deref(&self) -> &LogosRlnModuleImpl {
+        &self.imp
+    }
+}
+
 /// A module instance wired to a fresh store in `dir` (the tests'
 /// on_context_ready stand-in), plus the store for direct seeding.
-pub(crate) fn imp_with_store(dir: std::path::PathBuf) -> (LogosRlnModuleImpl, Arc<Store>) {
+pub(crate) fn imp_with_store(dir: std::path::PathBuf) -> (TestImp, Arc<Store>) {
     let imp = LogosRlnModuleImpl::default();
-    imp.open_store(dir);
+    sealed_store::store::open_current(dir);
     let store = imp.store().expect("test store open");
-    (imp, store)
+    // OWNERSHIP: the instance's guard and the test each hold a handle.
+    let guard = PublishedStore(Arc::clone(&store));
+    (TestImp { imp, _store: guard }, store)
 }
