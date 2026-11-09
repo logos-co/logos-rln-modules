@@ -205,6 +205,7 @@ pub(crate) fn auto_unlock_disabled() -> bool {
 fn read_file_secret(dir: &std::path::Path) -> (Option<Zeroizing<String>>, Option<String>) {
     match std::fs::read_to_string(dir.join(AUTO_SECRET_FILE)) {
         Ok(raw) => {
+            let raw = Zeroizing::new(raw);
             let trimmed = raw.trim();
             if trimmed.is_empty() {
                 (

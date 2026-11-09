@@ -124,7 +124,7 @@ pub(crate) fn generate_proof_with(
     let rate_limit = record.cache.rate_limit.unwrap_or(0);
 
     // Decrypt the credential in-module (requires an unlocked keystore).
-    let credential = store.unseal_credential(&hash)?;
+    let mut credential = store.unseal_credential(&hash)?;
 
     // Fetch the Merkle path first — it can fail without spending a slot. A
     // cache hit is ZERO registry I/O; a miss falls back to the on-demand
@@ -147,8 +147,10 @@ pub(crate) fn generate_proof_with(
     let message_id =
         store.reserve_message_id(&hash, &rln_id_hex, epoch, retain_floor, rate_limit, size)?;
 
+    // OWNERSHIP: the secret moves out of the credential (`mem::take`: its
+    // Drop forbids a field move) into the material; both wipe on drop.
     let material = proof::WitnessMaterial {
-        identity_secret_hash_hex: credential.identity_secret_hash.clone(),
+        identity_secret_hash_hex: std::mem::take(&mut credential.identity_secret_hash),
         rate_limit,
         message_id,
         path_elements_hex,

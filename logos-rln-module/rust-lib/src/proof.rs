@@ -38,9 +38,9 @@ use rln::prelude::{
     RLNBuilder, RLNMerkleProof, RLNProof, RLNProofValues, RLNWitnessInput, SecretFr, Stateless,
     VerifyProofError, RLN,
 };
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::registry_id::{bytes_to_hex, hex_to_bytes32, hex_to_vec};
+use crate::registry_id::{bytes_to_hex, hex_decode_into, hex_to_bytes32, hex_to_vec};
 
 /// The circuit's fixed Merkle depth; a supplied path MUST have this length or
 /// witness construction fails.
@@ -74,6 +74,8 @@ pub(crate) enum ProofError {
 /// Everything the circuit needs about the membership, assembled by the caller
 /// (`generate_proof`) from the keystore credential and the registry's Merkle
 /// proof. Hex is lowercase, 32-byte little-endian — the crate-wide encoding.
+/// Every field is wiped on drop, the secret among them.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub(crate) struct WitnessMaterial {
     /// Decrypted `identity_secret_hash` (LE hex) — used only to build the
     /// witness, never stored or returned.
@@ -534,8 +536,14 @@ pub(crate) fn generate(
         )));
     }
 
-    let secret_bytes = hex_to_bytes32(&material.identity_secret_hash_hex)
-        .ok_or_else(|| ProofError::BadInput("identity_secret_hash: expected 32-byte hex".into()))?;
+    // Decoded in place into a buffer wiped on drop; `SecretFr` (zeroized on
+    // drop) holds the only other copy.
+    let mut secret_bytes = Zeroizing::new([0u8; 32]);
+    if !hex_decode_into(&material.identity_secret_hash_hex, &mut secret_bytes[..]) {
+        return Err(ProofError::BadInput(
+            "identity_secret_hash: expected 32-byte hex".into(),
+        ));
+    }
     let identity_secret = SecretFr::deserialize_compressed(&secret_bytes[..])
         .map_err(|e| ProofError::BadInput(format!("identity_secret: {e}")))?;
 
@@ -1072,5 +1080,12 @@ mod tests {
             secret,
             "3c87aa7480ec2cad022ef39c256ddb6e4fb083c7d4a0dfdc4eee891feda7a62b"
         );
+    }
+
+    // The material carries a copy of the identity secret, wiped when it drops.
+    #[test]
+    fn witness_material_is_zeroized_on_drop() {
+        fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        wiped_on_drop::<WitnessMaterial>();
     }
 }
