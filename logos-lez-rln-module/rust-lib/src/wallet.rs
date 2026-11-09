@@ -787,17 +787,14 @@ fn select_network(sel: &mut Selector, reference: &str) -> (NetworkReply, Action)
     // Re-checked under the lock: a home someone configured since bring-up
     // looked is adopted as it stands, never overwritten.
     if home.join(CONFIG_FILE).exists() {
-        let action = apply_plan(
-            sel,
-            home.clone(),
-            plan_home(
-                &home,
-                EnvView {
-                    sequencer: String::new(),
-                    network: String::new(),
-                },
-            ),
+        let plan = plan_home(
+            &home,
+            EnvView {
+                sequencer: String::new(),
+                network: String::new(),
+            },
         );
+        let action = apply_plan(sel, home, plan);
         let reply = match &sel.selection {
             Selection::Bound { home, binding } => {
                 answer_bound(home, binding, &reference, &mut sel.operator_noted)
@@ -1762,12 +1759,10 @@ pub(crate) fn status_json() -> String {
     // wait, "failed" means waiting longer will not help. `detail` is for a
     // human reading a log.
     let (name, detail) = match &state.readiness {
-        Readiness::Ready => ("ready", String::new()),
-        Readiness::Pending(detail) if detail.is_empty() => {
-            ("pending", "opening the wallet".to_owned())
-        }
-        Readiness::Pending(detail) => ("pending", detail.clone()),
-        Readiness::Failed(reason) => ("failed", reason.clone()),
+        Readiness::Ready => ("ready", ""),
+        Readiness::Pending(detail) if detail.is_empty() => ("pending", "opening the wallet"),
+        Readiness::Pending(detail) => ("pending", detail.as_str()),
+        Readiness::Failed(reason) => ("failed", reason.as_str()),
     };
     // `payer` is local configuration, never a chain read: this method is what
     // a consumer polls to tell "coming up" from "broken", so it must not be

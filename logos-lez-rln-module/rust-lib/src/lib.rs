@@ -470,23 +470,37 @@ fn roots_to_json_array(roots: &[[u8; 32]]) -> serde_json::Value {
     )
 }
 
+/// One proof as the wire carries it: `ProofJson`'s fields plus the shared
+/// `valid_roots`, declared in alphabetical order — the frozen wire key order
+/// (pinned by `augmented_proofs_match_json_roundtrip` and
+/// `several_augmented_proofs_serialize_to_the_wire_text`).
+// OWNERSHIP: a serialisation view borrowing the proof and the one roots array every proof shares.
+#[derive(serde::Serialize)]
+struct ProofWithRoots<'a> {
+    depth: u32,
+    leaf: &'a str,
+    leaf_index: u64,
+    path_elements: &'a [String],
+    path_indices: &'a [u8],
+    root: &'a str,
+    valid_roots: &'a serde_json::Value,
+}
+
 /// Serialize proofs plus the shared `valid_roots` array to the wire JSON.
-/// `serde_json::Value` objects are BTreeMaps, so keys serialize
-/// alphabetically — the frozen wire order (pinned by
-/// `augmented_proofs_match_json_roundtrip`).
 fn proofs_with_roots_json(proofs: &[native::ProofJson], roots_array: &serde_json::Value) -> String {
-    let augmented: Vec<serde_json::Value> = proofs
+    let augmented: Vec<ProofWithRoots<'_>> = proofs
         .iter()
-        .map(|p| {
-            let mut obj = match serde_json::to_value(p) {
-                Ok(serde_json::Value::Object(obj)) => obj,
-                _ => serde_json::Map::new(),
-            };
-            obj.insert("valid_roots".to_string(), roots_array.clone());
-            serde_json::Value::Object(obj)
+        .map(|p| ProofWithRoots {
+            depth: p.depth,
+            leaf: &p.leaf,
+            leaf_index: p.leaf_index,
+            path_elements: &p.path_elements,
+            path_indices: &p.path_indices,
+            root: &p.root,
+            valid_roots: roots_array,
         })
         .collect();
-    serde_json::Value::Array(augmented).to_string()
+    serde_json::to_string(&augmented).unwrap_or_default()
 }
 
 /// Build and send one `Register`, dated by chain time read now. `Err(why)` =
@@ -652,7 +666,7 @@ fn preflight_register(
             bytes_to_hex(&plan.treasury_account_id)
         ));
     }
-    let quote: Option<serde_json::Value> = serde_json::from_str(&fee_state::get_fee_state()).ok();
+    let quote = fee_state::fee_quote();
     let ceiling = |key: &str| {
         quote
             .as_ref()
@@ -770,12 +784,7 @@ fn register_watch(mut w: RegisterWatch) {
                 "{WHO}: tx {} reverted and a re-send would too — not re-sending: {why}",
                 w.tx_hash
             );
-            reg_in_flight(|m| {
-                m.insert(
-                    w.reg_key.clone(),
-                    (RegisterReply::refused(why), Instant::now()),
-                )
-            });
+            reg_in_flight(|m| m.insert(w.reg_key, (RegisterReply::refused(why), Instant::now())));
             return;
         }
         eprintln!(
@@ -1028,7 +1037,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         let prior = reg_in_flight(|m| match m.get(&reg_key) {
             Some((reply, _)) => Some(reply.clone()),
             None => {
-                m.insert(reg_key.clone(), (placeholder.clone(), Instant::now()));
+                m.insert(reg_key.clone(), (placeholder, Instant::now()));
                 None
             }
         });
@@ -1075,7 +1084,8 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         // Callers poll get_membership() for the authoritative leaf_index
         // from the membership PDA.
         let reply = RegisterReply::pending(plan.next_leaf_index, rate_limit, Some(&send_result));
-        reg_in_flight(|m| m.insert(reg_key.clone(), (reply.clone(), Instant::now())));
+        let reply_json = reply.to_json();
+        reg_in_flight(|m| m.insert(reg_key.clone(), (reply, Instant::now())));
         spawn_register_watch(RegisterWatch {
             config_account: ctx.config_account,
             payer_hex,
@@ -1084,7 +1094,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             reg_key,
             tx_hash: send_result.into_tx_hash(),
         });
-        reply.to_json()
+        reply_json
     }
 
     fn get_membership(&self, config_account_id: String, id_commitment_hex: String) -> String {
@@ -1355,6 +1365,49 @@ mod tests {
         assert!(current_str.contains("\"root\":\"bb"));
         let expected_tail = format!("\"valid_roots\":[\"{}\"]}}]", "ee".repeat(32));
         assert!(current_str.ends_with(&expected_tail));
+    }
+
+    // Several proofs share one roots array; every proof carries all of it.
+    // Pins the full text (key order, number widths, escapes, empty paths)
+    // and its equality with the round-trip, plus the empty list.
+    #[test]
+    fn several_augmented_proofs_serialize_to_the_wire_text() {
+        let proof =
+            |leaf: &str, root: &str, leaf_index, depth, elements: &[&str], indices: &[u8]| {
+                native::ProofJson {
+                    leaf: leaf.into(),
+                    root: root.into(),
+                    leaf_index,
+                    depth,
+                    path_elements: elements.iter().map(|e| (*e).to_owned()).collect(),
+                    path_indices: indices.to_vec(),
+                }
+            };
+        let proofs = vec![
+            proof("a1", "r1", 0, 1, &["p1", "p2"], &[1, 0]),
+            proof("a\"2\\", "r2", u64::MAX, u32::MAX, &[], &[]),
+            proof("é\u{1}", "", 7, 3, &["x"], &[255]),
+        ];
+        let roots_array = serde_json::json!(["e1", "e2"]);
+        let current = proofs_with_roots_json(&proofs, &roots_array);
+        assert_eq!(
+            current,
+            r#"[{"depth":1,"leaf":"a1","leaf_index":0,"path_elements":["p1","p2"],"path_indices":[1,0],"root":"r1","valid_roots":["e1","e2"]},{"depth":4294967295,"leaf":"a\"2\\","leaf_index":18446744073709551615,"path_elements":[],"path_indices":[],"root":"r2","valid_roots":["e1","e2"]},{"depth":3,"leaf":"é\u0001","leaf_index":7,"path_elements":["x"],"path_indices":[255],"root":"","valid_roots":["e1","e2"]}]"#
+        );
+        let roundtrip: Vec<serde_json::Value> = proofs
+            .iter()
+            .map(|p| {
+                let mut obj = match serde_json::to_value(p).unwrap() {
+                    serde_json::Value::Object(obj) => obj,
+                    other => panic!("a proof serializes to an object, got {other}"),
+                };
+                // OWNERSHIP: the round-trip reference puts an owned copy in every object.
+                obj.insert("valid_roots".to_owned(), roots_array.clone());
+                serde_json::Value::Object(obj)
+            })
+            .collect();
+        assert_eq!(current, serde_json::Value::Array(roundtrip).to_string());
+        assert_eq!(proofs_with_roots_json(&[], &roots_array), "[]");
     }
 
     #[test]

@@ -332,9 +332,10 @@ pub fn tree_main_account_id(
     Ok(derive_pda(registration_program, &main_seed(&tree_id)))
 }
 
-/// One wire proof object. Serialized by the caller via `serde_json::Value`
-/// (BTreeMap ⇒ alphabetical keys, the frozen wire order), so field order
-/// here is NOT wire-significant.
+/// One wire proof object, without the shared `valid_roots`. The caller
+/// serializes it through lib.rs's `ProofWithRoots`, whose field order is the
+/// frozen wire order (alphabetical), so field order here is NOT
+/// wire-significant.
 #[derive(Serialize)]
 pub(crate) struct ProofJson {
     pub(crate) leaf: String,
@@ -770,7 +771,7 @@ mod tests {
         assert!(check_register(&config, 1u64 << TREE_DEPTH, &good, min_rate)
             .unwrap_err()
             .starts_with("tree_full"));
-        let mut full = config.clone();
+        let mut full = config;
         let max = config_field_u64(&full, CONFIG_OFFSET_MAX_TOTAL_RATE_LIMIT);
         full[CONFIG_OFFSET_CURRENT_TOTAL_RATE_LIMIT..CONFIG_OFFSET_CURRENT_TOTAL_RATE_LIMIT + 8]
             .copy_from_slice(&max.to_le_bytes());

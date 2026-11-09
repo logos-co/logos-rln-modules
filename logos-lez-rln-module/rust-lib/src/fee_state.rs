@@ -54,21 +54,35 @@ const BLOCK_HEADER_SIZE: usize = BLOCK_TIMESTAMP_OFFSET + 8;
 /// The RPC `result` object as compact JSON; "" before a network is selected
 /// and on any transport or parse error (logged).
 pub(crate) fn get_fee_state() -> String {
+    fee_quote()
+        .map(|quote| quote.to_string())
+        .unwrap_or_default()
+}
+
+/// `get_fee_state`'s `result` object as a value; `None` where that answers ""
+/// (logged the same way).
+pub(crate) fn fee_quote() -> Option<serde_json::Value> {
     let Some(sequencer) = wallet::sequencer_addr() else {
         eprintln!("get_fee_state: no sequencer configured yet");
-        return String::new();
+        return None;
     };
-    match fetch(&sequencer) {
-        Ok(state) => state,
+    match fetch_quote(&sequencer) {
+        Ok(quote) => Some(quote),
         Err(e) => {
             eprintln!("get_fee_state: {sequencer}: {e}");
-            String::new()
+            None
         }
     }
 }
 
+/// `fetch_quote` as `get_fee_state`'s compact JSON text.
+#[cfg(test)]
 pub(crate) fn fetch(sequencer: &str) -> Result<String, String> {
-    result_of(&post(sequencer, REQUEST)?)
+    fetch_quote(sequencer).map(|quote| quote.to_string())
+}
+
+fn fetch_quote(sequencer: &str) -> Result<serde_json::Value, String> {
+    result_object(&post(sequencer, REQUEST)?)
 }
 
 /// The sequencer's last block id (getLastBlockId), or None when it cannot be
@@ -178,26 +192,32 @@ fn post(url: &str, body: &str) -> Result<String, String> {
 
 /// A JSON-RPC reply's `result` value (null included); its `error` otherwise.
 fn rpc_result(url: &str, body: &str, cap: u64) -> Result<serde_json::Value, String> {
-    let reply: serde_json::Value = serde_json::from_str(&post_capped(url, body, cap)?)
+    let mut reply: serde_json::Value = serde_json::from_str(&post_capped(url, body, cap)?)
         .map_err(|e| format!("reply parse: {e}"))?;
     if let Some(error) = reply.get("error") {
         return Err(format!("RPC error {error}"));
     }
     reply
-        .get("result")
-        .cloned()
+        .get_mut("result")
+        .map(serde_json::Value::take)
         .ok_or_else(|| "reply carries no result".to_owned())
 }
 
-/// A JSON-RPC reply's `result`, which must be an object; its `error` otherwise.
+/// `result_object` as compact JSON text.
+#[cfg(test)]
 fn result_of(body: &str) -> Result<String, String> {
-    let reply: serde_json::Value =
+    result_object(body).map(|result| result.to_string())
+}
+
+/// A JSON-RPC reply's `result`, which must be an object; its `error` otherwise.
+fn result_object(body: &str) -> Result<serde_json::Value, String> {
+    let mut reply: serde_json::Value =
         serde_json::from_str(body).map_err(|e| format!("reply parse: {e}"))?;
     if let Some(error) = reply.get("error") {
         return Err(format!("RPC error {error}"));
     }
-    match reply.get("result") {
-        Some(result) if result.is_object() => Ok(result.to_string()),
+    match reply.get_mut("result") {
+        Some(result) if result.is_object() => Ok(result.take()),
         _ => Err("reply carries no result object".to_owned()),
     }
 }
