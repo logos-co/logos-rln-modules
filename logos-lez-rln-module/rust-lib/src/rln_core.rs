@@ -377,6 +377,7 @@ pub fn merkle_proofs_exec(
                 .iter()
                 .map(|e| bytes_to_hex(e))
                 .collect(),
+            // OWNERSHIP: the wire proof owns the used prefix of the fixed-size array.
             path_indices: proof.path_indices[..depth].to_vec(),
         });
     }
@@ -493,6 +494,7 @@ pub fn decode_membership(account_data: &[u8]) -> Result<MembershipState, RlnErro
 /// ST_EXPIRED consts (logos-rln-module). The two crates are
 /// deliberately decoupled — no shared type — and the contract is pinned by
 /// that crate's `membership_state_wire_strings` test.
+// OWNERSHIP: every answer is a string literal.
 pub fn membership_status(
     grace_start_ms: u64,
     grace_duration_sec: u32,

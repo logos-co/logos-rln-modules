@@ -55,6 +55,7 @@ pub(crate) use generated::*;
 
 /// Lock a mutex, recovering the guard from a poisoned lock (a panicked
 /// handler must not wedge every later one).
+// OWNERSHIP: the guard borrows the caller's mutex for as long as it is held.
 pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -72,6 +73,8 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// land in the same slot.
 type RegInFlightMap = std::collections::HashMap<String, (RegisterReply, Instant)>;
 
+// OWNERSHIP: Mutex — handlers and watcher threads share the map; LazyLock because
+// `HashMap::new` is not const.
 static REG_IN_FLIGHT: std::sync::LazyLock<Mutex<RegInFlightMap>> =
     std::sync::LazyLock::new(|| Mutex::new(RegInFlightMap::new()));
 
@@ -238,11 +241,13 @@ struct RlnConfigContext {
 /// Why a config account cannot serve as a registry here. `status` is the
 /// machine-readable kind check_registry reports; `detail` says it for a person.
 struct RegistryProblem {
+    // OWNERSHIP: every status is a string literal.
     status: &'static str,
     detail: String,
 }
 
 impl RegistryProblem {
+    // OWNERSHIP: every status is a string literal.
     fn new(status: &'static str, detail: String) -> Self {
         Self { status, detail }
     }
@@ -807,6 +812,7 @@ fn register_watch(mut w: RegisterWatch) {
         };
         let reply = RegisterReply::pending(plan.next_leaf_index, w.rate_limit, Some(&send_result));
         w.tx_hash = send_result.into_tx_hash();
+        // OWNERSHIP: the map owns a key copy; the watcher keeps its own for the next polls.
         reg_in_flight(|m| m.insert(w.reg_key.clone(), (reply, Instant::now())));
     }
     // The entry goes with its watcher: a re-send refreshed its timestamp, so
@@ -1036,21 +1042,27 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         // concurrent and repeat callers get the first submission's reply.
         let reg_key = bytes_to_hex(&plan.membership_account_id);
         let placeholder = RegisterReply::pending(plan.next_leaf_index, rate_limit, None);
+        // A prior entry is answered from under the lock (its rate and its
+        // text); the map keeps the entry itself.
         let prior = reg_in_flight(|m| match m.get(&reg_key) {
-            Some((reply, _)) => Some(reply.clone()),
+            Some((reply, _)) => {
+                let prior_rate = match reply {
+                    RegisterReply::Submitted { rate_limit: r, .. } => Some(*r),
+                    _ => None,
+                };
+                Some((prior_rate, reply.to_json()))
+            }
             None => {
+                // OWNERSHIP: the map owns a key copy; this call keeps reg_key for
+                // its own later inserts, the removal and the watcher.
                 m.insert(reg_key.clone(), (placeholder, Instant::now()));
                 None
             }
         });
-        if let Some(reply) = prior {
+        if let Some((prior_rate, prior_json)) = prior {
             // One membership per commitment is the program's rule, so the
             // first submission answers every caller; a caller that asked for
             // another rate learns which one is on its way from the reply.
-            let prior_rate = match &reply {
-                RegisterReply::Submitted { rate_limit, .. } => Some(*rate_limit),
-                _ => None,
-            };
             match prior_rate {
                 Some(r) if r != rate_limit => eprintln!(
                     "register_member: registration already submitted this session at rate {r}, \
@@ -1060,7 +1072,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
                     "register_member: registration already submitted this session — returning prior reply"
                 ),
             }
-            return reply.to_json();
+            return prior_json;
         }
 
         // A send the wallet could not make (no signing key for the payer, no
@@ -1087,6 +1099,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         // from the membership PDA.
         let reply = RegisterReply::pending(plan.next_leaf_index, rate_limit, Some(&send_result));
         let reply_json = reply.to_json();
+        // OWNERSHIP: the map owns a key copy; the watcher takes reg_key itself.
         reg_in_flight(|m| m.insert(reg_key.clone(), (reply, Instant::now())));
         spawn_register_watch(RegisterWatch {
             config_account: ctx.config_account,

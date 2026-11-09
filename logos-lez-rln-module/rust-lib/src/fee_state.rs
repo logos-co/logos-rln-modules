@@ -26,6 +26,9 @@ use base64::Engine as _;
 
 use crate::wallet;
 
+// OWNERSHIP: every error here is an owned String (most are formatted), so the
+// literal messages are converted with `to_owned`.
+
 const REQUEST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"getFeeState","params":[]}"#;
 const HEAD_REQUEST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"getLastBlockId","params":[]}"#;
 

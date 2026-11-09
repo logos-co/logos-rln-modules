@@ -442,6 +442,7 @@ static WALLET: OnceLock<Wallet> = OnceLock::new();
 /// `REG_IN_FLIGHT` does not cover this — it keys on the membership PDA, so
 /// two DIFFERENT memberships still race. Reads are deliberately outside: the
 /// `single` -> `multi` bump exists to keep them concurrent.
+// OWNERSHIP: a unit Mutex — a token held across each submission; it guards the nonce, not data.
 static SEND_LOCK: Mutex<()> = Mutex::new(());
 
 /// Signalled once bring-up settles, either way.
@@ -459,6 +460,7 @@ pub(crate) enum Source {
 }
 
 impl Source {
+    // OWNERSHIP: every name is a string literal.
     fn as_str(self) -> &'static str {
         match self {
             Source::Table => "table",
@@ -489,6 +491,7 @@ pub(crate) struct EnvView {
 
 impl EnvView {
     fn from_env() -> Self {
+        // OWNERSHIP: the trimmed copy outlives the variable's temporary String.
         let read = |name: &str| std::env::var(name).unwrap_or_default().trim().to_owned();
         Self {
             sequencer: read(SEQUENCER_ENV),
@@ -541,6 +544,7 @@ pub(crate) fn plan_home(home: &Path, env: EnvView) -> Plan {
     }
     if !env.network.is_empty() {
         return match networks::network(&env.network) {
+            // OWNERSHIP: the plan owns copies of the static table's strings.
             Some(n) => Plan::Provision {
                 sequencer: n.sequencer.clone(),
                 binding: Binding::Recorded {
@@ -571,12 +575,12 @@ fn read_marker(home: &Path) -> Result<Option<Binding>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
-    let doc: serde_json::Value =
+    let mut doc: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
-    let network = doc
-        .get("network")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
+    let network = match doc.get_mut("network").map(serde_json::Value::take) {
+        Some(serde_json::Value::String(network)) => network,
+        _ => String::new(),
+    };
     let source = match doc.get("source").and_then(|v| v.as_str()) {
         Some("table") => Source::Table,
         Some("env") => Source::Env,
@@ -585,10 +589,7 @@ fn read_marker(home: &Path) -> Result<Option<Binding>, String> {
     if network.is_empty() {
         return Err(format!("{} names no network", path.display()));
     }
-    Ok(Some(Binding::Recorded {
-        network: network.to_owned(),
-        source,
-    }))
+    Ok(Some(Binding::Recorded { network, source }))
 }
 
 /// Write a home's config and marker. The marker goes first: a crash between
@@ -645,6 +646,7 @@ struct Selector {
 ///
 /// Lock order: `SELECTION` before `STATE`, never the reverse — `pending` and
 /// `fail` take `STATE` while this is held.
+// OWNERSHIP: Mutex — on_context_ready, use_network and every chain read share the selection.
 static SELECTION: Mutex<Selector> = Mutex::new(Selector {
     selection: Selection::Unresolved,
     operator_noted: false,
@@ -675,6 +677,7 @@ fn apply_plan(sel: &mut Selector, home: PathBuf, plan: Plan) -> Action {
     match plan {
         Plan::Adopt(binding) => {
             log_binding("adopting", &home, &binding);
+            // OWNERSHIP: two owners — the selection keeps the home; the action starts on it.
             sel.selection = Selection::Bound {
                 home: home.clone(),
                 binding,
@@ -683,10 +686,12 @@ fn apply_plan(sel: &mut Selector, home: PathBuf, plan: Plan) -> Action {
         }
         Plan::Provision { sequencer, binding } => {
             if let Err(e) = provision_home(&home, &sequencer, &binding) {
+                // OWNERSHIP: two owners — the selection and the action each keep the reason.
                 sel.selection = Selection::Failed(e.clone());
                 return Action::Fail(e);
             }
             log_binding(&format!("provisioned for {sequencer}"), &home, &binding);
+            // OWNERSHIP: two owners — the selection keeps the home; the action starts on it.
             sel.selection = Selection::Bound {
                 home: home.clone(),
                 binding,
@@ -699,6 +704,7 @@ fn apply_plan(sel: &mut Selector, home: PathBuf, plan: Plan) -> Action {
             Action::Await
         }
         Plan::Failed(reason) => {
+            // OWNERSHIP: two owners — the selection and the action each keep the reason.
             sel.selection = Selection::Failed(reason.clone());
             Action::Fail(reason)
         }
@@ -730,6 +736,7 @@ struct NetworkReply {
     /// Not accepted YET: the home is not known, ask again.
     retry: bool,
     /// "table" | "env" | "operator"; "" when nothing is bound.
+    // OWNERSHIP: every source is a string literal.
     source: &'static str,
 }
 
@@ -738,6 +745,7 @@ impl NetworkReply {
         Self {
             accepted: false,
             detail,
+            // OWNERSHIP: the reply owns its copy; a bound network stays in the selection.
             network: network.to_owned(),
             retry: false,
             source: "",
@@ -766,13 +774,14 @@ fn select_network(sel: &mut Selector, reference: &str) -> (NetworkReply, Action)
             return (
                 NetworkReply {
                     accepted: false,
+                    // OWNERSHIP: the reply's detail is an owned String (most are formatted).
                     detail: "the wallet home is not resolved yet".to_owned(),
                     network: String::new(),
                     retry: true,
                     source: "",
                 },
                 Action::None,
-            )
+            );
         }
         Selection::Failed(reason) => {
             return (
@@ -782,10 +791,12 @@ fn select_network(sel: &mut Selector, reference: &str) -> (NetworkReply, Action)
         }
         Selection::Bound { home, binding } => {
             return (
-                answer_bound(home, binding, &reference, &mut sel.operator_noted),
+                answer_bound(home, binding, reference, &mut sel.operator_noted),
                 Action::None,
             )
         }
+        // OWNERSHIP: the selection keeps Awaiting(home) — an unknown network must leave it
+        // selectable; apply_plan, when it binds, takes this copy.
         Selection::Awaiting(home) => home.clone(),
     };
 
@@ -802,11 +813,12 @@ fn select_network(sel: &mut Selector, reference: &str) -> (NetworkReply, Action)
         let action = apply_plan(sel, home, plan);
         let reply = match &sel.selection {
             Selection::Bound { home, binding } => {
-                answer_bound(home, binding, &reference, &mut sel.operator_noted)
+                answer_bound(home, binding, reference, &mut sel.operator_noted)
             }
             Selection::Failed(reason) => {
                 NetworkReply::refused(format!("the wallet cannot come up: {reason}"), "")
             }
+            // OWNERSHIP: the reply's detail is an owned String (most are formatted).
             _ => NetworkReply::refused("the wallet home changed under selection".to_owned(), ""),
         };
         return (reply, action);
@@ -818,6 +830,7 @@ fn select_network(sel: &mut Selector, reference: &str) -> (NetworkReply, Action)
             Action::None,
         );
     };
+    // OWNERSHIP: the binding and the plan own copies of the static table's strings.
     let binding = Binding::Recorded {
         network: network.reference.clone(),
         source: Source::Table,
@@ -831,11 +844,13 @@ fn select_network(sel: &mut Selector, reference: &str) -> (NetworkReply, Action)
         },
     );
     let reply = match &action {
+        // OWNERSHIP: two owners — the reply reports the reason, the action records it.
         Action::Fail(e) => NetworkReply::refused(e.clone(), ""),
         _ => NetworkReply {
             accepted: true,
             detail: String::new(),
-            network: network.reference.clone(),
+            // The table entry was found by this very reference.
+            network: reference,
             retry: false,
             source: Source::Table.as_str(),
         },
@@ -846,7 +861,7 @@ fn select_network(sel: &mut Selector, reference: &str) -> (NetworkReply, Action)
 fn answer_bound(
     home: &Path,
     binding: &Binding,
-    reference: &str,
+    reference: String,
     operator_noted: &mut bool,
 ) -> NetworkReply {
     match binding {
@@ -861,16 +876,18 @@ fn answer_bound(
             }
             NetworkReply {
                 accepted: true,
+                // OWNERSHIP: the reply's detail is an owned String (most are formatted).
                 detail: "operator-configured home; the network is not checked".to_owned(),
-                network: reference.to_owned(),
+                network: reference,
                 retry: false,
                 source: "operator",
             }
         }
-        Binding::Recorded { network, source } if network == reference => NetworkReply {
+        // Equal to the recorded network, so the request's own string is the answer.
+        Binding::Recorded { network, source } if *network == reference => NetworkReply {
             accepted: true,
             detail: String::new(),
-            network: network.clone(),
+            network: reference,
             retry: false,
             source: source.as_str(),
         },
@@ -905,6 +922,8 @@ pub(crate) fn use_network(reference: &str) -> String {
 /// unbound or operator-configured.
 pub(crate) fn bound_network() -> Option<String> {
     match &lock(&SELECTION).selection {
+        // OWNERSHIP: copied out so the SELECTION lock is released before the caller's chain
+        // read (and before status_json takes STATE).
         Selection::Bound {
             binding: Binding::Recorded { network, .. },
             ..
@@ -917,11 +936,11 @@ pub(crate) fn bound_network() -> Option<String> {
 /// is selected, or when the config names none. Read from the file rather than
 /// the wallet, so it answers while bring-up is still opening the wallet.
 pub(crate) fn sequencer_addr() -> Option<String> {
-    let home = match &lock(&SELECTION).selection {
-        Selection::Bound { home, .. } => home.clone(),
+    // The path is built under the lock and owned, so the file read runs without it.
+    let path = match &lock(&SELECTION).selection {
+        Selection::Bound { home, .. } => home.join(CONFIG_FILE),
         _ => return None,
     };
-    let path = home.join(CONFIG_FILE);
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| eprintln!("lez-rln wallet: read {}: {e}", path.display()))
         .ok()?;
@@ -986,6 +1005,7 @@ fn start_bring_up(home: PathBuf) {
         return;
     }
     std::thread::Builder::new()
+        // OWNERSHIP: Builder::name takes an owned String.
         .name("lez-rln-wallet".to_owned())
         .spawn(move || bring_up(&home))
         .map(|_| ())
@@ -1515,6 +1535,7 @@ pub(crate) fn read_account(account_id: &[u8; 32]) -> AccountRead {
         } else {
             unsafe { std::slice::from_raw_parts(state.data, state.data_len) }
         };
+        // OWNERSHIP: required copy — the library frees this buffer just below.
         out.push((state.program.data, data.to_vec()));
     }
     // SAFETY: the struct the call just filled, freed exactly once.
@@ -1564,6 +1585,7 @@ impl Mention {
 }
 
 /// A send failure as the `<kind>: <reason>` string callers match on.
+// OWNERSHIP: an owned String in every arm — the SendResult stores it and one arm formats.
 fn send_error(rc: i32) -> String {
     match rc {
         ffi::PAYER_CANNOT_FUND => {
@@ -1694,6 +1716,7 @@ pub(crate) fn send_generic_public_transaction(
     let tx_hash = if result.tx_hash.is_null() {
         String::new()
     } else {
+        // OWNERSHIP: required copy — the library frees the string just below.
         unsafe { std::ffi::CStr::from_ptr(result.tx_hash) }
             .to_string_lossy()
             .into_owned()

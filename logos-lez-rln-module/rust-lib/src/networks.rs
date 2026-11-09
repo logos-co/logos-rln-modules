@@ -76,7 +76,9 @@ fn parse(raw: &str) -> Result<Vec<Network>, String> {
 /// as empty — a module that knows no networks still serves an operator-staged
 /// home — rather than panicking across the FFI boundary.
 /// `tests::the_embedded_table_parses` keeps that from shipping.
+// OWNERSHIP: the compile-time table, parsed once into a static and never freed.
 fn table() -> &'static [Network] {
+    // OWNERSHIP: OnceLock — parsed on first use by whichever thread asks first.
     static TABLE: OnceLock<Vec<Network>> = OnceLock::new();
     TABLE.get_or_init(|| {
         parse(TABLE_JSON).unwrap_or_else(|e| {
@@ -87,12 +89,14 @@ fn table() -> &'static [Network] {
 }
 
 /// The network a CAIP-2 reference names, if this build knows it.
+// OWNERSHIP: borrowed from the static table.
 pub(crate) fn network(reference: &str) -> Option<&'static Network> {
     table().iter().find(|n| n.reference == reference)
 }
 
 /// The network a registry's config account (64-hex) is deployed on, if the
 /// table lists it.
+// OWNERSHIP: borrowed from the static table.
 pub(crate) fn network_of_config(config_hex: &str) -> Option<&'static Network> {
     let config_hex = config_hex.trim().to_ascii_lowercase();
     table().iter().find(|n| {
@@ -103,6 +107,7 @@ pub(crate) fn network_of_config(config_hex: &str) -> Option<&'static Network> {
 }
 
 /// Every reference in table order, for a refusal to list.
+// OWNERSHIP: borrowed from the static table.
 pub(crate) fn known_references() -> Vec<&'static str> {
     table().iter().map(|n| n.reference.as_str()).collect()
 }
