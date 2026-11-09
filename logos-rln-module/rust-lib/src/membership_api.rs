@@ -221,7 +221,7 @@ pub(crate) fn ensure_membership_impl(
     if let Some(key) = rest.as_object().and_then(|o| o.keys().next()) {
         return Err(ApiError::new(
             ErrorKind::InvalidArgument,
-            &format!(
+            format!(
                 "ensure_membership takes only rate_limit; '{key}' selects a scoped \
                  registration, which is register_membership's"
             ),
@@ -274,7 +274,7 @@ pub(crate) fn ensure_membership_impl(
                 provider::select_networks(std::slice::from_ref(&canonical));
                 ensure::run_alongside(canonical, rate_limit);
             })
-            .map_err(|e| ApiError::internal(&format!("cannot spawn provisioning: {e}")))?;
+            .map_err(|e| ApiError::internal(format!("cannot spawn provisioning: {e}")))?;
     }
     ok_json(
         views::MembershipStateView::unknown(&registry.canonical)

@@ -193,7 +193,7 @@ fn refresh_one(registry: &CanonicalRegistryId) -> Result<(), ApiError> {
     let backend = provider::backend_for(&registry.namespace).ok_or_else(|| {
         ApiError::new(
             ErrorKind::UnknownRegistry,
-            &format!("no registry provider for namespace {}", registry.namespace),
+            format!("no registry provider for namespace {}", registry.namespace),
         )
     })?;
     refresh_one_with(registry, backend.tree)

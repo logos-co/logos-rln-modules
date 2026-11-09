@@ -183,7 +183,7 @@ fn account_for_dir(dir: &str) -> String {
     registry_id::bytes_to_hex(&Sha256::digest(dir.as_bytes()))
 }
 
-fn keychain_err(message: &str) -> ApiError {
+fn keychain_err(message: impl Into<String>) -> ApiError {
     ApiError::new(ErrorKind::KeychainUnavailable, message)
 }
 
@@ -277,7 +277,7 @@ fn quarantine_secret_file(dir: &std::path::Path) {
 static AUTO_UNLOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn auto_unlock_core(
-    store: &std::sync::Arc<sealed::Store>,
+    store: &sealed::Store,
 ) -> Result<(usize, &'static str, Zeroizing<String>), ApiError> {
     let _walk = crate::util::lock(&AUTO_UNLOCK);
     let dir = store.base_dir().to_path_buf();
@@ -303,7 +303,7 @@ fn auto_unlock_core(
     if let Some(e) = rejected_file {
         return Err(ApiError::new(
             ErrorKind::BadPassword,
-            &format!(
+            format!(
                 "{} — the {AUTO_SECRET_FILE} that held it was moved aside; {REMEMBER_HINT}{note}",
                 e.message
             ),
@@ -315,30 +315,30 @@ fn auto_unlock_core(
         } else {
             "is already provisioned with a password (no credentials yet)"
         };
-        return Err(keychain_err(&format!(
+        return Err(keychain_err(format!(
             "no stored auto-unlock secret, but the keystore {what} — {REMEMBER_HINT} (restoring \
              the keystore files from a backup first if entries are quarantined){note}",
         )));
     }
     if file_note.is_some() {
-        return Err(keychain_err(&format!(
+        return Err(keychain_err(format!(
             "the auto-unlock secret file cannot be read, so the module will not self-provision \
              over it — move it aside or repair it first{note}",
         )));
     }
     let mut raw = Zeroizing::new([0u8; 32]);
     getrandom::getrandom(raw.as_mut())
-        .map_err(|e| ApiError::internal(&format!("no entropy for secret: {e}")))?;
+        .map_err(|e| ApiError::internal(format!("no entropy for secret: {e}")))?;
     let secret = Zeroizing::new(registry_id::bytes_to_hex(&raw[..]));
     crate::sealed_store::fs::write_durable(&dir, AUTO_SECRET_FILE, secret.as_bytes())
-        .map_err(|e| ApiError::internal(&format!("could not persist the generated secret: {e}")))?;
+        .map_err(|e| ApiError::internal(format!("could not persist the generated secret: {e}")))?;
     let count = store.unlock(&secret)?;
     Ok((count, "created", secret))
 }
 
 pub(crate) fn auto_unlock_impl() -> Result<serde_json::Value, ApiError> {
     if auto_unlock_disabled() {
-        return Err(keychain_err(&format!(
+        return Err(keychain_err(format!(
             "module-owned auto-unlock is disabled on this deployment ({DISABLE_ENV} is set) — \
              unlock with the user's password instead"
         )));
@@ -391,7 +391,7 @@ pub(crate) fn remember_impl() -> Result<serde_json::Value, ApiError> {
     })?;
     let account = account_for_dir(&dir);
     let payload = Zeroizing::new(registry_id::bytes_to_hex(password.as_bytes()));
-    with_backend(|k| k.write(SERVICE, &account, &payload)).map_err(|e| keychain_err(&e))?;
+    with_backend(|k| k.write(SERVICE, &account, &payload)).map_err(keychain_err)?;
     Ok(serde_json::json!({ "remembered": true }))
 }
 

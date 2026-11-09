@@ -134,7 +134,7 @@ pub(crate) fn reply_result(
 
 /// Serialize a typed reply view (`views.rs`) into its wire `Value`.
 fn ok_json<T: serde::Serialize>(v: T) -> Result<serde_json::Value, ApiError> {
-    serde_json::to_value(v).map_err(|e| ApiError::internal(&format!("serialize reply: {e}")))
+    serde_json::to_value(v).map_err(|e| ApiError::internal(format!("serialize reply: {e}")))
 }
 
 /// start/stop bodies span several supervisor critical sections; interleaving
@@ -165,7 +165,7 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
         serde_json::json!({})
     } else {
         serde_json::from_str(config_json)
-            .map_err(|e| ApiError::new(ErrorKind::InvalidArgument, &format!("config_json: {e}")))?
+            .map_err(|e| ApiError::new(ErrorKind::InvalidArgument, format!("config_json: {e}")))?
     };
 
     let epoch_size_sec = cfg
@@ -207,9 +207,12 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
             roots::track(&registry);
             match set {
                 Some(c) => {
+                    // OWNERSHIP: the map key and the `registries` list each own the id.
                     per_registry.insert(registry.canonical.clone(), c);
                 }
                 None => {
+                    // OWNERSHIP: the map key and the `registries` list each own the
+                    // id; every registry's config owns its copy of the default.
                     per_registry
                         .entry(registry.canonical.clone())
                         .or_insert(RegistryConfig {
@@ -238,6 +241,7 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
                         |key: &str| o.get(key).and_then(|x| x.as_u64()).filter(|n| *n > 0);
                     // An entry's own block wins; an explicit null opts out.
                     let allocator = match o.get("allocator") {
+                        // OWNERSHIP: every registry's config owns its copy of the default.
                         None => default_allocator.clone(),
                         Some(v) => DelegatedOptions::from_allocator_block(
                             Some(v),
@@ -301,6 +305,8 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
             .iter()
             .map(|r| {
                 let c = per_registry.get(r);
+                // OWNERSHIP: the pass moves into the worker thread's closure;
+                // config::install keeps the originals.
                 ensure::Provision {
                     registry: r.clone(),
                     rate_limit: c.map(|c| c.rate_limit).unwrap_or(default_rate),
@@ -311,8 +317,15 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
     } else {
         Vec::new()
     };
+    // OWNERSHIP: moved into the worker thread's closure; config::install takes the original.
     let selection_order = registries.clone();
-    let reply_registries = registries.clone();
+    // Serialized before `install` takes the list; returned after every effect below.
+    let reply = ok_json(views::StartReply::new(
+        epoch_size_sec,
+        max_epoch_gap,
+        overrides_view,
+        &registries,
+    ));
     config::install(ModuleConfig {
         epoch_size_sec,
         max_epoch_gap,
@@ -341,12 +354,7 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
         &[poller::ensure_running, roots::ensure_refresher],
     );
 
-    ok_json(views::StartReply::new(
-        epoch_size_sec,
-        max_epoch_gap,
-        overrides_view,
-        reply_registries,
-    ))
+    reply
 }
 
 /// Spec stop(): halt the maintenance tasks. Sleeping workers are joined

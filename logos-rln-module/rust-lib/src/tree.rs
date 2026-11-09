@@ -45,19 +45,19 @@ pub(crate) trait TreeSource: Send + Sync {
     fn valid_roots(&self, registry: &CanonicalRegistryId) -> Result<RootSet, ApiError>;
 }
 
-fn fault(what: &str) -> ApiError {
+fn fault(what: impl Into<String>) -> ApiError {
     ApiError::new(ErrorKind::ProviderFailure, what)
 }
 
 fn hex32(v: Option<&Value>, what: &str) -> Result<[u8; 32], ApiError> {
     v.and_then(Value::as_str)
         .and_then(hex_to_bytes32)
-        .ok_or_else(|| fault(&format!("{what} is not 32-byte hex")))
+        .ok_or_else(|| fault(format!("{what} is not 32-byte hex")))
 }
 
 fn hex32_array(v: Option<&Value>, what: &str) -> Result<Vec<[u8; 32]>, ApiError> {
     v.and_then(Value::as_array)
-        .ok_or_else(|| fault(&format!("{what} is not an array")))?
+        .ok_or_else(|| fault(format!("{what} is not an array")))?
         .iter()
         .map(|e| hex32(Some(e), what))
         .collect()
@@ -76,7 +76,7 @@ impl MerkleProof {
         let path_elements = hex32_array(o.get("path_elements"), "merkle proof path_elements")?;
         let depth = path_elements.len();
         if depth == 0 || depth > RLN_TREE_DEPTH {
-            return Err(fault(&format!(
+            return Err(fault(format!(
                 "merkle proof has an impossible depth {depth}"
             )));
         }
@@ -99,7 +99,7 @@ impl MerkleProof {
         }
         if let Some(declared) = o.get("depth") {
             if declared.as_u64() != Some(depth as u64) {
-                return Err(fault(&format!(
+                return Err(fault(format!(
                     "merkle proof declares depth {declared} over a {depth}-element path"
                 )));
             }
@@ -132,10 +132,7 @@ impl MerkleProof {
         o.insert("leaf".into(), Value::from(bytes_to_hex(&self.leaf)));
         o.insert("leaf_index".into(), Value::from(self.leaf_index));
         o.insert("path_elements".into(), hexes(&self.path_elements));
-        o.insert(
-            "path_indices".into(),
-            Value::from(self.path_indices.clone()),
-        );
+        o.insert("path_indices".into(), Value::from(&self.path_indices[..]));
         o.insert("root".into(), Value::from(bytes_to_hex(&self.root)));
         if let Some(roots) = &self.valid_roots {
             o.insert("valid_roots".into(), hexes(roots));
@@ -148,6 +145,7 @@ impl MerkleProof {
         let depth = self.path_elements.len();
         let mut path_elements_hex: Vec<String> =
             self.path_elements.iter().map(|e| bytes_to_hex(e)).collect();
+        // OWNERSHIP: the Witness owns a padded copy; the proof stays readable.
         let mut path_indices = self.path_indices.clone();
         depth_bridge::pad_path(&mut path_elements_hex, &mut path_indices, depth);
         Witness {
@@ -174,7 +172,7 @@ impl RootSet {
             .and_then(Value::as_u64)
             .ok_or_else(|| fault("roots reply has no depth"))? as usize;
         if depth == 0 || depth > RLN_TREE_DEPTH {
-            return Err(fault(&format!(
+            return Err(fault(format!(
                 "roots reply declares an impossible depth {depth}"
             )));
         }

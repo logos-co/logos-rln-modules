@@ -286,22 +286,23 @@ impl EpochQuotaView {
 /// always present; that one is the per-registry table in force (every
 /// registry any `start()` named, with its epoch size and max gap), omitted
 /// while no call has named a registry.
+// OWNERSHIP: serialisation view; borrows start()'s registry list for one to_value call.
 #[derive(Serialize)]
-pub(crate) struct StartReply {
+pub(crate) struct StartReply<'a> {
     epoch_size_sec: u64,
     max_epoch_gap: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     overrides: Option<serde_json::Value>,
-    registries: Vec<String>,
+    registries: &'a [String],
     started: bool,
 }
 
-impl StartReply {
+impl<'a> StartReply<'a> {
     pub(crate) fn new(
         epoch_size_sec: u64,
         max_epoch_gap: u64,
         overrides: Option<serde_json::Value>,
-        registries: Vec<String>,
+        registries: &'a [String],
     ) -> Self {
         StartReply {
             epoch_size_sec,
@@ -417,15 +418,16 @@ impl UnlockKeystoreReply {
 
 /// The typed error envelope's body — mirrors `ApiError::body`'s
 /// `{"class":…,"kind":…,"message":…}`. Not a `.lidl` record.
+// OWNERSHIP: serialisation view; borrows the ApiError's message for one to_value call.
 #[derive(Serialize)]
-pub(crate) struct ErrorBody {
+pub(crate) struct ErrorBody<'a> {
     class: &'static str,
     kind: &'static str,
-    message: String,
+    message: &'a str,
 }
 
-impl ErrorBody {
-    pub(crate) fn new(class: &'static str, kind: &'static str, message: String) -> Self {
+impl<'a> ErrorBody<'a> {
+    pub(crate) fn new(class: &'static str, kind: &'static str, message: &'a str) -> Self {
         ErrorBody {
             class,
             kind,

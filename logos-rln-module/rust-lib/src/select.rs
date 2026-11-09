@@ -32,7 +32,7 @@ pub(crate) fn parse_selector(selector_json: &str) -> Result<Selector, ApiError> 
         return Ok(Selector::None);
     }
     let v: serde_json::Value = serde_json::from_str(trimmed)
-        .map_err(|e| ApiError::new(ErrorKind::InvalidArgument, &format!("selector_json: {e}")))?;
+        .map_err(|e| ApiError::new(ErrorKind::InvalidArgument, format!("selector_json: {e}")))?;
     if let Some(hash) = v.get("by_hash").and_then(|x| x.as_str()) {
         return Ok(Selector::ByHash(hash.to_string()));
     }
@@ -41,7 +41,7 @@ pub(crate) fn parse_selector(selector_json: &str) -> Result<Selector, ApiError> 
         Some("highest_rate_limit") => Ok(Selector::HighestRateLimit),
         Some(other) => Err(ApiError::new(
             ErrorKind::InvalidArgument,
-            &format!("unknown strategy {other:?} (round_robin | highest_rate_limit)"),
+            format!("unknown strategy {other:?} (round_robin | highest_rate_limit)"),
         )),
         None => Err(ApiError::new(
             ErrorKind::InvalidArgument,

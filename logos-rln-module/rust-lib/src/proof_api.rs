@@ -21,8 +21,8 @@ use crate::views;
 
 pub(crate) fn proof_error(e: proof::ProofError) -> ApiError {
     match e {
-        proof::ProofError::BadInput(m) => ApiError::new(ErrorKind::InvalidArgument, &m),
-        proof::ProofError::Engine(m) => ApiError::new(ErrorKind::Transient, &m),
+        proof::ProofError::BadInput(m) => ApiError::new(ErrorKind::InvalidArgument, m),
+        proof::ProofError::Engine(m) => ApiError::new(ErrorKind::Transient, m),
     }
 }
 
@@ -287,7 +287,7 @@ pub(crate) fn validate_proof_with(
     let expected_epoch = epoch_of_timestamp(timestamp, size)?;
     let x = signal.resolve()?;
     let mut proof_value: serde_json::Value = serde_json::from_str(proof_json)
-        .map_err(|e| ApiError::new(ErrorKind::InvalidArgument, &format!("proof_json: {e}")))?;
+        .map_err(|e| ApiError::new(ErrorKind::InvalidArgument, format!("proof_json: {e}")))?;
     // Mix omits this derivable public input on the network. Reconstruct it
     // from the trusted request scope; cryptographic verification still binds
     // the received proof to this application and epoch.

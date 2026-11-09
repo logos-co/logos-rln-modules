@@ -549,6 +549,7 @@ pub(crate) fn generate(
         .identity_secret(identity_secret)
         .user_message_limit(Fr::from(material.rate_limit))
         .message_id(Fr::from(material.message_id))
+        // OWNERSHIP: the zerokit proof owns its indices; the material is borrowed.
         .merkle_proof(RLNMerkleProof::new(
             path_elements,
             material.path_indices.clone(),

@@ -59,7 +59,7 @@ pub(crate) fn validate_delegated(d: &DelegatedOptions) -> Result<(), ApiError> {
             (None, None) => {
                 return Err(ApiError::new(
                     ErrorKind::InvalidArgument,
-                    &format!("auth_type '{t}' needs auth_payload or auth_provider"),
+                    format!("auth_type '{t}' needs auth_payload or auth_provider"),
                 ))
             }
             _ => {}
@@ -92,7 +92,7 @@ impl DelegatedOptions {
             Some(_) => {
                 return Err(ApiError::new(
                     ErrorKind::InvalidArgument,
-                    &format!("{what} must be an object {{discover?, peer_id?, multiaddr?, auth_type?, auth_payload?|auth_provider?, auth_args?}}"),
+                    format!("{what} must be an object {{discover?, peer_id?, multiaddr?, auth_type?, auth_payload?|auth_provider?, auth_args?}}"),
                 ))
             }
         };
@@ -102,7 +102,7 @@ impl DelegatedOptions {
             Some(other) => {
                 return Err(ApiError::new(
                     ErrorKind::InvalidArgument,
-                    &format!("{what}.discover must be a boolean, got {other}"),
+                    format!("{what}.discover must be a boolean, got {other}"),
                 ))
             }
         };
@@ -113,7 +113,7 @@ impl DelegatedOptions {
                 Some(serde_json::Value::String(s)) => Ok(Some(s.trim().to_string())),
                 Some(other) => Err(ApiError::new(
                     ErrorKind::InvalidArgument,
-                    &format!("{what}.{key} must be a string, got {other}"),
+                    format!("{what}.{key} must be a string, got {other}"),
                 )),
             }
         };
@@ -127,7 +127,7 @@ impl DelegatedOptions {
             auth_args: text("auth_args")?,
         };
         validate_delegated(&d)
-            .map_err(|e| ApiError::new(e.kind, &format!("{what}: {}", e.message)))?;
+            .map_err(|e| ApiError::new(e.kind, format!("{what}: {}", e.message)))?;
         Ok(Some(d))
     }
 

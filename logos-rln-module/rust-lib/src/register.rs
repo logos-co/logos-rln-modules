@@ -38,7 +38,7 @@ pub(crate) fn parse_registry_options(
             Err(e) => {
                 return Err(ApiError::new(
                     ErrorKind::InvalidArgument,
-                    &format!("options_json: {e}"),
+                    format!("options_json: {e}"),
                 ))
             }
         }
@@ -59,7 +59,7 @@ pub(crate) fn parse_registry_options(
             None => {
                 return Err(ApiError::new(
                     ErrorKind::InvalidArgument,
-                    &format!("RegistryOptions value for '{key}' must be a string (char* pair)"),
+                    format!("RegistryOptions value for '{key}' must be a string (char* pair)"),
                 ))
             }
         };
@@ -70,7 +70,7 @@ pub(crate) fn parse_registry_options(
         if prior.is_some() {
             return Err(ApiError::new(
                 ErrorKind::InvalidArgument,
-                &format!("duplicate RegistryOptions key '{key}'"),
+                format!("duplicate RegistryOptions key '{key}'"),
             ));
         }
     }
@@ -332,7 +332,13 @@ pub(crate) fn register_impl(
     // credential.
     let (rate_limit, opts) = parse_registry_options(options_json)?;
     let delegated = DelegatedOptions::from_registry_options(&opts)?;
-    register_scoped(store, &registry, &rln_id_hex, rate_limit, delegated)
+    register_scoped(
+        store,
+        &registry,
+        &rln_id_hex,
+        rate_limit,
+        delegated.as_ref(),
+    )
 }
 
 /// The registration itself, on an ALREADY-PARSED scope and options:
@@ -353,14 +359,12 @@ pub(crate) fn register_scoped(
     registry: &registry_id::CanonicalRegistryId,
     rln_id_hex: &str,
     rate_limit: u64,
-    delegated: Option<DelegatedOptions>,
+    delegated: Option<&DelegatedOptions>,
 ) -> Result<serde_json::Value, ApiError> {
-    let registry = registry.clone();
-    let rln_id_hex = rln_id_hex.to_string();
-    let backend = backend_of(&registry)?;
+    let backend = backend_of(registry)?;
     // Claimed for the whole dispatch (RAII): the live-record scan below is
     // only sound while no other register for the same scope is in flight.
-    let _claim = RegisterClaim::take(&registry.canonical, &rln_id_hex)?;
+    let _claim = RegisterClaim::take(&registry.canonical, rln_id_hex)?;
 
     // Idempotent PER SCOPE: a LIVE (pending/active/grace_period) record for
     // this scope short-circuits; terminal states (failed, expired, erased)
@@ -369,10 +373,10 @@ pub(crate) fn register_scoped(
     // blast radius); one membership can still back many applications at
     // proof time (see scope_candidates).
     let store = store?;
-    let records = records_for_registry(&store, &registry);
+    let records = records_for_registry(&store, registry);
     if let Some(rec) = records
         .iter()
-        .find(|r| !r.quarantined && r.cache.state.is_live() && scope_matches(r, &rln_id_hex))
+        .find(|r| !r.quarantined && r.cache.state.is_live() && scope_matches(r, rln_id_hex))
     {
         let mismatch = rec.cache.rate_limit != Some(rate_limit);
         // A live membership bound to a DIFFERENT epoch size can never reserve
@@ -394,14 +398,14 @@ pub(crate) fn register_scoped(
     // credential (spec: above max_rate_limit SHALL fail). An unreadable
     // registry skips the pre-check — it enforces its own bounds at
     // submission.
-    match backend.registry.get_registry_bounds(&registry) {
+    match backend.registry.get_registry_bounds(registry) {
         Ok(bounds) => {
             let max = bounds.get("max_rate_limit").and_then(|x| x.as_u64());
             let min = bounds.get("min_rate_limit").and_then(|x| x.as_u64());
             if max.is_some_and(|m| rate_limit > m) || min.is_some_and(|m| rate_limit < m) {
                 return Err(ApiError::new(
                     ErrorKind::InvalidArgument,
-                    &format!(
+                    format!(
                         "rate_limit {rate_limit} outside registry bounds [{}, {}]",
                         min.map(|m| m.to_string()).unwrap_or_else(|| "?".into()),
                         max.map(|m| m.to_string()).unwrap_or_else(|| "?".into()),
@@ -418,6 +422,8 @@ pub(crate) fn register_scoped(
     let commitment = registry_id::hex_to_bytes32(&commitment_hex)
         .ok_or_else(|| ApiError::internal("generated commitment is not 32 bytes"))?;
     let hash = registry_id::membership_hash(&registry.canonical, &commitment);
+    // OWNERSHIP: the credential owns its fields; the commitment is read again
+    // below and the registry is borrowed.
     let credential = StoredCredential {
         identity_commitment: commitment_hex.clone(),
         identity_secret_hash: secret_hash_hex,
@@ -431,9 +437,11 @@ pub(crate) fn register_scoped(
     // (allocations, the epoch-size binding, and the floor start unset; the
     // binding and floor are adopted at the first successful reservation —
     // registration doesn't know the app's final epoch size).
+    // OWNERSHIP: `insert` takes the block by value; the commitment is read
+    // again by the submit and the scope is borrowed.
     let identity = sealed_store::format::IdentityBlock {
         registry_id: registry.canonical.clone(),
-        rln_identifier: rln_id_hex.clone(),
+        rln_identifier: rln_id_hex.to_string(),
         identity_commitment: commitment_hex.clone(),
         submitted_at: now_unix(),
     };
@@ -443,9 +451,10 @@ pub(crate) fn register_scoped(
         store.update_cache(&hash, |m| m.confirm_deadline = Some(deadline))?;
     }
 
-    let submit = match &delegated {
+    let submit = match delegated {
         Some(d) => provider::gifter_request_async(
             &delegated_request_args(d, &commitment_hex, rate_limit, &registry.account),
+            // OWNERSHIP: the callback outlives this call; `hash` is read below.
             delegated_submit_callback(
                 Arc::downgrade(&store),
                 hash.clone(),
@@ -453,9 +462,10 @@ pub(crate) fn register_scoped(
             ),
         ),
         None => backend.registry.register_async(
-            &registry,
+            registry,
             &commitment_hex,
             rate_limit,
+            // OWNERSHIP: the callback outlives this call; `hash` is read below.
             funded_submit_callback(Arc::downgrade(&store), hash.clone()),
         ),
     };

@@ -251,7 +251,7 @@ fn remember(gate: &mut HashMap<String, Result<(), String>>, reference: &str, ans
 fn network_refused(registry: &CanonicalRegistryId, detail: &str) -> ApiError {
     ApiError::new(
         ErrorKind::UnknownRegistry,
-        &format!(
+        format!(
             "{}: {TARGET_MODULE} will not serve network '{}': {detail}",
             registry.canonical, registry.reference
         ),
@@ -282,7 +282,7 @@ pub(crate) fn ensure_network(registry: &CanonicalRegistryId) -> Result<(), ApiEr
         }
         Gate::Retry => Err(ApiError::new(
             ErrorKind::NotReady,
-            &format!(
+            format!(
                 "{TARGET_MODULE} cannot select network '{}' yet (its wallet home is not resolved)",
                 registry.reference
             ),
@@ -363,9 +363,8 @@ pub(crate) fn gifter_request_async(
         return Ok(());
     }
     let client = gifter_client();
-    let args_json = args_json.to_string();
     dispatch_recorded("request", on_done, |done| {
-        client.request_async_with_timeout(&args_json, GIFTER_REQUEST_TIMEOUT, done)
+        client.request_async_with_timeout(args_json, GIFTER_REQUEST_TIMEOUT, done)
     })
 }
 
@@ -387,7 +386,7 @@ pub(crate) struct DiscoverReply {
 impl DiscoverReply {
     fn from_reply(raw: &str) -> Result<Self, ApiError> {
         let v: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
-            ApiError::new(ErrorKind::ProviderFailure, &format!("discover parse: {e}"))
+            ApiError::new(ErrorKind::ProviderFailure, format!("discover parse: {e}"))
         })?;
         Ok(DiscoverReply {
             candidates: v
@@ -564,7 +563,7 @@ fn explained(prov: &dyn Registry, registry: &CanonicalRegistryId, e: ApiError) -
         return e;
     }
     match registry_problem(prov, registry) {
-        Some(msg) => ApiError::new(ErrorKind::UnknownRegistry, &msg),
+        Some(msg) => ApiError::new(ErrorKind::UnknownRegistry, msg),
         None => e,
     }
 }
@@ -595,7 +594,7 @@ struct LezRlnProvider;
 fn provider_failure(method: &str) -> ApiError {
     ApiError::new(
         ErrorKind::ProviderFailure,
-        &format!("{TARGET_MODULE}.{method} failed (empty reply)"),
+        format!("{TARGET_MODULE}.{method} failed (empty reply)"),
     )
 }
 
@@ -608,7 +607,7 @@ fn provider_failure(method: &str) -> ApiError {
 /// other side: leaf 0 is a VALID leaf, so defaulting would prove against the
 /// wrong membership.)
 fn parse_membership_reply(raw: &str) -> Result<Option<ProviderMembership>, ApiError> {
-    let fault = |msg: String| ApiError::new(ErrorKind::ProviderFailure, &msg);
+    let fault = |msg: String| ApiError::new(ErrorKind::ProviderFailure, msg);
     let v: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| fault(format!("get_membership reply parse: {e}")))?;
     let registered = v
@@ -705,7 +704,7 @@ impl Registry for LezRlnProvider {
         serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
             ApiError::new(
                 ErrorKind::ProviderFailure,
-                &format!("bounds reply parse: {e}"),
+                format!("bounds reply parse: {e}"),
             )
         })
     }
@@ -725,7 +724,7 @@ impl Registry for LezRlnProvider {
         serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
             ApiError::new(
                 ErrorKind::ProviderFailure,
-                &format!("check_registry parse: {e}"),
+                format!("check_registry parse: {e}"),
             )
         })
     }
@@ -743,7 +742,7 @@ impl Payer for LezRlnProvider {
         serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
             ApiError::new(
                 ErrorKind::ProviderFailure,
-                &format!("wallet_status parse: {e}"),
+                format!("wallet_status parse: {e}"),
             )
         })
     }
@@ -762,7 +761,7 @@ impl Payer for LezRlnProvider {
         let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
             ApiError::new(
                 ErrorKind::ProviderFailure,
-                &format!("balance reply parse: {e}"),
+                format!("balance reply parse: {e}"),
             )
         })?;
         // A decimal STRING on the wire: a u128 balance exceeds JSON number
@@ -788,9 +787,8 @@ impl Payer for LezRlnProvider {
                 client.get_fee_state_async_with_timeout(FEE_STATE_TIMEOUT, done)
             }),
         )?;
-        serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
-            ApiError::new(ErrorKind::ProviderFailure, &format!("fee state parse: {e}"))
-        })
+        serde_json::from_str::<serde_json::Value>(&raw)
+            .map_err(|e| ApiError::new(ErrorKind::ProviderFailure, format!("fee state parse: {e}")))
     }
 }
 
@@ -818,7 +816,7 @@ impl TreeSource for LezRlnProvider {
         let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
             ApiError::new(
                 ErrorKind::ProviderFailure,
-                &format!("proofs reply parse: {e}"),
+                format!("proofs reply parse: {e}"),
             )
         })?;
         let first = v.as_array().and_then(|arr| arr.first()).ok_or_else(|| {
@@ -843,7 +841,7 @@ impl TreeSource for LezRlnProvider {
         let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
             ApiError::new(
                 ErrorKind::ProviderFailure,
-                &format!("roots reply parse: {e}"),
+                format!("roots reply parse: {e}"),
             )
         })?;
         RootSet::from_provider_json(&parsed)
@@ -861,7 +859,7 @@ pub(crate) mod fake {
     fn unanswered(what: &str) -> ApiError {
         ApiError::new(
             ErrorKind::ProviderFailure,
-            &format!("fake {what}: no answer configured"),
+            format!("fake {what}: no answer configured"),
         )
     }
 

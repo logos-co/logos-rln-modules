@@ -13,7 +13,7 @@ pub(crate) fn parse_hex32(field: &str, hex: &str) -> Result<([u8; 32], String), 
     let bytes = registry_id::hex_to_bytes32(hex).ok_or_else(|| {
         ApiError::new(
             ErrorKind::InvalidArgument,
-            &format!("{field} must be 32-byte hex"),
+            format!("{field} must be 32-byte hex"),
         )
     })?;
     let hex = registry_id::bytes_to_hex(&bytes);
@@ -21,7 +21,7 @@ pub(crate) fn parse_hex32(field: &str, hex: &str) -> Result<([u8; 32], String), 
 }
 
 pub(crate) fn parse_registry(raw: &str) -> Result<registry_id::CanonicalRegistryId, ApiError> {
-    registry_id::parse(raw).map_err(|e| ApiError::new(ErrorKind::InvalidArgument, &e))
+    registry_id::parse(raw).map_err(|e| ApiError::new(ErrorKind::InvalidArgument, e))
 }
 
 /// The registry's local membership records.
@@ -155,7 +155,7 @@ pub(crate) fn backend_of(
     provider::backend_for(&registry.namespace).ok_or_else(|| {
         ApiError::new(
             ErrorKind::UnknownRegistry,
-            &format!("no registry provider for namespace {}", registry.namespace),
+            format!("no registry provider for namespace {}", registry.namespace),
         )
     })
 }

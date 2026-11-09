@@ -16,7 +16,7 @@ use crate::sealed_store::store as sealed;
 pub(crate) fn provision_impl(options_json: &str) -> Result<serde_json::Value, ApiError> {
     let raw = options_json.trim();
     let opts: serde_json::Value = serde_json::from_str(if raw.is_empty() { "{}" } else { raw })
-        .map_err(|e| ApiError::new(ErrorKind::InvalidArgument, &format!("options_json: {e}")))?;
+        .map_err(|e| ApiError::new(ErrorKind::InvalidArgument, format!("options_json: {e}")))?;
     let sequencer = opts
         .get("sequencer_addr")
         .and_then(|v| v.as_str())
@@ -30,7 +30,7 @@ pub(crate) fn provision_impl(options_json: &str) -> Result<serde_json::Value, Ap
 
     let home = sealed::current_or_uninit()?.base_dir().join("wallet-home");
     std::fs::create_dir_all(&home)
-        .map_err(|e| ApiError::internal(&format!("create {}: {e}", home.display())))?;
+        .map_err(|e| ApiError::internal(format!("create {}: {e}", home.display())))?;
 
     let config_path = home.join("wallet_config.json");
     let storage_path = home.join("storage.json");
@@ -73,7 +73,7 @@ pub(crate) fn provision_impl(options_json: &str) -> Result<serde_json::Value, Ap
                     .and_then(|()| std::fs::rename(&tmp, &config_path));
                 let _ = std::fs::remove_file(&claim);
                 write.map_err(|e| {
-                    ApiError::internal(&format!("write {}: {e}", config_path.display()))
+                    ApiError::internal(format!("write {}: {e}", config_path.display()))
                 })?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -82,7 +82,7 @@ pub(crate) fn provision_impl(options_json: &str) -> Result<serde_json::Value, Ap
                 config_existed = true;
             }
             Err(e) => {
-                return Err(ApiError::internal(&format!(
+                return Err(ApiError::internal(format!(
                     "claim {}: {e}",
                     claim.display()
                 )))

@@ -78,14 +78,14 @@ pub(crate) struct ApiError {
 }
 
 impl ApiError {
-    pub(crate) fn new(kind: ErrorKind, message: &str) -> Self {
+    pub(crate) fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         ApiError {
             kind,
-            message: message.to_string(),
+            message: message.into(),
         }
     }
 
-    pub(crate) fn internal(message: &str) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         ApiError::new(ErrorKind::Internal, message)
     }
 
@@ -95,7 +95,7 @@ impl ApiError {
         serde_json::to_value(crate::views::ErrorBody::new(
             self.kind.class(),
             self.kind.as_str(),
-            self.message.clone(),
+            &self.message,
         ))
         .unwrap_or(serde_json::Value::Null)
     }

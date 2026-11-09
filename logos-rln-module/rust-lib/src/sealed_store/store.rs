@@ -249,7 +249,7 @@ impl Store {
             // the store password at first write; the uuid survives so sibling
             // files stay bound across a password change while empty.
             let params =
-                provision_params().map_err(|e| ApiError::internal(&format!("kdf params: {e}")))?;
+                provision_params().map_err(|e| ApiError::internal(format!("kdf params: {e}")))?;
             let keys = derive_keys(password, &params)?;
             let uuid = match inner.store_uuid {
                 Some(u) => u,
@@ -263,7 +263,7 @@ impl Store {
             let file =
                 SealedFile::provision(params, bytes_to_hex(&keys.verify[..]), bytes_to_hex(&uuid));
             fs::write_durable_json(&self.dir, format::SEALED_FILE, &file)
-                .map_err(|e| ApiError::internal(&format!("sealed store save: {e}")))?;
+                .map_err(|e| ApiError::internal(format!("sealed store save: {e}")))?;
             inner.sealed = Some(file);
             inner.store_uuid = Some(uuid);
             inner.session = Some(Session {
@@ -469,11 +469,11 @@ impl Store {
         };
         let plaintext = Zeroizing::new(
             serde_json::to_vec(credential)
-                .map_err(|e| ApiError::internal(&format!("credential serialize: {e}")))?,
+                .map_err(|e| ApiError::internal(format!("credential serialize: {e}")))?,
         );
         let aad = format::credential_aad(hash, &identity, &uuid);
         let (nonce, ct) = crypto::seal(&session.keys.seal, &aad, &plaintext)
-            .map_err(|e| ApiError::internal(&format!("credential seal: {e}")))?;
+            .map_err(|e| ApiError::internal(format!("credential seal: {e}")))?;
         let Some(sealed) = inner.sealed.as_mut() else {
             return Err(ApiError::internal("sealed store is not provisioned"));
         };
@@ -486,7 +486,7 @@ impl Store {
             },
         );
         fs::write_durable_json(&self.dir, format::SEALED_FILE, sealed)
-            .map_err(|e| ApiError::internal(&format!("sealed store save: {e}")))?;
+            .map_err(|e| ApiError::internal(format!("sealed store save: {e}")))?;
         self.swap_snapshot(inner);
         Ok(())
     }
@@ -527,10 +527,10 @@ impl Store {
                     ErrorKind::BadPassword,
                     "session password no longer opens this entry",
                 ),
-                other => ApiError::internal(&format!("credential unseal: {other}")),
+                other => ApiError::internal(format!("credential unseal: {other}")),
             })?;
         serde_json::from_slice(&plaintext)
-            .map_err(|e| ApiError::internal(&format!("credential parse: {e}")))
+            .map_err(|e| ApiError::internal(format!("credential parse: {e}")))
     }
 
     // ---------------------------------------------------- snapshot reads
@@ -762,9 +762,9 @@ fn provision_params() -> Result<KdfParams, crypto::CryptoError> {
 }
 
 fn derive_keys(password: &str, params: &KdfParams) -> Result<SubKeys, ApiError> {
-    let mk = MasterKey::derive(password, params)
-        .map_err(|e| ApiError::internal(&format!("kdf: {e}")))?;
-    SubKeys::derive(&mk).map_err(|e| ApiError::internal(&format!("kdf: {e}")))
+    let mk =
+        MasterKey::derive(password, params).map_err(|e| ApiError::internal(format!("kdf: {e}")))?;
+    SubKeys::derive(&mk).map_err(|e| ApiError::internal(format!("kdf: {e}")))
 }
 
 /// True when the entry's AEAD opens under this session AND the plaintext
@@ -835,7 +835,7 @@ fn reservation_guards(
     if alloc.epoch_size_sec != 0 && alloc.epoch_size_sec != epoch_size_sec {
         return Err(ApiError::new(
             ErrorKind::Permanent,
-            &format!(
+            format!(
                 "configured epoch_size_sec {epoch_size_sec} differs from {} — the size this \
                  membership's allocations are bound to; a rebased epoch numbering could \
                  reissue spent slots. Register a fresh membership under the new size",
@@ -1198,7 +1198,7 @@ fn write_allocations(dir: &Path, inner: &mut Inner) -> Result<(), ApiError> {
         root_mac: bytes_to_hex(&root),
     };
     fs::write_durable_json(dir, format::ALLOCATIONS_FILE, &file)
-        .map_err(|e| ApiError::internal(&format!("allocations save: {e}")))?;
+        .map_err(|e| ApiError::internal(format!("allocations save: {e}")))?;
     inner.raw_sections = file.sections;
     inner.root_mac_raw = Some(root);
     Ok(())
@@ -1210,7 +1210,7 @@ fn write_cache(dir: &Path, inner: &Inner) -> Result<(), ApiError> {
         ..CacheFile::new()
     };
     fs::write_atomic_loose_json(dir, format::CACHE_FILE, &file)
-        .map_err(|e| ApiError::internal(&format!("cache save: {e}")))
+        .map_err(|e| ApiError::internal(format!("cache save: {e}")))
 }
 
 fn build_snapshot(inner: &Inner) -> Snapshot {

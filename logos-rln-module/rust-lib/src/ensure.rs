@@ -245,13 +245,7 @@ fn delegate_one(
         &format!("asking {who}"),
     );
     let store = crate::sealed_store::store::current_or_uninit();
-    let reply = match register_scoped(
-        store,
-        registry,
-        REGISTRY_WIDE,
-        rate_limit,
-        Some(allocator.clone()),
-    ) {
+    let reply = match register_scoped(store, registry, REGISTRY_WIDE, rate_limit, Some(allocator)) {
         Ok(v) => v,
         Err(e) if e.kind == ErrorKind::Locked => {
             return Delegated::Locked(format!("{who}: {}", e.message))
@@ -796,7 +790,7 @@ fn provision_one(
                     let detail = status.get("detail").and_then(|x| x.as_str()).unwrap_or("");
                     return Err(ApiError::new(
                         ErrorKind::ProviderFailure,
-                        &format!("the registry module's wallet failed to come up: {detail}"),
+                        format!("the registry module's wallet failed to come up: {detail}"),
                     ));
                 }
                 Some("pending") => {
@@ -839,7 +833,7 @@ fn provision_one(
     // version. Say so now, instead of failing later on an empty read or
     // waiting for funds that would buy nothing.
     if let Some(msg) = crate::provider::registry_problem(backend.registry, registry) {
-        return Err(ApiError::new(ErrorKind::UnknownRegistry, &msg));
+        return Err(ApiError::new(ErrorKind::UnknownRegistry, msg));
     }
 
     // 2. The price and the fee reserve. Read before the funding wait so the
@@ -1680,8 +1674,8 @@ mod tests {
             }
         }
 
-        fn run(&self, allocator: serde_json::Value) {
-            let allocator = DelegatedOptions::from_allocator_block(Some(&allocator), "x").unwrap();
+        fn run(&self, allocator: &serde_json::Value) {
+            let allocator = DelegatedOptions::from_allocator_block(Some(allocator), "x").unwrap();
             ensure::run_with(
                 vec![ensure::Provision {
                     registry: self.registry.clone(),
@@ -1731,7 +1725,7 @@ mod tests {
             }),
         );
         let began = std::time::Instant::now();
-        pass.run(serde_json::json!({}));
+        pass.run(&serde_json::json!({}));
         let step = ensure::progress(&pass.registry).expect("a step is recorded");
         assert_eq!(step.step, ensure::Step::Done, "{}", step.detail);
         assert!(step.detail.contains("(discovered)"), "{}", step.detail);
@@ -1766,7 +1760,7 @@ mod tests {
                 _ => listed(1),
             }),
         );
-        pass.run(serde_json::json!({}));
+        pass.run(&serde_json::json!({}));
         let step = ensure::progress(&pass.registry).expect("a step is recorded");
         assert_eq!(step.step, ensure::Step::Done, "{}", step.detail);
         assert!(step.detail.contains("(discovered)"), "{}", step.detail);
@@ -1798,7 +1792,7 @@ mod tests {
                 _ => listed(1),
             }),
         );
-        pass.run(serde_json::json!({}));
+        pass.run(&serde_json::json!({}));
         let step = ensure::progress(&pass.registry).expect("a step is recorded");
         assert_eq!(pass.counts(), (1, 0, 1, 2), "the funded submit was reached");
         assert_eq!(
@@ -1829,7 +1823,7 @@ mod tests {
                 _ => listed(1),
             }),
         );
-        pass.run(serde_json::json!({ "peer_id": "p", "multiaddr": "/m", "discover": false }));
+        pass.run(&serde_json::json!({ "peer_id": "p", "multiaddr": "/m", "discover": false }));
         assert_eq!(pass.counts(), (1, 0, 1, 2));
     }
 
