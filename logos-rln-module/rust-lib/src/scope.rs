@@ -1,6 +1,8 @@
 //! Scope resolution: registry and rln_identifier parsing, which local records
 //! back a scope, and the registry provider serving its namespace.
 
+use std::sync::Arc;
+
 use crate::error::{ApiError, ErrorKind};
 use crate::lifecycle::MembershipRecord;
 use crate::provider;
@@ -25,10 +27,11 @@ pub(crate) fn parse_registry(raw: &str) -> Result<registry_id::CanonicalRegistry
 }
 
 /// The registry's local membership records.
+// OWNERSHIP: shared handles of the store's published records.
 pub(crate) fn records_for_registry(
     store: &Store,
     registry: &registry_id::CanonicalRegistryId,
-) -> Vec<MembershipRecord> {
+) -> Vec<Arc<MembershipRecord>> {
     store.records_for(&registry.canonical)
 }
 
@@ -67,12 +70,13 @@ pub(crate) fn scope_matches_for_test(record_rln_id: &str, scope_rln_id: &str) ->
 /// read answers that record, and so must the proof.
 // OWNERSHIP: the candidates borrow from the caller's `records`.
 pub(crate) fn scope_candidates<'a>(
-    records: &'a [MembershipRecord],
+    records: &'a [Arc<MembershipRecord>],
     rln_id_hex: &str,
 ) -> Vec<&'a MembershipRecord> {
     let usable = |r: &&MembershipRecord| !r.quarantined && r.cache.state.is_usable();
     let own: Vec<&MembershipRecord> = records
         .iter()
+        .map(Arc::as_ref)
         .filter(usable)
         .filter(|r| r.identity.rln_identifier == rln_id_hex)
         .collect();
@@ -81,13 +85,14 @@ pub(crate) fn scope_candidates<'a>(
     }
     let wide: Vec<&MembershipRecord> = records
         .iter()
+        .map(Arc::as_ref)
         .filter(usable)
         .filter(|r| r.identity.rln_identifier.is_empty())
         .collect();
     if !wide.is_empty() {
         return wide;
     }
-    records.iter().collect()
+    records.iter().map(Arc::as_ref).collect()
 }
 
 /// Which record answers a `get_membership_state(scope)` read.
@@ -110,15 +115,17 @@ pub(crate) enum ScopeState<'a> {
 /// rank is ambiguous. Proof-time resolution stays `scope_candidates`'s
 /// (usable records only).
 pub(crate) fn resolve_scope_state<'a>(
-    records: &'a [MembershipRecord],
+    records: &'a [Arc<MembershipRecord>],
     rln_id_hex: &str,
 ) -> ScopeState<'a> {
     let own: Vec<&MembershipRecord> = records
         .iter()
+        .map(Arc::as_ref)
         .filter(|r| !r.quarantined && r.identity.rln_identifier == rln_id_hex)
         .collect();
     let wide: Vec<&MembershipRecord> = records
         .iter()
+        .map(Arc::as_ref)
         .filter(|r| !r.quarantined && r.identity.rln_identifier.is_empty())
         .collect();
     for rank in [own, wide] {
@@ -140,6 +147,7 @@ pub(crate) fn resolve_scope_state<'a>(
     }
     let usable: Vec<&MembershipRecord> = records
         .iter()
+        .map(Arc::as_ref)
         .filter(|r| !r.quarantined && r.cache.state.is_usable())
         .collect();
     match usable.len() {

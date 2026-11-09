@@ -150,7 +150,7 @@ pub(crate) struct MembershipStateView<'a> {
     /// registration may be attempted (spec: a failed submission SHALL report
     /// whether it is retryable). Present only on those states.
     #[serde(skip_serializing_if = "Option::is_none")]
-    failed_reason: Option<String>,
+    failed_reason: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retryable: Option<bool>,
 }
@@ -233,7 +233,7 @@ impl<'a> MembershipStateView<'a> {
     }
 
     /// Attach a terminal record's reason and retryability.
-    pub(crate) fn with_failure(mut self, reason: Option<String>, retryable: Option<bool>) -> Self {
+    pub(crate) fn with_failure(mut self, reason: Option<&'a str>, retryable: Option<bool>) -> Self {
         self.failed_reason = reason;
         self.retryable = retryable;
         self
@@ -573,7 +573,7 @@ mod tests {
     fn state_and_verdict_views_serialize_every_field() {
         let state =
             MembershipStateView::resolved("h-1", "logos:local:r", MembershipState::Failed, 7, 300)
-                .with_failure(Some("confirmation_window_elapsed".into()), Some(true))
+                .with_failure(Some("confirmation_window_elapsed"), Some(true))
                 .with_provisioning(Some(ProvisioningView::new(
                     "registering",
                     "step detail".into(),

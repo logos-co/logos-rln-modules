@@ -81,7 +81,7 @@ pub const CONFIRMATION_WINDOW_SECS: u64 = 300;
 /// Registry-derived cache state, deliberately outside the authenticated
 /// surface — tampering it is self-DoS, not disclosure; the poller heals it
 /// from the registry.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct CacheState {
     pub state: MembershipState,
     /// Provisional while pending (pre-submit estimate); authoritative after

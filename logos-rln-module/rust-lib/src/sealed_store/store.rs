@@ -98,9 +98,12 @@ struct Inner {
     lock: Option<std::fs::File>,
 }
 
-/// The read-only publication: identity + cache + alloc + quarantine clones.
+/// The read-only publication: one record per sealed credential, derived from
+/// its identity + cache + alloc + quarantine state.
 struct Snapshot {
-    records: BTreeMap<String, MembershipRecord>,
+    // OWNERSHIP: each record is shared by successive snapshots while its
+    // inputs are unchanged, and handed to readers as a cheap handle clone.
+    records: BTreeMap<String, Arc<MembershipRecord>>,
 }
 
 pub struct Store {
@@ -201,7 +204,7 @@ impl Store {
             root_mac_raw: loaded.root_mac_raw,
             lock: Some(lock),
         };
-        let snapshot = build_snapshot(&inner);
+        let snapshot = build_snapshot(&inner, None);
         Ok(Arc::new(Store {
             dir,
             write: Mutex::new(inner),
@@ -540,26 +543,40 @@ impl Store {
 
     // ---------------------------------------------------- snapshot reads
 
-    pub fn membership(&self, hash: &str) -> Option<MembershipRecord> {
+    pub fn membership(&self, hash: &str) -> Option<Arc<MembershipRecord>> {
+        // OWNERSHIP: cheap Arc handle clone of the published record.
         self.snapshot_arc().records.get(hash).cloned()
     }
 
-    pub fn records_for(&self, canonical_registry: &str) -> Vec<MembershipRecord> {
+    pub fn records_for(&self, canonical_registry: &str) -> Vec<Arc<MembershipRecord>> {
         self.snapshot_arc()
             .records
             .values()
             .filter(|r| r.identity.registry_id == canonical_registry)
+            // OWNERSHIP: cheap Arc handle clones of the published records.
             .cloned()
             .collect()
     }
 
+    /// Whether any of the registry's records satisfies `pred`.
+    pub fn any_for_registry(
+        &self,
+        canonical_registry: &str,
+        pred: impl Fn(&MembershipRecord) -> bool,
+    ) -> bool {
+        self.snapshot_arc()
+            .records
+            .values()
+            .any(|r| r.identity.registry_id == canonical_registry && pred(r))
+    }
+
     /// The poller's confirmation work list: non-quarantined `pending`.
-    pub fn pending_records(&self) -> Vec<MembershipRecord> {
+    pub fn pending_records(&self) -> Vec<Arc<MembershipRecord>> {
         self.snapshot_arc()
             .records
             .values()
             .filter(|r| awaits_confirmation(r))
-            // OWNERSHIP: the poller works on owned records outside the snapshot lock.
+            // OWNERSHIP: cheap Arc handle clones of the published records.
             .cloned()
             .collect()
     }
@@ -569,12 +586,12 @@ impl Store {
         self.snapshot_arc()
             .records
             .values()
-            .any(awaits_confirmation)
+            .any(|r| awaits_confirmation(r))
     }
 
     /// The state-refresh work list, widened to include Unknown — heal-only,
     /// so a lost cache file's defaulted rows are re-read from the registry.
-    pub fn refreshable_records(&self) -> Vec<MembershipRecord> {
+    pub fn refreshable_records(&self) -> Vec<Arc<MembershipRecord>> {
         self.snapshot_arc()
             .records
             .values()
@@ -588,6 +605,7 @@ impl Store {
                             | MembershipState::Unknown
                     )
             })
+            // OWNERSHIP: cheap Arc handle clones of the published records.
             .cloned()
             .collect()
     }
@@ -755,11 +773,17 @@ impl Store {
     // ----------------------------------------------------------- helpers
 
     fn snapshot_arc(&self) -> Arc<Snapshot> {
+        // OWNERSHIP: cheap Arc handle clone; the snapshot lock is released
+        // before the caller reads.
         crate::util::lock(&self.snapshot).clone()
     }
 
+    /// Every caller holds the write lock, so the publication read here is
+    /// the one this call replaces. The rebuild runs outside the snapshot
+    /// lock: readers never wait on it.
     fn swap_snapshot(&self, inner: &Inner) {
-        *crate::util::lock(&self.snapshot) = Arc::new(build_snapshot(inner));
+        let next = build_snapshot(inner, Some(&self.snapshot_arc()));
+        *crate::util::lock(&self.snapshot) = Arc::new(next);
     }
 }
 
@@ -1230,21 +1254,41 @@ fn write_cache(dir: &Path, inner: &Inner) -> Result<(), ApiError> {
         .map_err(|e| ApiError::internal(format!("cache save: {e}")))
 }
 
-fn build_snapshot(inner: &Inner) -> Snapshot {
+/// One record per sealed credential. A record of `prior` whose identity,
+/// cache row, allocation section and quarantine flag all equal the current
+/// ones is shared as is; every other record is derived afresh.
+fn build_snapshot(inner: &Inner, prior: Option<&Snapshot>) -> Snapshot {
+    let no_cache = CacheState::default();
+    let no_alloc = AllocationState::default();
     let mut records = BTreeMap::new();
     if let Some(f) = &inner.sealed {
         for (hash, entry) in &f.credentials {
-            records.insert(
-                hash.clone(),
-                MembershipRecord {
+            let cache = inner.cache.get(hash).unwrap_or(&no_cache);
+            let alloc = inner.sections.get(hash).unwrap_or(&no_alloc);
+            let quarantined =
+                inner.census_quarantined.contains(hash) || inner.keyed_quarantined.contains(hash);
+            let record = match prior.and_then(|p| p.records.get(hash)) {
+                Some(r)
+                    if r.quarantined == quarantined
+                        && r.identity == entry.identity
+                        && r.cache == *cache
+                        && r.alloc == *alloc =>
+                {
+                    // OWNERSHIP: cheap Arc handle clone of an unchanged record.
+                    Arc::clone(r)
+                }
+                // OWNERSHIP: the snapshot owns its copy of the authoritative
+                // state; `Inner` keeps mutating its own.
+                _ => Arc::new(MembershipRecord {
                     hash: hash.clone(),
                     identity: entry.identity.clone(),
-                    cache: inner.cache.get(hash).cloned().unwrap_or_default(),
-                    alloc: inner.sections.get(hash).cloned().unwrap_or_default(),
-                    quarantined: inner.census_quarantined.contains(hash)
-                        || inner.keyed_quarantined.contains(hash),
-                },
-            );
+                    cache: cache.clone(),
+                    alloc: alloc.clone(),
+                    quarantined,
+                }),
+            };
+            // OWNERSHIP: the map owns its key; the sealed file keeps its own.
+            records.insert(hash.clone(), record);
         }
     }
     Snapshot { records }
@@ -2416,6 +2460,101 @@ mod tests {
             rec.alloc.allocations.iter().map(|a| a.used).sum::<u64>(),
             20
         );
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The published snapshot equals a from-scratch build after every kind
+    /// of mutation, shares each record whose inputs did not change, and never
+    /// alters a record a reader already holds.
+    #[test]
+    fn snapshot_shares_unchanged_records_and_matches_a_full_rebuild() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("snapshot-share");
+        let registry = format!("logos:local:{}", "dc".repeat(32));
+
+        let matches_full_rebuild = |store: &Store| {
+            let inner = crate::util::lock(&store.write);
+            let full = build_snapshot(&inner, None);
+            let published = store.snapshot_arc();
+            assert_eq!(
+                published.records.keys().collect::<Vec<_>>(),
+                full.records.keys().collect::<Vec<_>>()
+            );
+            for (hash, want) in &full.records {
+                let got = &published.records[hash];
+                assert_eq!(got.hash, want.hash);
+                assert!(got.identity == want.identity, "identity of {hash}");
+                assert!(got.cache == want.cache, "cache of {hash}");
+                assert!(got.alloc == want.alloc, "alloc of {hash}");
+                assert_eq!(got.quarantined, want.quarantined, "quarantine of {hash}");
+            }
+        };
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let a = insert_membership(&store, &registry, &[0x71u8; 32]);
+        let b = insert_membership(&store, &registry, &[0x72u8; 32]);
+        matches_full_rebuild(&store);
+        let (a0, b0) = (store.membership(&a).unwrap(), store.membership(&b).unwrap());
+
+        // A cache write rebuilds only its own record.
+        store
+            .update_cache(&a, |m| {
+                m.state = MembershipState::Active;
+                m.leaf_index = Some(3);
+            })
+            .unwrap();
+        matches_full_rebuild(&store);
+        let (a1, b1) = (store.membership(&a).unwrap(), store.membership(&b).unwrap());
+        assert!(!Arc::ptr_eq(&a0, &a1));
+        assert!(Arc::ptr_eq(&b0, &b1));
+        assert_eq!(a1.cache.state, MembershipState::Active);
+        assert_eq!(a1.cache.leaf_index, Some(3));
+        assert_eq!(
+            a0.cache.state,
+            MembershipState::Pending,
+            "a held record never changes"
+        );
+        assert_eq!(a0.cache.leaf_index, None);
+
+        // A reservation rebuilds only its own record.
+        store.reserve_message_id(&b, "aa", 10, 9, 5, 600).unwrap();
+        matches_full_rebuild(&store);
+        let (a2, b2) = (store.membership(&a).unwrap(), store.membership(&b).unwrap());
+        assert!(Arc::ptr_eq(&a1, &a2));
+        assert!(!Arc::ptr_eq(&b1, &b2));
+        assert_eq!(b2.alloc.epoch_size_sec, 600);
+        assert_eq!(b1.alloc.epoch_size_sec, 0, "a held record never changes");
+
+        // A write that changes nothing shares the record.
+        store.update_cache(&a, |_| {}).unwrap();
+        matches_full_rebuild(&store);
+        assert!(Arc::ptr_eq(&a2, &store.membership(&a).unwrap()));
+
+        // An insert adds its record and shares the others.
+        let c = insert_membership(&store, &registry, &[0x73u8; 32]);
+        matches_full_rebuild(&store);
+        assert!(Arc::ptr_eq(&a2, &store.membership(&a).unwrap()));
+        assert!(Arc::ptr_eq(&b2, &store.membership(&b).unwrap()));
+        assert_eq!(store.records_for(&registry).len(), 3);
+        assert!(store.membership(&c).is_some());
+
+        // A keyed quarantine (a content-only section edit fails that
+        // section's MAC at unlock) rebuilds the quarantined record only.
+        store.close();
+        drop(store);
+        edit_json(&dir.join(format::ALLOCATIONS_FILE), |v| {
+            v["sections"][c.as_str()]["prune_floor"] = 999u64.into();
+        });
+        let store = Store::open(dir.clone()).unwrap();
+        let (a3, b3) = (store.membership(&a).unwrap(), store.membership(&b).unwrap());
+        store.unlock("pw").unwrap();
+        matches_full_rebuild(&store);
+        assert!(store.membership(&c).unwrap().quarantined);
+        assert!(Arc::ptr_eq(&a3, &store.membership(&a).unwrap()));
+        assert!(Arc::ptr_eq(&b3, &store.membership(&b).unwrap()));
 
         store.close();
         let _ = std::fs::remove_dir_all(&dir);

@@ -33,7 +33,7 @@ pub(crate) struct EpochAllocation {
 /// set — a field added here is authenticated, a field added elsewhere is
 /// not. Local security state with NO authoritative source to re-read,
 /// tamper-bound by the allocations ledger's section MAC.
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
 pub(crate) struct AllocationState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) allocations: Vec<EpochAllocation>,

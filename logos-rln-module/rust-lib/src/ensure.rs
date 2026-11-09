@@ -265,9 +265,8 @@ fn delegate_one(
             return Delegated::Superseded;
         }
         let record_now = crate::sealed_store::store::current().and_then(|s| {
-            records_for_registry(&s, registry)
-                .into_iter()
-                .find(|r| r.hash == hash)
+            s.membership(&hash)
+                .filter(|r| r.identity.registry_id == registry.canonical)
         });
         match record_now {
             Some(r) if r.cache.state.is_usable() => {
@@ -295,11 +294,10 @@ fn delegate_one(
             }
             Some(r) if r.cache.state == MembershipState::Pending => {}
             Some(r) => {
-                let why = r
-                    .cache
-                    .failed_reason
-                    .unwrap_or_else(|| format!("record went {:?}", r.cache.state));
-                return Delegated::Refused(format!("{who}: {why}"));
+                return Delegated::Refused(match r.cache.failed_reason.as_deref() {
+                    Some(why) => format!("{who}: {why}"),
+                    None => format!("{who}: record went {:?}", r.cache.state),
+                });
             }
             // The store was republished under the pass; keep looking until the hold ends.
             None => {}
@@ -425,7 +423,7 @@ fn run_as(registries: Vec<Provision>, mine: u64) {
 pub(crate) fn pending_membership_present(registry: &registry_id::CanonicalRegistryId) -> bool {
     crate::sealed_store::store::current()
         .map(|s| {
-            records_for_registry(&s, registry).iter().any(|r| {
+            s.any_for_registry(&registry.canonical, |r| {
                 !r.quarantined && r.cache.state == crate::lifecycle::MembershipState::Pending
             })
         })
@@ -453,7 +451,7 @@ pub(crate) fn wait_confirmed(registry: &registry_id::CanonicalRegistryId, mine: 
 /// is every other pass's nonce.
 pub(crate) fn any_pending_membership() -> bool {
     crate::sealed_store::store::current()
-        .map(|s| s.pending_records().iter().any(|r| !r.quarantined))
+        .map(|s| s.has_pending())
         .unwrap_or(false)
 }
 
@@ -490,9 +488,9 @@ pub(crate) fn ticket_in_force() -> u64 {
 pub(crate) fn live_membership_present(registry: &registry_id::CanonicalRegistryId) -> bool {
     crate::sealed_store::store::current()
         .map(|s| {
-            records_for_registry(&s, registry)
-                .iter()
-                .any(|r| !r.quarantined && r.cache.state.is_live())
+            s.any_for_registry(&registry.canonical, |r| {
+                !r.quarantined && r.cache.state.is_live()
+            })
         })
         .unwrap_or(false)
 }
@@ -535,11 +533,13 @@ fn settle_live(registry: &registry_id::CanonicalRegistryId, mine: u64) -> Live {
             if !saw_pending {
                 return Live::None;
             }
+            // OWNERSHIP: the verdict owns a copy of the reason; the record
+            // stays shared with the store's snapshot.
             let why = records
-                .into_iter()
+                .iter()
                 .filter(|r| r.cache.state == MembershipState::Failed)
                 .max_by_key(|r| r.identity.submitted_at)
-                .and_then(|r| r.cache.failed_reason)
+                .and_then(|r| r.cache.failed_reason.clone())
                 .unwrap_or_else(|| "the pending registration failed".to_string());
             return Live::Failed(why);
         }

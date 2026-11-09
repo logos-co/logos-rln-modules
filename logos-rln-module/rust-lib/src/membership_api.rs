@@ -147,6 +147,13 @@ pub(crate) fn get_membership_state_impl(
             record.cache.rate_limit.unwrap_or(0),
         ),
     };
+    // Why, and whether to try again — read back after the write above so a
+    // reason this very call recorded is what the caller sees.
+    let now = if merged.is_live() {
+        None
+    } else {
+        store.membership(hash)
+    };
     let mut view = views::MembershipStateView::resolved(
         hash,
         &registry.canonical,
@@ -154,12 +161,8 @@ pub(crate) fn get_membership_state_impl(
         leaf_index,
         rate_limit,
     );
-    if !merged.is_live() {
-        // Why, and whether to try again — read back after the write above so
-        // a reason this very call recorded is what the caller sees.
-        if let Some(now) = store.membership(hash) {
-            view = view.with_failure(now.cache.failed_reason, now.cache.retryable);
-        }
+    if let Some(now) = &now {
+        view = view.with_failure(now.cache.failed_reason.as_deref(), now.cache.retryable);
     }
     ok_json(view)
 }
@@ -229,6 +232,7 @@ pub(crate) fn ensure_membership_impl(
     let records = records_for_registry(&store, &registry);
     let live: Vec<&MembershipRecord> = records
         .iter()
+        .map(Arc::as_ref)
         .filter(|r| !r.quarantined && r.cache.state.is_live())
         .collect();
     match live.as_slice() {

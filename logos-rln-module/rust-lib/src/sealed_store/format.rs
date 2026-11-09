@@ -52,7 +52,7 @@ pub struct SealedEntry {
     pub ct: String,    // hex
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct IdentityBlock {
     pub registry_id: String,
     pub rln_identifier: String,
