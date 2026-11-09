@@ -138,7 +138,10 @@ pub(crate) fn resolve_scope_state<'a>(
         return match live.len() {
             1 => ScopeState::One(live[0]),
             0 => {
-                let latest = rank.iter().max_by_key(|r| r.identity.submitted_at).expect("non-empty rank");
+                let latest = rank
+                    .iter()
+                    .max_by_key(|r| r.identity.submitted_at)
+                    .expect("invariant: an empty rank is skipped above");
                 ScopeState::One(latest)
             }
             _ => ScopeState::Ambiguous(

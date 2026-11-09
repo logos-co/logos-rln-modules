@@ -107,7 +107,7 @@ pub(crate) fn select<'a, R: Borrow<MembershipRecord>>(
             // Highest rate; ties break to the LOWEST hash (deterministic).
             .max_by(|a, b| rate(a).cmp(&rate(b)).then(b.hash.cmp(&a.hash)))
             .copied()
-            .expect("non-empty candidates")),
+            .expect("invariant: an empty candidate list returned above")),
         Selector::RoundRobin => {
             // OWNERSHIP: the cursor map owns its key, inserted on every call.
             let key = (scope.0.to_string(), scope.1.to_string());

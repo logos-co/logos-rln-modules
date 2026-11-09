@@ -200,7 +200,7 @@ fn spawn_into(
             // and the thread's own teardown remain.
             CVAR.notify_all();
         })
-        .expect("spawn worker thread")
+        .expect("invariant: the OS can spawn a worker thread")
 }
 
 /// start(): permit + spawn maintenance (each `respawn` entry idempotently

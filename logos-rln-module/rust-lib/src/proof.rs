@@ -311,9 +311,11 @@ static RLN_STATELESS: LazyLock<RLN<Stateless, ArkGroth16Backend<PoseidonHash>>> 
         RLNBuilder::stateless()
             .graph(
                 graph_from_raw(DEPTH_10_GRAPH, Some(RLN_TREE_DEPTH), None)
-                    .expect("vendored depth-10 graph must load"),
+                    .expect("invariant: the vendored depth-10 graph loads at the circuit depth"),
             )
-            .zkey(zkey_from_raw(DEPTH_10_ZKEY).expect("vendored depth-10 zkey must load"))
+            .zkey(
+                zkey_from_raw(DEPTH_10_ZKEY).expect("invariant: the vendored depth-10 zkey loads"),
+            )
             .build()
     });
 
@@ -361,7 +363,9 @@ pub(crate) fn epoch_from_bytes(bytes: &[u8; 32]) -> Option<u64> {
         return None;
     }
     Some(u64::from_le_bytes(
-        bytes[..8].try_into().expect("8-byte slice"),
+        bytes[..8]
+            .try_into()
+            .expect("invariant: an 8-byte range converts to [u8; 8]"),
     ))
 }
 
@@ -399,7 +403,7 @@ pub(crate) fn expected_external_nullifier(epoch: u64, rln_identifier: &[u8; 32])
 fn fr_to_bytes32(fr: &Fr) -> [u8; 32] {
     let mut out = [0u8; 32];
     fr.serialize_compressed(&mut out[..])
-        .expect("Fr canonical LE form is exactly 32 bytes");
+        .expect("invariant: Fr's canonical LE form is exactly 32 bytes");
     out
 }
 
@@ -416,7 +420,7 @@ fn secret_to_bytes32(secret: &SecretFr) -> [u8; 32] {
 fn write_secret_bytes32(secret: &SecretFr, out: &mut [u8; 32]) {
     secret
         .serialize_compressed(&mut out[..])
-        .expect("SecretFr canonical LE form is exactly 32 bytes");
+        .expect("invariant: SecretFr's canonical LE form is exactly 32 bytes");
 }
 
 /// Extend a registry's Merkle path and root to the circuit's depth.
@@ -460,7 +464,7 @@ pub(crate) mod depth_bridge {
         let mut bytes = [0u8; 32];
         value
             .serialize_compressed(&mut bytes[..])
-            .expect("a field element serializes into 32 bytes");
+            .expect("invariant: a field element serializes into 32 bytes");
         bytes_to_hex(&bytes)
     }
 

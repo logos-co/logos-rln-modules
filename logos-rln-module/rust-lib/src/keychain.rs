@@ -166,7 +166,10 @@ fn with_backend<R>(f: impl FnOnce(&dyn Keychain) -> R) -> R {
     if guard.is_none() {
         *guard = Some(default_backend());
     }
-    f(guard.as_ref().expect("backend just installed").as_ref())
+    f(guard
+        .as_ref()
+        .expect("invariant: the backend is installed just above")
+        .as_ref())
 }
 
 #[cfg(test)]

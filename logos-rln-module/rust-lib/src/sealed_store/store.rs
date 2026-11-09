@@ -76,7 +76,10 @@ pub(crate) const UNINIT_MSG: &str =
 /// The open store, or `internal` naming why there is none — the handlers'
 /// read.
 pub(crate) fn current_or_cause() -> Result<Arc<Store>, ApiError> {
-    match &*STORE.read().unwrap() {
+    match &*STORE
+        .read()
+        .expect("invariant: no holder of the store cell panics (panic = \"abort\")")
+    {
         // OWNERSHIP: cheap Arc handle clone, taken out of the read lock.
         StoreCell::Ready(store) => Ok(Arc::clone(store)),
         StoreCell::Unready(cause) => Err(ApiError::internal(cause)),
@@ -105,7 +108,9 @@ pub(crate) fn current_or_uninit() -> Result<Arc<Store>, ApiError> {
 /// sequence runs under the write lock so a re-context cannot interleave with
 /// another, and no reader sees the closed store.
 pub(crate) fn open_current(dir: PathBuf) {
-    let mut cell = STORE.write().unwrap();
+    let mut cell = STORE
+        .write()
+        .expect("invariant: no holder of the store cell panics (panic = \"abort\")");
     if let StoreCell::Ready(prev) = &*cell {
         prev.close();
     }
@@ -123,7 +128,9 @@ pub(crate) fn open_current(dir: PathBuf) {
 /// Close the current store, if any, and leave the cell unready with `cause`,
 /// under the write lock.
 pub(crate) fn close_current(cause: String) {
-    let mut cell = STORE.write().unwrap();
+    let mut cell = STORE
+        .write()
+        .expect("invariant: no holder of the store cell panics (panic = \"abort\")");
     if let StoreCell::Ready(prev) = &*cell {
         prev.close();
     }
