@@ -211,17 +211,20 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
                     // OWNERSHIP: the map key and the `registries` list each own the id.
                     per_registry.insert(registry.canonical.clone(), c);
                 }
+                // A configured registry keeps its values.
+                None if per_registry.contains_key(&registry.canonical) => {}
                 None => {
                     // OWNERSHIP: the map key and the `registries` list each own the
                     // id; every registry's config owns its copy of the default.
-                    per_registry
-                        .entry(registry.canonical.clone())
-                        .or_insert(RegistryConfig {
+                    per_registry.insert(
+                        registry.canonical.clone(),
+                        RegistryConfig {
                             epoch_size_sec,
                             max_epoch_gap,
                             rate_limit: default_rate,
                             allocator: default_allocator.clone(),
-                        });
+                        },
+                    );
                 }
             }
             if !registries.contains(&registry.canonical) {
@@ -269,18 +272,19 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
     // rejecting start() would DoS validate_proof for every scope over one
     // stale local membership.
     if let Some(store) = sealed_store::store::current() {
-        for (hash, registry, bound) in store.epoch_size_bindings() {
-            let canonical = registry_id::parse(&registry)
-                .map(|r| r.canonical)
-                .unwrap_or(registry);
+        for record in store.epoch_size_bindings() {
+            let registry = &record.identity.registry_id;
+            let parsed = registry_id::parse(registry);
+            let canonical = parsed.as_ref().map_or(registry, |r| &r.canonical);
+            let bound = record.alloc.epoch_size_sec;
             let configured = per_registry
-                .get(&canonical)
+                .get(canonical)
                 .map(|c| c.epoch_size_sec)
                 .unwrap_or(epoch_size_sec);
             if bound != 0 && bound != configured {
                 eprintln!(
                     "{}",
-                    epoch_binding_warning(&hash, &canonical, bound, configured)
+                    epoch_binding_warning(&record.hash, canonical, bound, configured)
                 );
             }
         }
@@ -892,7 +896,7 @@ mod tests {
         .unwrap();
         assert_eq!(rate, 42);
         assert_eq!(
-            DelegatedOptions::from_registry_options(&flat).unwrap(),
+            DelegatedOptions::from_registry_options(flat).unwrap(),
             Some(a_alloc)
         );
 

@@ -338,7 +338,7 @@ pub(crate) fn register_impl(
     // vocabulary). Validated up front so a malformed request never mints a
     // credential.
     let (rate_limit, opts) = parse_registry_options(options_json)?;
-    let delegated = DelegatedOptions::from_registry_options(&opts)?;
+    let delegated = DelegatedOptions::from_registry_options(opts)?;
     register_scoped(
         store,
         &registry,
@@ -428,8 +428,8 @@ pub(crate) fn register_scoped(
     // the keystore and never returned across this interface. It goes straight
     // into the credential (wiped on drop), before any early return.
     let (commitment_hex, secret_hash_hex) = proof::generate_identity().map_err(proof_error)?;
-    // OWNERSHIP: the credential owns its fields; the commitment is read again
-    // below and the registry is borrowed.
+    // OWNERSHIP: the credential and the identity block each own the
+    // commitment; the registry is borrowed.
     let credential = StoredCredential {
         identity_commitment: commitment_hex.clone(),
         identity_secret_hash: secret_hash_hex,
@@ -446,12 +446,12 @@ pub(crate) fn register_scoped(
     // (allocations, the epoch-size binding, and the floor start unset; the
     // binding and floor are adopted at the first successful reservation —
     // registration doesn't know the app's final epoch size).
-    // OWNERSHIP: `insert` takes the block by value; the commitment is read
-    // again by the submit and the scope is borrowed.
+    // OWNERSHIP: `insert` takes the block by value, so the submit reads the
+    // credential's commitment; the scope is borrowed.
     let identity = sealed_store::format::IdentityBlock {
         registry_id: registry.canonical.clone(),
         rln_identifier: rln_id_hex.to_string(),
-        identity_commitment: commitment_hex.clone(),
+        identity_commitment: commitment_hex,
         submitted_at: now_unix(),
     };
     store.insert(&hash, identity, &credential, rate_limit)?;
@@ -462,8 +462,14 @@ pub(crate) fn register_scoped(
 
     let submit = match delegated {
         Some(d) => provider::gifter_request_async(
-            &delegated_request_args(d, &commitment_hex, rate_limit, &registry.account),
-            // OWNERSHIP: the callback outlives this call; `hash` is read below.
+            &delegated_request_args(
+                d,
+                &credential.identity_commitment,
+                rate_limit,
+                &registry.account,
+            ),
+            // OWNERSHIP: the callback outlives this call and owns its hash and
+            // account; `hash` is read below and `registry` is borrowed.
             delegated_submit_callback(
                 Arc::downgrade(&store),
                 hash.clone(),
@@ -472,7 +478,7 @@ pub(crate) fn register_scoped(
         ),
         None => backend.registry.register_async(
             registry,
-            &commitment_hex,
+            &credential.identity_commitment,
             rate_limit,
             // OWNERSHIP: the callback outlives this call; `hash` is read below.
             funded_submit_callback(Arc::downgrade(&store), hash.clone()),
@@ -1076,7 +1082,7 @@ mod tests {
         );
         let flat = |pairs: serde_json::Value| {
             let (_, flat) = parse_registry_options(&pairs.to_string()).unwrap();
-            DelegatedOptions::from_registry_options(&flat).unwrap()
+            DelegatedOptions::from_registry_options(flat).unwrap()
         };
         assert_eq!(
             flat(serde_json::json!([{ "key": "delegated", "value": "true" }])),

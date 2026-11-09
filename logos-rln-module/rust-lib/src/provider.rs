@@ -245,15 +245,15 @@ pub(crate) fn interpret_use_network(raw: &str) -> Gate {
 }
 
 /// Keep a definitive answer; drop a `Retry`.
-fn remember(gate: &mut HashMap<String, Result<(), String>>, reference: &str, answer: &Gate) {
+fn remember(gate: &mut HashMap<String, Result<(), String>>, reference: &str, answer: Gate) {
     match answer {
         Gate::Accepted => {
             // OWNERSHIP: the gate owns its key; the caller's reference is borrowed.
             gate.insert(reference.to_owned(), Ok(()));
         }
         Gate::Refused(detail) => {
-            // OWNERSHIP: the gate owns its key and a copy of the refusal the caller still reads.
-            gate.insert(reference.to_owned(), Err(detail.clone()));
+            // OWNERSHIP: the gate owns its key; the caller's reference is borrowed.
+            gate.insert(reference.to_owned(), Err(detail));
         }
         Gate::Retry => {}
     }
@@ -284,15 +284,27 @@ pub(crate) fn ensure_network(registry: &CanonicalRegistryId) -> Result<(), ApiEr
     let raw = await_reply("use_network", READ_TIMEOUT, |done| {
         client.use_network_async_with_timeout(&registry.reference, READ_TIMEOUT, done)
     })?;
-    let answer = interpret_use_network(&raw);
-    remember(&mut lock(&NETWORK_GATE), &registry.reference, &answer);
-    match answer {
-        Gate::Accepted => Ok(()),
+    match interpret_use_network(&raw) {
+        Gate::Accepted => {
+            remember(
+                &mut lock(&NETWORK_GATE),
+                &registry.reference,
+                Gate::Accepted,
+            );
+            Ok(())
+        }
         Gate::Refused(detail) => {
+            // The reply is built first; the detail then moves into the gate.
             let err = network_refused(registry, &detail);
+            remember(
+                &mut lock(&NETWORK_GATE),
+                &registry.reference,
+                Gate::Refused(detail),
+            );
             eprintln!("membership provider: {}", err.message);
             Err(err)
         }
+        // Not remembered: asked again next time.
         Gate::Retry => Err(ApiError::new(
             ErrorKind::NotReady,
             format!(
@@ -1205,13 +1217,13 @@ mod tests {
     #[test]
     fn only_definitive_answers_are_remembered() {
         let mut gate = HashMap::new();
-        remember(&mut gate, "devnet", &Gate::Retry);
+        remember(&mut gate, "devnet", Gate::Retry);
         assert!(gate.is_empty(), "a retry must be asked again");
-        remember(&mut gate, "devnet", &Gate::Accepted);
+        remember(&mut gate, "devnet", Gate::Accepted);
         remember(
             &mut gate,
             "testnet",
-            &Gate::Refused("bound to devnet".to_owned()),
+            Gate::Refused("bound to devnet".to_owned()),
         );
         assert_eq!(gate.get("devnet"), Some(&Ok(())));
         assert_eq!(

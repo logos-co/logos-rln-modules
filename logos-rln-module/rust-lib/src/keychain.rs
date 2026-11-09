@@ -217,16 +217,19 @@ pub(crate) fn auto_unlock_disabled() -> bool {
 fn read_file_secret(dir: &std::path::Path) -> (Option<Zeroizing<String>>, Option<String>) {
     match std::fs::read_to_string(dir.join(AUTO_SECRET_FILE)) {
         Ok(raw) => {
-            let raw = Zeroizing::new(raw);
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
+            // Trimmed in place: one buffer, wiped on drop (spare capacity included).
+            let mut secret = Zeroizing::new(raw);
+            let end = secret.trim_end().len();
+            secret.truncate(end);
+            let start = secret.len() - secret.trim_start().len();
+            secret.drain(..start);
+            if secret.is_empty() {
                 (
                     None,
                     Some(format!("{AUTO_SECRET_FILE} is present but empty")),
                 )
             } else {
-                // OWNERSHIP: the trimmed secret is its own wiped copy; `raw` is wiped on drop.
-                (Some(Zeroizing::new(trimmed.to_string())), None)
+                (Some(secret), None)
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),

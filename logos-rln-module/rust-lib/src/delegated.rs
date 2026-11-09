@@ -134,11 +134,12 @@ impl DelegatedOptions {
 
     /// The RegistryOptions flat pairs `parse_registry_options` leaves
     /// (rate_limit removed) — `register_membership`'s delegated vocabulary.
-    /// `None` = a funded registration, which takes no auth material.
+    /// `None` = a funded registration, which takes no auth material. The
+    /// option texts move out of `opts`.
     pub(crate) fn from_registry_options(
-        opts: &serde_json::Value,
+        mut opts: serde_json::Value,
     ) -> Result<Option<Self>, ApiError> {
-        if !flat_bool_option(opts, "delegated") {
+        if !flat_bool_option(&opts, "delegated") {
             if ["auth_type", "auth_payload", "auth_provider", "auth_args"]
                 .iter()
                 .any(|k| opts.get(*k).is_some())
@@ -154,24 +155,14 @@ impl DelegatedOptions {
         let d = Self {
             discover: match opts.get("discover") {
                 None => true,
-                Some(_) => flat_bool_option(opts, "discover"),
+                Some(_) => flat_bool_option(&opts, "discover"),
             },
-            // OWNERSHIP: the options own their text; the request is borrowed.
-            gifter_peer_id: opts
-                .get("gifter_peer_id")
-                .and_then(|x| x.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            // OWNERSHIP: the options own their text; the request is borrowed.
-            gifter_multiaddr: opts
-                .get("gifter_multiaddr")
-                .and_then(|x| x.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            auth_type: flat_str_option(opts, "auth_type"),
-            auth_payload: flat_str_option(opts, "auth_payload"),
-            auth_provider: flat_str_option(opts, "auth_provider"),
-            auth_args: flat_str_option(opts, "auth_args"),
+            gifter_peer_id: flat_str_option(&mut opts, "gifter_peer_id").unwrap_or_default(),
+            gifter_multiaddr: flat_str_option(&mut opts, "gifter_multiaddr").unwrap_or_default(),
+            auth_type: flat_str_option(&mut opts, "auth_type"),
+            auth_payload: flat_str_option(&mut opts, "auth_payload"),
+            auth_provider: flat_str_option(&mut opts, "auth_provider"),
+            auth_args: flat_str_option(&mut opts, "auth_args"),
         };
         validate_delegated(&d)?;
         Ok(Some(d))
@@ -186,14 +177,13 @@ pub(crate) fn flat_bool_option(options: &serde_json::Value, key: &str) -> bool {
     options.get(key).and_then(|v| v.as_str()) == Some("true")
 }
 
-/// Read a RegistryOptions flat string field; absent and "" both mean unset.
-/// String-typed by construction — see `flat_bool_option`.
-pub(crate) fn flat_str_option(options: &serde_json::Value, key: &str) -> Option<String> {
-    options
-        .get(key)
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from)
+/// Take a RegistryOptions flat string field out of `options`; absent and ""
+/// both mean unset. String-typed by construction — see `flat_bool_option`.
+pub(crate) fn flat_str_option(options: &mut serde_json::Value, key: &str) -> Option<String> {
+    match options.get_mut(key).map(serde_json::Value::take) {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s),
+        _ => None,
+    }
 }
 
 /// Gifter `request` args for a delegated registration: the scope's registry

@@ -712,20 +712,15 @@ impl Store {
             .collect()
     }
 
-    /// Every membership's persisted epoch-size binding (0 = not yet bound),
-    /// with the registry it belongs to.
-    pub fn epoch_size_bindings(&self) -> Vec<(String, String, u64)> {
+    /// Every membership, for its persisted epoch-size binding
+    /// (`alloc.epoch_size_sec`, 0 = not yet bound) and the registry it
+    /// belongs to (`identity.registry_id`).
+    pub fn epoch_size_bindings(&self) -> Vec<Arc<MembershipRecord>> {
         self.snapshot_arc()
             .records
             .values()
-            // OWNERSHIP: the rows outlive the snapshot handle taken here (one copy per start()).
-            .map(|r| {
-                (
-                    r.hash.clone(),
-                    r.identity.registry_id.clone(),
-                    r.alloc.epoch_size_sec,
-                )
-            })
+            // OWNERSHIP: cheap Arc handle clones of the published records.
+            .cloned()
             .collect()
     }
 
@@ -1554,7 +1549,15 @@ mod tests {
         let store = Store::open(dir.clone()).unwrap();
         assert_eq!(store.unlock("pw").unwrap(), 1);
         assert_eq!(
-            store.epoch_size_bindings(),
+            store
+                .epoch_size_bindings()
+                .iter()
+                .map(|r| (
+                    r.hash.clone(),
+                    r.identity.registry_id.clone(),
+                    r.alloc.epoch_size_sec
+                ))
+                .collect::<Vec<_>>(),
             vec![(hash.clone(), registry, 600)]
         );
         let rewound = store.reserve_message_id(&hash, "aa", 10, 9, 5, 600);
