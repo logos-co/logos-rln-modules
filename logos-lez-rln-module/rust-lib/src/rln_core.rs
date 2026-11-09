@@ -139,7 +139,7 @@ pub const CONFIG_STATE_SIZE: usize = rln_layouts::state::CONFIG_STATE_SIZE;
 pub fn config_field_32(config_data: &[u8], offset: usize) -> [u8; 32] {
     config_data[offset..offset + 32]
         .try_into()
-        .expect("32-byte config field")
+        .expect("invariant: a 32-byte range converts to [u8; 32]")
 }
 
 /// LE-integer field readers for the same offset scheme (callers pre-check
@@ -148,7 +148,7 @@ pub fn config_field_u32(config_data: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(
         config_data[offset..offset + 4]
             .try_into()
-            .expect("u32 config field"),
+            .expect("invariant: a 4-byte range converts to [u8; 4]"),
     )
 }
 
@@ -156,7 +156,7 @@ pub fn config_field_u64(config_data: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(
         config_data[offset..offset + 8]
             .try_into()
-            .expect("u64 config field"),
+            .expect("invariant: an 8-byte range converts to [u8; 8]"),
     )
 }
 
@@ -164,7 +164,7 @@ pub fn config_field_u128(config_data: &[u8], offset: usize) -> u128 {
     u128::from_le_bytes(
         config_data[offset..offset + 16]
             .try_into()
-            .expect("u128 config field"),
+            .expect("invariant: a 16-byte range converts to [u8; 16]"),
     )
 }
 
@@ -278,12 +278,16 @@ pub fn build_merkle_proof(main_data: &[u8], leaf_index: u64) -> Result<RlnMerkle
         return Err(RlnError::InvalidLeafIndex);
     }
 
-    let root: [u8; 32] = main_data[OFFSET_ROOT..OFFSET_ROOT + 32].try_into().unwrap();
+    let root: [u8; 32] = main_data[OFFSET_ROOT..OFFSET_ROOT + 32]
+        .try_into()
+        .expect("invariant: a 32-byte range converts to [u8; 32]");
 
     let cached_defaults: Vec<[u8; 32]> = (0..=depth)
         .map(|level| {
             let start = OFFSET_CACHED_NODES + level * 32;
-            main_data[start..start + 32].try_into().unwrap()
+            main_data[start..start + 32]
+                .try_into()
+                .expect("invariant: a 32-byte range converts to [u8; 32]")
         })
         .collect();
     let tree_data = &main_data[OFFSET_TREE_DATA..];
