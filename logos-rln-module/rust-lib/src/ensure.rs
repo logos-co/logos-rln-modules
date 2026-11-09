@@ -1080,61 +1080,66 @@ pub(crate) struct Progress {
     /// Only ever set with `Step::AwaitingFunding`.
     pub(crate) funding: Option<Funding>,
     /// Why the registry's allocator did not deliver — set once the pass has
-    /// fallen back to the funded steps, cleared when a new pass begins.
+    /// fallen back to the funded steps, kept across the steps recorded after
+    /// it, cleared when a new pass begins.
     pub(crate) fallback_reason: Option<String>,
 }
 
+/// Per registry: the last step reported and the fallback reason in force.
+/// An entry, once recorded, is replaced step by step and never removed.
 static PROGRESS: Mutex<Option<HashMap<String, Progress>>> = Mutex::new(None);
-/// Per registry: the allocator's failure the current pass is working around.
-static FALLBACK: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
+/// Every caller has recorded a step for `registry` earlier in its pass
+/// (`delegate_one` records `Delegating` first; `settle_live` records its wait
+/// before it can answer `Failed`), so the entry exists.
 fn set_fallback(registry: &str, why: &str) {
-    crate::util::lock(&FALLBACK)
-        .get_or_insert_with(HashMap::new)
-        .insert(registry.to_owned(), why.to_owned());
-}
-
-fn clear_fallback(registry: &str) {
-    if let Some(m) = crate::util::lock(&FALLBACK).as_mut() {
-        m.remove(registry);
+    if let Some(p) = crate::util::lock(&PROGRESS)
+        .as_mut()
+        .and_then(|m| m.get_mut(registry))
+    {
+        p.fallback_reason = Some(why.to_owned());
     }
 }
 
-fn fallback_of(registry: &str) -> Option<String> {
-    crate::util::lock(&FALLBACK)
-        .as_ref()
-        .and_then(|m| m.get(registry).cloned())
+fn clear_fallback(registry: &str) {
+    if let Some(p) = crate::util::lock(&PROGRESS)
+        .as_mut()
+        .and_then(|m| m.get_mut(registry))
+    {
+        p.fallback_reason = None;
+    }
 }
 
-fn record_progress(registry: &str, progress: Progress) {
+/// Record a step; the entry's fallback reason stays as it was.
+fn record_progress(registry: &str, step: Step, detail: &str, funding: Option<Funding>) {
     let mut guard = crate::util::lock(&PROGRESS);
-    guard
-        .get_or_insert_with(HashMap::new)
-        .insert(registry.to_owned(), progress);
+    let map = guard.get_or_insert_with(HashMap::new);
+    match map.get_mut(registry) {
+        Some(p) => {
+            p.step = step;
+            p.detail = detail.to_owned();
+            p.funding = funding;
+        }
+        None => {
+            map.insert(
+                registry.to_owned(),
+                Progress {
+                    step,
+                    detail: detail.to_owned(),
+                    funding,
+                    fallback_reason: None,
+                },
+            );
+        }
+    }
 }
 
 fn record(registry: &str, step: Step, detail: &str) {
-    record_progress(
-        registry,
-        Progress {
-            step,
-            detail: detail.to_owned(),
-            funding: None,
-            fallback_reason: None,
-        },
-    );
+    record_progress(registry, step, detail, None);
 }
 
 fn record_funding(registry: &str, detail: &str, funding: Funding) {
-    record_progress(
-        registry,
-        Progress {
-            step: Step::AwaitingFunding,
-            detail: detail.to_owned(),
-            funding: Some(funding),
-            fallback_reason: None,
-        },
-    );
+    record_progress(registry, Step::AwaitingFunding, detail, Some(funding));
 }
 
 /// Note that a pass has been asked for, before its thread has recorded
@@ -1152,11 +1157,8 @@ pub(crate) fn mark_requested(registry: &str) {
 pub(crate) fn progress(registry: &str) -> Option<Progress> {
     crate::util::lock(&PROGRESS)
         .as_ref()
+        // OWNERSHIP: the reader gets a copy taken under the lock.
         .and_then(|m| m.get(registry).cloned())
-        .map(|p| Progress {
-            fallback_reason: fallback_of(registry),
-            ..p
-        })
 }
 
 // ---------------------------------------------------------------------------
