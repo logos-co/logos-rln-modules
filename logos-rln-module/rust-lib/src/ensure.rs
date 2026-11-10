@@ -374,11 +374,12 @@ pub(crate) fn run_with(registries: Vec<Provision>, ticket: u64) {
 }
 
 /// `run_with` for one registry asked for OUTSIDE `start()` — `ensure_membership`
-/// from a UI. It adopts the ticket in force instead of taking a new one, so
-/// it supersedes nothing: a `start()` pass parked on another registry's
-/// funding keeps waiting. The next `start()` ends it like any other pass, and
-/// `is_running` keeps two from working the same registry at once.
-pub(crate) fn run_alongside(registry: String, rate_limit: u64) {
+/// from a UI. It runs under `ticket`, the one its `ActivePass::claim` marker
+/// was taken under, instead of taking a new one, so it supersedes nothing: a
+/// `start()` pass parked on another registry's funding keeps waiting. The next
+/// `start()` after the claim ends it like any other pass, and `is_running`
+/// keeps two from working the same registry at once.
+pub(crate) fn run_alongside(registry: String, rate_limit: u64, ticket: u64) {
     let allocator = crate::config::allocator_for(&registry);
     run_as(
         vec![Provision {
@@ -386,7 +387,7 @@ pub(crate) fn run_alongside(registry: String, rate_limit: u64) {
             rate_limit,
             allocator,
         }],
-        EPOCH.load(Ordering::SeqCst),
+        ticket,
     )
 }
 
@@ -1220,6 +1221,11 @@ impl ActivePass {
         map.insert(registry.to_owned(), ticket);
         Some(ActivePass(registry.to_owned(), ticket))
     }
+
+    /// The ticket the marker was taken under; the pass it rides with runs under it.
+    pub(crate) fn ticket(&self) -> u64 {
+        self.1
+    }
 }
 
 impl Drop for ActivePass {
@@ -1601,6 +1607,44 @@ mod tests {
         let step = ensure::progress(&canonical).expect("a step is recorded");
         assert_eq!(step.step, ensure::Step::AwaitingFunding);
         assert_eq!(step.detail, "keystore locked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A start() landing between ensure_membership's claim and its pass body
+    // ends that pass: the body runs under the claim's ticket, not the one in
+    // force when it gets going.
+    #[test]
+    fn an_ensure_pass_claimed_before_a_start_is_ended_by_it() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        crate::worker::reset_for_test();
+        let dir =
+            std::env::temp_dir().join(format!("rln-ensure-claim-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_imp, store) = imp_with_store(dir.clone());
+        store.unlock("pw").unwrap();
+        let registry = format!("logos:local:{}", "7f".repeat(32));
+        let canonical = registry_id::parse(&registry).unwrap().canonical;
+        // A live membership: a pass that runs at all records `Done` at once.
+        seed_membership(
+            &store,
+            "pc",
+            &canonical,
+            &"57".repeat(32),
+            "",
+            &"e7".repeat(32),
+            MembershipState::Active,
+            3,
+            100,
+        );
+
+        let pass = ActivePass::claim(&canonical).expect("no pass holds the registry");
+        ensure::mark_requested(&canonical);
+        ensure::supersede();
+        ensure::run_alongside(canonical.clone(), 100, pass.ticket());
+        let step = ensure::progress(&canonical).expect("a step is recorded");
+        assert_eq!(step.step, ensure::Step::WaitingForWallet);
+        assert_eq!(step.detail, "");
+        drop(pass);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

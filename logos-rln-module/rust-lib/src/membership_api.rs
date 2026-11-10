@@ -268,6 +268,7 @@ pub(crate) fn ensure_membership_impl(
         ensure::mark_requested(&registry.canonical);
         // OWNERSHIP: moved into the pass thread; the reply below reads the registry.
         let canonical = registry.canonical.clone();
+        let ticket = pass.ticket();
         // OWNERSHIP: detached (handle dropped, not in SUP): the thread owns the marker, the id and the rate; EPOCH and STOPPED end the pass.
         std::thread::Builder::new()
             .name("rln-ensure".to_owned())
@@ -276,7 +277,7 @@ pub(crate) fn ensure_membership_impl(
                 // The order start() keeps: the registry's network binds
                 // the lez module's wallet before anything reads through it.
                 provider::select_networks(std::slice::from_ref(&canonical));
-                ensure::run_alongside(canonical, rate_limit);
+                ensure::run_alongside(canonical, rate_limit, ticket);
             })
             .map_err(|e| ApiError::internal(format!("cannot spawn provisioning: {e}")))?;
     }
