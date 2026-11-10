@@ -1090,6 +1090,7 @@ fn bring_up(home: &Path) {
     });
     *state = Readiness::Ready;
     SETTLED.notify_all();
+    drop(state);
     eprintln!("lez-rln wallet: ready ({})", home.display());
 }
 
@@ -1683,21 +1684,23 @@ pub(crate) fn send_generic_public_transaction(
 
     let wallet = wallet("send_generic_public_transaction")?;
     let mut result = ffi::TransactionResult::default();
-    // SAFETY: a live handle; mentions, message and payer all outlive the call;
-    // the out struct is ours.
-    let rc = unsafe {
+    let rc = {
         // One submission at a time; see SEND_LOCK.
         let _serialized = lock(&SEND_LOCK);
-        ffi::wallet_ffi_send_generic_public_transaction(
-            wallet.0,
-            ffi_mentions.as_ptr(),
-            ffi_mentions.len(),
-            root,
-            message.as_ptr(),
-            message.len(),
-            payer_ptr,
-            &raw mut result,
-        )
+        // SAFETY: a live handle; mentions, message and payer all outlive the call;
+        // the out struct is ours.
+        unsafe {
+            ffi::wallet_ffi_send_generic_public_transaction(
+                wallet.0,
+                ffi_mentions.as_ptr(),
+                ffi_mentions.len(),
+                root,
+                message.as_ptr(),
+                message.len(),
+                payer_ptr,
+                &raw mut result,
+            )
+        }
     };
     if rc != ffi::SUCCESS {
         let error = send_error(rc);

@@ -67,11 +67,11 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// (60-90s on testnet), and a duplicate Register submit poisons the allocator
 /// wallet's nonce sequence for the whole confirmation window.
 ///
-/// The key is the membership PDA hex — the canonical `(tree_id,
+/// The key is the membership PDA id — the canonical `(tree_id,
 /// id_commitment)` identity — NOT the raw caller strings: equivalent but
 /// differently-formatted inputs (`0xAB..` vs `ab..`, base58 vs 64-hex) must
 /// land in the same slot.
-type RegInFlightMap = std::collections::HashMap<String, (RegisterReply, Instant)>;
+type RegInFlightMap = std::collections::HashMap<[u8; 32], (RegisterReply, Instant)>;
 
 // OWNERSHIP: Mutex — handlers and watcher threads share the map; LazyLock because
 // `HashMap::new` is not const.
@@ -82,6 +82,11 @@ static REG_IN_FLIGHT: std::sync::LazyLock<Mutex<RegInFlightMap>> =
 /// same session, so entries expire; 300s still covers both the seconds-apart
 /// double-fire and the 60-90s testnet confirmation delay.
 const REG_IN_FLIGHT_TTL: Duration = Duration::from_secs(300);
+
+/// The caller's payer must hold the registry price plus the fee reserve.
+fn can_afford(balance: u128, price: u128, reserve: u128) -> bool {
+    balance >= price.saturating_add(reserve)
+}
 
 fn reg_in_flight<R>(f: impl FnOnce(&mut RegInFlightMap) -> R) -> R {
     let mut map = lock(&REG_IN_FLIGHT);
@@ -636,7 +641,7 @@ struct RegisterWatch {
     payer_hex: String,
     id_commitment: [u8; 32],
     rate_limit: u64,
-    reg_key: String,
+    reg_key: [u8; 32],
     tx_hash: String,
 }
 
@@ -694,7 +699,7 @@ fn preflight_register(
         .saturating_mul(exec)
         .saturating_add(REGISTER_DATA_ALLOWANCE.saturating_mul(stor));
     let needed = price.saturating_add(reserve);
-    if balance < needed {
+    if !can_afford(balance, price, reserve) {
         return Err(format!(
             "insufficient_balance: payer {payer_hex} holds {balance}, a registration needs {needed} \
              ({price} price + {reserve} fee reserve at the next block's base fee ceiling)"
@@ -812,8 +817,7 @@ fn register_watch(mut w: RegisterWatch) {
         };
         let reply = RegisterReply::pending(plan.next_leaf_index, w.rate_limit, Some(&send_result));
         w.tx_hash = send_result.into_tx_hash();
-        // OWNERSHIP: the map owns a key copy; the watcher keeps its own for the next polls.
-        reg_in_flight(|m| m.insert(w.reg_key.clone(), (reply, Instant::now())));
+        reg_in_flight(|m| m.insert(w.reg_key, (reply, Instant::now())));
     }
     // The entry goes with its watcher: a re-send refreshed its timestamp, so
     // left alone it would answer "pending" for up to another TTL with nobody
@@ -1040,7 +1044,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
 
         // In-flight dedup (see REG_IN_FLIGHT): the first caller submits;
         // concurrent and repeat callers get the first submission's reply.
-        let reg_key = bytes_to_hex(&plan.membership_account_id);
+        let reg_key = plan.membership_account_id;
         let placeholder = RegisterReply::pending(plan.next_leaf_index, rate_limit, None);
         // A prior entry is answered from under the lock (its rate and its
         // text); the map keeps the entry itself.
@@ -1053,9 +1057,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
                 Some((prior_rate, reply.to_json()))
             }
             None => {
-                // OWNERSHIP: the map owns a key copy; this call keeps reg_key for
-                // its own later inserts, the removal and the watcher.
-                m.insert(reg_key.clone(), (placeholder, Instant::now()));
+                m.insert(reg_key, (placeholder, Instant::now()));
                 None
             }
         });
@@ -1099,8 +1101,7 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
         // from the membership PDA.
         let reply = RegisterReply::pending(plan.next_leaf_index, rate_limit, Some(&send_result));
         let reply_json = reply.to_json();
-        // OWNERSHIP: the map owns a key copy; the watcher takes reg_key itself.
-        reg_in_flight(|m| m.insert(reg_key.clone(), (reply, Instant::now())));
+        reg_in_flight(|m| m.insert(reg_key, (reply, Instant::now())));
         spawn_register_watch(RegisterWatch {
             config_account: ctx.config_account,
             payer_hex,
@@ -1315,8 +1316,8 @@ mod tests {
     // fall out of the dedup map, while a fresh entry keeps deduping.
     #[test]
     fn reg_in_flight_entries_expire_after_ttl() {
-        let stale_key = "aa".repeat(32);
-        let fresh_key = "bb".repeat(32);
+        let stale_key = [0xaa_u8; 32];
+        let fresh_key = [0xbb_u8; 32];
         let Some(back_dated) =
             Instant::now().checked_sub(REG_IN_FLIGHT_TTL + Duration::from_secs(1))
         else {
@@ -1324,14 +1325,8 @@ mod tests {
             return;
         };
         reg_in_flight(|m| {
-            m.insert(
-                stale_key.clone(),
-                (RegisterReply::refused("stale"), back_dated),
-            );
-            m.insert(
-                fresh_key.clone(),
-                (RegisterReply::refused("fresh"), Instant::now()),
-            );
+            m.insert(stale_key, (RegisterReply::refused("stale"), back_dated));
+            m.insert(fresh_key, (RegisterReply::refused("fresh"), Instant::now()));
         });
         reg_in_flight(|m| {
             assert!(!m.contains_key(&stale_key), "stale entry must be evicted");
@@ -1341,6 +1336,27 @@ mod tests {
             );
             m.remove(&fresh_key);
         });
+    }
+
+    // Pins today's preflight arithmetic: the balance read is the caller's
+    // payer (which may differ from the module payer) and must cover the price
+    // plus the fee reserve.
+    #[test]
+    fn preflight_requires_the_callers_payer_to_cover_price_and_fee_reserve() {
+        let (price, reserve) = (1_000_u128, 50_u128);
+        // Exactly price + reserve is enough; one less is not.
+        assert!(can_afford(1_050, price, reserve));
+        assert!(!can_afford(1_049, price, reserve));
+        // A caller payer that covers only the price is refused.
+        assert!(!can_afford(1_000, price, reserve));
+        // Different payers: a rich module payer does not help a poor caller
+        // payer, because only the caller's balance is compared.
+        let (module_payer_balance, caller_payer_balance) = (10_000_u128, 100_u128);
+        assert!(can_afford(module_payer_balance, price, reserve));
+        assert!(!can_afford(caller_payer_balance, price, reserve));
+        // Saturating sums never wrap.
+        assert!(!can_afford(u128::MAX - 1, u128::MAX, 1));
+        assert!(can_afford(u128::MAX, u128::MAX, 1));
     }
 
     // Pins proofs_with_roots_json to the byte output of the string
