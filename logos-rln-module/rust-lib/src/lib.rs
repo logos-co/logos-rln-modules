@@ -637,7 +637,10 @@ impl LiblogosRlnModule for LogosRlnModuleImpl {
 
 // The one `no_mangle` the scaffold contract requires of author code: the
 // generated `__logos_install_hook` resolves this symbol by linkage.
-#[allow(unsafe_code)]
+#[allow(
+    unsafe_code,
+    reason = "the scaffold contract's one #[no_mangle] install symbol"
+)]
 #[no_mangle]
 pub extern "Rust" fn logos_module_install() {
     install::<LogosRlnModuleImpl>();

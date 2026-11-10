@@ -170,13 +170,7 @@ static BACKEND: Mutex<Option<Box<dyn Keychain + Send>>> = Mutex::new(None);
 
 fn with_backend<R>(f: impl FnOnce(&dyn Keychain) -> R) -> R {
     let mut guard = crate::util::lock(&BACKEND);
-    if guard.is_none() {
-        *guard = Some(default_backend());
-    }
-    f(guard
-        .as_ref()
-        .expect("invariant: the backend is installed just above")
-        .as_ref())
+    f(&**guard.get_or_insert_with(default_backend))
 }
 
 #[cfg(test)]

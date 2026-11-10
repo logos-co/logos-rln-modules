@@ -647,8 +647,7 @@ impl Store {
     // ---------------------------------------------------- snapshot reads
 
     pub fn membership(&self, hash: &str) -> Option<Arc<MembershipRecord>> {
-        // OWNERSHIP: cheap Arc handle clone of the published record.
-        self.snapshot_arc().records.get(hash).cloned()
+        self.snapshot_arc().records.get(hash).map(Arc::clone)
     }
 
     pub fn records_for(&self, canonical_registry: &str) -> Vec<Arc<MembershipRecord>> {
@@ -656,8 +655,7 @@ impl Store {
             .records
             .values()
             .filter(|r| r.identity.registry_id == canonical_registry)
-            // OWNERSHIP: cheap Arc handle clones of the published records.
-            .cloned()
+            .map(Arc::clone)
             .collect()
     }
 
@@ -679,8 +677,7 @@ impl Store {
             .records
             .values()
             .filter(|r| awaits_confirmation(r))
-            // OWNERSHIP: cheap Arc handle clones of the published records.
-            .cloned()
+            .map(Arc::clone)
             .collect()
     }
 
@@ -708,8 +705,7 @@ impl Store {
                             | MembershipState::Unknown
                     )
             })
-            // OWNERSHIP: cheap Arc handle clones of the published records.
-            .cloned()
+            .map(Arc::clone)
             .collect()
     }
 
@@ -720,8 +716,7 @@ impl Store {
         self.snapshot_arc()
             .records
             .values()
-            // OWNERSHIP: cheap Arc handle clones of the published records.
-            .cloned()
+            .map(Arc::clone)
             .collect()
     }
 
@@ -873,9 +868,8 @@ impl Store {
     // ----------------------------------------------------------- helpers
 
     fn snapshot_arc(&self) -> Arc<Snapshot> {
-        // OWNERSHIP: cheap Arc handle clone; the snapshot lock is released
-        // before the caller reads.
-        crate::util::lock(&self.snapshot).clone()
+        // The guard is a temporary: the snapshot lock is released at the end of this statement, before the caller reads.
+        Arc::clone(&crate::util::lock(&self.snapshot))
     }
 
     /// Every caller holds the write lock, so the publication read here is

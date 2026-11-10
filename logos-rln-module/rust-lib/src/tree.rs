@@ -125,8 +125,7 @@ impl MerkleProof {
     /// The wire `get_merkle_proof` object: the lidl's keys in alphabetical
     /// order, `valid_roots` only when the source gave one.
     pub(crate) fn to_wire(&self) -> Value {
-        let hexes =
-            |v: &[[u8; 32]]| Value::from(v.iter().map(|e| bytes_to_hex(e)).collect::<Vec<_>>());
+        let hexes = |v: &[[u8; 32]]| v.iter().map(|e| bytes_to_hex(e)).collect::<Value>();
         let mut o = serde_json::Map::new();
         o.insert("depth".into(), Value::from(self.path_elements.len()));
         o.insert("leaf".into(), Value::from(bytes_to_hex(&self.leaf)));

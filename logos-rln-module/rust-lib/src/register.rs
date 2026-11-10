@@ -133,25 +133,24 @@ pub(crate) fn funded_submit_callback(
                 // The lez module refused to submit (an argument or balance the
                 // program would reject). Nothing was sent: fail now with its
                 // reason instead of waiting out the confirmation window.
-                Ok(reply) if register_refusal(&reply).is_some() => {
-                    let why = register_refusal(&reply).unwrap_or_default();
-                    m.record_async_submit_error(&why, false)
-                }
-                // A reply that lands after the poller confirmed the record
-                // from the registry has nothing authoritative to add: the
-                // estimate must not replace the chain's leaf.
-                Ok(_) if m.state != MembershipState::Pending => {}
-                Ok(reply) => {
-                    // The reply's leaf_index is a pre-submit ESTIMATE; recorded
-                    // for observability, authoritative only after the poller's
-                    // read-back.
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&reply) {
-                        if let Some(leaf) = v.get("leaf_index").and_then(|x| x.as_u64()) {
-                            m.leaf_index = Some(leaf);
+                Ok(reply) => match register_refusal(&reply) {
+                    Some(why) => m.record_async_submit_error(&why, false),
+                    // A reply that lands after the poller confirmed the record
+                    // from the registry has nothing authoritative to add: the
+                    // estimate must not replace the chain's leaf.
+                    None if m.state != MembershipState::Pending => {}
+                    None => {
+                        // The reply's leaf_index is a pre-submit ESTIMATE; recorded
+                        // for observability, authoritative only after the poller's
+                        // read-back.
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&reply) {
+                            if let Some(leaf) = v.get("leaf_index").and_then(|x| x.as_u64()) {
+                                m.leaf_index = Some(leaf);
+                            }
                         }
+                        m.tx_result = Some(reply);
                     }
-                    m.tx_result = Some(reply);
-                }
+                },
                 Err(e) => m.record_async_submit_error(&e.message, is_retryable_submit_error(&e)),
             }),
             None => Err(ApiError::internal(
@@ -643,6 +642,48 @@ mod tests {
             store.membership("hp").unwrap().cache.state,
             MembershipState::Active
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn funded_reply_refusal_fails_a_pending_record_and_an_acceptance_records_its_estimate() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir =
+            std::env::temp_dir().join(format!("rln-funded-refusal-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_imp, store) = imp_with_store(dir.clone());
+        store.unlock("pw").unwrap();
+        let registry = format!("logos:local:{}", "6f".repeat(32));
+        for (hash, seed) in [("hr", "4a"), ("hk", "4b")] {
+            seed_membership(
+                &store,
+                hash,
+                &registry,
+                &seed.repeat(32),
+                "",
+                &"fc".repeat(32),
+                MembershipState::Pending,
+                0,
+                100,
+            );
+        }
+        funded_submit_callback(Arc::downgrade(&store), "hr".into())(Ok(
+            r#"{"error":"insufficient_funds: x"}"#.to_string(),
+        ));
+        let rec = store.membership("hr").unwrap();
+        assert_eq!(rec.cache.state, MembershipState::Failed);
+        assert_eq!(
+            rec.cache.failed_reason.as_deref(),
+            Some("submit_failed: insufficient_funds: x")
+        );
+        assert_eq!(rec.cache.retryable, Some(false));
+
+        let accepted = r#"{"leaf_index":3,"pending":true,"tx_result":"{}"}"#;
+        funded_submit_callback(Arc::downgrade(&store), "hk".into())(Ok(accepted.to_string()));
+        let rec = store.membership("hk").unwrap();
+        assert_eq!(rec.cache.state, MembershipState::Pending);
+        assert_eq!(rec.cache.leaf_index, Some(3));
+        assert_eq!(rec.cache.tx_result.as_deref(), Some(accepted));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -221,11 +221,9 @@ pub fn transition_event<'a>(
     }
     // Serde's `rename_all` on MembershipState is the single source of truth
     // for the wire strings.
-    let wire = |s: MembershipState| {
-        serde_json::to_value(s)
-            .ok()
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_default()
+    let wire = |s: MembershipState| match serde_json::to_value(s) {
+        Ok(serde_json::Value::String(text)) => text,
+        _ => String::new(),
     };
     Some((
         &record.identity.registry_id,
