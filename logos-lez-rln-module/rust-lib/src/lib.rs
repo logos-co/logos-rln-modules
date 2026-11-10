@@ -1340,22 +1340,19 @@ mod tests {
         });
     }
 
-    // Pins today's preflight arithmetic: the balance read is the caller's
-    // payer (which may differ from the module payer) and must cover the price
-    // plus the fee reserve.
+    // Pins the preflight arithmetic: a balance must cover the price plus the
+    // fee reserve.
     #[test]
-    fn preflight_requires_the_callers_payer_to_cover_price_and_fee_reserve() {
+    fn can_afford_requires_the_balance_to_cover_price_plus_fee_reserve() {
         let (price, reserve) = (1_000_u128, 50_u128);
         // Exactly price + reserve is enough; one less is not.
         assert!(can_afford(1_050, price, reserve));
         assert!(!can_afford(1_049, price, reserve));
-        // A caller payer that covers only the price is refused.
+        // A balance that covers only the price is refused.
         assert!(!can_afford(1_000, price, reserve));
-        // Different payers: a rich module payer does not help a poor caller
-        // payer, because only the caller's balance is compared.
-        let (module_payer_balance, caller_payer_balance) = (10_000_u128, 100_u128);
-        assert!(can_afford(module_payer_balance, price, reserve));
-        assert!(!can_afford(caller_payer_balance, price, reserve));
+        // A balance well above the sum is enough; one well below it is not.
+        assert!(can_afford(10_000, price, reserve));
+        assert!(!can_afford(100, price, reserve));
         // Saturating sums never wrap.
         assert!(!can_afford(u128::MAX - 1, u128::MAX, 1));
         assert!(can_afford(u128::MAX, u128::MAX, 1));
