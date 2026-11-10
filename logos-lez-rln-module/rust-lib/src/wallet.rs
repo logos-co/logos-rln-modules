@@ -107,12 +107,12 @@ const READY_WAIT: Duration = Duration::from_secs(30);
 /// sequencer allows; unused gas is refunded, so a cheaper call still pays less.
 pub(crate) const GAS_LIMIT: u64 = 10_000_000;
 
-#[allow(unsafe_code)]
+#[allow(unsafe_code, reason = "core_ffi C-ABI declarations")]
 mod ffi {
     //! Declarations for LEZ's `core_ffi` library, mirrored field
-    //! for field from `core_ffi.h`. `#[allow(unsafe_code)]` is scoped to this
-    //! module, as it is for the generated scaffold and the lp test transport:
-    //! the crate keeps `deny(unsafe_code)` everywhere else.
+    //! for field from `core_ffi.h`. The calls sit in the wallet functions below,
+    //! each with its own scoped `unsafe_code` exemption; the crate keeps
+    //! `deny(unsafe_code)` everywhere else.
     use std::ffi::{c_char, c_void};
 
     pub type WalletHandle = c_void;
@@ -376,7 +376,10 @@ mod ffi {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "unsafe impl Send/Sync for the opaque core_ffi wallet pointer"
+)]
 mod handle {
     /// The opaque wallet pointer.
     ///
@@ -391,6 +394,8 @@ mod handle {
     // SAFETY: the pointer is opaque — this crate never dereferences it — and
     // every library entry point takes the wallet's own lock before use.
     unsafe impl Send for Handle {}
+    // SAFETY: a shared `&Handle` only passes the pointer to core_ffi entry points, each of
+    // which takes the wallet's own lock, so concurrent calls are serialized by the library.
     unsafe impl Sync for Handle {}
 }
 use handle::Handle;
@@ -460,7 +465,6 @@ pub(crate) enum Source {
 }
 
 impl Source {
-    // OWNERSHIP: every name is a string literal.
     fn as_str(self) -> &'static str {
         match self {
             Source::Table => "table",
@@ -491,7 +495,6 @@ pub(crate) struct EnvView {
 
 impl EnvView {
     fn from_env() -> Self {
-        // OWNERSHIP: the trimmed copy outlives the variable's temporary String.
         let read = |name: &str| std::env::var(name).unwrap_or_default().trim().to_owned();
         let sequencer = read(SEQUENCER_ENV);
         let mut network = read(NETWORK_ENV);
@@ -544,7 +547,6 @@ pub(crate) fn plan_home(home: &Path, env: EnvView) -> Plan {
     }
     if !env.network.is_empty() {
         return match networks::network(&env.network) {
-            // OWNERSHIP: the plan owns copies of the static table's strings.
             Some(n) => Plan::Provision {
                 sequencer: n.sequencer.clone(),
                 binding: Binding::Recorded {
@@ -645,7 +647,9 @@ struct Selector {
 /// must not both find the home unconfigured.
 ///
 /// Lock order: `SELECTION` before `STATE`, never the reverse — `pending` and
-/// `fail` take `STATE` while this is held.
+/// `fail` take `STATE` while this is held. `perform` runs under it too, so one
+/// step's `STATE` write lands before the next step can start bring-up —
+/// releasing first would let an Await overwrite a concurrent bind's Ready.
 // OWNERSHIP: Mutex — on_context_ready, use_network and every chain read share the selection.
 static SELECTION: Mutex<Selector> = Mutex::new(Selector {
     selection: Selection::Unresolved,
@@ -677,7 +681,6 @@ fn apply_plan(sel: &mut Selector, home: PathBuf, plan: Plan) -> Action {
     match plan {
         Plan::Adopt(binding) => {
             log_binding("adopting", &home, &binding);
-            // OWNERSHIP: two owners — the selection keeps the home; the action starts on it.
             sel.selection = Selection::Bound {
                 home: home.clone(),
                 binding,
@@ -686,12 +689,10 @@ fn apply_plan(sel: &mut Selector, home: PathBuf, plan: Plan) -> Action {
         }
         Plan::Provision { sequencer, binding } => {
             if let Err(e) = provision_home(&home, &sequencer, &binding) {
-                // OWNERSHIP: two owners — the selection and the action each keep the reason.
                 sel.selection = Selection::Failed(e.clone());
                 return Action::Fail(e);
             }
             log_binding(&format!("provisioned for {sequencer}"), &home, &binding);
-            // OWNERSHIP: two owners — the selection keeps the home; the action starts on it.
             sel.selection = Selection::Bound {
                 home: home.clone(),
                 binding,
@@ -704,7 +705,6 @@ fn apply_plan(sel: &mut Selector, home: PathBuf, plan: Plan) -> Action {
             Action::Await
         }
         Plan::Failed(reason) => {
-            // OWNERSHIP: two owners — the selection and the action each keep the reason.
             sel.selection = Selection::Failed(reason.clone());
             Action::Fail(reason)
         }
@@ -736,7 +736,6 @@ struct NetworkReply {
     /// Not accepted YET: the home is not known, ask again.
     retry: bool,
     /// "table" | "env" | "operator"; "" when nothing is bound.
-    // OWNERSHIP: every source is a string literal.
     source: &'static str,
 }
 
@@ -745,7 +744,6 @@ impl NetworkReply {
         Self {
             accepted: false,
             detail,
-            // OWNERSHIP: the reply owns its copy; a bound network stays in the selection.
             network: network.to_owned(),
             retry: false,
             source: "",
@@ -774,7 +772,6 @@ fn select_network(sel: &mut Selector, reference: &str) -> (NetworkReply, Action)
             return (
                 NetworkReply {
                     accepted: false,
-                    // OWNERSHIP: the reply's detail is an owned String (most are formatted).
                     detail: "the wallet home is not resolved yet".to_owned(),
                     network: String::new(),
                     retry: true,
@@ -818,7 +815,6 @@ fn select_network(sel: &mut Selector, reference: &str) -> (NetworkReply, Action)
             Selection::Failed(reason) => {
                 NetworkReply::refused(format!("the wallet cannot come up: {reason}"), "")
             }
-            // OWNERSHIP: the reply's detail is an owned String (most are formatted).
             _ => NetworkReply::refused("the wallet home changed under selection".to_owned(), ""),
         };
         return (reply, action);
@@ -830,7 +826,6 @@ fn select_network(sel: &mut Selector, reference: &str) -> (NetworkReply, Action)
             Action::None,
         );
     };
-    // OWNERSHIP: the binding and the plan own copies of the static table's strings.
     let binding = Binding::Recorded {
         network: network.reference.clone(),
         source: Source::Table,
@@ -844,7 +839,6 @@ fn select_network(sel: &mut Selector, reference: &str) -> (NetworkReply, Action)
         },
     );
     let reply = match &action {
-        // OWNERSHIP: two owners — the reply reports the reason, the action records it.
         Action::Fail(e) => NetworkReply::refused(e.clone(), ""),
         _ => NetworkReply {
             accepted: true,
@@ -876,7 +870,6 @@ fn answer_bound(
             }
             NetworkReply {
                 accepted: true,
-                // OWNERSHIP: the reply's detail is an owned String (most are formatted).
                 detail: "operator-configured home; the network is not checked".to_owned(),
                 network: reference,
                 retry: false,
@@ -982,7 +975,6 @@ pub(crate) fn spawn_bring_up(persistence_path: &str) {
                     "no instance_persistence_path from the host and no {HOME_ENV} — the wallet \
                      has nowhere to live"
                 );
-                // OWNERSHIP: two owners — the selection and the readiness each keep the reason.
                 sel.selection = Selection::Failed(reason.clone());
                 fail(reason);
                 return;
@@ -1005,7 +997,6 @@ fn start_bring_up(home: PathBuf) {
         return;
     }
     std::thread::Builder::new()
-        // OWNERSHIP: Builder::name takes an owned String.
         .name("lez-rln-wallet".to_owned())
         .spawn(move || bring_up(&home))
         .map(|_| ())
@@ -1015,7 +1006,7 @@ fn start_bring_up(home: PathBuf) {
         });
 }
 
-/// Guards `spawn_bring_up` against a second entry; see there.
+/// Guards `start_bring_up` against a second entry; see there.
 static BRINGUP_STARTED: AtomicBool = AtomicBool::new(false);
 
 fn fail(reason: String) {
@@ -1194,7 +1185,7 @@ enum OpenError {
     Fatal(String),
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code, reason = "core_ffi open/create_new; frees the mnemonic")]
 fn open_or_create(config: &Path, storage: &Path) -> Result<Handle, OpenError> {
     let c = cstring(config).map_err(OpenError::Fatal)?;
     let s = cstring(storage).map_err(OpenError::Fatal)?;
@@ -1266,7 +1257,7 @@ fn open_or_create(config: &Path, storage: &Path) -> Result<Handle, OpenError> {
 /// The public key behind `payer_hex` as 64 hex chars, or "" when the wallet
 /// holds no signing key for it. Loud: such a payer cannot sign, so nothing
 /// this module sends would be accepted.
-#[allow(unsafe_code)]
+#[expect(unsafe_code, reason = "core_ffi wallet_ffi_get_public_account_key")]
 fn public_key_of(handle: &Handle, payer_hex: &str) -> String {
     let Some(bytes) = crate::hex::hex_to_bytes32(payer_hex) else {
         return String::new();
@@ -1288,7 +1279,7 @@ fn public_key_of(handle: &Handle, payer_hex: &str) -> String {
     bytes_to_hex(&out.public_key.data)
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code, reason = "core_ffi wallet_ffi_import_public_account")]
 fn import_payer_key(handle: &Handle) -> Result<(), String> {
     let Ok(raw) = std::env::var(PAYER_KEY_ENV) else {
         return Ok(());
@@ -1353,7 +1344,7 @@ fn fee_payer_env_hex() -> Result<Option<String>, String> {
 /// account is worth nothing until someone transfers to it — which is exactly
 /// why the id is published (`wallet_status`) rather than kept private: an
 /// operator, or the e2e harness, has to be able to send to it.
-#[allow(unsafe_code)]
+#[expect(unsafe_code, reason = "core_ffi wallet_ffi_create_account_public")]
 fn resolve_payer(handle: &Handle, home: &Path) -> Result<String, String> {
     if let Some(configured) = fee_payer_env_hex()? {
         eprintln!("lez-rln wallet: paying from the configured account {configured}");
@@ -1399,7 +1390,7 @@ fn resolve_payer(handle: &Handle, home: &Path) -> Result<String, String> {
     Ok(id)
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code, reason = "core_ffi wallet_ffi_save")]
 fn save(handle: &Handle) -> Result<(), String> {
     // SAFETY: a live handle.
     let rc = unsafe { ffi::wallet_ffi_save(handle.0) };
@@ -1414,7 +1405,7 @@ fn save(handle: &Handle) -> Result<(), String> {
 /// The wallet serves no reads while a sync runs, but during bring-up nothing
 /// is being served yet — handlers wait on `SETTLED` — so this takes the whole
 /// range in one call.
-#[allow(unsafe_code)]
+#[expect(unsafe_code, reason = "core_ffi block height and sync")]
 fn sync(handle: &Handle) -> Result<u64, String> {
     let mut head: u64 = 0;
     // SAFETY: a live handle and a valid out-pointer.
@@ -1459,7 +1450,6 @@ fn wallet_config_json(sequencer: &str) -> String {
 
 /// The wallet, once bring-up has settled. `None` means unusable, and the
 /// caller reports an empty string.
-// OWNERSHIP: process-lifetime borrow of the handle in the write-once `WALLET` static.
 fn wallet(who: &str) -> Option<&'static Handle> {
     let mut state = lock(&STATE);
     loop {
@@ -1498,7 +1488,10 @@ pub(crate) enum AccountRead {
     Error,
 }
 
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "core_ffi account read; views and frees the library-owned buffers"
+)]
 pub(crate) fn read_account(account_id: &[u8; 32]) -> AccountRead {
     let Some(wallet) = wallet("read_account") else {
         return AccountRead::Error;
@@ -1520,13 +1513,13 @@ pub(crate) fn read_account(account_id: &[u8; 32]) -> AccountRead {
         );
         return AccountRead::Error;
     }
-    // SAFETY: on success the library hands back an actor-state array it owns,
-    // valid for `actor_states_len` entries, each pointing at `data_len` bytes,
-    // until `wallet_ffi_free_account_data`.
     let states: &[ffi::ActorState] =
         if account.actor_states.is_null() || account.actor_states_len == 0 {
             &[]
         } else {
+            // SAFETY: non-null and non-empty (checked above); on success the library owns this
+            // array of `actor_states_len` entries until `wallet_ffi_free_account_data` below, and
+            // `states` is not used after it.
             unsafe { std::slice::from_raw_parts(account.actor_states, account.actor_states_len) }
         };
     let mut out = Vec::with_capacity(states.len());
@@ -1534,6 +1527,8 @@ pub(crate) fn read_account(account_id: &[u8; 32]) -> AccountRead {
         let data: &[u8] = if state.data.is_null() || state.data_len == 0 {
             &[]
         } else {
+            // SAFETY: non-null and non-empty (checked above); `data_len` bytes the library owns
+            // until the free below, copied out before it.
             unsafe { std::slice::from_raw_parts(state.data, state.data_len) }
         };
         // OWNERSHIP: required copy — the library frees this buffer just below.
@@ -1586,7 +1581,6 @@ impl Mention {
 }
 
 /// A send failure as the `<kind>: <reason>` string callers match on.
-// OWNERSHIP: an owned String in every arm — the SendResult stores it and one arm formats.
 fn send_error(rc: i32) -> String {
     match rc {
         ffi::PAYER_CANNOT_FUND => {
@@ -1649,7 +1643,10 @@ impl SendResult {
 /// Submit a public transaction: `message` is delivered to the actor
 /// `mentions[root]` selects, and every mention is declared, in order. `None`
 /// when the arguments are unusable or the wallet is not up (logged).
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "core_ffi send; reads and frees the library-owned result"
+)]
 pub(crate) fn send_generic_public_transaction(
     mentions: &[Mention],
     root: usize,
@@ -1714,12 +1711,12 @@ pub(crate) fn send_generic_public_transaction(
             tx_hash: String::new(),
         });
     }
-    // SAFETY: on success tx_hash is null or a null-terminated string the
-    // library owns until the free below.
     let tx_hash = if result.tx_hash.is_null() {
         String::new()
     } else {
         // OWNERSHIP: required copy — the library frees the string just below.
+        // SAFETY: non-null (checked above); a null-terminated string the library owns until the
+        // free below.
         unsafe { std::ffi::CStr::from_ptr(result.tx_hash) }
             .to_string_lossy()
             .into_owned()
@@ -1736,7 +1733,6 @@ pub(crate) fn send_generic_public_transaction(
 }
 
 /// The account this module signs and pays with, or "" before bring-up settles.
-// OWNERSHIP: process-lifetime borrow from the `WALLET` static, never replaced or freed.
 pub(crate) fn payer_hex() -> &'static str {
     WALLET
         .get()
@@ -1749,10 +1745,9 @@ pub(crate) fn payer_hex() -> &'static str {
 /// id is malformed, or the sequencer did not reply. That is deliberately not
 /// zero: a caller deciding whether it can afford to register would read an
 /// unreachable chain as "broke" and give up permanently.
-#[allow(unsafe_code)]
+#[expect(unsafe_code, reason = "core_ffi wallet_ffi_get_balance")]
 pub(crate) fn native_balance(account_hex: &str) -> Option<(String, u128)> {
     let id_hex = if account_hex.trim().is_empty() {
-        // OWNERSHIP: the reply carries its own copy; `WALLET` keeps the payer.
         payer_hex().to_owned()
     } else {
         crate::hex::canonical_account_hex(account_hex)?

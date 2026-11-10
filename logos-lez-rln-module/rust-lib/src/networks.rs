@@ -38,7 +38,10 @@ struct Table {
 pub(crate) struct Network {
     pub(crate) reference: String,
     // Descriptive only; read by the tests and by humans.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "descriptive; read by the tests and by humans")
+    )]
     pub(crate) description: String,
     pub(crate) sequencer: String,
     pub(crate) registries: Vec<Registry>,
@@ -49,15 +52,39 @@ pub(crate) struct Network {
 pub(crate) struct Registry {
     // Only `config_account` is read at runtime (`network_of_config`); the rest
     // identify the deployment for whoever edits the table.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "identifies the deployment for whoever edits the table"
+        )
+    )]
     pub(crate) deployment: String,
     /// Base58, as the descriptor carries it.
     pub(crate) config_account: String,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "identifies the deployment for whoever edits the table"
+        )
+    )]
     pub(crate) tree_id: String,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "identifies the deployment for whoever edits the table"
+        )
+    )]
     pub(crate) registration_program_id: String,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "identifies the deployment for whoever edits the table"
+        )
+    )]
     pub(crate) merkle_program_id: String,
 }
 
@@ -76,7 +103,6 @@ fn parse(raw: &str) -> Result<Vec<Network>, String> {
 /// as empty — a module that knows no networks still serves an operator-staged
 /// home — rather than panicking across the FFI boundary.
 /// `tests::the_embedded_table_parses` keeps that from shipping.
-// OWNERSHIP: the compile-time table, parsed once into a static and never freed.
 fn table() -> &'static [Network] {
     // OWNERSHIP: OnceLock — parsed on first use by whichever thread asks first.
     static TABLE: OnceLock<Vec<Network>> = OnceLock::new();
@@ -89,14 +115,12 @@ fn table() -> &'static [Network] {
 }
 
 /// The network a CAIP-2 reference names, if this build knows it.
-// OWNERSHIP: borrowed from the static table.
 pub(crate) fn network(reference: &str) -> Option<&'static Network> {
     table().iter().find(|n| n.reference == reference)
 }
 
 /// The network a registry's config account (64-hex) is deployed on, if the
 /// table lists it.
-// OWNERSHIP: borrowed from the static table.
 pub(crate) fn network_of_config(config_hex: &str) -> Option<&'static Network> {
     let config_hex = config_hex.trim().to_ascii_lowercase();
     table().iter().find(|n| {
@@ -107,7 +131,6 @@ pub(crate) fn network_of_config(config_hex: &str) -> Option<&'static Network> {
 }
 
 /// Every reference in table order, for a refusal to list.
-// OWNERSHIP: borrowed from the static table.
 pub(crate) fn known_references() -> Vec<&'static str> {
     table().iter().map(|n| n.reference.as_str()).collect()
 }
