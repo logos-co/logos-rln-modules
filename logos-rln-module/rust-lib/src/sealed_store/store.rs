@@ -540,18 +540,27 @@ impl Store {
         // caller (register) mints a fresh random identity, so the same hash
         // never recurs with real spent slots. A future import/restore path that
         // reuses a hash would make this a slot-reissue footgun — gate it there.
-        let was_quarantined =
-            inner.census_quarantined.remove(hash) | inner.keyed_quarantined.remove(hash);
-        if was_quarantined {
+        let was_census_quarantined = inner.census_quarantined.remove(hash);
+        let was_keyed_quarantined = inner.keyed_quarantined.remove(hash);
+        // What a failed commit puts back: `None` leaves an honest existing
+        // section as is; `Some(prev)` restores the displaced section, or no entry.
+        let section_undo = if was_census_quarantined || was_keyed_quarantined {
+            Some(
+                inner
+                    .sections
+                    .insert(hash.to_string(), AllocationState::default()),
+            )
+        } else if inner.sections.contains_key(hash) {
+            None
+        } else {
             inner
                 .sections
                 .insert(hash.to_string(), AllocationState::default());
-        } else {
-            inner.sections.entry(hash.to_string()).or_default();
-        }
+            Some(None)
+        };
         write_allocations(&self.dir, inner)?;
 
-        inner.cache.insert(
+        let prev_cache = inner.cache.insert(
             hash.to_string(),
             CacheState {
                 state: MembershipState::Pending,
@@ -578,7 +587,7 @@ impl Store {
         let Some(sealed) = inner.sealed.as_mut() else {
             return Err(ApiError::internal("sealed store is not provisioned"));
         };
-        sealed.credentials.insert(
+        let prev_credential = sealed.credentials.insert(
             hash.to_string(),
             SealedEntry {
                 identity,
@@ -586,8 +595,22 @@ impl Store {
                 ct: bytes_to_hex(&ct),
             },
         );
-        fs::write_durable_json(&self.dir, format::SEALED_FILE, sealed)
-            .map_err(|e| ApiError::internal(format!("sealed store save: {e}")))?;
+        if let Err(e) = fs::write_durable_json(&self.dir, format::SEALED_FILE, sealed) {
+            // The commit point did not land: every in-memory trace of this
+            // insert goes, so no later snapshot swap or write publishes it.
+            restore_entry(&mut sealed.credentials, hash, prev_credential);
+            restore_entry(&mut inner.cache, hash, prev_cache);
+            if let Some(prev) = section_undo {
+                restore_entry(&mut inner.sections, hash, prev);
+            }
+            if was_census_quarantined {
+                inner.census_quarantined.insert(hash.to_string());
+            }
+            if was_keyed_quarantined {
+                inner.keyed_quarantined.insert(hash.to_string());
+            }
+            return Err(ApiError::internal(format!("sealed store save: {e}")));
+        }
         self.swap_snapshot(inner);
         Ok(())
     }
@@ -1355,6 +1378,21 @@ fn write_allocations(dir: &Path, inner: &mut Inner) -> Result<(), ApiError> {
     inner.raw_sections = file.sections;
     inner.root_mac_raw = Some(root);
     Ok(())
+}
+
+/// Puts back the value an insert under `key` displaced, or removes the entry
+/// when there was none.
+fn restore_entry<V>(map: &mut BTreeMap<String, V>, key: &str, prev: Option<V>) {
+    match prev {
+        Some(p) => {
+            if let Some(slot) = map.get_mut(key) {
+                *slot = p;
+            }
+        }
+        None => {
+            map.remove(key);
+        }
+    }
 }
 
 fn write_cache(dir: &Path, inner: &Inner) -> Result<(), ApiError> {
@@ -2539,6 +2577,53 @@ mod tests {
         assert!(store.refreshable_records().iter().any(|r| r.hash == hash_b));
         assert_eq!(store.unlock("pw").unwrap(), 2, "zero quarantined");
 
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_sealed_commit_leaves_no_membership() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("failed-commit");
+        let registry = format!("logos:local:{}", "dc".repeat(32));
+        let commitment_a = [0x5cu8; 32];
+        let commitment_b = [0x5du8; 32];
+        let commitment_c = [0x5eu8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash_a = insert_membership(&store, &registry, &commitment_a);
+
+        // A directory at the sealed file's temp path makes the commit write fail.
+        let obstacle = dir.join(format!("{}.tmp", format::SEALED_FILE));
+        std::fs::create_dir(&obstacle).unwrap();
+        let hash_b = registry_id::membership_hash(&registry, &commitment_b);
+        assert!(store
+            .insert(
+                &hash_b,
+                identity_for(&registry, &commitment_b),
+                &credential_for(&registry, &commitment_b),
+                100,
+            )
+            .is_err());
+        std::fs::remove_dir(&obstacle).unwrap();
+
+        store.update_cache(&hash_a, |_| {}).unwrap();
+        assert!(
+            store.membership(&hash_b).is_none(),
+            "an uncommitted insert is not a membership"
+        );
+        let hash_c = insert_membership(&store, &registry, &commitment_c);
+        store.close();
+        drop(store);
+
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(store.membership(&hash_a).is_some());
+        assert!(store.membership(&hash_c).is_some());
+        assert!(
+            store.membership(&hash_b).is_none(),
+            "the failed insert was never persisted"
+        );
         store.close();
         let _ = std::fs::remove_dir_all(&dir);
     }
