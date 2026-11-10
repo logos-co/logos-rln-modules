@@ -542,21 +542,21 @@ impl Store {
         // reuses a hash would make this a slot-reissue footgun — gate it there.
         let was_census_quarantined = inner.census_quarantined.remove(hash);
         let was_keyed_quarantined = inner.keyed_quarantined.remove(hash);
-        // What a failed commit puts back: `None` leaves an honest existing
-        // section as is; `Some(prev)` restores the displaced section, or no entry.
-        let section_undo = if was_census_quarantined || was_keyed_quarantined {
-            Some(
-                inner
-                    .sections
-                    .insert(hash.to_string(), AllocationState::default()),
-            )
+        // A failed commit removes only a section this insert added: a reset
+        // section is what `write_allocations` puts on disk, and an honest
+        // existing one is untouched.
+        let section_added = if was_census_quarantined || was_keyed_quarantined {
+            inner
+                .sections
+                .insert(hash.to_string(), AllocationState::default());
+            false
         } else if inner.sections.contains_key(hash) {
-            None
+            false
         } else {
             inner
                 .sections
                 .insert(hash.to_string(), AllocationState::default());
-            Some(None)
+            true
         };
         write_allocations(&self.dir, inner)?;
 
@@ -598,11 +598,18 @@ impl Store {
         if let Err(e) = fs::write_durable_json(&self.dir, format::SEALED_FILE, sealed) {
             // The commit point did not land: every in-memory trace of this
             // insert goes, so no later snapshot swap or write publishes it.
+            // A failure after the rename landed (parent-directory fsync) leaves
+            // the credential on disk but absent in memory until the next sealed
+            // write or a restart.
             restore_entry(&mut sealed.credentials, hash, prev_credential);
             restore_entry(&mut inner.cache, hash, prev_cache);
-            if let Some(prev) = section_undo {
-                restore_entry(&mut inner.sections, hash, prev);
+            if section_added {
+                inner.sections.remove(hash);
             }
+            // A previously quarantined hash keeps the reset section, which is
+            // what `raw_sections` and disk hold, and its flags as they were: the
+            // census flag holds until restart, the keyed flag until an unlock
+            // re-verifies against that on-disk state, the verdict a restart reaches.
             if was_census_quarantined {
                 inner.census_quarantined.insert(hash.to_string());
             }
@@ -2623,6 +2630,185 @@ mod tests {
         assert!(
             store.membership(&hash_b).is_none(),
             "the failed insert was never persisted"
+        );
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The allocations section for `hash` as the file on disk holds it.
+    fn disk_section(dir: &Path, hash: &str) -> serde_json::Value {
+        read_json(&dir.join(format::ALLOCATIONS_FILE))["sections"][hash].take()
+    }
+
+    /// Whether `alloc` is the state the on-disk `section` encodes.
+    fn section_matches(alloc: &AllocationState, section: &serde_json::Value) -> bool {
+        let rows: Vec<(&str, u64, u64)> = section["allocations"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .map(|r| {
+                        (
+                            r["rln_identifier"].as_str().unwrap(),
+                            r["epoch"].as_u64().unwrap(),
+                            r["used"].as_u64().unwrap(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mem_rows: Vec<(&str, u64, u64)> = alloc
+            .allocations
+            .iter()
+            .map(|a| (a.rln_identifier.as_str(), a.epoch, a.used))
+            .collect();
+        section["epoch_size_sec"].as_u64() == Some(alloc.epoch_size_sec)
+            && section["prune_floor"].as_u64() == Some(alloc.prune_floor)
+            && rows == mem_rows
+    }
+
+    #[test]
+    fn a_failed_sealed_commit_over_a_quarantined_hash_keeps_memory_on_disk() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("failed-commit-quarantined");
+        let registry = format!("logos:local:{}", "de".repeat(32));
+        let commitment_a = [0x5fu8; 32];
+        let commitment_b = [0x60u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash_a = insert_membership(&store, &registry, &commitment_a);
+        let hash_b = insert_membership(&store, &registry, &commitment_b);
+        assert_eq!(
+            store
+                .reserve_message_id(&hash_a, "aa", 10, 9, 5, 600)
+                .unwrap(),
+            0
+        );
+        store.close();
+        drop(store);
+
+        edit_json(&dir.join(format::ALLOCATIONS_FILE), |v| {
+            v["sections"][hash_a.as_str()]["allocations"][0]["used"] = 0.into();
+        });
+        let store = Store::open(dir.clone()).unwrap();
+        assert_eq!(store.unlock("pw").unwrap(), 1);
+        assert!(store.is_quarantined(&hash_a));
+        let untrusted = store.membership(&hash_a).unwrap();
+        assert!(
+            untrusted.alloc != AllocationState::default(),
+            "the tampered counters are distinguishable from a reset section"
+        );
+
+        let obstacle = dir.join(format!("{}.tmp", format::SEALED_FILE));
+        std::fs::create_dir(&obstacle).unwrap();
+        let retried = IdentityBlock {
+            submitted_at: 1,
+            ..identity_for(&registry, &commitment_a)
+        };
+        assert!(retried != untrusted.identity);
+        assert!(store
+            .insert(
+                &hash_a,
+                retried,
+                &credential_for(&registry, &commitment_a),
+                100,
+            )
+            .is_err());
+        std::fs::remove_dir(&obstacle).unwrap();
+
+        store.update_cache(&hash_b, |_| {}).unwrap();
+        let rec = store.membership(&hash_a).unwrap();
+        assert!(
+            rec.identity == untrusted.identity,
+            "the failed insert's credential is not published"
+        );
+        assert!(rec.cache == untrusted.cache);
+        assert!(
+            rec.quarantined,
+            "the quarantine is not lifted by a failed insert"
+        );
+        assert!(
+            section_matches(&rec.alloc, &disk_section(&dir, &hash_a)),
+            "the in-memory section is the one on disk"
+        );
+
+        store.lock();
+        assert_eq!(store.unlock("pw").unwrap(), 2);
+        let rec = store.membership(&hash_a).unwrap();
+        assert!(
+            rec.alloc != untrusted.alloc,
+            "the untrusted counters are never re-verified into trust"
+        );
+        assert!(section_matches(&rec.alloc, &disk_section(&dir, &hash_a)));
+        assert!(rec.identity == untrusted.identity);
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_sealed_commit_over_an_existing_hash_keeps_the_previous_membership() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("failed-commit-existing");
+        let registry = format!("logos:local:{}", "df".repeat(32));
+        let commitment = [0x62u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &commitment);
+        store
+            .update_cache(&hash, |c| {
+                c.state = MembershipState::Active;
+                c.leaf_index = Some(7);
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .reserve_message_id(&hash, "aa", 10, 9, 5, 600)
+                .unwrap(),
+            0
+        );
+        let before = store.membership(&hash).unwrap();
+
+        let obstacle = dir.join(format!("{}.tmp", format::SEALED_FILE));
+        std::fs::create_dir(&obstacle).unwrap();
+        let retried = IdentityBlock {
+            submitted_at: 1,
+            ..identity_for(&registry, &commitment)
+        };
+        assert!(retried != before.identity);
+        let replacement = StoredCredential {
+            identity_commitment: registry_id::bytes_to_hex(&commitment),
+            identity_secret_hash: "88".repeat(32),
+            registry_id: registry,
+        };
+        assert!(store.insert(&hash, retried, &replacement, 200).is_err());
+        std::fs::remove_dir(&obstacle).unwrap();
+
+        store.update_cache(&hash, |_| {}).unwrap();
+        let rec = store.membership(&hash).unwrap();
+        assert!(
+            rec.identity == before.identity,
+            "the previous identity stays"
+        );
+        assert!(rec.cache == before.cache, "the previous cache row stays");
+        assert!(rec.alloc == before.alloc, "the honest counters stay");
+        assert!(!rec.quarantined);
+        assert_eq!(
+            store.unseal_credential(&hash).unwrap().identity_secret_hash,
+            "77".repeat(32),
+            "the previous credential is the one that unseals"
+        );
+        store.close();
+        drop(store);
+
+        let store = Store::open(dir.clone()).unwrap();
+        assert_eq!(store.unlock("pw").unwrap(), 1);
+        let rec = store.membership(&hash).unwrap();
+        assert!(rec.identity == before.identity);
+        assert!(rec.cache == before.cache);
+        assert_eq!(
+            store.unseal_credential(&hash).unwrap().identity_secret_hash,
+            "77".repeat(32)
         );
         store.close();
         let _ = std::fs::remove_dir_all(&dir);
