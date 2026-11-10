@@ -50,6 +50,10 @@ pub(crate) struct AllocationState {
     pub(crate) prune_floor: u64,
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a fn(&T) -> bool"
+)]
 fn is_zero(n: &u64) -> bool {
     *n == 0
 }

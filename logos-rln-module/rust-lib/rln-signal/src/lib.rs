@@ -118,11 +118,13 @@ mod tests {
     fn ffi_entry_matches_library() {
         let signal = b"Hello, RLN!";
         let mut out = [0u8; 32];
+        // SAFETY: `signal` is valid for `signal.len()` bytes and `out` is a writable 32-byte buffer.
         let rc = unsafe { rln_signal_hash(signal.as_ptr(), signal.len(), out.as_mut_ptr()) };
         assert_eq!(rc, 0);
         assert_eq!(out, signal_hash(signal));
 
         let mut empty = [0u8; 32];
+        // SAFETY: a null signal pointer is accepted when the length is 0; `empty` is a writable 32-byte buffer.
         let rc = unsafe { rln_signal_hash(core::ptr::null(), 0, empty.as_mut_ptr()) };
         assert_eq!(rc, 0);
         assert_eq!(empty, signal_hash(b""));
@@ -132,11 +134,13 @@ mod tests {
     fn ffi_entry_refuses_null_pointers() {
         let signal = b"x";
         assert_eq!(
+            // SAFETY: `signal` is valid for 1 byte; the null output pointer is rejected before any write.
             unsafe { rln_signal_hash(signal.as_ptr(), 1, core::ptr::null_mut()) },
             1
         );
         let mut out = [0u8; 32];
         assert_eq!(
+            // SAFETY: the null signal pointer with a non-zero length is rejected before any read; `out` is a writable 32-byte buffer.
             unsafe { rln_signal_hash(core::ptr::null(), 1, out.as_mut_ptr()) },
             2
         );

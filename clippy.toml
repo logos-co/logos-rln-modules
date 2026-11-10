@@ -1,0 +1,2 @@
+# staticlib: no pub item here is an exported Rust API, so lints fire on pub items too
+avoid-breaking-exported-api = false

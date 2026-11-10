@@ -86,7 +86,10 @@ pub(crate) fn opts_arr(pairs: &[(&str, &str)]) -> String {
 
 /// Seed one membership: insert (Pending), then push the cache row to
 /// the wanted state/leaf/rate. Needs the store unlocked.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test seeding helper: each argument is one persisted field of the row"
+)]
 pub(crate) fn seed_membership(
     store: &Store,
     hash: &str,

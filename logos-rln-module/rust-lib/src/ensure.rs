@@ -1719,7 +1719,7 @@ mod tests {
             ));
             crate::provider::fake::REGISTER_CALLS.store(0, Ordering::SeqCst);
             let (requests, probes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-            let (r, p, at) = (requests.clone(), probes.clone(), registry.clone());
+            let (r, p, at) = (Arc::clone(&requests), Arc::clone(&probes), registry.clone());
             crate::test_support::install_gifter(Box::new(move |method, args| {
                 let n = if method == "request" { &r } else { &p }.fetch_add(1, Ordering::SeqCst);
                 answers(method, n, args, &at)
@@ -1805,7 +1805,7 @@ mod tests {
         let _serial = crate::lock(&TEST_GLOBAL_LOCK);
         DISCOVERY_RETRY_SECS.store(1, Ordering::SeqCst);
         let seen = std::sync::Arc::new(Mutex::new(None));
-        let saw = seen.clone();
+        let saw = std::sync::Arc::clone(&seen);
         let pass = DiscoveryPass::new(
             "unfunded",
             0,

@@ -105,7 +105,10 @@ mod lp_test_transport {
     // `#[no_mangle]` definitions are what the crate-wide `deny(unsafe_code)`
     // exists to flag; these five exist only to give the test binary a link
     // target, and never run past returning "no client".
-    #![allow(unsafe_code)]
+    #![expect(
+        unsafe_code,
+        reason = "test-only link targets for the protocol archive symbols; each only returns \"no client\""
+    )]
     use std::ffi::{c_char, c_int, c_void};
 
     #[no_mangle]

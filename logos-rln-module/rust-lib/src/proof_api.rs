@@ -1027,7 +1027,7 @@ mod tests {
         // No membership yet → a zero-budget SNAPSHOT, not an error (spec
         // SHALL): rate_limit 0 is the no-usable-membership signal, so it can
         // never be confused with an exhausted budget.
-        let q = get_epoch_quota_impl(Ok(store.clone()), &registry, &rln_id, &ts).unwrap();
+        let q = get_epoch_quota_impl(Ok(Arc::clone(&store)), &registry, &rln_id, &ts).unwrap();
         assert_eq!(q["rate_limit"], 0, "got: {q}");
         assert_eq!(q["remaining"], 0, "got: {q}");
         assert!(q["epoch_index"].as_u64().is_some(), "got: {q}");
@@ -1048,7 +1048,7 @@ mod tests {
             100,
         );
 
-        let fresh = get_epoch_quota_impl(Ok(store.clone()), &registry, &rln_id, &ts).unwrap();
+        let fresh = get_epoch_quota_impl(Ok(Arc::clone(&store)), &registry, &rln_id, &ts).unwrap();
         assert_eq!(fresh["rate_limit"], serde_json::json!(100));
         assert_eq!(fresh["remaining"], serde_json::json!(100));
         let epoch_index = fresh["epoch_index"].as_u64().expect("numeric epoch index");
@@ -1062,14 +1062,15 @@ mod tests {
         store
             .reserve_message_id(&hash, &rln_id, epoch_index, epoch_index, 100, 600)
             .unwrap();
-        let spent = get_epoch_quota_impl(Ok(store.clone()), &registry, &rln_id, &ts).unwrap();
+        let spent = get_epoch_quota_impl(Ok(Arc::clone(&store)), &registry, &rln_id, &ts).unwrap();
         assert_eq!(spent["epoch_index"], serde_json::json!(epoch_index));
         assert_eq!(spent["remaining"], serde_json::json!(98));
 
         // The queried epoch is fixed by the timestamp (spec): the NEXT epoch,
         // still inside the default gap, keeps its own untouched budget.
         let next_ts = ((epoch_index + 1) * 600).to_string();
-        let next = get_epoch_quota_impl(Ok(store.clone()), &registry, &rln_id, &next_ts).unwrap();
+        let next =
+            get_epoch_quota_impl(Ok(Arc::clone(&store)), &registry, &rln_id, &next_ts).unwrap();
         assert_eq!(next["epoch_index"], serde_json::json!(epoch_index + 1));
         assert_eq!(next["rate_limit"], serde_json::json!(100));
         assert_eq!(next["remaining"], serde_json::json!(100));
@@ -1238,7 +1239,7 @@ mod tests {
         // MISS: cold cache falls back to the registry — dead transport, so
         // provider_failure proves a real read was attempted.
         let miss = generate_proof_impl(
-            Ok(store.clone()),
+            Ok(Arc::clone(&store)),
             &reg,
             &rln_id_hex,
             signal_hex,
@@ -1338,7 +1339,7 @@ mod tests {
         let ts = now_unix().to_string();
 
         let bad = generate_proof_with(
-            Ok(store.clone()),
+            Ok(Arc::clone(&store)),
             &reg,
             &rln_id_hex,
             SignalArg::Prehashed(&"ff".repeat(32)),

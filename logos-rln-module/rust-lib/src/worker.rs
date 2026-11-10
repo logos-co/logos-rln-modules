@@ -344,7 +344,7 @@ mod tests {
 
         // Both waits far outlast the test: only a nudge can return either.
         let woke = Arc::new(AtomicBool::new(false));
-        let woke2 = woke.clone();
+        let woke2 = Arc::clone(&woke);
         let subscriber = std::thread::spawn(move || {
             woke2.store(
                 wait_tick_or_nudge(gen, Duration::from_secs(60)),
@@ -352,7 +352,7 @@ mod tests {
             );
         });
         let returned = Arc::new(AtomicBool::new(false));
-        let returned2 = returned.clone();
+        let returned2 = Arc::clone(&returned);
         let bystander = std::thread::spawn(move || {
             let due = wait_tick(gen, Duration::from_secs(60));
             returned2.store(true, Ordering::SeqCst);
@@ -460,7 +460,7 @@ mod tests {
         reset_for_test();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let exited = Arc::new(AtomicBool::new(false));
-        spawn_blocking_for_test(gate.clone(), exited.clone());
+        spawn_blocking_for_test(Arc::clone(&gate), Arc::clone(&exited));
 
         // stop() must NOT wait for the blocked worker's ~80s read — it
         // detaches after the grace and returns promptly.

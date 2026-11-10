@@ -1820,7 +1820,10 @@ pub(crate) fn status_json() -> String {
 /// exercises the argument handling above and never reaches a real wallet. The
 /// real symbols come from the library at the final plugin link.
 #[cfg(test)]
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "test-only link targets for the wallet_ffi symbols; each answers \"no wallet\""
+)]
 mod wallet_ffi_test_transport {
     use super::ffi;
     use std::ffi::{c_char, c_void};
@@ -1908,7 +1911,10 @@ mod wallet_ffi_test_transport {
     pub extern "C" fn wallet_ffi_free_account_data(_a: *mut ffi::Account) {}
 
     #[no_mangle]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the wallet_ffi C signature"
+    )]
     pub extern "C" fn wallet_ffi_send_generic_public_transaction(
         _h: *mut ffi::WalletHandle,
         _am: *const ffi::AccountMention,

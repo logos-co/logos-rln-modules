@@ -452,9 +452,9 @@ mod tests {
         let fail_writes = Arc::new(AtomicBool::new(false));
         let fail_reads = Arc::new(AtomicBool::new(false));
         set_backend_for_tests(Box::new(FakeKeychain {
-            items: items.clone(),
-            fail_writes: fail_writes.clone(),
-            fail_reads: fail_reads.clone(),
+            items: Arc::clone(&items),
+            fail_writes: Arc::clone(&fail_writes),
+            fail_reads: Arc::clone(&fail_reads),
         }));
         let dir =
             std::env::temp_dir().join(format!("rln-ms-keychain-{tag}-{}", std::process::id()));
