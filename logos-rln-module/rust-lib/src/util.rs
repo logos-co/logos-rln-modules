@@ -5,7 +5,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Poison-recovering lock: a poisoned mutex is a bug elsewhere, not a
 /// reason to wedge every future call.
-// OWNERSHIP: the guard borrows the caller's mutex.
 pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }

@@ -60,7 +60,6 @@ static ROUND_ROBIN: Mutex<Option<HashMap<(String, String), String>>> = Mutex::ne
 /// Resolve the record to use. `records` is the registry's full local list of
 /// [`MembershipRecord`]s (owned, borrowed or shared); `scope` = (canonical
 /// registry_id, lowercase rln_identifier hex).
-// OWNERSHIP: the selected record borrows from the caller's `records`.
 pub(crate) fn select<'a, R: Borrow<MembershipRecord>>(
     records: &'a [R],
     scope: (&str, &str),
@@ -109,7 +108,6 @@ pub(crate) fn select<'a, R: Borrow<MembershipRecord>>(
             .copied()
             .expect("invariant: an empty candidate list returned above")),
         Selector::RoundRobin => {
-            // OWNERSHIP: the cursor map owns its key, inserted on every call.
             let key = (scope.0.to_string(), scope.1.to_string());
             let mut guard = lock(&ROUND_ROBIN);
             let map = guard.get_or_insert_with(HashMap::new);
@@ -123,8 +121,6 @@ pub(crate) fn select<'a, R: Borrow<MembershipRecord>>(
                     .unwrap_or(candidates[0]),
                 None => candidates[0],
             };
-            // OWNERSHIP: the cursor map owns its copy of the hash; the
-            // record stays borrowed from the caller.
             map.insert(key, next.hash.clone());
             Ok(next)
         }

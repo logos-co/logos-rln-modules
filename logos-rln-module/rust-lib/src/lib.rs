@@ -388,7 +388,7 @@ struct LogosRlnModuleImpl {}
 
 impl LogosRlnModuleImpl {
     /// The open store (cloned out), or `internal` naming why there is none.
-    // OWNERSHIP: a handle cloned out of the cell, so no lock spans the handler.
+    // OWNERSHIP: an Arc cloned out of the cell, so no lock spans the handler; the *_impl bodies take it as an unopened Result so their argument errors win over a missing store.
     fn store(&self) -> Result<Arc<Store>, ApiError> {
         sealed_store::store::current_or_cause()
     }

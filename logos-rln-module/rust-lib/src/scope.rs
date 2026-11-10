@@ -27,7 +27,6 @@ pub(crate) fn parse_registry(raw: &str) -> Result<registry_id::CanonicalRegistry
 }
 
 /// The registry's local membership records.
-// OWNERSHIP: shared handles of the store's published records.
 pub(crate) fn records_for_registry(
     store: &Store,
     registry: &registry_id::CanonicalRegistryId,
@@ -68,7 +67,6 @@ pub(crate) fn scope_matches_for_test(record_rln_id: &str, scope_rln_id: &str) ->
 /// every record backs it. A scope whose own membership is active beside a
 /// start()-provisioned registry-wide one proves with its own — the state
 /// read answers that record, and so must the proof.
-// OWNERSHIP: the candidates borrow from the caller's `records`.
 pub(crate) fn scope_candidates<'a>(
     records: &'a [Arc<MembershipRecord>],
     rln_id_hex: &str,
@@ -96,8 +94,6 @@ pub(crate) fn scope_candidates<'a>(
 }
 
 /// Which record answers a `get_membership_state(scope)` read.
-// OWNERSHIP: `One` borrows the answering record from the records the caller
-// holds; the ambiguity reason is a string literal.
 pub(crate) enum ScopeState<'a> {
     One(&'a MembershipRecord),
     Ambiguous(&'static str),
@@ -114,7 +110,6 @@ pub(crate) enum ScopeState<'a> {
 /// scope names its registry"). More than one live record at the winning
 /// rank is ambiguous. Proof-time resolution stays `scope_candidates`'s
 /// (usable records only).
-// OWNERSHIP: the answer borrows its record from `records`.
 pub(crate) fn resolve_scope_state<'a>(
     records: &'a [Arc<MembershipRecord>],
     rln_id_hex: &str,

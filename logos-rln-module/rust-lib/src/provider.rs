@@ -75,7 +75,6 @@ pub(crate) fn init_client() {
 
 /// The shared typed client to the lez module, created on first use. The lock is
 /// released before the caller makes any SDK call.
-// OWNERSHIP: cheap Arc handle clone; a call keeps its client if the slot is reset.
 fn lez_client() -> Arc<LiblogosLezRlnModuleClient> {
     let mut slot = lock(&LEZ_CLIENT);
     Arc::clone(slot.get_or_insert_with(|| Arc::new(LiblogosLezRlnModuleClient::new())))
@@ -154,7 +153,7 @@ fn fold_reply(method: &str, result: Result<String, LogosError>) -> Result<String
 /// handler has returned. One mutex orders the two, so a completion racing the
 /// return is delivered exactly once either way.
 fn dispatch_recorded(
-    method: &'static str, // OWNERSHIP: a method-name literal, moved into the SDK callback.
+    method: &'static str,
     on_done: RegisterCallback,
     // OWNERSHIP: the SDK's completion callback type: a boxed closure run on its thread.
     start: impl FnOnce(Box<dyn FnOnce(Result<String, LogosError>) + Send + 'static>),
@@ -170,7 +169,7 @@ fn dispatch_recorded(
         on_done: Some(on_done),
         sync_result: None,
     }));
-    let cb_state = Arc::clone(&state); // OWNERSHIP: the callback's handle.
+    let cb_state = Arc::clone(&state);
     start(Box::new(move |result| {
         let outcome = fold_reply(method, result);
         let mut st = lock(&cb_state);
@@ -248,11 +247,9 @@ pub(crate) fn interpret_use_network(raw: &str) -> Gate {
 fn remember(gate: &mut HashMap<String, Result<(), String>>, reference: &str, answer: Gate) {
     match answer {
         Gate::Accepted => {
-            // OWNERSHIP: the gate owns its key; the caller's reference is borrowed.
             gate.insert(reference.to_owned(), Ok(()));
         }
         Gate::Refused(detail) => {
-            // OWNERSHIP: the gate owns its key; the caller's reference is borrowed.
             gate.insert(reference.to_owned(), Err(detail));
         }
         Gate::Retry => {}
@@ -364,7 +361,6 @@ pub(crate) fn select_networks(tracked: &[String]) {
 /// dispatch margin.
 pub(crate) const GIFTER_REQUEST_TIMEOUT: Duration = Duration::from_secs(340);
 
-// OWNERSHIP: process-lifetime borrow of the never-replaced client.
 fn gifter_client() -> &'static RlnGifterModuleClient {
     LazyLock::force(&GIFTER_CLIENT)
 }

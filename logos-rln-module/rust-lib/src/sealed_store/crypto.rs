@@ -16,11 +16,11 @@ pub enum CryptoError {
     /// AEAD open failed — wrong password or tampered ciphertext/AAD/nonce.
     BadPassword,
     /// Hex/length problems in stored fields.
-    Malformed(&'static str), // OWNERSHIP: a string literal.
+    Malformed(&'static str),
     /// No CSPRNG available (seal/generate only).
     NoEntropy,
     /// KDF machinery rejected its inputs.
-    Kdf(&'static str), // OWNERSHIP: a string literal.
+    Kdf(&'static str),
 }
 
 impl core::fmt::Display for CryptoError {

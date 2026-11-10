@@ -20,7 +20,6 @@ use crate::lifecycle::{MembershipRecord, MembershipState};
 /// shape inside the `.lidl` `Membership` record. Exposes only the
 /// commitment; no method releases the identity secret across this
 /// interface.
-// OWNERSHIP: short-lived serialisation view over a record the caller holds.
 #[derive(Serialize)]
 pub(crate) struct CredentialView<'a> {
     identity_commitment: &'a str,
@@ -29,7 +28,6 @@ pub(crate) struct CredentialView<'a> {
 /// The public Membership view (spec Membership minus secrets) — mirrors the
 /// `.lidl` `Membership` record. Shared by `register`, `select_membership`,
 /// and `get_memberships`.
-// OWNERSHIP: short-lived serialisation view over a record the caller holds.
 #[derive(Serialize)]
 pub(crate) struct MembershipView<'a> {
     credential: CredentialView<'a>,
@@ -53,7 +51,6 @@ pub(crate) struct MembershipView<'a> {
     tx_result: Option<&'a str>,
 }
 
-// OWNERSHIP: the constructor ties the view to the hash and record it borrows.
 impl<'a> MembershipView<'a> {
     /// `quarantined` (metadata tamper-check failed) forces `state:"failed"`
     /// and `failed_reason:"metadata_tamper"` and suppresses `retryable` — a
@@ -129,7 +126,6 @@ pub(crate) fn public_membership(
 /// `leaf_index` / `rate_limit` only once a single membership resolves for
 /// the scope. `state:"unknown"` when none does; more than one candidate is
 /// an `ambiguous_selection` error, not this shape.
-// OWNERSHIP: short-lived serialisation view over a record the caller holds.
 #[derive(Serialize)]
 pub(crate) struct MembershipStateView<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -179,12 +175,10 @@ pub(crate) struct ProvisioningView {
     price: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     required: Option<String>,
-    // OWNERSHIP: every step name is a string literal (`ensure::Step::as_str`).
     step: &'static str,
 }
 
 impl ProvisioningView {
-    // OWNERSHIP: every step name is a string literal (`ensure::Step::as_str`).
     pub(crate) fn new(step: &'static str, detail: String) -> Self {
         ProvisioningView {
             balance: None,
@@ -221,7 +215,6 @@ impl ProvisioningView {
     }
 }
 
-// OWNERSHIP: the constructors tie the view to the ids and reason they borrow.
 impl<'a> MembershipStateView<'a> {
     pub(crate) fn unknown(registry_id: &'a str) -> Self {
         MembershipStateView {
@@ -293,7 +286,6 @@ impl EpochQuotaView {
 /// always present; that one is the per-registry table in force (every
 /// registry any `start()` named, with its epoch size and max gap), omitted
 /// while no call has named a registry.
-// OWNERSHIP: serialisation view; borrows start()'s registry list for one to_value call.
 #[derive(Serialize)]
 pub(crate) struct StartReply<'a> {
     epoch_size_sec: u64,
@@ -304,7 +296,6 @@ pub(crate) struct StartReply<'a> {
     started: bool,
 }
 
-// OWNERSHIP: the constructor ties the reply to the registry list it borrows.
 impl<'a> StartReply<'a> {
     pub(crate) fn new(
         epoch_size_sec: u64,
@@ -383,12 +374,10 @@ pub(crate) struct VerdictReply {
     external_nullifier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recovered_secret: Option<String>,
-    // OWNERSHIP: every verdict is a string literal.
     verdict: &'static str,
 }
 
 impl VerdictReply {
-    // OWNERSHIP: every verdict is a string literal.
     pub(crate) fn verdict(verdict: &'static str) -> Self {
         VerdictReply {
             external_nullifier: None,
@@ -430,18 +419,14 @@ impl UnlockKeystoreReply {
 
 /// The typed error envelope's body — mirrors `ApiError::body`'s
 /// `{"class":…,"kind":…,"message":…}`. Not a `.lidl` record.
-// OWNERSHIP: serialisation view; borrows the ApiError's message for one to_value call.
 #[derive(Serialize)]
 pub(crate) struct ErrorBody<'a> {
-    // OWNERSHIP: `class` and `kind` are `ErrorKind`'s string literals.
     class: &'static str,
     kind: &'static str,
     message: &'a str,
 }
 
-// OWNERSHIP: the constructor ties the body to the message it borrows.
 impl<'a> ErrorBody<'a> {
-    // OWNERSHIP: `class` and `kind` are `ErrorKind`'s string literals.
     pub(crate) fn new(class: &'static str, kind: &'static str, message: &'a str) -> Self {
         ErrorBody {
             class,

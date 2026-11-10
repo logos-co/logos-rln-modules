@@ -297,7 +297,6 @@ impl RegisterClaim {
     pub(crate) fn take(registry: &str, rln_id_hex: &str) -> Result<RegisterClaim, ApiError> {
         let mut set = lock(&REGISTER_IN_FLIGHT);
         let set = set.get_or_insert_with(std::collections::HashSet::new);
-        // OWNERSHIP: the claim owns its key (its Drop removes it); the arguments are borrowed.
         let key = (registry.to_string(), rln_id_hex.to_string());
         if set.contains(&key) {
             return Err(ApiError::new(
@@ -326,7 +325,7 @@ impl Drop for RegisterClaim {
 /// callback lands on the module's event loop after this returns); the store
 /// lock is NEVER held across a provider call.
 pub(crate) fn register_impl(
-    store: Result<Arc<Store>, ApiError>, // OWNERSHIP: the handler's handle on the current store.
+    store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
     rln_identifier_hex: &str,
     options_json: &str,

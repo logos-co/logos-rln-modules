@@ -23,7 +23,7 @@ struct CachedPath {
     leaf_index: u64,
 }
 
-// OWNERSHIP: filled by the warm worker and generate handlers, read per generate.
+// OWNERSHIP: filled by the poller's refresh pass (poller and start's warm-up threads) and generate's miss fallback; read per generate.
 static PATHS: Mutex<Option<HashMap<String, CachedPath>>> = Mutex::new(None);
 
 /// The cached path for `hash`, or `None` on a cold cache or a leaf_index
@@ -54,7 +54,7 @@ pub(crate) fn fill_path_cache(
     }
     let (path_elements_hex, path_indices) = (witness.path_elements_hex, witness.path_indices);
     lock(&PATHS).get_or_insert_with(HashMap::new).insert(
-        hash.to_string(), // OWNERSHIP: the map owns its key.
+        hash.to_string(),
         CachedPath {
             path_elements_hex,
             path_indices,

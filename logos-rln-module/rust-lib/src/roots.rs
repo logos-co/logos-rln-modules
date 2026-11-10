@@ -76,7 +76,7 @@ pub(crate) fn adopt(canonical: &str, roots: Vec<[u8; 32]>) {
         return;
     }
     lock(&WINDOWS).get_or_insert_with(HashMap::new).insert(
-        canonical.to_string(), // OWNERSHIP: the map owns its key.
+        canonical.to_string(),
         Window {
             roots,
             updated_at: crate::util::now_unix(),
@@ -101,7 +101,6 @@ pub(crate) fn admit(canonical: &str, root: [u8; 32]) {
         }
         None => {
             windows.insert(
-                // OWNERSHIP: the map owns its key, copied for a new registry only.
                 canonical.to_string(),
                 Window {
                     roots: vec![root],
@@ -122,7 +121,6 @@ pub(crate) fn track(registry: &CanonicalRegistryId) {
         // First interest wins: an existing entry is kept. The key is
         // allocated only on that first call (every generate/validate lands here).
         if !tracked.contains_key(&registry.canonical) {
-            // OWNERSHIP: the map owns its key and its copy of the id.
             tracked.insert(registry.canonical.clone(), registry.clone());
         }
     }
@@ -220,7 +218,6 @@ fn refresh_one_with(registry: &CanonicalRegistryId, tree: &dyn TreeSource) -> Re
     match windows.get_mut(&registry.canonical) {
         Some(w) => *w = window,
         None => {
-            // OWNERSHIP: the map owns its key.
             windows.insert(registry.canonical.clone(), window);
         }
     }

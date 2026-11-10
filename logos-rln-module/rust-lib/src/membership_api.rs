@@ -41,7 +41,7 @@ pub(crate) fn provisioning_view(registry: &str) -> Option<views::ProvisioningVie
 /// loser a registration is in flight that it never issued. The cache write
 /// below is a compare-and-set instead.
 pub(crate) fn get_membership_state_impl(
-    store: Result<Arc<Store>, ApiError>, // OWNERSHIP: the handler's handle on the current store.
+    store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
     rln_identifier_hex: &str,
 ) -> Result<serde_json::Value, ApiError> {
@@ -172,7 +172,7 @@ pub(crate) fn get_membership_state_impl(
 /// only — the identity credential is never released. No unlocked keystore
 /// is required.
 pub(crate) fn select_membership_impl(
-    store: Result<Arc<Store>, ApiError>, // OWNERSHIP: the handler's handle on the current store.
+    store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
     rln_identifier_hex: &str,
     selector_json: &str,
@@ -210,7 +210,7 @@ pub(crate) fn select_membership_impl(
 /// caller polls next anyway, and this call stays clear of a 70 s provider
 /// deadline.
 pub(crate) fn ensure_membership_impl(
-    store: Result<Arc<Store>, ApiError>, // OWNERSHIP: the handler's handle on the current store.
+    store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
     options_json: &str,
 ) -> Result<serde_json::Value, ApiError> {
@@ -268,8 +268,9 @@ pub(crate) fn ensure_membership_impl(
         ensure::mark_requested(&registry.canonical);
         // OWNERSHIP: moved into the pass thread; the reply below reads the registry.
         let canonical = registry.canonical.clone();
+        // OWNERSHIP: detached (handle dropped, not in SUP): the thread owns the marker, the id and the rate; EPOCH and STOPPED end the pass.
         std::thread::Builder::new()
-            .name("rln-ensure".to_owned()) // OWNERSHIP: `Builder::name` takes a `String`.
+            .name("rln-ensure".to_owned())
             .spawn(move || {
                 let _claim = pass;
                 // The order start() keeps: the registry's network binds
@@ -286,7 +287,7 @@ pub(crate) fn ensure_membership_impl(
 }
 
 pub(crate) fn get_memberships_impl(
-    store: Result<Arc<Store>, ApiError>, // OWNERSHIP: the handler's handle on the current store.
+    store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
 ) -> Result<serde_json::Value, ApiError> {
     let registry = parse_registry(registry_id_raw)?;

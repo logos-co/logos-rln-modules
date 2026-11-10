@@ -55,7 +55,7 @@ pub(crate) fn install(config: ModuleConfig) {
 /// first-named order and the per-registry table, both empty before any start.
 pub(crate) fn registries_snapshot() -> (Vec<String>, BTreeMap<String, RegistryConfig>) {
     match lock(&CONFIG).as_ref() {
-        // OWNERSHIP: copied out, so the lock is released at return.
+        // OWNERSHIP: start()'s working copy: it merges into it and installs it whole, so a failed start leaves the table in force untouched.
         Some(c) => (c.registries.clone(), c.per_registry.clone()),
         None => (Vec::new(), BTreeMap::new()),
     }

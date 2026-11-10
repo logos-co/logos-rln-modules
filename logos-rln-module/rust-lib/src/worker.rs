@@ -145,7 +145,6 @@ pub(crate) fn generation_for_test() -> u64 {
 /// Spawn `body(generation)` into `slot` if permitted and not already alive.
 /// A slot whose previous worker has returned is reaped (instant join) and
 /// respawned; a live worker makes this a no-op.
-// OWNERSHIP: thread names are string literals.
 pub(crate) fn ensure(slot: Slot, name: &'static str, body: fn(u64)) {
     fn held(s: &mut Supervisor, slot: Slot) -> &mut Held {
         match slot {
@@ -182,15 +181,13 @@ pub(crate) fn ensure(slot: Slot, name: &'static str, body: fn(u64)) {
 /// worker's wake already sees that worker `done`. (Setting it before the
 /// SUP-locked tail deadlocks: the reaper holds SUP and joins; the worker
 /// parks on SUP.)
-// OWNERSHIP: the body moves into the spawned thread, so it is Send and owns
-// its captures; thread names are string literals.
+// OWNERSHIP: 'static: stop() may detach this thread mid-read, so the body cannot borrow (no thread::scope); names are literals.
 fn spawn_into(
     name: &'static str,
     gen: u64,
     body: impl FnOnce() + Send + 'static,
 ) -> (JoinHandle<()>, Arc<AtomicBool>) {
     let done = Arc::new(AtomicBool::new(false));
-    // OWNERSHIP: cheap Arc handle clone, moved into the worker thread.
     let done_in = Arc::clone(&done);
     let handle = std::thread::Builder::new()
         .name(name.into())

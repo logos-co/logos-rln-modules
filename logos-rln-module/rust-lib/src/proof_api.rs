@@ -36,7 +36,7 @@ pub(crate) fn proof_error(e: proof::ProofError) -> ApiError {
 /// LE hex) plus the spent `message_id`, the u64 `epoch_index`, the
 /// `membership_hash`, and `proof_canonical`.
 pub(crate) fn generate_proof_impl(
-    store: Result<Arc<Store>, ApiError>, // OWNERSHIP: the handler's handle on the current store.
+    store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
     rln_identifier_hex: &str,
     signal_hex: &str,
@@ -81,7 +81,7 @@ impl SignalArg<'_> {
 }
 
 pub(crate) fn generate_proof_with(
-    store: Result<Arc<Store>, ApiError>, // OWNERSHIP: the handler's handle on the current store.
+    store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
     rln_identifier_hex: &str,
     signal: SignalArg<'_>,
@@ -382,7 +382,7 @@ pub(crate) fn validate_proof_with(
 /// error (spec SHALL): rate_limit 0 always means "no usable membership",
 /// never an exhausted budget.
 pub(crate) fn get_epoch_quota_impl(
-    store: Result<Arc<Store>, ApiError>, // OWNERSHIP: the handler's handle on the current store.
+    store: Result<Arc<Store>, ApiError>,
     registry_id_raw: &str,
     rln_identifier_hex: &str,
     timestamp: &str,

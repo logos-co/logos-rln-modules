@@ -90,7 +90,6 @@ pub(crate) fn record_verified(
     // The registry's key is allocated only on its first verified proof.
     let epochs = match log.get_mut(registry) {
         Some(epochs) => epochs,
-        // OWNERSHIP: the map owns its key.
         None => log.entry(registry.to_string()).or_default(),
     };
     epochs.retain(|&e, _| e >= retain_floor);

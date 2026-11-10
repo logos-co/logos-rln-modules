@@ -491,7 +491,7 @@ pub(crate) mod depth_bridge {
     /// substituting one here would be worse than passing it through.
     pub(crate) fn fold_root(root_hex: &str, depth: usize) -> String {
         let Some(mut root) = fr_from_hex(root_hex) else {
-            return root_hex.to_string(); // OWNERSHIP: the passthrough of a malformed root.
+            return root_hex.to_string();
         };
         for height in depth..RLN_TREE_DEPTH {
             root = Hasher::<PoseidonHash>::hash_pair(root, ZERO_LADDER[height]);
@@ -572,7 +572,6 @@ pub(crate) fn generate(
         .identity_secret(identity_secret)
         .user_message_limit(Fr::from(material.rate_limit))
         .message_id(Fr::from(material.message_id))
-        // OWNERSHIP: the zerokit proof owns its indices; the material is borrowed.
         .merkle_proof(RLNMerkleProof::new(
             path_elements,
             material.path_indices.clone(),

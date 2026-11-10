@@ -348,7 +348,6 @@ pub(crate) enum Step {
 }
 
 impl Step {
-    // OWNERSHIP: every step name is a string literal.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Step::Delegating => "delegating",
@@ -537,8 +536,6 @@ fn settle_live(registry: &registry_id::CanonicalRegistryId, mine: u64) -> Live {
             if !saw_pending {
                 return Live::None;
             }
-            // OWNERSHIP: the verdict owns a copy of the reason; the record
-            // stays shared with the store's snapshot.
             let why = records
                 .iter()
                 .filter(|r| r.cache.state == MembershipState::Failed)
@@ -1207,7 +1204,7 @@ impl ActivePass {
         crate::util::lock(&ACTIVE)
             .get_or_insert_with(HashMap::new)
             .insert(registry.to_owned(), ticket);
-        ActivePass(registry.to_owned(), ticket) // OWNERSHIP: the marker's copy, for its Drop.
+        ActivePass(registry.to_owned(), ticket)
     }
 
     /// The marker, if no pass holds the registry: the check and the entry
@@ -1221,7 +1218,7 @@ impl ActivePass {
         }
         // OWNERSHIP: the map and the marker (its Drop looks the entry up) each own the key.
         map.insert(registry.to_owned(), ticket);
-        Some(ActivePass(registry.to_owned(), ticket)) // OWNERSHIP: the marker's copy, for its Drop.
+        Some(ActivePass(registry.to_owned(), ticket))
     }
 }
 

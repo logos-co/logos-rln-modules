@@ -110,7 +110,6 @@ impl DelegatedOptions {
             match obj.get(key) {
                 None | Some(serde_json::Value::Null) => Ok(None),
                 Some(serde_json::Value::String(s)) if s.trim().is_empty() => Ok(None),
-                // OWNERSHIP: the options own their trimmed text; the request is borrowed.
                 Some(serde_json::Value::String(s)) => Ok(Some(s.trim().to_string())),
                 Some(other) => Err(ApiError::new(
                     ErrorKind::InvalidArgument,

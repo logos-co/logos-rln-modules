@@ -297,7 +297,6 @@ pub struct CacheFileRef<'a> {
     pub entries: &'a BTreeMap<String, CacheState>,
 }
 
-// OWNERSHIP: the constructor ties the view to the map it borrows.
 impl<'a> CacheFileRef<'a> {
     pub fn new(entries: &'a BTreeMap<String, CacheState>) -> CacheFileRef<'a> {
         CacheFileRef {
@@ -325,12 +324,10 @@ pub(crate) fn note_granted_by(hash: &str, reply: &serde_json::Value) {
     let who = if discovered {
         format!("{peer} (discovered)")
     } else {
-        // OWNERSHIP: the map owns its copy; the caller reads the reply on.
         peer.to_string()
     };
     crate::util::lock(&GRANTED_BY)
         .get_or_insert_with(std::collections::HashMap::new)
-        // OWNERSHIP: the map owns its key; the caller's hash is borrowed.
         .insert(hash.to_owned(), who);
 }
 
@@ -338,7 +335,6 @@ pub(crate) fn note_granted_by(hash: &str, reply: &serde_json::Value) {
 pub(crate) fn granted_by(hash: &str) -> Option<String> {
     crate::util::lock(&GRANTED_BY)
         .as_ref()
-        // OWNERSHIP: copied out from under the lock.
         .and_then(|m| m.get(hash).cloned())
 }
 

@@ -81,7 +81,6 @@ pub(crate) fn current_or_cause() -> Result<Arc<Store>, ApiError> {
         .read()
         .expect("invariant: no holder of the store cell runs code that can panic")
     {
-        // OWNERSHIP: cheap Arc handle clone, taken out of the read lock.
         StoreCell::Ready(store) => Ok(Arc::clone(store)),
         StoreCell::Unready(cause) => Err(ApiError::internal(cause.as_ref())),
     }
@@ -90,13 +89,11 @@ pub(crate) fn current_or_cause() -> Result<Arc<Store>, ApiError> {
 /// The open store, if any — the worker loops' read (poison-recovering).
 pub(crate) fn current() -> Option<Arc<Store>> {
     match &*STORE.read().unwrap_or_else(PoisonError::into_inner) {
-        // OWNERSHIP: cheap Arc handle clone, taken out of the read lock.
         StoreCell::Ready(store) => Some(Arc::clone(store)),
         StoreCell::Unready(_) => None,
     }
 }
 
-// OWNERSHIP: the handle `current()` copies out of the read lock.
 pub(crate) fn current_or_uninit() -> Result<Arc<Store>, ApiError> {
     current().ok_or_else(|| ApiError::internal(UNINIT_MSG))
 }
@@ -279,7 +276,6 @@ impl Store {
                         "sealed store: entry {hash} fails membership_hash recomputation — \
                          quarantined"
                     );
-                    // OWNERSHIP: the quarantine set owns its hashes; the file keeps its own.
                     census.insert(hash.clone());
                 }
             }
@@ -399,7 +395,6 @@ impl Store {
                 eprintln!(
                     "sealed store: entry {hash} fails credential authentication — quarantined"
                 );
-                // OWNERSHIP: the quarantine set owns its hashes; the file keeps its own.
                 keyed.insert(hash.clone());
             }
         }
@@ -416,7 +411,6 @@ impl Store {
                     "sealed store: entry {hash} allocation section MAC is missing or fails \
                      verification — quarantined"
                 );
-                // OWNERSHIP: the quarantine set owns its hashes; the file keeps its own.
                 keyed.insert(hash.clone());
             }
         }
@@ -446,7 +440,6 @@ impl Store {
                 );
                 for hash in sealed.credentials.keys() {
                     if !inner.census_quarantined.contains(hash) {
-                        // OWNERSHIP: the quarantine set owns its hashes; the file keeps its own.
                         keyed.insert(hash.clone());
                     }
                 }
@@ -549,7 +542,6 @@ impl Store {
         // reuses a hash would make this a slot-reissue footgun — gate it there.
         let was_quarantined =
             inner.census_quarantined.remove(hash) | inner.keyed_quarantined.remove(hash);
-        // OWNERSHIP: each of the store's maps owns its key; the caller's hash is borrowed.
         if was_quarantined {
             inner
                 .sections
@@ -559,7 +551,6 @@ impl Store {
         }
         write_allocations(&self.dir, inner)?;
 
-        // OWNERSHIP: each of the store's maps owns its key; the caller's hash is borrowed.
         inner.cache.insert(
             hash.to_string(),
             CacheState {
@@ -587,7 +578,6 @@ impl Store {
         let Some(sealed) = inner.sealed.as_mut() else {
             return Err(ApiError::internal("sealed store is not provisioned"));
         };
-        // OWNERSHIP: each of the store's maps owns its key; the caller's hash is borrowed.
         sealed.credentials.insert(
             hash.to_string(),
             SealedEntry {
@@ -747,7 +737,6 @@ impl Store {
                 "no such membership_hash",
             ));
         }
-        // OWNERSHIP: the cache map owns its key; the caller's hash is borrowed.
         let row = inner.cache.entry(hash.to_string()).or_default();
         let prior = row.state;
         f(row);
@@ -1031,7 +1020,6 @@ fn quarantine_all(sealed: Option<&SealedFile>, census: &mut BTreeSet<String>, wh
     }
     eprintln!("sealed store: {why}; quarantining every membership");
     for hash in f.credentials.keys() {
-        // OWNERSHIP: the quarantine set owns its hashes; the file keeps its own.
         census.insert(hash.clone());
     }
 }
@@ -1239,7 +1227,6 @@ fn load_allocations(
                 eprintln!(
                     "sealed store: credential {hash} has no allocations section — quarantined"
                 );
-                // OWNERSHIP: the quarantine set owns its hashes; the file keeps its own.
                 census.insert(hash.clone());
             }
         }
@@ -1285,7 +1272,6 @@ fn load_cache(dir: &Path, sealed: Option<&SealedFile>) -> BTreeMap<String, Cache
         Some(f) => {
             entries.retain(|hash, _| f.credentials.contains_key(hash));
             for hash in f.credentials.keys() {
-                // OWNERSHIP: the cache map owns its keys; the sealed file keeps its own.
                 entries.entry(hash.clone()).or_default();
             }
         }
@@ -1351,7 +1337,6 @@ fn write_allocations(dir: &Path, inner: &mut Inner) -> Result<(), ApiError> {
         };
         let mac_bytes = registry_id::hex_to_bytes32(&section.mac).unwrap_or([0u8; 32]);
         macs.insert(hash.as_str(), mac_bytes);
-        // OWNERSHIP: the written file's map (kept as `raw_sections`) owns its key.
         sections.insert(hash.clone(), section);
     }
     let root = format::mac(
@@ -1398,7 +1383,6 @@ fn build_snapshot(inner: &Inner, prior: Option<&Snapshot>) -> Snapshot {
                         && r.cache == *cache
                         && r.alloc == *alloc =>
                 {
-                    // OWNERSHIP: cheap Arc handle clone of an unchanged record.
                     Arc::clone(r)
                 }
                 // OWNERSHIP: the snapshot owns its copy of the authoritative
@@ -1411,7 +1395,6 @@ fn build_snapshot(inner: &Inner, prior: Option<&Snapshot>) -> Snapshot {
                     quarantined,
                 }),
             };
-            // OWNERSHIP: the map owns its key; the sealed file keeps its own.
             records.insert(hash.clone(), record);
         }
     }

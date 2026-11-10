@@ -120,7 +120,7 @@ pub(crate) fn reserve_slot(
             return Err(AllocError::BudgetExhausted);
         }
         alloc.allocations.push(EpochAllocation {
-            rln_identifier: rln_identifier_hex.to_string(), // OWNERSHIP: the new row owns its id.
+            rln_identifier: rln_identifier_hex.to_string(),
             epoch,
             used: 1,
         });

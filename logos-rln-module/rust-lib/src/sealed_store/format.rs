@@ -168,7 +168,6 @@ pub const MAX_CREDENTIALS: usize = 1024;
 pub const MAX_SECTIONS: usize = 1024;
 pub const MAX_ROWS_PER_SECTION: usize = 4096;
 
-// OWNERSHIP: every cap violation is a string literal.
 pub fn check_sealed_caps(f: &SealedFile) -> Result<(), &'static str> {
     if f.credentials.len() > MAX_CREDENTIALS {
         return Err("too many credentials");
@@ -176,7 +175,6 @@ pub fn check_sealed_caps(f: &SealedFile) -> Result<(), &'static str> {
     Ok(())
 }
 
-// OWNERSHIP: every cap violation is a string literal.
 pub fn check_allocations_caps(f: &AllocationsFile) -> Result<(), &'static str> {
     if f.sections.len() > MAX_SECTIONS {
         return Err("too many sections");

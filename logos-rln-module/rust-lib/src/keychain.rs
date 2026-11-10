@@ -153,7 +153,6 @@ impl Keychain for Unavailable {
     }
 }
 
-// OWNERSHIP: type-erased backend: the platform's, or a test seam's fake.
 fn default_backend() -> Box<dyn Keychain + Send> {
     #[cfg(target_os = "macos")]
     {
@@ -165,7 +164,7 @@ fn default_backend() -> Box<dyn Keychain + Send> {
     }
 }
 
-// OWNERSHIP: the installed backend, shared by handler threads; tests replace it.
+// OWNERSHIP: the installed backend (the platform's, or a test's fake); with_backend holds this lock across the security CLI call, so keychain reads and writes never interleave.
 static BACKEND: Mutex<Option<Box<dyn Keychain + Send>>> = Mutex::new(None);
 
 fn with_backend<R>(f: impl FnOnce(&dyn Keychain) -> R) -> R {
@@ -286,7 +285,6 @@ static AUTO_UNLOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn auto_unlock_core(
     store: &sealed::Store,
-    // OWNERSHIP: the source is a string literal.
 ) -> Result<(usize, &'static str, Zeroizing<String>), ApiError> {
     let _walk = crate::util::lock(&AUTO_UNLOCK);
     let dir = store.base_dir();
