@@ -175,7 +175,9 @@ pub(crate) fn delegated_confirm_deadline(submitted_at: u64) -> u64 {
 }
 
 /// Fire-and-record tail of a delegated submit: a gifter {"error":…} marks
-/// the record failed (and says so on `membership_state_changed`), as does a
+/// the record failed (and says so on `membership_state_changed`), unless it
+/// carries `unconfirmed: true` (the allocator submitted and did not see the
+/// registration land: the record stays pending under its deadline), as does a
 /// grant on a registry other than the scope's (the poller would never see
 /// it); a grant records the leaf estimate and a funded-style tx_result
 /// envelope on a pending record, and re-opens one the window already failed
@@ -213,6 +215,20 @@ pub(crate) fn delegated_submit_callback(
                         })
                         .or(granted_elsewhere);
                     if let Some(msg) = error {
+                        // The allocator submitted the registration and did not
+                        // see it land within its own budget: it may still
+                        // land. The record keeps its confirmation deadline,
+                        // so the poller confirms it from the registry or the
+                        // window fails it, as for a reply that never came.
+                        if v.get("unconfirmed").and_then(serde_json::Value::as_bool) == Some(true)
+                        {
+                            note_granted_by(&hash, &v);
+                            eprintln!(
+                                "membership delegated: {msg}; {hash} stays pending until the \
+                                 registry shows it or its confirmation window ends"
+                            );
+                            return;
+                        }
                         // A late gifter rejection must not overwrite a state
                         // the poller already confirmed from the registry
                         // (authoritative). Only a still-pending record fails.
@@ -505,6 +521,70 @@ mod tests {
     use crate::generated::LiblogosRlnModule;
     use crate::test_support::{imp_with_store, opts_arr, seed_membership, TEST_GLOBAL_LOCK};
     use crate::LogosRlnModuleImpl;
+
+    // An allocator that answers `unconfirmed` submitted the registration and
+    // did not see it land within its own budget. The record stays pending
+    // for the poller, under the deadline it already carries, and remembers
+    // who was asked; any other failure reply still fails it.
+    #[test]
+    fn an_unconfirmed_gift_stays_pending_for_the_poller() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir = std::env::temp_dir().join(format!("rln-unconfirmed-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_imp, store) = imp_with_store(dir.clone());
+        store.unlock("pw").unwrap();
+        let registry = format!("logos:local:{}", "6f".repeat(32));
+        let account = "6f".repeat(32);
+        seed_membership(
+            &store,
+            "hu",
+            &registry,
+            &"49".repeat(32),
+            "",
+            &"fb".repeat(32),
+            MembershipState::Pending,
+            0,
+            100,
+        );
+        delegated_submit_callback(Arc::downgrade(&store), "hu".into(), account.clone())(Ok(
+            r#"{"error":"p: unconfirmed: registration submitted (tx ab) but not on chain within 150s; it may still land","gifterPeerId":"p","discovered":true,"unconfirmed":true}"#.to_string(),
+        ));
+        let rec = store.membership("hu").unwrap();
+        assert_eq!(
+            rec.cache.state,
+            MembershipState::Pending,
+            "left for the poller: {:?}",
+            rec.cache.failed_reason
+        );
+        assert!(rec.cache.failed_reason.is_none());
+        assert_eq!(
+            lifecycle::granted_by("hu").as_deref(),
+            Some("p (discovered)")
+        );
+
+        seed_membership(
+            &store,
+            "hr",
+            &registry,
+            &"4a".repeat(32),
+            "",
+            &"fc".repeat(32),
+            MembershipState::Pending,
+            0,
+            100,
+        );
+        delegated_submit_callback(Arc::downgrade(&store), "hr".into(), account)(Ok(
+            r#"{"error":"p: credential already used: x","gifterPeerId":"p","discovered":true}"#
+                .to_string(),
+        ));
+        let rec = store.membership("hr").unwrap();
+        assert_eq!(rec.cache.state, MembershipState::Failed);
+        assert_eq!(
+            rec.cache.failed_reason.as_deref(),
+            Some("gifter_failed: p: credential already used: x")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // The submit replies land after the poller may already have confirmed
     // the record from the registry: neither the funded estimate nor the
