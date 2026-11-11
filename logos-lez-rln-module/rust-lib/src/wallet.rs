@@ -126,6 +126,7 @@ mod ffi {
     pub const INVALID_ACCOUNT_ID: i32 = 13;
     pub const PAYER_CANNOT_FUND: i32 = 21;
     pub const WRONG_PASSWORD: i32 = 25;
+    pub const WOULD_REVERT: i32 = 26;
     /// The code the test transport answers with.
     #[cfg(test)]
     pub const NO_WALLET: i32 = WALLET_NOT_INITIALIZED;
@@ -155,6 +156,7 @@ mod ffi {
             22 => "not supported",
             23 => "response too big",
             WRONG_PASSWORD => "wrong password",
+            WOULD_REVERT => "would revert",
             99 => "internal error",
             _ => "unlisted",
         };
@@ -270,12 +272,82 @@ mod ffi {
         pub address_openings_size: usize,
     }
 
+    /// `FfiFeeState`: the fee quote a dry run was priced against.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct FeeState {
+        pub height: u64,
+        pub base_fee_exec: u64,
+        pub base_fee_stor: u64,
+        pub next_base_fee_exec_floor: u64,
+        pub next_base_fee_exec_ceiling: u64,
+        pub next_base_fee_stor_floor: u64,
+        pub next_base_fee_stor_ceiling: u64,
+        pub max_gas_exec: u64,
+        pub max_gas_stor: u64,
+    }
+
+    /// `FfiDryRunReport`. This module never asks for a dry run, so the report
+    /// stays zeroed; the struct is declared because the library writes it into
+    /// every `TransactionResult`.
+    #[repr(C)]
+    pub struct DryRunReport {
+        pub fee_state: FeeState,
+        pub cycles: u64,
+        pub fee_at_head: U128,
+        pub reserve_at_head: U128,
+        pub wire_bytes: u64,
+        pub revert_reason: *mut c_char,
+        pub headroom_blocks: u64,
+        pub exec_ceiling: u64,
+        pub stor_ceiling: u64,
+        pub headroom_reserve: U128,
+        pub claims: u64,
+        pub swept: U128,
+    }
+
+    /// `FfiFeeDeclaration`: the fee a public transaction declared.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct FeeDeclaration {
+        pub payer: Bytes32,
+        pub gas_limit: u64,
+        pub tip: u64,
+        pub max_fee: U128,
+    }
+
+    /// `FfiPrivateFee`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct PrivateFee {
+        pub payer: Bytes32,
+        pub reserve: U128,
+        pub has_refund_to: bool,
+        pub refund_to: Bytes32,
+    }
+
+    /// `FfiDeclaredFee`. `kind` is the C enum `FfiFeeKind` (0 none, 1 public,
+    /// 2 private).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct DeclaredFee {
+        pub kind: u32,
+        pub public_fee: FeeDeclaration,
+        pub private_fee: PrivateFee,
+    }
+
+    /// `FfiTransactionResult` as of LEZ v0.4.0-rc3, which appended
+    /// `is_dry_run`, `dry_run` and `fee`. The library writes all of it, so a
+    /// shorter struct here would be written past its end.
     #[repr(C)]
     pub struct TransactionResult {
         pub tx_hash: *mut c_char,
         pub success: bool,
         pub secrets_data: *const Bytes32,
         pub secrets_size: usize,
+        pub is_dry_run: bool,
+        pub dry_run: DryRunReport,
+        pub fee: DeclaredFee,
     }
 
     impl Default for TransactionResult {
@@ -285,6 +357,22 @@ mod ffi {
                 success: false,
                 secrets_data: std::ptr::null(),
                 secrets_size: 0,
+                is_dry_run: false,
+                dry_run: DryRunReport {
+                    fee_state: FeeState::default(),
+                    cycles: 0,
+                    fee_at_head: U128::default(),
+                    reserve_at_head: U128::default(),
+                    wire_bytes: 0,
+                    revert_reason: std::ptr::null_mut(),
+                    headroom_blocks: 0,
+                    exec_ceiling: 0,
+                    stor_ceiling: 0,
+                    headroom_reserve: U128::default(),
+                    claims: 0,
+                    swept: U128::default(),
+                },
+                fee: DeclaredFee::default(),
             }
         }
     }
@@ -1595,6 +1683,10 @@ fn send_error(rc: i32) -> String {
                 .to_owned()
         }
         ffi::NETWORK_ERROR => "sequencer: the transaction was not accepted".to_owned(),
+        // The wallet simulates before it submits: nothing was sent or charged.
+        ffi::WOULD_REVERT => {
+            "would_revert: the transaction reverts when simulated, so it was not sent".to_owned()
+        }
         other => format!("wallet: {}", ffi::describe(other)),
     }
 }
@@ -2085,6 +2177,7 @@ mod tests {
     #[test]
     fn send_errors_name_their_kind() {
         assert!(send_error(ffi::PAYER_CANNOT_FUND).starts_with("insufficient_balance: "));
+        assert!(send_error(ffi::WOULD_REVERT).starts_with("would_revert: "));
         assert!(send_error(ffi::KEY_NOT_FOUND).starts_with("no_signing_key: "));
         assert!(send_error(ffi::INVALID_ACCOUNT_ID).starts_with("pda_mismatch: "));
         assert_eq!(send_error(99), "wallet: code 99 (internal error)");

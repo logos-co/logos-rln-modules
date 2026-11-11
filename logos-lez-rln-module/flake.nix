@@ -20,13 +20,13 @@
     # on macOS, a Metal toolchain stub and an unsandboxed build; the LEZ flake
     # supplies all of that and a module flake cannot.
     #
-    # Upstream LEZ v0.4.0-rc1: the wallet library is `core_ffi` (packages.core,
+    # Upstream LEZ v0.4.0-rc3: the wallet library is `core_ffi` (packages.core,
     # header core_ffi.h), wallet_ffi_open takes the storage password, and a
     # transaction names the actor its message is delivered to. The wallet takes
     # its execution gas limit from config (#884), which a registration needs:
     # ~9.1M of the 10M cap, against a stock default of 2M.
     logos-execution-zone.url =
-      "github:logos-blockchain/logos-execution-zone/v0.4.0-rc1";
+      "github:logos-blockchain/logos-execution-zone/v0.4.0-rc3";
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:
