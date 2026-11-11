@@ -994,11 +994,13 @@ impl LiblogosLezRlnModule for LogosLezRlnModuleImpl {
             return String::new();
         };
 
-        // One account signs the Register tx, pays the registry price from its
-        // NATIVE balance and pays the fee. Empty means "this module's own
-        // payer", which is what a registry-agnostic consumer passes; a caller
-        // paying on someone else's behalf names an account whose key this
-        // wallet holds, because the signature is what authorizes the debit.
+        // The named account signs the Register tx and pays the registry price
+        // from its NATIVE balance; the fee is always reserved from this
+        // module's own payer (`fee_payer_hex`). Empty means "this module's own
+        // payer", which makes them one account and is what the membership
+        // module and the gifter pass. Any other account must have its key in
+        // this wallet, and is preflighted for price plus fee reserve although
+        // it pays only the price, while the fee payer is not preflighted.
         let payer_hex = if payer_account_id.trim().is_empty() {
             wallet::payer_hex().to_owned()
         } else {
